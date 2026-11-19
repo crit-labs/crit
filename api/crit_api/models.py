@@ -285,6 +285,7 @@ class ModelContext:
         self.drafters = ()  # an installed engine's drafter downloads (crit pull), as folders
         self.leases, self.views = [], []
         self.progress = progress
+        self._worked = 0.0   # when working() last sent a status
 
     @property
     def model_id(self):
@@ -299,6 +300,29 @@ class ModelContext:
         """A verified file held for the pool lifetime, for native file loaders."""
         self.pool.verify_sources()
         return self.pool.paths[name]
+
+    def model_folder(self):
+        """The folder the verified files are held in (the checkpoint's, or its verified copy): what a loader opens as
+        the model. A checkpoint without a config.json (a lone GGUF, whose config Core derives) has one too."""
+        self.pool.verify_sources()
+        top = sorted(name for name in self.pool.paths if "/" not in name)
+        if not top:
+            raise ValueError("the served checkpoint holds no file at its top level")
+        return Path(self.pool.paths[top[0]]).parent
+
+    def working(self, what, done=None, total=None):
+        """What a long step of the engine's load is doing (crit_core.engine.LoadContext.working), sent as the
+        loading status's `work`, at most once a second and once more when it is done; nothing once the load is
+        over."""
+        import time
+        stamp = time.monotonic()
+        last = done is not None and done == total
+        if not self.progress or (stamp - self._worked < 1.0 and not last):
+            return
+        self._worked = stamp
+        self.progress("loading_engine", work={"what": str(what)[:200],
+                                              **({"done": int(done)} if done is not None else {}),
+                                              **({"total": int(total)} if total is not None else {})})
 
     def device(self, compatibility, nbytes, allocate, inputs=()):
         def loading():

@@ -365,6 +365,11 @@ class DeviceTests(PluginTestCase):
             self.cache(store, 1, 16, 24, ring_slots=16)          # the ring leaves too few
         with self.assertRaisesRegex(ValueError, "ring holds a layer's every expert"):
             self.cache(store, 1, 16, 40, ring_slots=8)
+        # Its own ring: a cache too small for a layer's experts beside the slots a plan needs is refused when it is
+        # made, naming the slots prompts take, not at its first prompt; with a CPU tier the same slots hold a ring.
+        with self.assertRaisesRegex(ValueError, "holds no prompt ring.*prompts take 32 slots"):
+            self.cache(store, 1, 16, 20)
+        self.assertEqual(len(self.cache(store, 1, 16, 20, cpu_tier=True).ring_slots), 16)
         self.assertEqual(len(self.cache(store, 1, 16, 12, cpu_tier=True, ring_slots=0).own), 12)
         other = expert_store.BundleStore({"bundle_bytes": 512}, 1, 16, self.device())
         self.addCleanup(other.close)
@@ -450,6 +455,111 @@ class DeviceTests(PluginTestCase):
                 seen = cache.telemetry(sync=True)
                 self.assertGreater(seen["prompt_copies"], 0)
                 self.assertEqual(seen["slots"], 80 if ring == "borrow" else 80 - 2 * experts)
+
+    def test_a_staged_layer_serves_every_chunk_of_a_span_across_steps(self):
+        # A span run layer by layer: every chunk asks prompt() for the same layer before the next layer comes. The
+        # layer's experts are staged once; a step's end keeps the ring (hold), decode plans move the residency in the
+        # slots beside it, and the next step's chunk reads every expert's bundle still, only what left the cache
+        # since staged again. Chunk by chunk the same chunks stage every layer once a chunk.
+        if self.device() != "cuda":
+            self.skipTest("the copy engine")
+        torch = self.torch
+        layers, experts, chunks = 4, 24, 5
+        store = self.store(layers, experts, bundle=4096, seed=5)
+        expected = torch.stack([store.bundle(l, e).view(torch.int32).sum(dtype=torch.int64)
+                                for l in range(layers) for e in range(experts)]).view(layers, experts).cuda()
+
+        def read(cache, layer, routes, rng):
+            ids = torch.tensor([rng.randrange(experts) for _ in range(routes)], device="cuda").view(-1, 2)
+            held, table = cache.prompt(layer, ids)
+            self.assertTrue(bool((table >= 0).all()), "a staged layer's table names a slot for every expert")
+            found = held[table.long()].view(experts, -1).view(torch.int32).sum(1, dtype=torch.int64)
+            self.assertTrue(torch.equal(found, expected[layer]), f"layer {layer}")
+
+        def decode(cache, rng, rounds=2):
+            for _ in range(rounds):
+                for layer in range(layers):
+                    cache.plan(layer, torch.tensor([rng.randrange(experts) for _ in range(6)], device="cuda"))
+
+        copies = {}
+        for native in self.kernels():
+            for order in ("chunks", "layers", "held"):
+                cache = self.cache(store, layers, experts, 80, native=native, ring_slots=2 * experts)
+                rng = random.Random(7)
+                decode(cache, rng, 4)
+                missing = sum(int(slot < 0) for slot in cache.directory.snapshot()[0])
+                long = 8 * experts   # routes of a chunk that is staged whole, whatever it routes
+                if order == "chunks":
+                    for chunk in range(chunks):
+                        for layer in range(layers):
+                            read(cache, layer, long, rng)
+                else:
+                    for layer in range(layers):
+                        for chunk in range(chunks):
+                            read(cache, layer, long if chunk < chunks - 1 else 4, rng)   # the last chunk a short one
+                            if order == "held" and chunk in (1, 3):   # a step ends inside the layer
+                                cache.end_prompt(hold=True)
+                                self.assertTrue(cache.holding and len(cache._ring_now) == 2 * experts)
+                                decode(cache, rng)   # plans beside the held ring: the residency moves
+                                self.assertTrue(cache.holding, "a decode plan leaves a held ring where it is")
+                cache.end_prompt()
+                self.assertFalse(cache.holding)
+                seen = cache.telemetry(sync=True)
+                self.assertEqual(seen["slots"], 80)   # the ring went back
+                copies[order] = seen["prompt_copies"]
+                if order == "layers":   # each layer's missing experts once, however many chunks read them
+                    self.assertLessEqual(copies[order], missing + 2 * experts)
+            self.assertGreater(copies["chunks"], 3 * copies["layers"], copies)
+            # held across steps: what the plans in between pushed out of the cache is staged again, nothing more
+            self.assertLess(copies["held"], copies["chunks"] // 2, copies)
+
+    def test_a_chunk_that_leaves_experts_unrouted_has_only_its_spans_routes_staged(self):
+        # A chunk of a few times stage_routes routes that routes a part of its layer: only the experts it routes
+        # cross the link. A later chunk of the span reads the layer's experts where the first found them and has
+        # what it routes beyond them staged beside; an expert no chunk routed has no slot. Once the span's chunks
+        # together route nearly the whole layer the later layers are staged whole, and the next prompt step starts
+        # over.
+        if self.device() != "cuda":
+            self.skipTest("the copy engine")
+        torch = self.torch
+        layers, experts = 3, 64
+        store = self.store(layers, experts, bundle=4096, seed=9)
+        expected = torch.stack([store.bundle(l, e).view(torch.int32).sum(dtype=torch.int64)
+                                for l in range(layers) for e in range(experts)]).view(layers, experts).cuda()
+
+        def read(cache, layer, routed, times):
+            ids = torch.tensor(list(routed) * times, device="cuda").view(-1, 2)
+            held, table = cache.prompt(layer, ids)
+            torch.cuda.synchronize()
+            picked = torch.tensor(list(routed), device="cuda")
+            self.assertTrue(bool((table[picked] >= 0).all()), "every routed expert has a slot")
+            found = held[table[picked].long()].view(len(routed), -1).view(torch.int32).sum(1, dtype=torch.int64)
+            self.assertTrue(torch.equal(found, expected[layer][picked]), f"layer {layer}")
+            return table.clone()
+
+        for native in self.kernels():
+            cache = self.cache(store, layers, experts, 200, native=native, ring_slots=2 * experts)
+            copies = lambda: cache.telemetry(sync=True)["prompt_copies"]   # noqa: E731
+            first = read(cache, 0, range(16), 4)            # 64 routes of 16 experts, none resident
+            self.assertEqual(copies(), 16)
+            self.assertEqual(int((first >= 0).sum()), 16)   # an expert the chunk does not route has no slot
+            second = read(cache, 0, range(8, 32), 3)        # the span's next chunk: 16 experts beyond the first's
+            self.assertEqual(copies(), 32)
+            self.assertTrue(torch.equal(second[:16], first[:16]), "the first chunk's experts stay where they are")
+            read(cache, 0, range(8, 32), 3)                 # nothing new: nothing copied
+            self.assertEqual(copies(), 32)
+            read(cache, 0, range(60), 2)                    # together nearly the whole layer
+            self.assertEqual(copies(), 60)
+            whole = read(cache, 1, range(16), 4)            # so the next layer is staged whole, the one after ahead
+            self.assertTrue(bool((whole >= 0).all()))
+            self.assertEqual(copies(), 60 + 2 * experts)
+            cache.end_prompt()
+            again = read(cache, 0, range(16), 4)            # another prompt step: its routes alone again
+            self.assertEqual(int((again >= 0).sum()), 16)
+            self.assertEqual(copies(), 60 + 2 * experts + 16)
+            self.assertEqual(cache.telemetry(sync=True)["routed_chunks"], 2)
+            cache.end_prompt()
+            self.assertEqual(cache.telemetry(sync=True)["slots"], 200)
 
     def test_an_elastic_cache_grows_and_shrinks_with_its_addresses_fixed(self):
         device = self.device()

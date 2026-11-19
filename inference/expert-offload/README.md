@@ -10,6 +10,9 @@ it decided.
 Use it whenever the routed experts might not fit beside the model's weights and its KV cache at the required context:
 recon's placement scenario `sparse_device_host` (experts in host memory) or `sparse_device_host_disk` (not even that).
 It also serves experts that do fit (the device tier), so an engine need not know which case it is in.
+Experts gated by GELU (Gemma 4's) are served as SwiGLU ones are: the model plugin calls `activate("gelu_tanh")`
+before `open()` (the fact `experts:activations`), the device rows take the gate in the grouped-experts kernel, and
+every miss goes over the link, since the CPU tier computes SiLU-gated NVFP4 and INT4 experts.
 
 Don't use it for a model without routed experts.
 
@@ -39,8 +42,39 @@ rounds find the plugin in its slot (its `start_round` and `count_round` run insi
 | How big is the device cache? | Every byte the device has free while the engine serves (below) | `open()`, then Core's step frames |
 | Who computes a decode miss? | `cpu` where it builds: the CPU tier ([host-expert-tier](../host-expert-tier/README.md)) computes every miss in the device's bits beside the device, while the link copies the missed expert into the cache beside the round; `link`: every miss copied into a cache slot before its layer reads it | `open()`: the CPU path needs nvfp4 W4A4 or int4 experts, the native tier and the in-stream join built here, and a mapped store |
 | Which experts stay? | Those routed last (`policy: recent`): a missed expert serves from the next round, in the slot of the expert routed longest ago | every decode round |
-| Which arithmetic? | Wherever the CPU computes misses, the device's decode rows take the CPU's integer order, so who computes an expert never changes a token; with misses over the link every row is grouped-experts' tensor arithmetic. Prompt chunks never go to the CPU: `prompt_arithmetic: tensor` runs them on tensor cores in a speed engine | the miss path, `prompt_arithmetic` |
-| Prompt chunks | The layer's non-resident experts staged through the cache's ring by the copy engine, one layer ahead; nothing admitted. A short chunk borrows as many ring slots as it has routes | every `forward(prompt=True)` |
+| Which arithmetic? | Wherever the CPU computes misses, the device's decode rows take the CPU's integer order, so who computes an expert never changes a token; with misses over the link every row is grouped-experts' tensor arithmetic. Prompt chunks never go to the CPU: `prompt_arithmetic: tensor` runs them on tensor cores where the engine asks `repeatable` or `row-exact` prompt rows | the miss path, `prompt_arithmetic` |
+| Prompt chunks | The layer's non-resident experts staged through the cache's ring by the copy engine, one layer ahead; nothing admitted. A short chunk borrows as many ring slots as it has routes. A staged layer serves every chunk that reads it, across steps (below) | every `forward(prompt=True)` |
+| A short prompt chunk's misses | Where the CPU tier computes decode misses and prompt rows keep its order (`prompt_arithmetic` declared), a chunk of fewer routes than a layer has experts sends its missed routes to the CPU tier when they cost less there than their experts over the link, by the two times `open()` measured (`miss_times_us`; under four fifths, as for decode misses): nothing copied, no ring borrowed, the same bits. Else, and in the tensor arithmetic, its routed misses are copied into the ring | every short `forward(prompt=True)`, from the times measured at `open()` |
+| What does the cache give back? | An elastic cache is a giver of the device's ledger: a prompt step's room, and the pages a KV pool backs as a sequence grows, come out of its coldest slots, down to its ring and, without a CPU tier, a layer's experts (over the link a miss needs a slot). A cache that keeps its size gives nothing back, so at `open()` it leaves the model's elastic pools the bytes they have reserved and not backed (`reasons.pools`) | the ledger's `need()` |
+| Layers stored otherwise | An NVFP4 checkpoint may store some layers' experts weight-only (W4A16: no input scales; a draft layer's) beside W4A4 ones. Where the CPU tier may serve misses those layers stay whole on the device, outside the cache and the tier (it computes W4A4 experts only), with or without a store file; where every miss goes over the link (misses `link`, a file tier, a store with compressed scales) they are cached as the others | `open()` |
+
+**Prompts: a layer's experts once a span.** A prompt chunk of a hundred tokens or more routes nearly every expert of
+a layer, so chunk by chunk every chunk brings every layer's non-resident experts over the link: on
+Qwen3.8-Flash-Next (49 expert layers, 69.7 GB of experts of which the cache holds about 20) that is some 48 GB and
+2.2 to 2.3 s a chunk whatever its size, 250 to 270 tokens a second of prefill with every step past crit serve's
+one-second cancel grace. Neither the link nor the CPU tier changes that: both read the same bytes from host memory at
+about the same rate. What changes it is the order of the model's loops. `stages_prompts()` tells the model plugin
+that prompt chunks stage so, and a model plugin that then runs a prompt's spans layer by layer (model-template's
+passes: every chunk of a span through one layer before the next layer) calls `forward(layer, ..., prompt=True)`
+once a chunk for the same layer: the cache serves the calls after the first from what the first staged, so each
+layer's experts cross the link once for the span, with the next layer's staged under the current one. Such a span
+takes several of Core's steps: while a prompt goes on (`end_step(prompts_open=True)`) the ring stays borrowed with
+the layer staged in it, decode rows of other requests plan beside it, and the next step stages only what their plans
+pushed out of the cache; when no prompt is in flight, or the request that held the ring is cancelled, the ring goes
+back. Nothing in it depends on the model: a layer id, its routes and the order of the calls. Measured through
+model-template on an RTX 5090 with every option here at its default: Qwen3.8-Flash-Next 2,131 tokens a second at a
+16,384-token prompt where chunk by chunk gave 555, Gemma 4 26B (46 GB of BF16 experts, GELU-gated) 4,727 where chunk
+by chunk gave 1,050, every step under 0.62 s and the same tokens either way ([the
+table](../model-template/README.md#the-serving-contracts)).
+
+So a prompt's experts are served three ways, each chosen here and none by the engine's author: a span of long
+chunks stages each layer once (the link, at the device's arithmetic rate for every chunk after); a short chunk
+copies its routed misses into the ring, or, where the CPU tier serves decode misses in the rows' own order and
+was measured the sooner, has the CPU tier compute them; and decode rows miss to the link or the CPU tier by the same
+measurement (`misses: auto`). `facts()`'s `prompts` and `reasons.misses` say which with the numbers. On a machine
+whose link and CPU tier read host memory at about the same rate (an RTX 5090 on PCIe 5.0 x16 beside a Ryzen 5
+9600: 110 to 140 us a missed expert either way) the short chunk's two ways cost the same and the link keeps it; the
+CPU's way is for a slower link, where the same measurement already sends decode misses to the CPU tier.
 
 **The cache's memory.** Under WDDM (Windows, WSL) an allocation past the device's memory is not refused: it moves to
 system memory and everything that reads it slows down. So the cache never takes memory it was not shown to be free:
@@ -53,14 +87,32 @@ system memory and everything that reads it slows down. So the cache never takes 
 - `margin_mib` is free at every moment: set it to the run's VRAM headroom (`crit plugins offload` writes it), and
   the run's device-memory checks read at least that at every step's peak.
 - A step that runs prompt tokens takes temporaries from the device. Before it (`begin_step`), the cache makes room
-  for a chunk of that size: what such steps were measured to take (`telemetry()` lists it per chunk size), an
-  eighth more and 32 MiB. Between prompts the cache leaves a short prompt's room free (`max_tokens` tokens), so a
-  chat turn takes nothing from it; a prompt of many steps makes room once, the blocks torch's allocator holds of
-  its earlier steps being that room; only a larger chunk has the cache give back its coldest slots. A chunk
+  for a chunk of that size: what such steps were measured to take from the device at their peak (`telemetry()`
+  lists it per chunk size), an eighth more and 32 MiB. The measurement is the device's, as the run's checks read
+  it: what the device holds outside the ledger's elastic ranges (whose growth asks the ledger for its own room)
+  over the step's start, torch's peak included, so blocks torch's
+  allocator keeps from a prompt's earlier steps cost a step nothing where it reuses them and count where it cannot
+  (a tensor larger than any kept block, as attention's grow with the context, takes new memory beside them).
+  That room is a forecast, and a forecast is off now and then (a step deeper in the context than any before it,
+  a plugin's temporaries outside the ledger), so the margin does not rest on it: the cache also looks at the step
+  as it runs, before every routed layer of every chunk, and keeps free beyond `margin_mib` never less than a
+  reserve of what such steps were seen to take from the device between two looks (the most of the last 64 steps,
+  half again and 32 MiB, 64 MiB at least). A step that outgrows its room is given its next stride before it takes
+  it, a look at a step that reuses its blocks reads torch's own count and costs nothing, and `telemetry()` counts
+  the looks that found the device had taken more and those at which the cache gave memory (`looks`, `extends`,
+  `reserve_bytes`).
+  Between prompts the cache leaves a short prompt's room free (`max_tokens` tokens), so a chat turn takes nothing
+  from it; only a step that takes more than such steps did has the cache give back its coldest slots. A chunk
   larger than any measured is given the largest's room in proportion to its tokens and what a first step of its
   kind left in use behind it so far (graphs, workspaces), for that one step: its own measurement follows. After
   the last prompt step (`end_step`) the prompt's blocks go back to the device (3 ms) and the cache grows back, so
-  the next prompt's peak is its own: blocks kept from a larger prompt would count as every later one's room. A
+  the next prompt's peak is its own: blocks kept from a larger prompt would count as every later one's room. It
+  grows back a bounded settle at a time (the device ledger's: 50 ms a step's frame), the rest in the following
+  steps' frames: backing two gigabytes at once took the driver over half a second under WSL, inside the last
+  prompt step and inside a cancel, past the cancel grace with the step's own work. A score's frame
+  (`begin_step(..., score=True)`) is measured apart: its rows' logits and their sort are a score's temporaries,
+  which a prompt step of as many tokens never makes, so they are no prompt chunk's room (learned as one, they
+  had every prompt give back and take again 1.7 GB the prompt did not use). A
   peak measured while the engine loaded is a first step's (its graphs' captures took memory beside the chunk's
   temporaries) and is forgotten once a served prompt of that size or larger took less: Qwen3.8-Flash-Next's
   load measured 234 to 358 MiB for chunks of 7 to 37 tokens, a served prompt of 70 to 80 tokens takes 108 to 128.
@@ -78,11 +130,24 @@ system memory and everything that reads it slows down. So the cache never takes 
   its size (it is not elastic).
 
 The cache is [device-expert-cache](../device-expert-cache/README.md)'s ExpertCache, the host store expert-tensors'
-BundleStore (mapped and registered, read in place by the CPU tier; a file under `store_dir` is built once per
-checkpoint and reopened), the disk tier's store a file read on the host (its misses cannot be
+BundleStore (host memory of its own, registered, read in place by the CPU tier; a file under `store_dir` is built
+once per checkpoint and read into that memory at later loads), the disk tier's store a file read on the host (its misses cannot be
 captured, so it decodes through `step()`), the CPU tier behind
 [heterogeneous-expert-dispatch](../heterogeneous-expert-dispatch/README.md)'s in-stream post and join, and every
 device row grouped-experts' kernel. The plugin adds no arithmetic of its own.
+
+**The store between loads.** Building the store reads every routed expert from the checkpoint and packs it: minutes
+for tens of gigabytes, at every load. A store file is built once and reopened (`complete`: the model skips its expert
+loads). `store_dir` names a folder for it. Without one, the plugin uses the host's plugin cache (`context.cache`, the
+`CRIT_PLUGIN_CACHE` folder: crit run sets it to `.plugin-cache` in the run's folder, so a candidate's first load
+builds the store and every later load of the run reopens it; `crit run stop` removes the folder). There the file is keyed by the checkpoint, the layout
+and the code of the package's plugins (another model plugin or other packing is another store), the cache holds one
+store a checkpoint (the others of that checkpoint are removed when a new one is built), and a new file is written
+only on a local disk and where the machine's plugin cache ledger (`crit_plugins.disk_cache`) makes room for it: every
+run's kept stores together stay under `CRIT_PLUGIN_CACHE_GIB` (default 100) and the disk keeps `CRIT_DISK_FLOOR_GIB`
+(default 50) free after the write, the least recently opened stores of any run, a run never stopped included, removed
+first. Where it cannot, `reasons.store` says why and the store is built in host memory as before. Set `CRIT_PLUGIN_CACHE` to another folder to share stores between runs,
+or to nothing for no cache.
 
 **The disk tier keeps each expert once.** Where host memory does not hold the experts, what it has free
 (`host_tier_mib`, by default all of it beside `ram_headroom_mib`) is a host tier between the file and the device
@@ -96,7 +161,7 @@ host tier. `telemetry()`'s `file_store` counts the host tier's hits, the file's 
 the ones that left for them. Not measured on a model larger than host memory yet.
 
 **The ram tier can hold its hottest experts once (`pinned`).** In the ram tier host memory holds every expert
-(the store, mapped and registered) and the device holds the resident ones a second time. Handing an evicted
+(the store, registered host memory) and the device holds the resident ones a second time. Handing an evicted
 expert back, as the disk tier does, has no place here: the store is one registered mapping the device reads at a
 fixed address, and taking a bundle's pages out of it and back costs a registration each way (measured on one
 machine: 470 to 540 us to register an expert's pages, 240 to 280 us to unregister them, beside 166 us for the
@@ -125,10 +190,34 @@ Windows kept 10.6 GiB or more available, wrote no page out, and the first reply 
 host that needs it cannot be told from inside (the VM above sees 77 GiB available either way).
 
 **What it says.** `facts()["expert_offload"]` names the tier, the miss path, the slots, the policy and the reason for
-each decision. `telemetry()["expert_offload"]` carries the cache's and the CPU tier's counters, the elastic cache's
+each decision, and `prompts`: whether prompt chunks stage their layers' experts, the link's rate as measured at
+`open()` (`link_us` a bundle, `link_gib_s`) and a sweep, the bytes and seconds of bringing every expert the cache
+does not hold to the device once (`sweep_bytes`, `sweep_seconds`): what a long chunk run through every layer pays,
+and a span run layer by layer pays once for all its chunks. `telemetry()["expert_offload"]` carries the cache's and the CPU tier's counters, the elastic cache's
 size and what prompt chunks took, who holds the device's memory (`device`: the cache, the model's weights, pools
 and workspaces in torch's allocator, what is free), and `diagnosis`, one line: the hit rate over the slots, where
 the misses went, those shares, and the next lever when the hit rate is low.
+
+**Experts a GGUF checkpoint stores (format `gguf`).** A GGUF file quantizes each layer's expert stacks in a block
+format of its own (Unsloth's UD-IQ1_M Qwen3.8-Flash-Next: gate and up projections IQ2_XXS, IQ2_XS or IQ2_S by layer,
+down projections Q2_0, two layers' IQ4_NL), so `begin(..., "gguf", ..., formats={layer: (gate_up, down)})` takes each
+layer's formats and a bundle is an expert's stored rows as the file has them: its gate and up rows, then at the next
+64-byte boundary its down rows ([code/gguf_experts.py](code/gguf_experts.py)). Bundles are cached, staged and
+streamed over the link as any other (every store, tier, cache and prompt path above). The slot is the bundle most
+layers need: the smallest layer bundle past which the wider layers hold at most a sixteenth of the experts' bytes.
+A narrower layer's bundle is padded to it; a wider layer's (a few layers a file stores in a wider format: two IQ4_NL
+layers of Qwen3.8-Flash-Next's UD-IQ1_M) is stored in pieces of a slot (extra store layers after the model's) and
+kept whole on the device at its own size, outside the cache (`reasons.outsized`), so no slot is padded to it. Their rows are crit's kernel gguf-rows' arithmetic, read where they lie in the cache's slots
+(a layer's gate-up and down stacks are views of the slot array at its stride): a decode row's routes on gguf-rows'
+gathered gemv (int8 activations a 32 values, each stored sub-block's exact integer dot, FP32 in the kernel's declared
+order), a prompt chunk's routes grouped by slot and multiplied on each expert by gguf-rows' matmul, which has the same
+bits, so a prompt row has its decode row's bits. The CPU tier computes GGUF misses in torch on the host, in gguf-rows'
+declared order with the splits the kernel takes on this device (`GgufCpuTier` over Core's `declared_rows`, the bundles
+read in place in the store): a route it serves has the bits it has in a slot. It is not native, so its rows join the
+device's after a synchronization and a round with it is not captured (`round_problems` says so); on `misses` auto it
+serves misses where the cache is too small for link misses, and where it is timed faster than the link. The model
+plugin hands GGUF experts as stored only to an experts plugin that provides
+`experts:gguf`, as this one does.
 
 The decisions are plain functions of sizes and measured times ([code/offload.py](code/offload.py)), so they run without
 a device:
@@ -213,16 +302,16 @@ and the three largest tensors by shape (a vocabulary-sized table shows there), f
 | --- | --- | --- |
 | `tier` | `auto` | Pin `device`, `ram` or `disk` |
 | `host_tier_mib` | -1 | The disk tier's host tier: -1 takes the host memory free beside `ram_headroom_mib`, 0 none (the page cache holds what was read) |
-| `misses` | `auto` | Pin `cpu` or `link`. `auto` times a missed expert on the CPU tier and over the link at load and takes the CPU tier only where it needs under four fifths of the link's time (`telemetry()`'s `miss_times_us`); the choice changes the device rows' arithmetic, so it is a [measured decision](../../docs/PLUGINS.md#measured-decisions): a package whose record holds it (`crit plugins decisions`) takes the same path in every process (`miss_times_from`: `recorded`), and without one each load measures: beside the CPU tier every device row runs the declared order, and the tier starts slow after a pause. Qwen3.8-Flash-Next on an RTX 5090 and a Ryzen 5 9600: the link (120 us against the tier's 110 to 140 warm), 73 sampled and 78 greedy tok/s on fresh prompts where the CPU tier gave 45 and 73 |
+| `misses` | `auto` | Pin `cpu` or `link`. `auto` times a missed expert on the CPU tier and over the link at load as the engine will serve each, and takes the CPU tier only where it needs under four fifths of the link's time (`telemetry()`'s `miss_times_us`, every timed batch in `miss_trials_us`). The link: batches of the same bundles until its rate has stopped doubling (a second at most), the fastest counted, timed before the CPU tier exists (a store just built or reopened pays an expert's first use several times over; a device left idle while the engine loaded has its link at its lowest speed and brings it up only after a fraction of a second under load, so its first batches agree with each other at a seventh of the rate it serves misses at; and the tier's threads take the processor the copies' host side runs on: timed any other way the link read 700 to 750 us here where it serves at 100, every miss went to the CPU tier, and with it every prompt row to the declared order, at under half the prefill rate). The CPU tier: computing the expert (`compute`) and the way of its layer's rows to the host and back (`handoff`), which a decode layer with a miss there pays and a copy never does; the choice changes the device rows' arithmetic, so it is a [measured decision](../../docs/PLUGINS.md#measured-decisions): a package whose record holds it (`crit plugins decisions`) takes the same path in every process (`miss_times_from`: `recorded`), and without one each load measures: beside the CPU tier every device row runs the declared order, and the tier starts slow after a pause. Qwen3.8-Flash-Next on an RTX 5090 and a Ryzen 5 9600 under WSL: the link (100 us against the tier's 80 to 125 to compute an expert and 180 to 240 for the handoff), 73 sampled and 78 greedy tok/s on fresh prompts where the CPU tier gave 45 and 73 |
 | `keep_routes` | 0 | An approximation, off by default: N keeps each token's first N routes of the router's order and leaves the rest out, not renormalized. Fewer expert rows and fewer misses for a changed model, the same for a row whatever the cache holds (so replies stay repeatable and independent of the rows beside them, which a skip of only the missed experts would not be). On Qwen3.8-Flash-Next's recorded routing (10 routes a token, 8,408 slots, replayed) 9 routes miss 119 experts a round where 10 miss 143, 8 miss 98 and 7 miss 80. Measured on that model on an RTX 5090 (the cache in 8,662 slots, six greedy replies of 256 tokens, the all-routes replies' tokens scored again): greedy decode 59.6 tok/s with all routes, 68.9 with 9 and 72.8 with 8; over 1,536 positions 9 routes keep the most likely token at 95.2% and move a mean total variation of 0.039 over the top 20 tokens, 8 routes 95.1% and 0.045, and every greedy reply leaves the all-routes reply within its first 80 tokens (a second all-routes run repeats the first bit for bit). A changed model, not a preserved one: Eval's drift budget judges it in quality mode `speed` |
 | `policy` | `recent` | The cache's residency beside the CPU tier: `recent`, or `ranked` (decayed route counts ranked every `swap_period` rounds) |
 | `swaps` | 512 | The most misses a round copies in |
 | `fill_blocks` | 32 | Thread blocks of the copies' fill kernel: too few and a round waits for its copies |
-| `prompt_arithmetic` | `auto` | `tensor`: prompt chunks on tensor cores; `declared`: the decode rows' order. `auto` is `tensor` where the engine asks `repeatable` or `row-exact` prompt rows (a speed run's engines do), else `declared` |
+| `prompt_arithmetic` | `auto` | `tensor`: prompt chunks on tensor cores; `declared`: the decode rows' order. `auto` is `tensor` where the engine asks `repeatable` or `row-exact` prompt rows, else `declared` (the default level, `exact`, in both quality modes) |
 | `reserve_mib` | 3072 | Device memory left free at `open()`, until the warm requests ran |
 | `margin_mib` | 256 | Device memory the elastic cache leaves free at every moment: the run's VRAM headroom |
 | `elastic` | on | The cache grows and shrinks with the device's free memory; off, it keeps its size from `open()` |
-| `store_dir`, `store_path` | empty | Where the bundle store file is kept (needed by the disk tier), or an existing complete store |
+| `store_dir`, `store_path` | empty | Where the bundle store file is kept, or an existing complete store. With neither, the store goes to the host's plugin cache where there is one (below), else it is built in host memory at every load |
 | `profile`, `profile_save` | empty | A routing profile the cache starts from, and where the plugin writes the routing it counted |
 | `pinned` | 0 | The ram tier's pinned core: this share (up to 0.9) of the cache's slots at `open()` holds the experts `profile` ranks hottest for good, and host memory does not hold them. For a host short of memory; needs `misses: cpu`, the recent policy, a profile and a store file |
 | `settings` | empty | A tuned settings file in the package |
@@ -266,6 +355,21 @@ With `margin_mib` 1024 that engine's least free device memory at a prompt step's
 run's full-context check reads) was 1,137 MiB over the 6,316-token prompt and the ten prompts after it, and 1,162
 to 1,275 MiB between requests; the long prompt had the cache give slots back once. With `margin_mib` 256 the
 device has 330 to 430 MiB free between requests.
+
+GGUF experts, measured on Unsloth's UD-IQ1_M Qwen3.8-Flash-Next (48 expert layers of 512, 34.8 GB stored) through
+model-template with every option here at its default, one RTX 5090 beside a Ryzen 5 9600 under WSL2, 131,072 tokens of
+context: the ram tier, every miss over the link (the CPU tier computes a GGUF expert in torch in 83 ms, the link
+copies it in 54 us), a slot of 1.51 MB (layers 4 and 27, IQ4_NL down projections, kept whole on the device: 1.88 GiB)
+and a store of 38.7 GB (48.4 GB when every slot was the widest layer's 1.97 MB), an elastic cache of 13,589 to 15,863
+slots (22.3 GiB; 12,792 before); the model's weights and pools 5.8 GiB (gguf-projections 3.6, these whole layers 1.9;
+the token table read in place off the device), 0.7 GiB free. Decode after a 2,000-token prompt 63.7 tok/s sampled and
+65.8 greedy (no drafter), 95% and 99% of their expert reads hits; prefill run layer by layer 210, 835 and 1,377 tok/s
+at 1,024, 4,096 and 16,384 prompt tokens (254, 406 and 411 with a prompt chunk's experts multiplied one slot at a
+time), a cancel inside the 16,384-token prompt settled 0.49 s after it was asked. The link moved bundles at 25.9 GiB/s
+at open() and 26 to 29 GB/s from the engine's own store after its first reply and after 10 s idle (PCIe 4.0 x16, as
+a pinned buffer moves them), also from a store reopened from disk; the 3.5 GiB/s measured earlier came from a run
+that shared the device with another process. The first 24-token prompt took 1.80 s (every routed expert staged into
+a cold cache), the same prompt again 0.39 s.
 
 Host tests check the host form against the reference bit for bit, the decision tree on given sizes and what a prompt
 step's memory follows. CUDA tests (`tests/test_device.py`) check that link misses give the all-device bits for decode

@@ -37,6 +37,12 @@ after drafting instead, a round's rows (16 a token from an SSD) leave the GPU id
 draft's rows cost a read and stay in the hot-row cache. `stats()` reports how often a wait found its rows ready and
 how long waits blocked, the idle time a round account charges to the table.
 
+**Rows in a block format.** A table a GGUF stores quantized (an n-gram table IQ4_NL, token rows Q8_0 or IQ4_XS) opens
+with `format="gguf:<TYPE>"` (the fact `embeddings:gguf`): a row is the file's blocks for its values, read and
+gathered as stored, and a lookup decodes the rows it read on the device with crit's kernel gguf-rows' `dequantize`
+(the format's own values, one rounding to the table's dtype), which a captured round runs as any other kernel. Where
+gguf-rows does not build, Core's host decoders decode them (`round_problems()` then says a captured round cannot).
+
 ## What the code supplies
 
 | File | Supplies |

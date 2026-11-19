@@ -56,7 +56,6 @@ multiplies through this module can be captured in a CUDA graph.
 import json
 import math
 
-from . import nvfp4 as codec
 
 # The folder of the plugin whose plugin.json declares the crit kernels device_nvfp4 loads (decode-gemv, fixed-tile-gemm,
 # mma-rows, pinned-gemm): quantized-projections' plugin.py sets it.
@@ -1596,7 +1595,6 @@ def from_blocked(blocked, rows, columns):
 
 # Draft-only re-encoding: the formats a stored matrix may be re-encoded to, and from which stored formats.
 ENCODINGS = {"nvfp4": ("bf16", "fp8:channel", "fp8:tensor"), "fp8": ("bf16",)}
-ENCODE_BYTES = 256 << 20   # FP64 values the encoders hold at a time
 
 
 def stored_bytes(tensors, format):
@@ -1605,51 +1603,12 @@ def stored_bytes(tensors, format):
     return sum(tensors[n].numel() * tensors[n].element_size() for n in names if n in tensors)
 
 
-_ENCODERS = {}
-
-
-def _encoder_tables(device):
-    """E4M3's 127 finite nonnegative values and E2M1's 8 magnitudes in FP64, ascending, with the midpoints between
-    neighbours (exact in FP64), on `device`."""
+def release(device):
+    """Torch's cached blocks nothing uses go back to the device (nothing happens on a host): the encoders' FP64 slices,
+    a load's warm-up, a stored copy its holder dropped. Torch's allocator would otherwise keep them reserved and cut
+    the next matrices out of them, which holds them for the engine's lifetime."""
     import torch
-    key = str(device)
-    if key not in _ENCODERS:
-        e4m3 = torch.tensor([codec.e4m3_value(b) for b in range(0x7F)], dtype=torch.float64, device=device)
-        e2m1 = torch.tensor(codec.E2M1, dtype=torch.float64, device=device)
-        _ENCODERS[key] = {"e4m3": e4m3, "e4m3_mids": (e4m3[1:] + e4m3[:-1]) / 2,
-                          "e2m1": e2m1, "e2m1_mids": (e2m1[1:] + e2m1[:-1]) / 2}
-    return _ENCODERS[key]
-
-
-def nearest(x, table, mids):
-    """For x >= 0 (FP64): the index of the nearest entry of `table` (ascending), ties to the even index, values past
-    the last entry saturating to it: nvfp4.py's _nearest elementwise. The two neighbours of x are at most a factor of
-    2 apart, so their distances to x are exact in FP64 and a tie is exactly x == midpoint."""
-    import torch
-    index = torch.bucketize(x, mids, right=False)        # midpoints strictly below x
-    at = mids[index.clamp(max=mids.numel() - 1)]
-    return index + ((index < mids.numel()) & (at == x) & (index % 2 == 1)).to(index.dtype)
-
-
-def _stored_values(tensors, format, device, first, last):
-    """Rows first..last of a stored bf16 (or 16/32-bit) or fp8 matrix as FP64 values, exactly (an E4M3 code times an
-    FP32 scale fits FP64)."""
-    import torch
-    weight = tensors["weight"][first:last]
-    if format == "bf16":
-        return weight.to(device=device, dtype=torch.float64)
-    codes = weight.to(device).view(torch.float8_e4m3fn).to(torch.float64)
-    scale = tensors["scale"].to(device=device, dtype=torch.float32).reshape(-1)
-    if format == "fp8:channel":
-        return codes * scale[first:last].to(torch.float64)[:, None]
-    return codes * scale[0].to(torch.float64)
-
-
-def _release(device):
-    """The encoders' FP64 slices go back to the device: torch's allocator would otherwise keep their blocks reserved
-    for the engine's lifetime."""
-    import torch
-    if device.type == "cuda":
+    if torch.device(device).type == "cuda":
         torch.cuda.empty_cache()
 
 
@@ -1662,54 +1621,16 @@ def reencode(tensors, format, encode, device=None):
     amax / 448 (1 for an all-zero row) and E4M3 codes e4m3(v / scale), the same rounding (fp8:channel). The stored
     values are taken exactly (FP64) and the encoders run on `device` (the weight's own unless given), a slice of rows
     at a time."""
-    import torch
+    tensors, format = _encode(tensors, format, encode, device)
+    release(tensors["weight"].device)   # after the encoders returned: their last slices have no holder any more
+    return tensors, format
+
+
+def _encode(tensors, format, encode, device):
+    from crit_plugins.encodings import encode as encoded
     if encode not in ENCODINGS:
         raise ValueError(f"a draft-only matrix re-encodes to {', '.join(ENCODINGS)}, not {encode!r}")
     if format not in ENCODINGS[encode]:
         raise ValueError(f"a stored {format} matrix does not re-encode to {encode} "
                          f"(from {', '.join(ENCODINGS[encode])}: re-encoding only makes a matrix smaller)")
-    weight = tensors["weight"]
-    device = torch.device(device) if device is not None else weight.device
-    rows, columns = weight.shape
-    if encode == "nvfp4" and columns % 16:
-        raise ValueError(f"an nvfp4 matrix has a multiple of 16 columns, not {columns}")
-    step = max(1, ENCODE_BYTES // (columns * 8))
-    spans = [(r, min(rows, r + step)) for r in range(0, rows, step)]
-    tables = _encoder_tables(device)
-    e4m3, e4m3_mids, e2m1_mids = tables["e4m3"], tables["e4m3_mids"], tables["e2m1_mids"]
-    if encode == "fp8":
-        codes = torch.empty(rows, columns, dtype=torch.uint8, device=device)
-        scale = torch.empty(rows, dtype=torch.float32, device=device)
-        for first, last in spans:
-            values = _stored_values(tensors, format, device, first, last)
-            if not bool(torch.isfinite(values).all()):
-                raise ValueError("a matrix with non-finite values does not re-encode")
-            amax = values.abs().amax(dim=-1)
-            s = torch.where(amax > 0, amax / codec.E4M3_MAX, torch.ones_like(amax)).to(torch.float32)
-            q = values / s.to(torch.float64)[:, None]
-            code = nearest(q.abs().clamp(max=codec.E4M3_MAX), e4m3, e4m3_mids)
-            code = code | (((q < 0) & (code > 0)).to(code.dtype) << 7)
-            codes[first:last], scale[first:last] = code.to(torch.uint8), s
-        _release(device)
-        return {"weight": codes.view(torch.float8_e4m3fn), "scale": scale}, "fp8:channel"
-    amax = 0.0
-    for first, last in spans:
-        values = _stored_values(tensors, format, device, first, last)
-        if not bool(torch.isfinite(values).all()):
-            raise ValueError("a matrix with non-finite values does not re-encode")
-        amax = max(amax, float(values.abs().max()))
-    g32 = torch.tensor(codec.global_scale([amax]), dtype=torch.float32)
-    g = float(g32)
-    codes = torch.empty(rows, columns // 2, dtype=torch.uint8, device=device)
-    scales = torch.empty(rows, columns // 16, dtype=torch.uint8, device=device)
-    for first, last in spans:
-        blocks = _stored_values(tensors, format, device, first, last).view(last - first, -1, 16)
-        s = nearest((blocks.abs().amax(dim=-1) * g / codec.E2M1_MAX).clamp(max=codec.E4M3_MAX), e4m3, e4m3_mids)
-        decoded = e4m3[s][..., None]
-        q = torch.where(decoded > 0, blocks * g / decoded.clamp(min=e4m3[1]), torch.zeros_like(blocks))
-        code = nearest(q.abs().clamp(max=codec.E2M1_MAX), tables["e2m1"], e2m1_mids)
-        code = (code | (((q < 0) & (code > 0)).to(code.dtype) << 3)).view(last - first, columns)
-        codes[first:last] = (code[:, 0::2] | (code[:, 1::2] << 4)).to(torch.uint8)
-        scales[first:last] = s.to(torch.uint8)
-    _release(device)
-    return {"weight": codes, "scale": scales, "global_scale": g32.to(device)}, "nvfp4"
+    return encoded(tensors, format, encode, device)

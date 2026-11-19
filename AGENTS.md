@@ -85,8 +85,12 @@ its launch command in `configuration.engine`, and `crit run` records, checks, me
 ([external engines](docs/RUN_RECORDS.md#external-engines)).
 
 - **Start from the selection.** Choose the `model` plugin for the checkpoint's architecture, then a plugin for each
-  slot it calls, from crit's library and crit-hub (`crit plugins list --model MODEL --device cuda` lists what fits
-  and the slots nothing fits; `crit plugins add`; `crit plugins status ENGINE/plugins` says which copies the
+  slot it calls: [model-template](inference/model-template/README.md) for every checkpoint one of its layouts covers,
+  and for any other a model plugin composed from its blocks (a layout file, a block class only for a layer part no
+  block computes), which keeps the serving contracts `serve --check` holds an engine to (exact rows, prompt spans
+  within the cancel grace, the device's room at a step's peak, drafting and batching) without writing them again.
+  Take the slots' plugins from crit's library and crit-hub (`crit plugins list --model MODEL --device cuda` lists
+  what fits and the slots nothing fits; `crit plugins add`; `crit plugins status ENGINE/plugins` says which copies the
   library has changed since and which the engine changed, and `crit plugins update` brings the unchanged ones up
   to the library). Put your own device code inside a plugin where it pays, keep each
   plugin's tests against its reference passing (`crit plugins test`) and declare the devices it runs on. A model
@@ -255,11 +259,16 @@ How to judge a round:
   A difference inside the quality spread (`budget_spread`) is no measurement.
 - **Exactness is a setting.** `configuration.exactness` says how exact the engine's rows are, for the `decode` and
   the `prompt` rows, on [the kernels' scale](kernels/README.md#exactness): `declared`, `exact`, `row-exact` or
-  `repeatable`. A candidate that sets none takes its run's quality mode's: `preserve` asks `exact` (a prompt row has
-  the bits of the same token decoded), `speed` asks `repeatable` (every plugin's fastest way). A plugin whose option
+  `repeatable`. A candidate that sets none takes its run's quality mode's, `exact` in both modes (a prompt row has
+  the bits of the same token decoded, which `serve --check` judges without a tolerance). A plugin whose option
   is `auto` takes its fastest way that keeps the level, the engine's facts say what each plugin keeps, and Core
   refuses an engine that keeps less than it asks ([exactness](docs/PLUGINS.md#exactness)). A phase's level is a lever
   like any other: change it with its speed and its drift measured.
+- **Precision follows the quality mode.** A candidate's configuration states the run's `quality_mode`, and a
+  plugin's precision option left on `auto` follows it ([precision](docs/PLUGINS.md#precision)). Load the output head
+  with role `head`: in `speed` quantized-projections then holds it in FP8, in `preserve` as stored. Write no head
+  option of your own into the model plugin, and count the head in the memory plan at the bytes it is held in. Where
+  `weights_policy` is `as_stored`, set quantized-projections' `head` to `stored`.
 - **Output differences are bugs until explained.** A drop in plain-greedy equality against an earlier candidate,
   or a difference between repeated identical requests (Eval's `repeatable` and `request_history` gates), is a bug
   until its root cause is demonstrated: the differing kernel or state located and the difference reproduced. Never

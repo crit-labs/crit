@@ -92,6 +92,21 @@ class RopeTableTests(unittest.TestCase):
         explicit = config({"rope_theta": 1e6, "rope_scaling": {"rope_type": "yarn", "factor": 8.0,
                                                                "original_max_position_embeddings": 4096}})
         self.assertEqual(rope_table(ratio.rope, 128, 32768), rope_table(explicit.rope, 128, 32768))
+        # Proportional rope (a config that keys its rope by layer type): a table as wide as the head, of which the
+        # first share turns at base ** (-2 i / head_dim) and the rest keeps its values.
+        typed = parse_model_config({"model_type": "gemma4_text", "hidden_size": 512, "num_attention_heads": 4,
+                                    "num_hidden_layers": 2, "max_position_embeddings": 32768,
+                                    "layer_types": ["sliding_attention", "full_attention"],
+                                    "rope_parameters": {
+                                        "full_attention": {"rope_type": "proportional", "rope_theta": 1e6,
+                                                           "partial_rotary_factor": 0.25},
+                                        "sliding_attention": {"rope_type": "default", "rope_theta": 1e4}}})
+        by_type = {entry.layer_type: entry.rope for entry in typed.rope_by_layer_type}
+        full = rope_table(by_type["full_attention"], 64)
+        self.assertEqual(len(full.inv_freq), 32)
+        for i, got in enumerate(full.inv_freq):
+            self.assertTrue(math.isclose(got, 1e6 ** (-2 * i / 64)) if i < 8 else got == 0.0, (i, got))
+        self.assertEqual(len(rope_table(by_type["sliding_attention"], 32).inv_freq), 16)
         # LongRoPE switches to its long factors only past the original length.
         long = config(CASES[-1][1])
         short, at, past = (rope_table(long.rope, 128, long.max_positions, n) for n in (None, 4096, 4097))

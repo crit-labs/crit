@@ -1,0 +1,131 @@
+{
+  "id": "model-template",
+  "category": "execution",
+  "summary": "A model plugin composed from tested blocks by a layout (data per architecture family), on the serving contracts every model plugin keeps: exact rows, prompt spans within crit serve's cancel grace and the device's room, a placement plan of every device tensor, captured rounds and prompt chunks, the prompt cache, drafting from the checkpoint's MTP layer",
+  "implementation_status": "reference",
+  "implementation_scope": "The model slot's plugin for every checkpoint a library layout covers (code/layouts: decoder for llama, qwen2, qwen3 and their mixtures of experts; gated-hybrid for qwen3_next and qwen3_5 with their MTP layers; latent for deepseek_v3: multi-head latent attention, grouped sigmoid routing; gated-streams for qwen4_exp: several residual streams, block-sparse attention, hashed n-gram rows, its draft layer), and compose() for an engine's own model plugin with a layout and blocks of its own. Blocks in torch over the other slots' device forms (attention, kv_cache, projections, recurrence, router, experts, norms, embeddings): no arithmetic of its own beyond reshapes, biases, gates, the hashed n-gram ids and a fixed-order row sum. On CUDA, and on the CPU through step().",
+  "agent_guidance": {
+    "use_when": "An engine's checkpoint is a decoder a library layout covers (start from the plugin as it is), or one whose layer parts are blocks the library has or the engine writes: compose its model plugin instead of writing the architecture and its serving from scratch",
+    "avoid_when": "The layer loop itself differs from both residuals the template has (one pre-norm stream, several mixed streams): a post-norm or encoder-decoder model. Write the model plugin, keeping the serving contracts as rows.py states them",
+    "provides": [
+      "A model plugin per layout: grouped-query and gated softmax attention, gated delta-rule layers, SwiGLU MLPs, mixtures of experts over any experts plugin (expert-offload included), the checkpoint's MTP layer as the device draft head",
+      "Exact rows: every matmul through RowGroups, prompt chunks alone with prompt=True and one-token rows in calls of at most invariant_rows, a step's decode rows and prompt chunks apart in expert-offload",
+      "Prompt spans timed and sized at load as a measured decision, so every prompt step at every context finishes inside the span budget and leaves the device's room; fixed-text scores in the same spans",
+      "Every device tensor planned through the placement plugin first (the routed experts left to an experts plugin that places them), cached blocks handed back after prompts and scores",
+      "Core's captured rounds (greedy and sampled, drafted), captured prompt chunks, Core's prompt cache, constrained, replayed, plain and log-probability requests, the info fields Core and crit serve require",
+      "requires_when per model type, so a selection missing the recurrence or expert slots is refused before load; the router's rule checked against the config"
+    ],
+    "engine_supplies": [
+      "The selection: a plugin in every slot the layout calls and its options (the router's rule, the experts plugin's)",
+      "For an architecture no layout covers: a layout file, and a block class for a layer part no block computes",
+      "The options a run sets: context, concurrency, prefill_chunk, span_seconds, pass_mib, headroom_mib, drafting width"
+    ],
+    "preserve": [
+      "Every matmul through ctx.mm (RowGroups) and every norm, rotary position and gated product through the norms slot",
+      "Chunk boundaries a function of the prompt alone: spans from the recorded fit, never from timings in the serving process",
+      "A chunk through a layer the same call whether a prompt runs chunk by chunk or layer by layer (passes): a block reads its layer's pools and the residual's state alone",
+      "Every device tensor planned before it is made"
+    ],
+    "adapt": [
+      "A block subclass for a layer part with other arithmetic (an attention variant, another FFN), passed to compose()",
+      "A layout of the engine's own for another family's tensor names and layer kinds",
+      "Span budget and room (span_seconds, headroom_mib) for the run's cancel grace and VRAM headroom"
+    ]
+  },
+  "path": "inference/model-template/README.md",
+  "code_path": "inference/model-template/code",
+  "code_files": [
+    {
+      "path": "inference/model-template/code/checkpoint.py",
+      "purpose": "The checkpoint's safetensors headers and tensors, its matrices as the projections and experts slots load them (stored formats, stacking, biases), its end tokens; a GGUF checkpoint through gguf.py"
+    },
+    {
+      "path": "inference/model-template/code/rows.py",
+      "purpose": "The serving contracts: RowGroups (each prompt chunk alone with prompt=True, one-token rows in calls of at most invariant_rows) and Spans (prompt spans from a load-time cost fit within a time budget and the device's room; the fastest span where a step's fixed part passes the budget)"
+    },
+    {
+      "path": "inference/model-template/code/blocks.py",
+      "purpose": "The blocks: Attention (grouped-query, biases, query/key norms, rotary positions, sliding windows, sinks, an output gate), IndexedAttention (block-sparse: index keys in a pool of keys only, block keys at their blocks' last positions, the choice by sparse-indexer or topk_blocks), LatentAttention (absorbed latent attention over a pool of one latent row a position), GatedDelta, NgramRows (hashed n-gram table rows gated into the streams), SwiGLU, MoE (router rule check, any experts plugin, expert-offload's calls, a gated shared expert), the step's Context and row_sum"
+    },
+    {
+      "path": "inference/model-template/code/model.py",
+      "purpose": "ComposedModel, Core's step model over the blocks: the placement plan, pools, step, commit, retire, score, admission, captured rounds and prompt chunks, the prompt cache, the span calibration, the MTP draft layer and its device head"
+    },
+    {
+      "path": "inference/model-template/code/compose.py",
+      "purpose": "compose(), the layouts' schema check, the library's layouts by model type, the options every composed model reads with their defaults, the kernel tuning folder"
+    },
+    {
+      "path": "inference/model-template/code/passes.py",
+      "purpose": "Prompt spans run layer by layer (a pass): every chunk of a span through one layer before the next, so an experts plugin that stages a layer's experts brings them over the link once a span; the same calls and bits as chunk by chunk"
+    },
+    {
+      "path": "inference/model-template/code/residual.py",
+      "purpose": "How blocks join the residual: PreNorm (one stream, the norm after a block's output fused with its add) and Streams (several residual streams mixed for each block and added into by its weights), and each one's draft layer"
+    },
+    {
+      "path": "inference/model-template/code/gguf.py",
+      "purpose": "A GGUF checkpoint under the Hugging Face names the blocks read: the converter's renames, stacks, merges, orders and transforms undone from the file's architecture (llama, qwen2, qwen3, qwen2moe, qwen3moe, qwen35, qwen35moe, qwen4exp, gemma4, deepseek2) and its draft (nextn) block as the draft layer, quantized matrices and experts as stored"
+    }
+  ],
+  "requires": {
+    "hardware": "A CUDA GPU for serving (captured rounds, timed spans); the CPU runs the same blocks through step(), which is how its tests run without a GPU",
+    "model": "A decoder whose layers a layout's blocks compute over one pre-norm residual stream or several mixed streams: softmax attention (grouped-query, optional gates, norms, windows, sinks), block-sparse attention with an indexer, latent attention, gated delta-rule layers, hashed n-gram table rows, SwiGLU MLPs or mixtures of experts, an optional MTP layer",
+    "workload": "Any: batched decode and prompt chunks of many requests, long contexts, drafted rounds"
+  },
+  "contract": {
+    "input": "Core's step model calls (open, step, commit, retire, score, admission, native_rounds) with the checkpoint's config and tensors",
+    "output": "Each row's tokens, log-probabilities and scores, with the bits the row has alone",
+    "ownership": "The model plugin owns its pools, sessions and the checkpoint's handles until the load ends; the other slots' plugins own their tensors",
+    "failure": "A selection missing a slot the layout calls, a router whose rule is not the checkpoint's, a layout naming an unknown block, a checkpoint no layout covers: ValueError or PluginError at load, naming what to set",
+    "core_boundary": "A model plugin: the layer arithmetic of the families its layouts cover stays out of Core; Core gives it the step model interface, the round driver, prompt graphs, the prompt cache, decisions and the memory and host services"
+  },
+  "dependencies": [
+    "torch",
+    "safetensors",
+    "crit_core and crit_plugins",
+    "attention-state's rope_table (its code)"
+  ],
+  "symbols": [
+    "Attention",
+    "Checkpoint",
+    "ComposedModel",
+    "Context",
+    "DEFAULTS",
+    "GatedDelta",
+    "IndexedAttention",
+    "LatentAttention",
+    "Matrices",
+    "MoE",
+    "MtpHead",
+    "NgramRows",
+    "PreNorm",
+    "RowGroups",
+    "Spans",
+    "Streams",
+    "SwiGLU",
+    "compose",
+    "fit",
+    "row_sum"
+  ],
+  "interactions": [
+    "attention-state",
+    "expert-offload",
+    "fused-norms",
+    "lookup-table-rows",
+    "mtp-decode",
+    "quantized-projections",
+    "sequential-recurrence",
+    "softmax-attention",
+    "sparse-indexer",
+    "token-sampling"
+  ],
+  "techniques": [
+    "model-template"
+  ],
+  "validation": {
+    "host": "tests/test_plugin.py: layouts check and cover the manifest's model types with their slots, options equal compose()'s defaults, spans the longest within budget and room and the fastest where none meets the budget, row groups",
+    "native": "tests/test_device.py and crit's tests/test_model_template.py through Core's loader, on CUDA or the CPU: scores and greedy choices against transformers for Llama, Qwen3 with a sliding-window layer, Qwen3-MoE (experts-reference, and expert-offload in its device, host-memory and file tiers), Qwen3-Next, Qwen3.5 with an MTP layer, DeepSeek V3 and Qwen4Exp below and past its indexer's budget; batched as alone, sampled repeatable, short spans, captured prompt chunks, drafted greedy replies equal to plain ones, rounds counting expert reads and hits",
+    "performance": "Not measured on a real checkpoint yet: the blocks call the slots' device forms the published engines call, so their speed is the selected plugins'"
+  }
+}

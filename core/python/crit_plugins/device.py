@@ -377,17 +377,30 @@ DEVICE_EXTENSIONS = {
     # live and who computes each miss; the model calls it as for experts that fit, with begin() before the loads and
     # open() after its own pools.
     "experts:offload": {
-        "begin": "begin(layers, experts, format, hidden, inter, device_bytes=0, identity=None, device='cuda') -> tier: "
-                 "the routed experts' geometry before the first load() (every layer whose experts load, a draft "
-                 "layer's included), the device bytes the model still allocates after the loads (KV, state, prompt "
-                 "pools); returns device, ram or disk",
+        "begin": "begin(layers, experts, format, hidden, inter, device_bytes=0, identity=None, device='cuda', "
+                 "formats=None) -> tier: the routed experts' geometry before the first load() (every layer whose "
+                 "experts load, a draft layer's included), the device bytes the model still allocates after the "
+                 "loads (KV, state, prompt pools); format gguf (a plugin that provides experts:gguf) takes each "
+                 "layer's formats, {layer: (gate_up type, down type)}; returns device, ram or disk",
         "open": "open(lend=None): after the model's pools, the cache in the free memory past its reserve (or in a KV "
                 "pool's spare bytes and idle pages) and the CPU tier; forward() opens it at its first call otherwise "
                 "(outside capture)",
         "end_step": "end_step(prompts_open=False): a step that ran prompt chunks ended. Core calls it (STEP_FRAMES); a "
-                    "model served outside Core calls it itself (the next decode plan ends the step too)",
+                    "model served outside Core calls it itself (the next decode plan ends the step too). While a "
+                    "prompt goes on (prompts_open) what it staged for the layer under way stays staged",
+        "stages_prompts": "stages_prompts() -> bool, after open(): a prompt chunk brings its layers' experts to the "
+                          "device (experts kept off it), and a layer staged for one chunk serves the chunks that read "
+                          "it next. A model plugin then runs a prompt's spans layer by layer, every chunk through "
+                          "one layer before the next layer, so a layer's experts are staged once a span",
         "routes": "routes() -> [(layer, [experts])]: the recorded decode routes (record_routes option), the trace crit "
                   "plugins offload --trace replays",
+    },
+    # Routed blocks gated otherwise than by SiLU, in the experts slot.
+    "experts:activations": {
+        "activate": "activate(name): the gate of the blocks' product, act(gate) * up, for every layer the plugin "
+                    "computes: silu (SwiGLU, the default) or gelu_tanh (GELU in its tanh form); before the first "
+                    "forward (an offload plugin: before open()). A model plugin calls it where the checkpoint's "
+                    "activation is not SiLU",
     },
     # A device expert cache in the expert_residency slot.
     "experts:cache": {
@@ -496,13 +509,43 @@ def topk_blocks(scores, k, positions=None, block_size=None):
     return ids
 
 
+def csf_decode(fixed, exceptions=None):
+    """E4M3 scale bytes [rows][groups] (uint8) from ModelOpt's CSF encoding (crit_core.model.schemes.csf_scale_shape):
+    fixed uint8 [rows / 16][16 * (1 + groups / 2)], per slab of 16 rows one base byte per row, then each row's 4-bit
+    codes (the low nibble first), scale = base + code (mod 256); exceptions (int32 or uint32 words: position row *
+    groups + col in the low 24 bits, the scale byte in the high 8) replace single scales. On fixed's device (torch), so
+    a store builder decodes on the host and a fill on the device by the same rule; leading dimensions (stacked
+    matrices) decode each."""
+    import torch
+    lead, (slabs, width) = tuple(fixed.shape[:-2]), tuple(fixed.shape[-2:])
+    if width % 16 or width < 32:
+        raise ValueError("CSF fixed rows are 16 * (1 + groups / 2) bytes")
+    groups = (width // 16 - 1) * 2
+    f = fixed.reshape(-1, slabs, width).view(torch.uint8)
+    m, size = f.shape[0], slabs * 16 * groups
+    base = f[:, :, :16].to(torch.int32)
+    packed = f[:, :, 16:].reshape(m, slabs, 16, groups // 2).to(torch.int32)
+    codes = torch.stack((packed & 15, packed >> 4), -1).reshape(m, slabs, 16, groups)
+    out = ((base[..., None] + codes) & 255).to(torch.uint8).reshape(m * size)
+    if exceptions is not None and exceptions.numel():
+        words = exceptions.reshape(m, -1).contiguous().view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+        pos = words & 0xFFFFFF
+        valid = (words != 0xFFFFFFFF) & (pos < size)   # -1: an unused word of a fixed-capacity list
+        index = torch.where(valid, pos + torch.arange(m, device=f.device)[:, None] * size, m * size)
+        padded = torch.cat([out, out.new_zeros(1)])
+        padded.index_copy_(0, index.reshape(-1), (words >> 24).to(torch.uint8).reshape(-1))
+        out = padded[:-1]
+    return out.reshape(*lead, slabs * 16, groups)
+
+
 # Step frames: what Core tells a plugin object, whatever its slot, when it has the method. A plugin whose memory or
 # state follows the requests in flight (an elastic expert cache making room for a prompt step) needs no call from
 # the model plugin for it. Core's native rounds run no Python: a frame is a step() or a score() the model runs.
 # What a plugin takes once the load is over is the ledger's (crit_plugins.memory: Core calls serve()).
 STEP_FRAMES = {
-    "begin_step": "begin_step(prompt_tokens): Core is about to call the model's step() (prompt_tokens: the prompt "
-                  "tokens its rows prefill, 0 for decode rows alone) or its score() (the text's tokens)",
+    "begin_step": "begin_step(prompt_tokens, score=False): Core is about to call the model's step() (prompt_tokens: "
+                  "the prompt tokens its rows prefill, 0 for decode rows alone) or its score() (the text's tokens, "
+                  "with score=True where the method takes it: a score also holds its rows' logits)",
     "end_step": "end_step(prompts_open): the call returned; prompts_open: whether a row of the step is still "
                 "prefilling, so another prompt step follows",
 }

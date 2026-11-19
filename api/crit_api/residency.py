@@ -20,6 +20,15 @@ RESULT = {"kind", "command_id", "status", "error", "max_concurrent_requests", "c
 
 # Seconds a cancelled command has to settle before its host is retired (docs/SERVING.md): fixed, not an option.
 CANCEL_GRACE_SECONDS = 1
+# Seconds between the lines crit serve prints of a load's reported work (crit_core.engine.LoadContext.working).
+WORK_REPORT_SECONDS = 30
+
+
+def work_line(work):
+    """A load's reported work as one line: what, and how far where it counts."""
+    done, total = work.get("done"), work.get("total")
+    counted = (f" {done:,} of {total:,}" if total is not None else f" {done:,}") if done is not None else ""
+    return f"{work.get('what', 'working')}{counted}"
 
 
 class ResidentRuntime:
@@ -27,6 +36,7 @@ class ResidentRuntime:
         self.ownership = ownership
         self.host_limit, self.device_limit = host_limit, device_limit
         self.tree = self.log = self.root = self.link = None
+        self.last_work = None   # the work the newest load last reported (its status's `work`), kept past a retire
         self.lifecycle = threading.RLock()
         self.on_retire = lambda: None
 
@@ -73,11 +83,13 @@ class ResidentRuntime:
         return link.pid if link else None
 
     def call(self, action, payload, stop, timeout, progress=None, request=None, progress_tools=None,
-             progress_reasoning=None, on_started=None):
+             progress_reasoning=None, on_started=None, stall=None):
         """Run one command on the host. A generation's payload carries its request record; its result carries the
         engine's response, and progress, progress_tools and progress_reasoning receive each streamed piece. A piece
         whose consumer raises OSError (its client is gone) cancels the command as a stop does: the result is then
-        "cancelled" with that error as "consumer_error", and the host stays loaded once the command settles."""
+        "cancelled" with that error as "consumer_error", and the host stays loaded once the command settles.
+        stall (a load's): past `timeout` the command goes on while the host's reported work (its status's `work`)
+        last advanced under that many seconds ago, and crit serve prints where the work stands."""
         if stop.is_set():
             return {"status": "cancelled", "error": "Stopped", "cleanup_settled": True}
         with self.lifecycle:
@@ -90,10 +102,10 @@ class ResidentRuntime:
                   if progress or progress_tools or progress_reasoning else None)
         limit = response_bytes(request) + MAX_JSON_BYTES if action in RESPONDING else MAX_JSON_BYTES
         return self._call(uuid.uuid4().hex, action, payload, stop, timeout, stream, on_started, root, tree, link,
-                          limit)
+                          limit, stall)
 
     def _call(self, cid, action, payload, stop, timeout, stream, on_started=None, root=None, tree=None, link=None,
-              limit=MAX_JSON_BYTES):
+              limit=MAX_JSON_BYTES, stall=None):
         root, tree, link = root or self.root, tree or self.tree, link or self.link
         if stop.is_set():
             return {"status": "cancelled", "error": "Stopped", "cleanup_settled": True}
@@ -104,9 +116,18 @@ class ResidentRuntime:
             deadline, cancelled_at, timed_out, consumer = time.monotonic() + timeout, None, False, None
             if on_started:
                 on_started(deadline)
+            shown, shown_at = None, time.monotonic()
             while True:
                 stamp = time.monotonic()
-                if stop.is_set() or stamp >= deadline:
+                advancing = False
+                if stall:
+                    work, worked = link.work, link.worked
+                    self.last_work = work
+                    advancing = worked is not None and stamp - worked < stall
+                    if work is not None and work != shown and stamp - shown_at >= WORK_REPORT_SECONDS:
+                        shown, shown_at = work, stamp
+                        print(f"crit serve: loading: {work_line(work)}", file=sys.stderr, flush=True)
+                if stop.is_set() or (stamp >= deadline and not advancing):
                     if cancelled_at is None:
                         timed_out = not stop.is_set()
                         cancelled_at = stamp

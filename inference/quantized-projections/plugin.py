@@ -3,6 +3,7 @@
 on the device, a checkpoint's stored BF16, FP8 or NVFP4 matrices on the engine's device, multiplied through cuBLASLt
 (device_matrices.py), NVFP4 ones with NVFP4 or 16-bit activations as `activations` says (device_nvfp4.py: crit's
 kernels that plugin.json declares, built on this machine's GPU, or torch fallbacks)."""
+import weakref
 from pathlib import Path
 
 from .quantized import device_matrices, implementation as grouped, nvfp4
@@ -18,6 +19,8 @@ class DeviceMatrices:
     decode, decode_rows, rows, tile_rows, invariant = "prompt", None, device_matrices.GEMV_ROWS, "auto", None
     fp8_activations = "fp8"
     decode_formats = {}   # decode_formats: a format's decode activations where they differ from decode_activations
+    head, head_by, head_encoding = "stored", None, None   # the `head` option as create() resolved it (asked_head)
+    stored_heads = ()   # (weak reference, device) of each stored 16-bit head re-encoded here, until release_dropped()
     scratch = None        # the engine's scratch (context.scratch), which the calls on its device compute in
 
     def close(self):
@@ -27,12 +30,30 @@ class DeviceMatrices:
 
     def load(self, tensors, format, role=None, encode=None):
         """role: the matrix's role in the model, as the model plugin names it (qkv, gate_up, ...), which picks its
-        prompt arithmetic where prompt_roles names it. encode: for a matrix only a drafter reads (an MTP layer, a
-        draft head; the model plugin passes it only for draft-only roles), the format to re-encode the stored one to
-        at load (device_matrices.ENCODINGS: nvfp4, fp8); an nvfp4 one multiplies 16-bit activations (no calibrated
-        activation scale), and facts() records the group under draft_encoding (a matrix already stored in the
-        encode format stays as stored and is recorded the same way: draft-only all the same)."""
-        activations, draft = self.activations, encode is not None
+        prompt arithmetic where prompt_roles names it. Role "head" (HEAD_ROLE) is the model's output head, the
+        vocabulary-wide matrix that makes the logits: with head fp8 (the `head` option, or its auto in quality mode
+        speed: asked_head) a head stored in 16 bits is re-encoded to FP8 rows at load (fp8:channel, one FP32 scale a
+        row: device_matrices.reencode) and is from then on an FP8 target matrix like a stored one, which facts()
+        records under head_encoding; a head stored quantized stays as stored. encode: for a matrix only a drafter
+        reads (an MTP layer, a draft head; the model plugin passes it only for draft-only roles), the format to
+        re-encode the stored one to at load (device_matrices.ENCODINGS: nvfp4, fp8); an nvfp4 one multiplies 16-bit
+        activations (no calibrated activation scale), and facts() records the group under draft_encoding (a matrix
+        already stored in the encode format stays as stored and is recorded the same way: draft-only all the
+        same)."""
+        self.release_dropped()
+        activations, draft, encoded_on = self.activations, encode is not None, None
+        if role == HEAD_ROLE and not draft and self.head == "fp8" and format in device_matrices.ENCODINGS["fp8"]:
+            stored, before = format, device_matrices.stored_bytes(tensors, format)
+            self.stored_heads = (*self.stored_heads, (weakref.ref(tensors["weight"]), tensors["weight"].device))
+            tensors, format = device_matrices.reencode(tensors, format, "fp8", self.device)
+            encoded_on = tensors["weight"].device
+            group = self.head_encoding or {"stored": stored, "encoded": format, "matrices": 0, "stored_bytes": 0,
+                                           "encoded_bytes": 0, "chosen": "the head option" if self.head_by is None
+                                           else f"head auto in quality mode {self.head_by}"}
+            after = device_matrices.stored_bytes(tensors, format)
+            self.head_encoding = {**group, "matrices": group["matrices"] + 1,
+                                  "stored_bytes": group["stored_bytes"] + before,
+                                  "encoded_bytes": group["encoded_bytes"] + after}
         if draft:
             stored, before = format, device_matrices.stored_bytes(tensors, format)
             if encode != format.split(":")[0]:
@@ -95,13 +116,29 @@ class DeviceMatrices:
         # The kernel each format's (each role's) prompt rows go through: native GEMMs are not row invariant.
         entry = self.prompt_kernels.get(name, [])
         self.prompt_kernels = {**self.prompt_kernels, name: sorted({*entry, found.prompt_kernel})}
+        if encoded_on is not None:
+            # What the re-encoded head's load left in torch's cache (its warm-up) goes back to the device before a
+            # next matrix is cut from those blocks.
+            device_matrices.release(encoded_on)
         return found
+
+    def release_dropped(self):
+        """The stored 16-bit copy of a re-encoded head, once the model plugin dropped it: its device block goes back
+        to the device instead of staying in torch's cache, where the next matrices would be cut from it and keep it
+        reserved for the engine's lifetime; what sizes itself by the device's free memory (an expert cache) then
+        gets the bytes the FP8 head gave up. A tensor's block is free only once the tensor is gone, so nothing can
+        hand it back at the drop itself: load() and facts() call this, the next calls a model plugin makes. A copy
+        something still holds (embeddings that share the head's tensor) is waited for."""
+        held = tuple((stored, device) for stored, device in self.stored_heads if stored() is not None)
+        for device in {device for stored, device in self.stored_heads if stored() is None}:
+            device_matrices.release(device)
+        self.stored_heads = held
 
     shapes = frozenset()
     paths = {}
     kernels = {}
     prompt_kernels = {}
-    mx_activations = "bf16"
+    mx_activations, mx_by = "bf16", None   # the `mxfp8_activations` option as create() resolved it (asked_mx)
     crossovers = {}
 
     def arithmetic(self, format):
@@ -185,8 +222,11 @@ class DeviceMatrices:
         tensor cores, so row_invariance prompt_rows is false; the same "pinned" with prompt_gemm pinned, one
         configuration a matrix shape, row invariant; mma-rows prompt-tile, pinned-gemm, fixed-tile-gemm,
         provider, torch), and
-        each draft-only role re-encoded at load (draft_encoding: stored and encoded format, matrices, bytes)."""
+        each draft-only role re-encoded at load (draft_encoding: stored and encoded format, matrices, bytes), and the
+        output head where it was re-encoded to FP8 at load (head_encoding: the same, and what chose it)."""
+        self.release_dropped()
         exact = self.exact()
+        chosen = {}   # what an option left to choose became, and by what
         found = {"row_invariance": {"rows": self.invariant or device_matrices.GEMV_ROWS,
                                     "prompt_rows": bool(self.loaded) and getattr(self, "prompt_invariant", False),
                                     "prompt_exact": exact}}
@@ -200,6 +240,8 @@ class DeviceMatrices:
                 "stored" if self.fp8_activations == "fp8" else "bf16"
         if "mxfp8" in self.loaded:   # its prompt rows multiply 16-bit rows or MXFP8 ones (mxfp8_activations)
             found["mxfp8"] = "stored" if self.mx_activations == "mxfp8" else "bf16"
+            if self.mx_by is not None:
+                chosen["mxfp8_activations"] = f"mxfp8_activations auto in quality mode {self.mx_by}"
         if "int4_zp" in self.loaded:
             found["int4_zp"] = "bf16"   # weight only (W4A16)
         prompt = {k: v for k, v in found.items() if k != "row_invariance"}
@@ -208,12 +250,14 @@ class DeviceMatrices:
         arithmetic = {f: self.arithmetic(f) for f in sorted(self.loaded & {"bf16", "fp8", "mxfp8", "nvfp4",
                                                                            "int4_zp"})}
         return {"row_invariance": found["row_invariance"], **({"prompt_activations": prompt} if prompt else {}),
+                **({"chosen": chosen} if chosen else {}),
                 **({"prompt_arithmetic": arithmetic} if arithmetic else {}),
                 **({"decode_activations": decode, "decode_paths": dict(self.paths)} if decode else {}),
                 **({"decode_kernels": dict(self.kernels)} if self.kernels else {}),
                 **({"decode_crossover": dict(self.crossovers)} if self.crossovers else {}),
                 **({"prompt_kernels": dict(self.prompt_kernels)} if self.prompt_kernels else {}),
                 **({"draft_encoding": draft} if draft else {}),
+                **({"head_encoding": dict(self.head_encoding)} if self.head_encoding else {}),
                 **({"matrices": [{"N": n, "K": k, "format": f} for n, k, f in sorted(self.shapes)]} if self.shapes else {})}
 
 
@@ -245,6 +289,38 @@ class NVFP4Projections(DeviceMatrices):
         return [weight.row(n) for n in range(weight.rows)]
 
 
+HEAD_ROLE = "head"   # the role a model plugin loads its output head with
+HEADS = ("auto", "stored", "fp8")
+
+
+def asked_head(head, mode):
+    """The `head` option under the quality mode the engine states (crit_plugins.kernels.quality_mode): auto is fp8
+    in speed, whose budget starts from an FP8 head, and stored in preserve or where no mode is stated (an engine
+    built outside a run, or before the option). A head set to one way is that way. Returns (head, the mode that
+    chose it or None)."""
+    if head not in HEADS:
+        raise ValueError(f"quantized-projections: head is one of {', '.join(HEADS)}, not {head!r}")
+    if head != "auto":
+        return head, None
+    return ("fp8", mode) if mode == "speed" else ("stored", None)
+
+
+MX_ACTIVATIONS = ("auto", "bf16", "mxfp8")
+
+
+def asked_mx(activations, mode):
+    """The `mxfp8_activations` option under the quality mode the engine states: auto is mxfp8 in speed, where a
+    quantized format's prompt rows start at its stored activations (a speed run's plans declare them so, and crit
+    run refuses 16-bit ones without a measurement), and bf16 in preserve or where no mode is stated. An option set
+    to one way is that way. Returns (activations, the mode that chose them or None)."""
+    if activations not in MX_ACTIVATIONS:
+        raise ValueError(f"quantized-projections: mxfp8_activations is one of {', '.join(MX_ACTIVATIONS)}, not "
+                         f"{activations!r}")
+    if activations != "auto":
+        return activations, None
+    return ("mxfp8", mode) if mode == "speed" else ("bf16", None)
+
+
 def asked_gemm(gemm, gemv, asked):
     """prompt_gemm auto and gemv auto under the level the engine asks of its prompt rows (crit_plugins.kernels.asks):
     the fastest prompt GEMM that keeps it. exact (and declared, which no GEMM here keeps: the loader then says so):
@@ -260,7 +336,7 @@ def asked_gemm(gemm, gemv, asked):
 
 
 def create(context, options, parts):
-    from crit_plugins.kernels import asks
+    from crit_plugins.kernels import asks, quality_mode
     if options["format"] == "nvfp4":
         found = NVFP4Projections(options["four_over_six"])
     else:
@@ -279,13 +355,14 @@ def create(context, options, parts):
         raise ValueError(f"quantized-projections: {how} gives prompt rows the decode tile's bits: gemv mma "
                          "or fp4, not " + gemv)
     found.roles = prompt_roles(options["prompt_roles"])
+    found.head, found.head_by = asked_head(options["head"], quality_mode())
     found.gemv = gemv
     found.decode = options["decode_activations"]
     found.decode_formats = decode_formats(options["decode_formats"])
     found.rows = options["decode_rows"]
     found.tile_rows = options["tile_rows"] if options["tile_rows"] == "auto" else int(options["tile_rows"])
     found.fp8_activations = options["fp8_activations"]
-    found.mx_activations = options["mxfp8_activations"]
+    found.mx_activations, found.mx_by = asked_mx(options["mxfp8_activations"], quality_mode())
     if found.device is not None and str(found.device).startswith("cuda"):
         device_matrices.buffers(found.device)   # the shared buffers memory() declares: each made at its first use
         found.scratch = getattr(context, "scratch", None)

@@ -127,13 +127,19 @@ def layout(format, hidden, inter):
     return {**found, "components": dict(found["components"])}
 
 
-def kernel_layout(found):
-    """The layout as the grouped experts kernel takes it: [format, bytes, offsets of _KEYS (-1 absent), hidden, inter]."""
+ACTIVATIONS = {"silu": 0, "gelu_tanh": 1}   # a block's gate, as the kernel numbers it
+
+
+def kernel_layout(found, activation="silu"):
+    """The layout as the grouped experts kernel takes it: [format, bytes, offsets of _KEYS (-1 absent), hidden, inter],
+    an int4_zp group after them, and for a block not gated by SiLU the group (0 for none) and then the activation."""
     components = found["components"]
     base, group = parse_format(found["format"])
-    return ([KERNEL_FORMATS[base], found["bundle_bytes"]]
-            + [components[k][0] if k in components else -1 for k in _KEYS] + [found["hidden"], found["inter"]]
-            + ([group] if group is not None else []))
+    plain = ([KERNEL_FORMATS[base], found["bundle_bytes"]]
+             + [components[k][0] if k in components else -1 for k in _KEYS] + [found["hidden"], found["inter"]])
+    if activation != "silu":
+        return plain + [group or 0, ACTIVATIONS[activation]]
+    return plain + ([group] if group is not None else [])
 
 
 def inter_of(format, hidden, bundle_bytes):

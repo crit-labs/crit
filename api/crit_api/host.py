@@ -189,9 +189,9 @@ class Host:
                        native_files='chat-model-file-v1' in spec.get('capabilities', []),
                        verify=bool(spec.get('verify_model')),
                        progress=lambda value: self.status("loading_model", progress=value))
-        def loading(state):
+        def loading(state, **extra):
             self.status(state, model_reused=not loaded, model_bytes=self.pool.host_bytes,
-                        model_device_bytes=self.pool.device_bytes)
+                        model_device_bytes=self.pool.device_bytes, **extra)
         loading("loading_engine")
         package = Path(spec["package_path"])
         # A sealed package keeps its bytes: importing its plugins must not write a __pycache__ into it. crit serve
@@ -390,13 +390,7 @@ class Host:
 
 
 def main():
-    if os.name != "nt":
-        import resource
-        # No core file: a crash of a host holding tens of GB would write one that large (a soft limit of 1 byte also
-        # stops pipe-based core handlers, which ignore 0).
-        hard = resource.getrlimit(resource.RLIMIT_CORE)[1]
-        if hard == resource.RLIM_INFINITY or hard >= 1:
-            resource.setrlimit(resource.RLIMIT_CORE, (1, hard))
+    # No core file from a crash: importing crit_core limits it for every process that uses crit.
     # The engine runs in this process: it keeps its speed while crit serve's or crit run eval's window is behind
     # another one.
     if not keep_full_speed():

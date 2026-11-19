@@ -15,6 +15,8 @@ stats() says why.
 
 The threads wait in the kernel and compute nothing, so they are not workers of the host's pool and are pinned
 nowhere. A buffer is anything writable with the buffer protocol (a numpy array, a memoryview of a tensor's bytes).
+
+write_memory(path, address, size) is the way out: memory the caller holds written to a file past the page cache.
 """
 import mmap
 import os
@@ -23,6 +25,73 @@ from concurrent.futures import ThreadPoolExecutor
 
 DEPTH = 8
 ALIGN = 4096
+
+def write_memory(path, address, size, progress=None, piece=64 << 20):
+    """Writes the `size` bytes at `address` (memory that starts on a page: a mapping) to the file at `path`, which
+    is made or cut to that size. Past the OS's page cache where the file system allows (O_DIRECT: whole blocks
+    straight from the memory, a last part of a block through a buffered write), so tens of gigabytes the caller
+    holds are not held a second time as dirty cache while they are written: beside a store that fills host memory
+    that copy pushed the host into its swap. Where direct writes are refused the writes are buffered, synced and
+    dropped from the cache a piece at a time. progress(done, size) hears of each piece. Returns whether the whole
+    blocks were written direct."""
+    import ctypes
+    size, at, direct = int(size), 0, False
+    base = os.O_WRONLY | os.O_CREAT | getattr(os, "O_BINARY", 0)
+    flag = getattr(os, "O_DIRECT", None)
+    if flag is not None and not address % ALIGN:
+        try:
+            fd = os.open(path, base | os.O_TRUNC | flag, 0o644)
+        except OSError:
+            fd = None
+        if fd is not None:
+            try:
+                whole = size - size % ALIGN
+                while at < whole:
+                    n = min(piece, whole - at)
+                    done = os.pwrite(fd, (ctypes.c_char * n).from_address(address + at), at)
+                    if done <= 0 or done % ALIGN:
+                        raise OSError(f"a direct write of {n} bytes wrote {done}")
+                    at += done
+                    if progress is not None:
+                        progress(at, size)
+                direct = True
+            except OSError:
+                pass   # the buffered writes go on from where the direct ones stopped
+            finally:
+                os.close(fd)
+    fd = os.open(path, base | (0 if at else os.O_TRUNC), 0o644)
+    try:
+        while at < size:
+            n = min(piece, size - at)
+            done = os.write(fd, (ctypes.c_char * n).from_address(address + at)) if not at and not hasattr(
+                os, "pwrite") else _pwrite(fd, (ctypes.c_char * n).from_address(address + at), at)
+            first, at = at, at + done
+            if hasattr(os, "posix_fadvise"):   # written and out of the cache before the next piece
+                os.fsync(fd)
+                os.posix_fadvise(fd, first, done, os.POSIX_FADV_DONTNEED)
+            if progress is not None:
+                progress(at, size)
+        os.ftruncate(fd, size)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return direct
+
+
+def _pwrite(fd, data, offset):
+    if hasattr(os, "pwrite"):
+        return os.pwrite(fd, data, offset)
+    os.lseek(fd, offset, os.SEEK_SET)
+    return os.write(fd, data)
+
+
+def _address(view):
+    """The address of a writable buffer's first byte, or 1 (no block's start) where it cannot be taken."""
+    import ctypes
+    try:
+        return ctypes.addressof(ctypes.c_char.from_buffer(view))
+    except (TypeError, ValueError):
+        return 1
 
 
 class _Handle:
@@ -82,6 +151,16 @@ class _Handle:
             got, view = 0, into
             while got < need:
                 n = self._pread_into(view[got:], offset + got)
+                if not n:
+                    raise OSError(f"unexpected end of file at {offset + got}")
+                got += n
+            return
+        if self.win is None and not offset % ALIGN and not need % ALIGN and _address(into) % ALIGN == 0:
+            # Whole blocks into memory that starts on a block (a mapping filled piece by piece): read where they go,
+            # without the pass through this thread's buffer.
+            got = 0
+            while got < need:
+                n = os.preadv(self.fd, [into[got:]], offset + got)
                 if not n:
                     raise OSError(f"unexpected end of file at {offset + got}")
                 got += n

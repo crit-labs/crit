@@ -41,11 +41,15 @@
     {
       "path": "inference/expert-offload/code/bench.py",
       "purpose": "The plugin alone on a bundle store file and a recorded routing trace: a captured graph a round as an engine runs it, the round's time, the CPU tier's share and time per missed expert, hits, misses and copies a round, for the options and each variant"
+    },
+    {
+      "path": "inference/expert-offload/code/gguf_experts.py",
+      "purpose": "Experts a GGUF checkpoint stores (format gguf): the slot layout of each layer's formats (wider layers in pieces, kept whole on the device), the bundles, gguf-rows over the slots (GgufRoutes, prompt chunks on its grouped GEMM) and the CPU tier in its declared order (GgufCpuTier)"
     }
   ],
   "requires": {
     "hardware": "A CUDA GPU grouped-experts builds for; for the CPU path, the native CPU tier (host-expert-arithmetic's integer rows) and mapped pinned host memory",
-    "model": "Expert-routed models with SwiGLU experts in any format grouped-experts computes; the CPU path for NVFP4 (W4A4) and INT4 experts",
+    "model": "Expert-routed models with SwiGLU experts in any format grouped-experts computes; the CPU path for NVFP4 (W4A4) and INT4 experts (native) and GGUF experts (in torch, gguf-rows' declared order)",
     "workload": "Decode and verify rounds and prompt chunks through experts that do not all fit on the device"
   },
   "contract": {

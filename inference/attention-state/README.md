@@ -38,8 +38,10 @@ explicit mask.
 head_dim)` dimensions rotate) and the attention factor that scales cos and sin,
 as Hugging Face's `ROPE_INIT_FUNCTIONS` derive them, for `default`, `mrope`,
 `linear`, dynamic NTK, YaRN (with `mscale`, `attention_factor` and `truncate`),
-`llama3` and `longrope`. `rope` is `crit_core.model`'s `RopeConfig`
-(`load_model_config(...).rope`), `max_position_embeddings` the declared length dynamic
+`llama3`, `longrope` and `proportional` (a table as wide as the head, of which
+the first `partial_rotary_factor` turns and the rest keeps its values). `rope` is
+`crit_core.model`'s `RopeConfig` (`load_model_config(...).rope`, or one layer
+type's of `rope_by_layer_type` where the config keys its rope by layer type), `max_position_embeddings` the declared length dynamic
 NTK needs and YaRN, Llama 3 and LongRoPE read when the rope object leaves factor or
 original length out; `sequence_length` picks dynamic NTK's base and LongRoPE's long
 factors past the original length. Other types and missing parameters are refused.

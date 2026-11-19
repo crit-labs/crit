@@ -24,6 +24,7 @@ void Engine::Impl::publish_group(std::span<const WorkItem> items, std::vector<Ro
         Lane* lane; std::span<const Token> tokens;
         std::uint32_t frontier, reused; bool prefilled; Finish finish;
         detail::Extents before;
+        detail::Pass pass;
     };
     std::vector<Staged> staged;
     std::vector<CommitDecision> decisions;
@@ -52,10 +53,11 @@ void Engine::Impl::publish_group(std::span<const WorkItem> items, std::vector<Ro
         if(item.budget.token_work &&
            (p.token_work > item.budget.token_work ||
             p.reused_prompt_tokens > p.prompt_tokens ||
-            p.prompt_tokens - p.reused_prompt_tokens > p.token_work ||
+            p.prompt_tokens - p.reused_prompt_tokens > std::uint64_t(p.token_work) + lane.pass.tokens ||
             (lane.prefilled && !p.token_work)))
             throw std::runtime_error("mixed token work exceeds grant or omits computation");
-        detail::validate_progress(p,item.budget,lane.frontier,*lane.request,"invalid or stalled concurrent progress");
+        detail::validate_progress(p,item.budget,lane.frontier,*lane.request,declaration,lane.pass,
+                                  "invalid or stalled concurrent progress");
         detail::validate_tokens(p.tokens,detail::valid_vocabulary(declaration),"generated token outside the valid vocabulary");
         logprobs.push_back(detail::logprob_rows(lane.request->options,p,detail::valid_vocabulary(declaration)));
     }
@@ -82,7 +84,9 @@ void Engine::Impl::publish_group(std::span<const WorkItem> items, std::vector<Ro
         auto& copied=request.staging;
         copied.clear();
         if(d.accepted) copied.assign(p.tokens.begin(),p.tokens.begin()+d.accepted);
-        staged.push_back({&lane,copied,lane.frontier+p.prompt_tokens,p.reused_prompt_tokens,p.prefill_complete,d.finish,before});
+        // The pass the row holds after this step, and its steps in a row without a consumed prompt token.
+        const detail::Pass pass{p.pass_tokens,p.prompt_tokens || !p.pass_tokens ? 0 : lane.pass.steps+1};
+        staged.push_back({&lane,copied,lane.frontier+p.prompt_tokens,p.reused_prompt_tokens,p.prefill_complete,d.finish,before,pass});
         decisions.push_back({item.key,item.session,d.accepted,d.terminal,cancelled || lane.terminal});
     }
     try { model->commit(decisions); }
@@ -96,7 +100,7 @@ void Engine::Impl::publish_group(std::span<const WorkItem> items, std::vector<Ro
     for(std::size_t i=0;i<staged.size();++i) {
         auto& value = staged[i]; auto& lane = *value.lane;
         lane.request->phases.step(value.frontier-lane.frontier,value.reused,lane.prefilled,value.prefilled,value.tokens.size());
-        lane.frontier=value.frontier; lane.prefilled=value.prefilled;
+        lane.frontier=value.frontier; lane.prefilled=value.prefilled; lane.pass=value.pass;
         bool wake;
         {
             std::lock_guard lock(lane.request->mutex);

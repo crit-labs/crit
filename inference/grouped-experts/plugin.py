@@ -44,6 +44,7 @@ class GroupedExperts:
     def __init__(self, context, options, parts):
         self.source = parts.get("expert_source")
         self.activations, self.arithmetic = options["activations"], options["arithmetic"]
+        self.activation = "silu"   # the blocks' gate (activate)
         self.workspace_bytes = int(options["workspace_mib"]) << 20
         self.device = getattr(context, "device", None)
         self.layers = {}         # layer -> {"format", "bytes", "bundles": {expert: uint8}, "store", "captured"}
@@ -77,6 +78,16 @@ class GroupedExperts:
         from crit_plugins.kernels import loaded
         return loaded().get(KERNEL, {}).get("reason") or "it did not load"
 
+    def activate(self, name):
+        """The gate of the blocks' product, act(gate) * up: silu (SwiGLU, the default) or gelu_tanh
+        (experts:activations), for every layer; before the first forward. The declared arithmetic is SwiGLU's."""
+        if name not in bundles.ACTIVATIONS:
+            raise ValueError(f"grouped-experts gates a block by {' or '.join(bundles.ACTIVATIONS)}, not {name!r}")
+        if name != "silu" and self.arithmetic == "declared":
+            raise ValueError("grouped-experts: arithmetic declared computes SwiGLU blocks (the CPU expert tier's "
+                             f"bits); a block gated by {name} runs arithmetic tensor")
+        self.activation = name
+
     # -- host form ------------------------------------------------------------------------------------------------------
     def run(self, layer, x, ids, weights):
         check_routes(x, ids, weights)
@@ -91,7 +102,7 @@ class GroupedExperts:
             return cache[expert]
 
         return reference.moe_block(x, ids, weights, lambda e: matrices(e)[0], lambda e: matrices(e)[1],
-                                   len(matrices(used[0])[0]) // 2)
+                                   len(matrices(used[0])[0]) // 2, activation=self.activation)
 
     # -- bundles --------------------------------------------------------------------------------------------------------
     def layout(self, format, hidden, inter):
@@ -265,12 +276,12 @@ class GroupedExperts:
         ws = self._workspace(tokens, top, experts, hidden, inter, x.device)
         if self.kernel is not None and x.is_cuda:
             xb = x if x.dtype == torch.bfloat16 and x.is_contiguous() else x.to(torch.bfloat16).contiguous()
-            return self.kernel.route_outputs(xb, ids.contiguous(), store, slots, bundles.kernel_layout(found), ws, a4,
-                                             self.arithmetic)
+            return self.kernel.route_outputs(xb, ids.contiguous(), store, slots,
+                                             bundles.kernel_layout(found, self.activation), ws, a4, self.arithmetic)
         if declared:
             raise ValueError(f"grouped-experts: arithmetic declared runs on crit's kernel {KERNEL}: CUDA "
                              f"activations, not {x.device}")
-        return fallback.route_outputs(x, ids, store, slots, found, a4, ws.y)
+        return fallback.route_outputs(x, ids, store, slots, found, a4, ws.y, self.activation)
 
     def combine(self, y, ids, weights, slots=None):
         """out [tokens][hidden] FP32: each token's routes in route order, fmaf(weight, row, sum), over the routes with

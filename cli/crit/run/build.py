@@ -34,11 +34,15 @@ def build(store, run_id, candidate_id, recipe, seconds=None, drop=(), package=Tr
             shutil.rmtree(work)
         shutil.copytree(folder / "source", work)
         # The candidate's configuration beside its plugins, as the package will carry it, so a build command that
-        # checks or reads the selection finds it (package_recipe binds it as no build output).
-        if not (work / "configuration.json").is_file():
-            from .store import configuration_text
-            configuration = read_json(folder / "candidate.json")["configuration"]
-            (work / "configuration.json").write_bytes(configuration_text(configuration).encode("utf-8"))
+        # checks or reads the selection finds it (package_recipe binds it as no build output). A source that carries
+        # the configuration as it was written, before crit completed it for the candidate (the recon's frozen block,
+        # the exactness of its rows, the quality mode), gets the completed one too: it is the same configuration, and
+        # the package takes the candidate's alone.
+        from .store import before_completion, configuration_text
+        configuration = read_json(folder / "candidate.json")["configuration"]
+        supplied = work / "configuration.json"
+        if not supplied.is_file() or before_completion(_read(supplied), configuration):
+            supplied.write_bytes(configuration_text(configuration).encode("utf-8"))
         log(f"crit run build: {' '.join(command)} in {work.relative_to(root).as_posix()}")
         attempt.end(*_run(command, work, attempt.log_path, attempt.deadline_at))
     result = attempt.settle()
@@ -55,6 +59,14 @@ def build(store, run_id, candidate_id, recipe, seconds=None, drop=(), package=Tr
         built["package"] = store.package(run_id, candidate_id, work, package_recipe(root, folder, work, recipe,
                                                                                     attempt.id))
     return built
+
+
+def _read(path):
+    """A JSON file's value, None where it does not parse."""
+    try:
+        return read_json(path)
+    except ValueError:
+        return None
 
 
 def _run(command, cwd, log_path, deadline_at):

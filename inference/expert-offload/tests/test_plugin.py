@@ -143,3 +143,74 @@ class ExpertOffloadTests(PluginTestCase):
         self.assertIn("its largest tensors: [250000][3072] bfloat16 1.5 of the-model", shared)   # a table, by shape
         self.assertNotIn("next lever", shared)                     # 90% hits: the shares say enough
         self.assertIn("device", offload.diagnosis({"tier": "device"}))
+
+
+GGUF = importlib.util.spec_from_file_location("expert_offload_gguf", CODE.with_name("gguf_experts.py"))
+gguf_experts = importlib.util.module_from_spec(GGUF)
+GGUF.loader.exec_module(gguf_experts)
+
+
+class GgufBundleTests(PluginTestCase):
+    """GGUF experts' bundles: each layer's formats, the down rows at the layer's 64-byte boundary after its gate-up rows,
+    the slot the bundle most layers need, a few wide layers (a sixteenth of the bytes at most) in pieces of a slot."""
+
+    def test_the_slot_leaves_only_a_few_wide_layers_outside(self):
+        self.assertEqual(gguf_experts.slot_bytes({0: 100, 1: 100, 2: 300}), 300)          # a third of the bytes: no
+        self.assertEqual(gguf_experts.slot_bytes({i: 100 for i in range(31)} | {31: 150}), 100)
+        self.assertEqual(gguf_experts.slot_bytes({i: 100 + i for i in range(20)}), 118)  # the widest outside
+        formats = {i: ("IQ2_XXS", "Q2_0") for i in range(20)}
+        formats[20] = ("IQ2_S", "Q2_0")
+        found = gguf_experts.layout(formats, 256, 128)
+        self.assertEqual((found["bundle_bytes"], found["sizes"][20]), (26112, 30208))
+        self.assertEqual((found["pieces"], found["store_layers"]), ({20: [21]}, 22))
+        import torch
+        bundle = torch.arange(30208, dtype=torch.int64).to(torch.uint8)
+        cut = gguf_experts.pieces(bundle, found, 20)
+        self.assertEqual([(where, piece.numel()) for where, piece in cut], [(20, 26112), (21, 26112)])
+        self.assertTrue(torch.equal(torch.cat([piece for _, piece in cut])[:30208], bundle))
+        formats[20] = ("Q8_0", "Q8_0")   # a sixth of the bytes: every slot that layer's size
+        self.assertEqual(gguf_experts.layout(formats, 256, 128)["pieces"], {})
+
+    def test_the_layout_holds_every_layers_formats_in_bundles_of_one_size(self):
+        found = gguf_experts.layout({0: ("IQ2_XXS", "Q2_0"), 1: ("IQ2_S", "IQ4_NL")}, 2560, 640)
+        gate_up = {0: 2 * 640 * 660, 1: 2 * 640 * 820}            # 2560 values a row: 10 blocks of 66 / 82 bytes
+        down = {0: 2560 * 180, 1: 2560 * 360}                      # 640 values a row: 10 Q2_0 / 20 IQ4_NL blocks
+        self.assertEqual(found["offsets"], {k: -(-v // 64) * 64 for k, v in gate_up.items()})
+        self.assertEqual(found["bundle_bytes"], max(found["offsets"][k] + -(-down[k] // 64) * 64 for k in down))
+        self.assertEqual(found["formats"], {0: ["IQ2_XXS", "Q2_0"], 1: ["IQ2_S", "IQ4_NL"]})
+        self.assertEqual(found["bundle_bytes"] % 16, 0)   # a bundle store's rows are whole 16-byte units
+
+    def test_a_bundle_is_the_stored_rows_at_their_offsets(self):
+        import torch
+        found = gguf_experts.layout({0: ("Q8_0", "Q2_0"), 1: ("Q4_K", "Q8_0")}, 256, 128)
+        g = torch.Generator().manual_seed(2)
+        gate_up = torch.randint(0, 256, (256, 272), dtype=torch.uint8, generator=g)     # Q8_0: 8 blocks of 34
+        down = torch.randint(0, 256, (256, 36), dtype=torch.uint8, generator=g)         # Q2_0: 2 blocks of 18
+        bundle = gguf_experts.pack({"weight": gate_up, "type": "Q8_0"}, {"weight": down, "type": "Q2_0"}, found, 0)
+        self.assertEqual(bundle.numel(), found["bundle_bytes"])
+        self.assertTrue(torch.equal(bundle[:gate_up.numel()], gate_up.reshape(-1)))
+        at = found["offsets"][0]
+        self.assertTrue(torch.equal(bundle[at:at + down.numel()], down.reshape(-1)))
+        with self.assertRaisesRegex(ValueError, "layer 1's experts are Q4_K / Q8_0"):
+            gguf_experts.pack({"weight": gate_up, "type": "Q8_0"}, {"weight": down, "type": "Q2_0"}, found, 1)
+        with self.assertRaisesRegex(ValueError, r"is \[256\]\[36\] bytes"):
+            gguf_experts.pack({"weight": gate_up, "type": "Q8_0"}, {"weight": down[:, :20], "type": "Q2_0"}, found, 0)
+
+    def test_a_store_folder_not_there_yet_is_made(self):
+        import os
+        import tempfile
+        if os.name == "nt":
+            self.skipTest("the ram tier's store is anonymous host memory through libc, which Windows does not have")
+        with tempfile.TemporaryDirectory() as folder:
+            store_dir = Path(folder) / "not" / "there"
+            experts = self.assemble(USE, {"store_dir": str(store_dir), "tier": "ram"})["experts"]
+            experts.begin(2, 4, "gguf", 256, 128, formats={0: ("Q8_0", "Q8_0"), 1: ("Q8_0", "Q8_0")}, device="cpu")
+            self.assertEqual(Path(experts.store.path).parent, store_dir)
+            experts.close()
+
+    def test_begin_takes_every_layers_formats(self):
+        experts = self.assemble(USE)["experts"]
+        with self.assertRaisesRegex(ValueError, "formats of every layer 0 .. 1"):
+            experts.begin(2, 4, "gguf", 256, 128, formats={0: ("Q8_0", "Q8_0")}, device="cpu")
+        with self.assertRaisesRegex(ValueError, "formats are a GGUF checkpoint's"):
+            self.assemble(USE)["experts"].begin(2, 4, "bf16", 256, 128, formats={}, device="cpu")

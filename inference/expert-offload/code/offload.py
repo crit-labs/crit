@@ -14,23 +14,47 @@ The decision tree, at begin() (sizes) and open() (after the model's own pools, w
                       device's rows then take the CPU's integer order
               link    every miss copied into a cache slot before its layer reads it (the clock picks the slot), the
                       device's rows in the kernel's tensor arithmetic
+    short     a prompt chunk of fewer routes than a layer has experts, where the CPU tier computes decode misses
+    prompts   and prompt rows keep its order: its missed routes on the CPU tier where they cost less there than
+              their experts over the link (both measured at open()), else copied into the ring as below
     prompts   a prompt chunk stages its layer's non-resident experts through the cache's ring and runs in the tensor
-              arithmetic (prompt_arithmetic) or the CPU's order
+              arithmetic (prompt_arithmetic) or the CPU's order. A staged layer serves every chunk that reads it: a
+              model that runs a span of a prompt layer by layer (stages_prompts tells it to) brings each layer's
+              experts over the link once for the span, however many chunks and steps it takes
 
 Nothing here is new arithmetic: the cache is device-expert-cache's ExpertCache, the store expert-tensors' BundleStore,
 the CPU tier host-expert-tier's CpuTier behind heterogeneous-expert-dispatch's DeviceDispatch, the rows grouped-experts'
-kernel (KernelRoutes)."""
+kernel (KernelRoutes), or for experts a GGUF checkpoint stores (format "gguf": each layer's formats as the file has
+them, gguf_experts.py) gguf-rows' kernel over the bundles in their slots (GgufRoutes) and, for their misses, its
+declared order on the host (GgufCpuTier)."""
 import hashlib
 import json
 import os
+from collections import deque
 from pathlib import Path
 
 GIB = 1 << 30
+# Files of a package's plugins that make a bundle what it is (the model plugin's reading of the checkpoint, the experts
+# plugins' packing): a store in the host's cache is keyed by them.
+CODE_SUFFIXES = (".py", ".json", ".cu", ".cuh", ".c", ".cc", ".cpp", ".h", ".hpp")
+# Filesystems a store file is not kept on unasked: every miss would read it over a network or a VM's file bridge.
+REMOTE_FILESYSTEMS = ("9p", "drvfs", "nfs", "nfs4", "cifs", "smb3", "fuse.sshfs", "virtiofs")
 CPU_FORMATS = ("nvfp4", "int4")
+# The formats whose misses the CPU tier computes: its own bundles' (native), and a GGUF's experts as stored (in torch,
+# gguf_experts.GgufCpuTier: gguf-rows' declared order on the host, joined after a synchronization)
+MISS_FORMATS = CPU_FORMATS + ("gguf",)
 PROFILE_KIND = "expert-offload-routing"
 # A prompt chunk is given what such steps were measured to take, an eighth more and SLACK: a step's peak varies from
 # run to run, and the device's free memory never falls under margin_mib for it.
 SLACK = 32 << 20
+# The room is a forecast, and a forecast is off now and then: a step deeper in the context than any before it, a
+# plugin's temporaries outside the ledger, a block torch's allocator cannot reuse. So a prompt step is also looked at
+# as it runs (every routed layer of every chunk: _look), and the cache keeps free, beyond margin_mib, never less than
+# a reserve of what such steps were seen to take from the device between two looks (the most of the last STRIDES
+# steps, half again and SLACK), RESERVE at least. Where a step outgrows its room the cache gives the next stride
+# before the step takes it, so the margin is kept by what the device does, not by what was predicted.
+RESERVE = 64 << 20
+STRIDES = 64
 
 
 def host_available_bytes():
@@ -49,6 +73,21 @@ def choose_tier(total_bytes, device_free, device_needs, host_free, margin, ram_h
     if total_bytes + ram_headroom <= host_free:
         return "ram"
     return "disk"
+
+
+def _filesystem(folder):
+    """The type of the filesystem `folder` is on, from /proc/mounts (its longest mount point); None where that
+    cannot be read (not Linux)."""
+    try:
+        mounts = Path("/proc/mounts").read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    folder, best = Path(folder).resolve(), (-1, None)
+    for line in mounts:
+        fields = line.split()
+        if len(fields) >= 3 and (folder == Path(fields[1]) or Path(fields[1]) in folder.parents):
+            best = max(best, (len(fields[1]), fields[2]))
+    return best[1]
 
 
 def cache_slots(free, margin, bundle_bytes):
@@ -94,6 +133,7 @@ def learn(peaks, first, tokens, peak, serving):
 # The CPU tier takes the misses where it computes a missed expert in under this share of the time the link copies
 # one: beside the CPU tier every device row runs the declared order, slower than the tensor cores', and the tier
 # needs its threads awake, so at equal times the link serves a round sooner and starts no slower after a pause.
+# A short prompt chunk's misses go by the same share (the cache's prompt_cpu).
 CPU_WINS = 0.8
 
 
@@ -103,7 +143,7 @@ def choose_misses(format, cpu_ready, forced="auto", measured=None):
     this machine: measured {"cpu": us, "link": us} a missed expert (the tier computing it, the link copying it),
     the CPU tier where it takes under CPU_WINS of the link's time; without a measurement, and where it is asked
     for, the CPU tier."""
-    if forced == "link" or format not in CPU_FORMATS or not cpu_ready:
+    if forced == "link" or format not in MISS_FORMATS or not cpu_ready:
         return "link"
     if forced == "cpu" or not measured:
         return "cpu"
@@ -267,6 +307,10 @@ class ExpertOffload:
     """The experts slot's device form for experts of any size against the device: load() every expert as for experts
     that fit, open() once the model's pools are made, forward() per routed layer."""
 
+    # Its bundles are packed on the host, whatever the tier: a model plugin hands load() host tensors (an expert
+    # read onto the device first crossed the link twice on its way to host memory, 25,000 times a load).
+    host_loads = True
+
     def __init__(self, source, placement, options, code, context):
         self.source, self.placement, self.options, self.code = source, placement, dict(options), code
         self.context = context
@@ -279,8 +323,13 @@ class ExpertOffload:
         self.misses = None
         self.miss_times = None     # {"cpu": us, "link": us} a missed expert, measured at open() where misses is auto
         self.miss_source = None    # "measured" in this process, or "recorded" in the package's decisions
+        self.miss_trials = None    # each timed batch's microseconds a missed expert, the uncounted first included
+        self.link_us = None        # microseconds the link takes a bundle, measured at open() (a mapped store on CUDA)
+        self.link_trials = None    # each timed batch's microseconds a bundle over the link, the uncounted first included
+        self.activation = "silu"   # the blocks' gate (activate): silu, or gelu_tanh in the tensor arithmetic
         self.reasons = {}
         self.bundle_layout = None
+        self.formats = None        # gguf: {layer: (gate_up type, down type)}, as the checkpoint stores each layer
         self.a4 = None             # nvfp4: the routed layers' experts carry their input scales (W4A4)
         self.a4_layers = {}        # nvfp4 layer -> whether its experts carry input scales (W4A4) or not (W4A16)
         self.resident = {}         # layer -> device store [experts][bundle_bytes]: W4A16 layers beside W4A4 ones
@@ -292,10 +341,16 @@ class ExpertOffload:
         self._peaks = {}         # {a prompt step's largest chunk in tokens: the most device bytes such a step took}
         self._chunk = 0          # the most tokens one prompt forward() ran
         self._frame = None       # the open step frame: [the chunk tokens it has room for, the most a forward() ran,
-        #                          what torch's allocator held in use before it (None: no prompt in it so far)]
+        #                          what torch's allocator held in use before it (None: no prompt in it so far),
+        #                          whether it is a score's, the device bytes held beside the cache before it,
+        #                          torch's reserved bytes at its last look, its largest stride between two]
+        self._score_peak = 0     # the most device bytes a score's frame took: its text's rows and their logits
         self._first = set()      # the chunk sizes of _peaks measured while the engine loaded (learn)
         self._left = 0           # the most a prompt step left in use behind it (a first step's graphs and workspaces)
         self._unsettled = False  # a prompt step ended and the cache has not grown back since
+        self._strides = deque(maxlen=STRIDES)   # the most each of the last prompt steps took between two looks
+        self.looks = 0           # the looks at prompt steps in flight (_look) that found the device had taken more
+        self.extends = 0         # and those at which the cache gave memory the step's room did not hold
         self._scratch = None     # a scratch of its own, where no engine gives one (a test, a bench)
         self.memory = None       # the device's memory (crit_plugins.memory): the ledger the cache is a giver of
         self.shrinks = 0
@@ -317,7 +372,18 @@ class ExpertOffload:
                 cache[expert] = self.source.matrices(layer, expert)
             return cache[expert]
         return reference.moe_block(x, ids, weights, lambda e: matrices(e)[0], lambda e: matrices(e)[1],
-                                   len(matrices(used[0])[0]) // 2)
+                                   len(matrices(used[0])[0]) // 2, activation=self.activation)
+
+    def activate(self, name):
+        """The gate of the blocks' product, act(gate) * up: silu (SwiGLU, the default) or gelu_tanh
+        (experts:activations), before open(). The CPU tier computes SwiGLU blocks alone, so a block gated otherwise
+        has its misses copied over the link and every row in the kernel's tensor arithmetic."""
+        known = self.code["grouped_bundles"].ACTIVATIONS
+        if name not in known:
+            raise ValueError(f"expert-offload gates a block by {' or '.join(known)}, not {name!r}")
+        if self.part is not None:
+            raise ValueError("the blocks' activation is set before open()")
+        self.activation = name
 
     # -- sizes and the tier -----------------------------------------------------------------------------------------
     def _settings(self):
@@ -340,22 +406,34 @@ class ExpertOffload:
         return self.code["tier_bundles"] if format in CPU_FORMATS else self.code["grouped_bundles"]
 
     def layout_of(self, format, hidden, inter):
+        if format == "gguf":
+            return self.code["gguf"].layout(self.formats, hidden, inter)
         return self.bundles(format).layout(format, hidden, inter)
 
-    def begin(self, layers, experts, format, hidden, inter, device_bytes=0, identity=None, device="cuda"):
+    def begin(self, layers, experts, format, hidden, inter, device_bytes=0, identity=None, device="cuda",
+              formats=None):
         """Before the loads: the routed experts' geometry (layers counts every layer whose experts load(), a draft
         layer's included), the device bytes the model will still allocate (its KV, state and prompt pools), and the
-        checkpoint's identity for a store file. Decides the tier and makes its store."""
+        checkpoint's identity for a store file. Format "gguf" (a GGUF checkpoint's experts as stored) takes each
+        layer's formats, {layer: (gate_up type, down type)}. Decides the tier and makes its store."""
         import torch
         from crit_plugins.memory import of
         if self.shape is not None:
             raise ValueError("begin() once, before the first load()")
+        if format == "gguf":
+            self.formats = {int(k): tuple(v) for k, v in dict(formats or {}).items()}
+            if sorted(self.formats) != list(range(int(layers))):
+                raise ValueError(f"GGUF experts take the formats of every layer 0 .. {int(layers) - 1}, not of "
+                                 f"{sorted(self.formats)}")
+        elif formats is not None:
+            raise ValueError("formats are a GGUF checkpoint's (format gguf)")
         self.device = torch.device(device)
         self.memory = of(self.device)
         self.shape = (int(layers), int(experts), format, int(hidden), int(inter))
         self.bundle_layout = self.layout_of(format, hidden, inter)
         size = int(self.bundle_layout["bundle_bytes"])
-        total = int(layers) * int(experts) * size
+        sizes = self.bundle_layout.get("sizes") or {layer: size for layer in range(int(layers))}
+        total = int(experts) * sum(sizes.values())
         margin = int(self._option("reserve_mib")) << 20
         free = self.memory.free(release=True)
         self.tier = choose_tier(total, free, int(device_bytes), host_available_bytes(), margin,
@@ -365,20 +443,22 @@ class ExpertOffload:
                                 f"{total / 1e9:.1f} GB of experts")
         if self.tier == "device":
             for layer in range(int(layers)):
-                self.stores[layer] = torch.zeros(int(experts), size, dtype=torch.uint8, device=self.device)
+                self.stores[layer] = torch.zeros(int(experts), max(size, sizes[layer]), dtype=torch.uint8,
+                                                 device=self.device)
             if self.placement is not None:
                 self.placement.plan({"expert_stores": total}, {"device": free, "host": 0})
             return self.tier
         path = self._store_path(identity)
         if self.tier == "ram":
-            self.store = self.source.open_store(self.bundle_layout, int(layers), int(experts), str(self.device),
-                                                path=path, identity=self._identity(identity) if path else None)
+            self.store = self.source.open_store(self.bundle_layout, self.store_layers, int(experts),
+                                                str(self.device), path=path,
+                                                identity=self._identity(identity) if path else None)
         else:
             if path is None:
                 raise ValueError("the disk tier keeps the experts in a file: give expert-offload a store_dir")
             given = int(self._option("host_tier_mib"))
             room = max(0, host_available_bytes() - (int(self._option("ram_headroom_mib")) << 20))
-            self.store = FileStore(self.bundle_layout, layers, experts, path,
+            self.store = FileStore(self.bundle_layout, self.store_layers, experts, path,
                                    host_bytes=room if given < 0 else given << 20)
             self.reasons["host_tier"] = (
                 f"{self.store.slots} of {self.store.keys} experts kept in host memory between the file and the "
@@ -390,7 +470,7 @@ class ExpertOffload:
         """A store_path names a complete store file of this checkpoint and layout: it is opened as it is, never
         rebuilt (a store that does not match is refused, not overwritten)."""
         store = self.code["store"]
-        layers, experts = self.shape[0], self.shape[1]
+        layers, experts = self.store_layers, self.shape[1]
         layout = store.store_layout(self.bundle_layout, getattr(self.source, "csf", None))
         want = {"kind": store.BUNDLES, "layers": layers, "experts": experts, **store._jsonable(layout),
                 "identity": store._jsonable(self._identity(identity))}
@@ -416,19 +496,100 @@ class ExpertOffload:
         if given:
             self._check_store(Path(given).expanduser(), identity)
             return str(Path(given).expanduser())
-        folder = self._option("store_dir")
-        if not folder:
-            return None
         layers, experts, format, hidden, inter = self.shape
-        key = hashlib.sha256(json.dumps([self._identity(identity), layers, experts, format, hidden, inter],
-                                        sort_keys=True, default=str).encode()).hexdigest()[:16]
-        return str(Path(folder).expanduser() / f"experts-{key}.bin")
+        parts = [self._identity(identity), layers, experts, format, hidden, inter]
+        if self.formats is not None:   # another quantization of the checkpoint is another store
+            parts.append(sorted(self.formats.items()))
+
+        def key(parts):
+            return hashlib.sha256(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()[:16]
+        folder = self._option("store_dir")
+        if folder:
+            Path(folder).expanduser().mkdir(parents=True, exist_ok=True)   # a folder named and not there yet
+            return str(Path(folder).expanduser() / f"experts-{key(parts)}.bin")
+        # No folder named: the host's cache for files a plugin can build again (context.cache: crit run gives every
+        # run one), so the loads after the first reopen the store instead of building it from the checkpoint again.
+        cache = getattr(self.context, "cache", None)
+        if cache is None:
+            return None
+        path = Path(cache) / "expert-offload" / f"experts-{key(parts + [self._code()])}.bin"
+        nbytes = self.store_layers * experts * int(self.bundle_layout["bundle_bytes"])
+        return str(path) if self._cached(path, nbytes, self._identity(identity)) else None
+
+    def _code(self):
+        """A digest of the package's plugin code (CODE_SUFFIXES under its plugins folder): a store another model
+        plugin read or other experts plugins packed is another store. Empty outside a package."""
+        package = getattr(self.context, "package", None)
+        plugins = Path(package) / "plugins" if package is not None else None
+        if plugins is None or not plugins.is_dir():
+            return ""
+        digest = hashlib.sha256()
+        for path in sorted(p for p in plugins.rglob("*") if p.suffix in CODE_SUFFIXES and p.is_file()
+                           and "__pycache__" not in p.parts):
+            digest.update(path.relative_to(plugins).as_posix().encode() + b"\0" + path.read_bytes() + b"\0")
+        return digest.hexdigest()
+
+    def _cached(self, path, nbytes, identity):
+        """Whether the store is kept at `path` in the host's cache. The cache holds one store a checkpoint: this
+        checkpoint's other stores there (built by other plugin code or in another layout) and files a build left
+        unfinished are removed first. A store already there is reopened; a new one is written only where the folder
+        is on a local disk and the machine's plugin cache ledger (crit_plugins.disk_cache) makes room for it: under
+        its cap, with its floor of free space left, the least recently used stores of any run removed first.
+        Otherwise the store is built in host memory, as without a cache, and the reason says why."""
+        from crit_plugins import disk_cache
+        store = self.code["store"]
+        folder = path.parent
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            for other in sorted(folder.glob("experts-*.bin")):
+                if other == path:
+                    continue
+                index = Path(str(other) + ".json")
+                try:
+                    stale = json.loads(index.read_text(encoding="utf-8")).get("identity") == store._jsonable(identity)
+                except (OSError, ValueError):
+                    stale = True   # no index: a build that did not finish
+                if stale:
+                    disk_cache.forget(other)
+                    for gone in (index, other):
+                        gone.unlink(missing_ok=True)
+            index = Path(str(path) + ".json")
+            if path.is_file() and index.is_file():
+                disk_cache.touch(path, [index])
+                self.reasons["store"] = f"reopened from the host's cache ({path}) where it is complete"
+                return True
+            kind = _filesystem(folder)
+            if kind in REMOTE_FILESYSTEMS:
+                self.reasons["store"] = (f"built in host memory at every load: the host's cache ({folder}) is on a "
+                                         f"{kind} filesystem; name a folder on a local disk with store_dir")
+                return False
+            admitted, reason = disk_cache.admit(path, nbytes, [index])
+            if not admitted:
+                self.reasons["store"] = f"built in host memory at every load: {reason}"
+                return False
+        except OSError as error:
+            self.reasons["store"] = f"built in host memory at every load: the host's cache is not usable ({error})"
+            return False
+        self.reasons["store"] = f"kept in the host's cache ({path}, {nbytes / GIB:.1f} GiB): later loads reopen it"
+        return True
+
+    @property
+    def store_layers(self):
+        """The store's layers: the model's, and for GGUF experts the extra layers an outsized layer's pieces take."""
+        return int((self.bundle_layout or {}).get("store_layers") or self.shape[0])
+
+    def outsized(self):
+        """The layers whose bundles are larger than the slot (GGUF experts in a wider format): kept whole on the
+        device at their own size, outside the cache (gguf_experts.layout)."""
+        return sorted((self.bundle_layout or {}).get("pieces") or ())
 
     # -- loads ------------------------------------------------------------------------------------------------------
     def layout(self, format, hidden, inter):
         return self.layout_of(format, hidden, inter)
 
     def pack(self, gate_up, down, format, layer=None):
+        if format == "gguf":
+            return self.code["gguf"].pack(gate_up, down, self.bundle_layout, layer)
         return self.bundles(format).pack(gate_up, down, format)
 
     @property
@@ -449,12 +610,25 @@ class ExpertOffload:
             if self.a4_layers.setdefault(int(layer), carries) != carries:
                 raise ValueError(f"layer {layer}'s nvfp4 experts mix W4A4 and W4A16: each carries its input scales "
                                  "or none does")
-        bundle = self.pack(gate_up, down, format)
+        bundle = self.pack(gate_up, down, format, layer)
         if self.tier == "device":
-            self.stores[int(layer)][int(expert)].copy_(bundle.to(self.device).view(-1))
+            row = self.stores[int(layer)][int(expert)]
+            row.copy_(bundle.to(self.device).view(-1)[:row.numel()])
+        elif not self.complete and format == "gguf":   # an outsized layer's bundle in pieces of a slot each
+            for where, piece in self.code["gguf"].pieces(bundle, self.bundle_layout, layer):
+                self.store.put(where, int(expert), piece)
         elif not self.complete:
             self.store.put(int(layer), int(expert), bundle)
         self.loaded += 1
+        if not self.loaded % 64:
+            self._working("expert store: experts packed", self.loaded, self.shape[0] * self.shape[1])
+
+    def _working(self, what, done=None, total=None):
+        """What a long step of the load is doing, for whoever serves the engine (LoadContext.working: crit serve
+        prints it, and does not time out a load whose work advances)."""
+        report = getattr(self.context, "working", None)
+        if callable(report):
+            report(what, done, total)
 
     # -- open: the cache and the CPU tier ---------------------------------------------------------------------------
     def spare_bytes(self, pool_bytes):
@@ -491,26 +665,74 @@ class ExpertOffload:
             slots = max(1, (end - first) // size - 1)
         else:
             free = self.memory.free(release=True)
-            slots = int(self.settings.get("slots") or 0) or cache_slots(free, int(self._option("reserve_mib")) << 20, size)
-            slots = min(slots, layers * experts)
+            reserve = int(self._option("reserve_mib")) << 20
+            slots = min(int(self.settings.get("slots") or 0) or cache_slots(free, reserve, size), layers * experts)
+            ceiling = self._max_slots(lend)
+            if ceiling <= slots:
+                # A cache that keeps its size (it cannot be elastic here, or it holds every expert) cannot give memory
+                # back: the pools the model made in elastic ranges (KV sized for the whole context, backed as
+                # sequences grow) keep the bytes they may still back. An elastic cache takes them meanwhile and gives
+                # them back as the pools ask (the ledger's need); so does one that holds fewer experts for the pools'
+                # sake where it can be elastic.
+                later = self._pools_unbacked()
+                if later:
+                    free = max(0, free - later)
+                    slots = min(slots, cache_slots(free, reserve, size))
+                    if ceiling <= slots:
+                        self.reasons["pools"] = (f"{later / GIB:.2f} GiB left free for the model's pools, which "
+                                                 "back their pages as sequences grow: this cache keeps its size")
             if self.placement is not None:
                 self.placement.plan({"expert_cache": (slots + 1) * size}, {"device": free, "host": 0})
         # Weight-only (W4A16) layers beside W4A4 ones (a draft layer's experts, say): the CPU's order is W4A4, so
-        # they stay on the device whole, outside the cache, and the cache keeps the W4A4 layers' slots.
+        # where the CPU tier may compute misses they stay on the device whole, outside the cache and outside the
+        # tier, and the cache keeps the W4A4 layers' slots. Where every miss goes over the link (a file tier, misses
+        # pinned to the link) every row is the kernel's tensor arithmetic, which reads each layer as it is stored:
+        # they are cached as the others.
         whole = ([layer for layer, carries in self.a4_layers.items() if not carries]
-                 if format == "nvfp4" and a4 == {True, False} else [])
-        if whole and not getattr(self.store, "mapped", False):
-            raise ValueError("W4A16 layers beside W4A4 ones need a mapped store (the ram tier)")
+                 if format == "nvfp4" and a4 == {True, False} and self._cpu_possible(format) else [])
+        # GGUF layers stored wider than the slot (outsized) are kept whole too, at their own size: the slot is sized
+        # for the rest, and no slot is padded to theirs.
+        outsized = self.outsized()
+        whole = whole + outsized
         if whole:
-            slots = max(1, slots - len(whole) * experts - 1)
+            own = self.bundle_layout.get("sizes") or {}
+            held = sum(experts * max(size, int(own.get(layer, size))) for layer in whole)
+            slots = max(1, slots - -(-held // size) - 1)
+        if hasattr(self.store, "working"):   # the store's seal reads a store file in: it says how far it is
+            self.store.working = self._working
         self.core = self._leave(slots, whole)   # before anything reads the store's region: that seals it
         for layer in whole:
-            rows = torch.empty(experts, size, dtype=torch.uint8)
-            self.store.read([layer * experts + e for e in range(experts)], rows)
-            self.resident[layer] = rows.to(self.device)
+            at = [layer] + list(self.bundle_layout.get("pieces", {}).get(layer, ()))
+            rows = torch.empty(experts, len(at) * size, dtype=torch.uint8)
+            for i, where in enumerate(at):
+                piece = torch.empty(experts, size, dtype=torch.uint8)
+                self.store.read([where * experts + e for e in range(experts)], piece)
+                rows[:, i * size:(i + 1) * size] = piece
+            own = int((self.bundle_layout.get("sizes") or {}).get(layer, size))
+            self.resident[layer] = rows[:, :max(own, size)].contiguous().to(self.device)
+        if outsized:
+            gib = sum(self.resident[layer].numel() for layer in outsized) / GIB
+            self.reasons["outsized"] = (f"layers {', '.join(map(str, outsized))} are stored wider than the slot "
+                                        f"({size:,} bytes, the size most layers need): kept whole on the device "
+                                        f"({gib:.2f} GiB), no slot padded to their size")
         self.slots = slots
+        # The link is timed once, here: before the CPU tier exists (its threads take the processor the copies' host
+        # side runs on) and before the cache takes the device's memory.
+        self.link_trials = self._link_trials(size)
+        self.link_us = min(self.link_trials[1:]) if self.link_trials else None
         cpu_ready = self._cpu(format, hidden, inter)
-        if cpu_ready and self._option("misses") == "auto":
+        # Over the link every miss takes a slot, so a plan keeps a layer's experts beside the prompt ring's: a cache
+        # with fewer slots serves prompts only with the CPU tier computing the misses, whatever the link's time.
+        link_slots = 2 * experts + (1 if self._max_slots(lend) > slots else 0)   # an elastic cache: one more
+        small = slots < link_slots
+        if cpu_ready and self._option("misses") == "auto" and small and format in MISS_FORMATS:
+            self.misses = "cpu"
+            self.miss_times = self._miss_times(layers, experts, hidden, size)
+            self.miss_source = "measured" if self.miss_times else None
+            self.reasons["misses_small"] = (
+                f"every miss on the CPU tier: the cache's {slots:,} slots hold no prompt ring of a layer's {experts} "
+                f"experts beside the {experts} a decode plan keeps when misses go over the link ({link_slots:,} slots)")
+        elif cpu_ready and self._option("misses") == "auto":
             # Who computes a miss changes the device rows' arithmetic, so the timed choice is a decision
             # (crit_plugins.decisions): a package that carries its record decides the same in every process.
             from crit_plugins import decisions
@@ -525,10 +747,16 @@ class ExpertOffload:
             self.miss_times, self.miss_source = row["measurement"] or None, row["source"]
         else:
             self.misses = choose_misses(format, cpu_ready, self._option("misses"))
+            if self.misses == "cpu":   # pinned to the CPU tier: timed all the same, for a short prompt chunk's misses
+                self.miss_times = self._miss_times(layers, experts, hidden, size)
+                self.miss_source = "measured" if self.miss_times else None
         if self.miss_times:
+            times = self.miss_times
+            parts = (f" ({times['compute']:.0f} to compute it, {times['handoff']:.0f} for its layer's rows to reach "
+                     "the host and come back)" if "handoff" in times else "")
             self.reasons["misses"] = (
-                f"a missed expert takes the CPU tier {self.miss_times['cpu']:.0f} us and the link "
-                f"{self.miss_times['link']:.0f} us here ({self.miss_source}): "
+                f"a missed expert takes the CPU tier {times['cpu']:.0f} us{parts} and the link "
+                f"{times['link']:.0f} us here ({self.miss_source}): "
                 + ("every miss on the CPU tier; the link copies it into the cache beside the round"
                    if self.misses == "cpu" else "every miss copied over the link"))
         if self.misses == "link" and self.dispatch is not None:
@@ -545,12 +773,14 @@ class ExpertOffload:
                                f"beside the CPU tier keeps them there; here the misses go to the {self.misses} "
                                f"({self.reasons.get('misses', 'no reason given')}): set pinned to 0")
         swaps = int(self._option("swaps"))
+        # (the store's layers: an outsized GGUF layer's extra pieces are keys no plan reads)
         self.cache = cache_code.ExpertCache(
-            layers, experts, self.bundle_layout, slots, self.device, self.store, lend, policy=self.policy,
+            self.store_layers, experts, self.bundle_layout, slots, self.device, self.store, lend, policy=self.policy,
             cpu_tier=self.misses == "cpu", record_routes=int(self._option("record_routes")),
             period=int(self._option("swap_period")), max_swaps=swaps, burst_swaps=4 * swaps,
             fill_blocks=int(self._option("fill_blocks")), side_swaps=bool(self._option("side_swaps")),
-            rows=int(self._option("round_rows")), max_slots=self._max_slots(lend), owner="expert-offload")
+            rows=int(self._option("round_rows")), max_slots=self._max_slots(lend), owner="expert-offload",
+            ring_slots=self.settings.get("ring_slots"))   # 0 in a settings file: a decode-only cache (tests)
         if self._elastic():
             self.memory.give(f"expert-offload:{id(self)}", self._release, self._regrow, keep=self._keep)
         if self.core:
@@ -595,7 +825,9 @@ class ExpertOffload:
                 if not core:
                     why = f"the cache's {slots:,} slots hold no core beside its prompt ring"
         if leave is not None and (core or whole):
-            left = leave(core + [layer * experts + e for layer in whole for e in range(experts)])
+            pieces = (self.bundle_layout or {}).get("pieces") or {}
+            stored = [where for layer in whole for where in [layer] + list(pieces.get(layer, ()))]
+            left = leave(core + [where * experts + e for where in stored for e in range(experts)])
             if core and not set(core) <= left:
                 core, why = [], "the store was sealed before the core was decided: every expert stays in host memory"
         if core:
@@ -658,6 +890,13 @@ class ExpertOffload:
         os.replace(part, path)
         return path
 
+    def _pools_unbacked(self):
+        """The device bytes other plugins' paged elastic ranges (crit_plugins.memory: a KV pool's pages, backed as
+        sequences come to hold them) have reserved and not backed yet."""
+        return sum(max(0, found.size - found.mapped - getattr(found, "host_mapped", 0))
+                   for key, found in self.memory.ranges.items()
+                   if getattr(found, "planes", None) and not key.startswith("expert-offload/"))
+
     def _max_slots(self, lend):
         """The slots an elastic cache reserves address space for (every expert), 0 when it cannot be elastic here
         (a KV pool lends its memory instead, or the driver's virtual memory API is not reachable)."""
@@ -710,41 +949,96 @@ class ExpertOffload:
             return 0
         return room + room // 8 + SLACK + (self._left if tokens > max(self._peaks) else 0)
 
+    def _frame_room(self, frame):
+        """The room of the step in flight: its chunk's, and for a score what a score was measured to take (its
+        rows' logits beside its chunks' temporaries), which no prompt step is given."""
+        room = self._room(frame[0])
+        if frame[3] and self._score_peak:
+            room = max(room, self._score_peak + self._score_peak // 8 + SLACK)
+        return room
+
+    def _beside(self):
+        """The device bytes held outside the device's elastic ranges: torch's blocks, the driver's and other
+        programs' memory; what the device's free memory says is taken, less every range (the cache's slots, KV and
+        state pages, scratch, a pass's rows), each of which asks the ledger for its growth (need) and so never comes
+        out of a step's room. A step's room is measured on it, the way the run's device-memory checks read a step's
+        peak."""
+        ranges = sum(r.mapped for r in self.memory.ranges.values())
+        return int(self.memory.total) - int(self.memory.free()) - ranges
+
+    def _reserve(self):
+        """What the cache keeps free beyond margin_mib while a prompt step runs, whatever is left of the step's
+        room: what prompt steps were seen to take from the device between two looks (the most of the last STRIDES
+        steps), half again and SLACK, RESERVE at least."""
+        stride = max(self._strides, default=0)
+        return max(RESERVE, stride + stride // 2 + SLACK)
+
     def _keep(self):
         """What an elastic cache leaves free on the device (the ledger's keep): margin_mib at every moment, and the
-        room of the prompt step in flight, or of a short prompt (max_tokens tokens) when none is, as far as torch's
-        allocator does not hold it already: the whole blocks it keeps unused from earlier steps, and the blocks this
-        step has taken so far, are that room in use. So a chat turn finds its memory without the cache giving any
-        back, a prompt of many steps makes room once, and KV pages a step reserves (the ledger's need) never come
-        out of the step's own room. While the engine loads it is margin_mib alone: the load's steps live on
+        room of the prompt step in flight less what the step has taken from the device so far (_beside over its
+        start: new torch blocks, anything else outside the ledger) but never less than the reserve (_reserve), or
+        the room of a short prompt (max_tokens tokens) when none is, less the whole blocks torch's allocator keeps
+        unused. A step's room is what such steps took from the device at their peak, so blocks torch keeps from
+        earlier steps of a prompt count as room only as far as the step reused them: a block it could not reuse (a
+        larger tensor than the block, as attention's grow with the context) takes new device memory, which that
+        measurement holds. The reserve is for the step the room did not foresee: it is free at every look, so the
+        step's next stride finds it. While the engine loads it is margin_mib alone: the load's steps live on
         reserve_mib."""
         if not self.memory.serving:
             return self._margin()
-        frame, held = self._frame, self.memory.torch()
-        if frame is not None and frame[2] is not None:   # the step's workspace so far: what torch holds over its base
-            return self._margin() + max(0, self._room(frame[0]) - (held["reserved"] - frame[2]))
-        return self._margin() + max(0, self._room(int(self.options["max_tokens"])) - held["unused"])
+        frame = self._frame
+        if frame is not None and frame[2] is not None:   # what the step took from the device so far
+            left = self._frame_room(frame) - (self._beside() - frame[4])
+            return self._margin() + max(left, self._reserve())
+        return self._margin() + max(0, self._room(int(self.options["max_tokens"])) - self.memory.torch()["unused"])
 
-    def begin_step(self, prompt_tokens):
+    def begin_step(self, prompt_tokens, score=False):
         """Core's step frame (crit_plugins.device.STEP_FRAMES; a model outside Core may call it): a step that runs
         prompt tokens takes its temporaries from the device, so an elastic cache first makes room for a chunk of
-        its size (_make_room). Decode rows need nothing. Between steps, never captured."""
-        self._frame = [0, 0, None]
+        its size (_make_room). Decode rows need nothing. score: the frame is a score's, whose rows' logits are
+        temporaries of its own: what it takes is learned for scores and never as a prompt chunk's room. Between
+        steps, never captured."""
+        self._frame = [0, 0, None, bool(score), None, 0, 0]
         if prompt_tokens and self._elastic():
             self._make_room(min(int(prompt_tokens), self._chunk) if self._chunk else int(prompt_tokens))
 
     def _make_room(self, tokens):
         """The step in flight gets the room of a prompt chunk of `tokens` tokens: the cache gives back what the
         device's free memory and the blocks torch holds of the prompt's earlier steps lack of it (the ledger's
-        need, over _keep). The step's workspace is measured from its first call here: every block torch holds over
-        what was in use then."""
+        need, over _keep). The step is measured from its first call here: what the device holds beside the cache
+        then, and torch's peak from then on."""
         frame = self._frame
         if frame[2] is None:
+            if not self.memory.serving:
+                # A step of the load starts on the blocks the load's other work left in torch's allocator, which a
+                # served prompt does not find (each one's blocks go back to the device after it): measured on them,
+                # its room would be what it took beyond them.
+                self.memory.release()
             self.memory.mark()
             held = self.memory.torch()
             frame[2] = held["reserved"] - held["unused"]
+            frame[4] = self._beside()
+            frame[5] = held["reserved"]
         frame[0] = tokens
         self.memory.need(0)
+
+    def _look(self):
+        """A look at the prompt step in flight, before each routed layer of each of its chunks: where torch's
+        allocator has taken more of the device since the last look, the step's largest such stride is kept (the
+        reserve is sized by it) and the ledger is asked again, so the cache gives what the device now has free less
+        than margin_mib and the reserve (_keep) before the step's next allocation. Torch's own count is read, no
+        call into the driver, so a look at a step that reuses its blocks costs nothing."""
+        frame = self._frame
+        if frame is None or frame[2] is None:
+            return
+        held = self.memory.torch()["reserved"]
+        if held <= frame[5]:
+            return
+        frame[6] = max(frame[6], held - frame[5])
+        frame[5] = held
+        self.looks += 1
+        if self.memory.need(0):
+            self.extends += 1
 
     def _prompt_forward(self, tokens):
         """A prompt chunk of `tokens` tokens reaches the experts: a chunk larger than the frame has room for (a
@@ -756,6 +1050,8 @@ class ExpertOffload:
         frame[1] = max(frame[1], tokens)
         if tokens > frame[0] and self._elastic():
             self._make_room(tokens)
+        elif self._elastic():
+            self._look()
 
     def end_step(self, prompts_open=False):
         """Core's step frame: the step returned. A prompt step's staged experts go back to the cache and what its
@@ -768,8 +1064,11 @@ class ExpertOffload:
         every later prompt's room, and the cache would leave that much free for good). A step without prompt tokens
         changes nothing and costs nothing."""
         frame, self._frame = self._frame, None
-        if self._prompt_open and self.cache is not None:
-            self.cache.end_prompt()
+        if self.cache is not None and (self._prompt_open or self.cache.holding):
+            # A prompt that goes on in a later step keeps the ring and the layer staged in it (a span run layer by
+            # layer takes many steps, and its layer's experts cross the link once); once no prompt is in flight the
+            # ring goes back to the cache, also when the prompt that held it ended without another step (a cancel).
+            self.cache.end_prompt(hold=bool(prompts_open))
         self._prompt_open, self._last_layer = False, None
         if not self._elastic():
             return
@@ -778,28 +1077,44 @@ class ExpertOffload:
                 held = self.memory.torch()
                 in_use = held["reserved"] - held["unused"]
                 self._left = max(self._left, in_use - frame[2])
-                peak = max(0, self.memory.peak() - max(frame[2], in_use))
-                learn(self._peaks, self._first, frame[1], peak, self.memory.serving)
-                self._chunk = max(self._chunk, frame[1])
+                # the device bytes the step took at its peak: what the device holds outside the ledger's ranges
+                # now over the step's start,
+                # and torch's blocks at the peak over now (Core's step probe reads the free memory at a step's
+                # peak the same way). Blocks torch kept from earlier steps and reused cost nothing; ones it could
+                # not reuse are counted in the new blocks it took.
+                peak = max(0, self._beside() - frame[4] + max(0, self.memory.peak() - held["reserved"]))
+                if frame[3]:
+                    self._score_peak = max(self._score_peak, peak)
+                else:
+                    learn(self._peaks, self._first, frame[1], peak, self.memory.serving)
+                    self._chunk = max(self._chunk, frame[1])
+                if self.memory.serving:   # (a step of the load takes its graphs' captures: no served step's stride)
+                    self._strides.append(max(frame[6], held["reserved"] - frame[5]))
             self._unsettled = True
-        if self._unsettled and not prompts_open and self.memory.serving:
-            self._unsettled = False
-            self.memory.release()
+        if not prompts_open and self.memory.serving and (self._unsettled or self.memory.owed):
+            # The cache grows back a settle at a time (the device's memory bounds each: backing memory costs the
+            # driver time, and this is a step's frame); what a settle leaves owed the next steps' frames take.
+            if self._unsettled:
+                self._unsettled = False
+                self.memory.release()
             self.memory.settle()
 
     def _load_kernel(self):
         if self.kernel is not None or self.device.type != "cuda":
             return
+        name = "gguf-rows" if self.shape[2] == "gguf" else "grouped-experts"
         try:
             from crit_plugins.kernels import load_kernel
-            self.kernel, self.kernel_reason = load_kernel("grouped-experts", folder=self.code["folder"]), None
+            self.kernel, self.kernel_reason = load_kernel(name, folder=self.code["folder"]), None
         except Exception as error:   # the plugin refuses below: there is no exact fallback fast enough to serve
             self.kernel, self.kernel_reason = None, str(error).splitlines()[0] if str(error) else type(error).__name__
         if self.kernel is None:
-            raise RuntimeError(f"expert-offload runs on crit's grouped-experts kernel, which is not here "
+            raise RuntimeError(f"expert-offload runs on crit's {name} kernel, which is not here "
                                f"({self.kernel_reason or 'it does not build on this machine'})")
 
     def _part(self, format, hidden, inter, declared=False):
+        if format == "gguf":   # gguf-rows over the slots (the CPU tier's GGUF rows are its declared order)
+            return self.code["gguf"].GgufRoutes(self.kernel, self.bundle_layout, activation=self.activation)
         dispatch = self.code["dispatch"]
         # A call's route rows are scratch (the engine's: Core's): the prompt chunk sizes a server meets cost the
         # largest call's rows, not a set each, in bytes every other plugin's calls compute in too.
@@ -807,9 +1122,16 @@ class ExpertOffload:
         if scratch is None:
             scratch = self._scratch = self._scratch or self.memory.scratch("expert-offload")
         part = dispatch.KernelRoutes(self.kernel, self.bundle_layout, self.code["grouped_bundles"].kernel_layout,
-                                     format, hidden, inter, a4=self.a4, scratch=scratch)
+                                     format, hidden, inter, a4=self.a4, scratch=scratch, activation=self.activation)
         part.decode_arithmetic = "declared" if declared else "tensor"
         return part
+
+    def _cpu_possible(self, format):
+        """Whether the CPU tier may compute this engine's misses at all: a format it computes, misses not pinned to
+        the link, a store it reads bundles of in place (mapped, in the slot layout)."""
+        return (format in MISS_FORMATS and self._option("misses") != "link" and getattr(self.store, "mapped", False)
+                and not getattr(self.store, "compressed", ())
+                and (self.activation == "silu" or format == "gguf" and self.activation == "gelu_tanh"))
 
     def _cpu(self, format, hidden, inter):
         """Whether the CPU tier and its in-stream join are built here (then self.dispatch holds them)."""
@@ -817,14 +1139,29 @@ class ExpertOffload:
         if format == "nvfp4" and not self.a4:
             self.reasons["misses"] = "the CPU tier's integer order is W4A4: these nvfp4 experts carry no input scales"
             return False
-        if format not in CPU_FORMATS or self._option("misses") == "link" or not getattr(self.store, "mapped", False):
-            self.reasons["misses"] = ("the CPU tier computes nvfp4 and int4 experts" if format not in CPU_FORMATS
-                                      else "misses pinned to the link" if self._option("misses") == "link"
-                                      else "a file tier's misses are read on the host")
+        if not self._cpu_possible(format):
+            self.reasons["misses"] = (
+                "the CPU tier computes nvfp4, int4 and GGUF experts" if format not in MISS_FORMATS
+                else f"the CPU tier computes SwiGLU blocks, and these are gated by {self.activation}"
+                if self.activation != "silu"
+                else "misses pinned to the link" if self._option("misses") == "link"
+                else "a file tier's misses are read on the host" if not getattr(self.store, "mapped", False)
+                else "the store keeps scale components compressed (the expert source's csf_scales), which the CPU "
+                     "tier does not read in place")
+            if self._option("misses") == "cpu" and getattr(self.store, "compressed", ()):
+                raise ValueError("misses: cpu over a store that keeps its scales compressed (the expert source's "
+                                 "csf_scales): the CPU tier reads bundles in place in the slot layout. Leave "
+                                 "csf_scales empty, or let the misses go over the link")
             return False
         try:
-            tier = c["cpu_tier"].CpuTier(hidden, inter, format, c["arithmetic"], c["quantized"], native=True,
-                                         workers=o["workers"], pin=o["pin"])
+            if format == "gguf":   # in torch, gguf-rows' declared order with the kernel's splits on this device
+                gguf = c["gguf"]
+                tier = gguf.GgufCpuTier(self.bundle_layout, self.shape[1],
+                                        gguf.tier_splits(self.kernel, self.bundle_layout, self.device),
+                                        activation=self.activation)
+            else:
+                tier = c["cpu_tier"].CpuTier(hidden, inter, format, c["arithmetic"], c["quantized"], native=True,
+                                             workers=o["workers"], pin=o["pin"])
         except Exception as error:   # no native tier here: misses over the link
             self.reasons["misses"] = f"the native CPU tier does not build: {str(error).splitlines()[0]}"
             return False
@@ -833,59 +1170,160 @@ class ExpertOffload:
         flat = host.view(-1)
         size = int(self.bundle_layout["bundle_bytes"])
         left = getattr(self.store, "left", ())   # held on the device alone: never a miss, and not in host memory
-        for layer in range(layers):
-            for expert in range(experts):
-                if layer * experts + expert in left:
-                    continue
-                at = (layer * experts + expert) * size
-                tier.add(layer * experts + expert, flat[at:at + size])
-        ext, reason = c["dispatch"].extension()
-        if ext is None:
+        # The layers kept whole on the device (W4A16 beside W4A4) are never the tier's: it computes W4A4 experts, and
+        # those layers' bundles carry no input scales.
+        served = [layer for layer in range(layers) if layer not in self.resident]
+        try:
+            for layer in served:
+                for expert in range(experts):
+                    if layer * experts + expert in left:
+                        continue
+                    at = (layer * experts + expert) * size
+                    tier.add(layer * experts + expert, flat[at:at + size])
+        except Exception as error:   # an expert the tier does not take: the misses go over the link, with the reason
+            tier.close()
+            if self._option("misses") == "cpu":
+                raise
+            self.reasons["misses"] = f"the CPU tier does not take these experts: {str(error).splitlines()[0]}"
+            return False
+        ext, reason = c["dispatch"].extension() if tier.native else (None, None)
+        if ext is None and tier.native:
             tier.close()
             self.reasons["misses"] = f"the in-stream join does not build: {reason}"
             return False
         part = self._part(format, hidden, inter, declared=True)
         self.dispatch = c["dispatch"].DeviceDispatch(
-            self.device, hidden, inter, format, tier, part, ext, experts, set(range(layers)),
+            self.device, hidden, inter, format, tier, part, ext, experts, set(served),
             max_tokens=int(o["max_tokens"]), prompt_arithmetic=self._asked_arithmetic(),
             owner="expert-offload")
+        if not tier.native:
+            self.reasons["misses"] = ("every miss on the CPU tier (GGUF experts in torch, gguf-rows' declared order: "
+                                      "joined after a synchronization, rounds with it not captured); the link copies "
+                                      "it into the cache beside the round")
+            return True
         # The CPU tier is ready: open() times a missed expert on it and over the link and takes the sooner
         # (choose_misses), unless misses pins one.
         self.reasons["misses"] = "every miss on the CPU tier; the link copies it into the cache beside the round"
         return True
 
-    def _miss_times(self, layers, experts, hidden, size, count=16, trials=3):
-        """{"cpu": us, "link": us} a missed expert on this machine now: the CPU tier computing `count` experts spread
-        over the layers for one token each, and the link copying their bundles to the device, the median of
-        `trials` such batches of other experts (a first batch wakes the tier's threads and is not counted). None
-        where either cannot be timed (no mapped store on a CUDA device)."""
+    def _miss_times(self, layers, experts, hidden, size, count=64, trials=5):
+        """{"cpu": us, "link": us, "compute": us, "handoff": us} a missed expert on this machine as the engine will
+        serve it. compute: the CPU tier computing `count` experts spread over the store for one token each, the
+        fastest of `trials` batches of the same experts after one that is not counted. link: the link copying a
+        bundle to the device as open() timed it before the tier existed (_link_trials). handoff: the rows' way to
+        the host and back (_handoff_us), which a decode layer with a miss on the CPU tier pays and a copy does not.
+        cpu: compute and handoff, a decode layer's miss (its layer misses one expert or two). The fastest batch is
+        what each side can do: other work on the host only ever slows one. The first batch is the experts' first use: it wakes the tier's threads and brings the
+        store's pages in (a store just built or reopened pays that once an expert, several times a miss's own time).
+        The batch is larger than the processor's caches, so the tier reads each expert from host memory again, as
+        a miss does. None where either cannot be timed (no mapped store on a CUDA device)."""
+        import time
+        import torch
+        if not self.link_trials or self.dispatch is None:
+            return None
+        tier = self.dispatch.tier
+        held = sorted(tier.entries)   # the experts the tier computes: not a layer kept whole
+        if not held:
+            return None
+        total = len(held)
+        count = min(count, total if tier.native else 8)   # a tier in torch: a few experts time it
+        x = torch.randn(1, hidden, generator=torch.Generator().manual_seed(0))
+        token = torch.zeros(count, dtype=torch.int32)
+        keys = torch.tensor([held[(i * 9973) % total] for i in range(count)], dtype=torch.int32)
+        cpu = []
+        for trial in range(trials + 1):
+            started = time.perf_counter()
+            tier.compute(keys, token, x)
+            cpu.append((time.perf_counter() - started) * 1e6 / count)
+        tier.reset_stats()
+        link = self.link_trials if len(self.link_trials) <= 12 else self.link_trials[:6] + self.link_trials[-6:]
+        self.miss_trials = {"cpu": [round(t, 1) for t in cpu], "link": [round(t, 1) for t in link]}
+        compute, handoff = min(cpu[1:]), self._handoff_us(hidden)
+        return {"cpu": compute + handoff, "link": min(self.link_trials[1:]), "compute": compute, "handoff": handoff}
+
+    def _handoff_us(self, hidden, trials=16):
+        """The microseconds a layer's rows take to reach the host and its answer to come back to the device on this
+        machine: what a decode layer pays before the CPU tier's first missed expert of it is computed and after its
+        last (the device stops for the host, the host for the device), and a copy over the link never does (it is
+        one more operation in the device's order). The median of `trials` turns of one row after two that are not
+        counted: a latency as a layer typically pays it, tens of microseconds where the device is the machine's own,
+        most of a millisecond where it is reached through a virtual machine."""
+        import time
+        import torch
+        x = torch.zeros(1, hidden, dtype=torch.bfloat16, device=self.device)
+        found = []
+        for trial in range(trials + 2):
+            torch.cuda.synchronize(self.device)
+            started = time.perf_counter()
+            x.float().cpu().to(self.device)
+            torch.cuda.synchronize(self.device)
+            found.append((time.perf_counter() - started) * 1e6)
+        return sorted(found[2:])[trials // 2]
+
+    def _link_trials(self, size, count=64, seconds=1.0, most=256):
+        """The microseconds the link takes to bring one bundle from the store to the device on this machine, as
+        the cache's fills read it: batches of the same `count` bundles spread over the store, one after another,
+        the first counted in the list and never used (the bundles' first use brings the store's pages in for the
+        host and for the device, which a served copy does not pay again). The link's time is the fastest of the
+        others. A device left idle while the engine loaded has its link at its lowest speed and brings it up only
+        under load, a fraction of a second later (an RTX 5090: 3.5 GiB/s for 0.2 to 0.4 s, then 25): its first
+        batches agree with each other at a seventh of the rate it serves misses at, with the device at work. So
+        the batches go on until four have run since the rate last doubled, for `seconds` after the first at
+        most, `most` batches at most: no early agreement ends them. None without a store the device reads in
+        place on a CUDA device."""
         import time
         import torch
         try:
             _, mapped = self.store.region()
-        except Exception:   # a store the device cannot read in place
+        except Exception:   # a store the device cannot read in place (a file tier)
             return None
-        if mapped is None or self.device.type != "cuda" or self.dispatch is None:
+        if mapped is None or self.device.type != "cuda":
             return None
-        tier, flat, total = self.dispatch.tier, mapped.view(-1), layers * experts   # the link as the cache's fills read it
-        x = torch.randn(1, hidden, generator=torch.Generator().manual_seed(0))
-        token = torch.zeros(count, dtype=torch.int32)
-        target = torch.empty(count, size, dtype=torch.uint8, device=self.device)
-        cpu, link = [], []
-        for trial in range(trials + 1):
-            keys = torch.tensor([((trial * count + i) * 9973) % total for i in range(count)], dtype=torch.int32)
-            started = time.perf_counter()
-            tier.compute(keys, token, x)
-            cpu.append((time.perf_counter() - started) * 1e6 / count)
+        flat, total = mapped.view(-1), self.shape[0] * self.shape[1]
+        left = getattr(self.store, "left", ())   # held on the device alone: not in host memory
+        keys = [key for key in (((7 + i) * 9973) % total for i in range(count)) if key not in left]
+        if not keys:
+            return None
+        target = torch.empty(len(keys), size, dtype=torch.uint8, device=self.device)
+        found, began, woke = [], None, None
+        while len(found) < most and (began is None or len(found) < 5 or time.perf_counter() - began < seconds):
             torch.cuda.synchronize(self.device)
             started = time.perf_counter()
-            for i, key in enumerate(keys.tolist()):
+            for i, key in enumerate(keys):
                 target[i].copy_(flat[key * size:(key + 1) * size], non_blocking=True)
             torch.cuda.synchronize(self.device)
-            link.append((time.perf_counter() - started) * 1e6 / count)
+            found.append((time.perf_counter() - started) * 1e6 / len(keys))
+            if began is None:
+                began = time.perf_counter()   # the first batch brought the pages in: the clock starts after it
+            elif 2 * found[-1] < max(found[1:]) and (woke is None or 2 * found[-1] < found[woke]):
+                woke = len(found) - 1         # the link came up: four more batches at its speed
+            if woke is not None and len(found) - woke > 4:
+                break
         del target
-        tier.reset_stats()
-        return {"cpu": sorted(cpu[1:])[trials // 2], "link": sorted(link[1:])[trials // 2]}
+        return found
+
+    def prompts(self):
+        """What a prompt costs these experts, from what was measured here: whether a chunk brings its layers'
+        experts to the device (stages_prompts()), the link's rate, and a sweep, the bytes and seconds of bringing
+        every expert the cache does not hold to the device once. A long chunk run through every layer pays a sweep;
+        a span run layer by layer pays one for all its chunks. {} where every expert is on the device."""
+        if self.cache is None:
+            return {}
+        size = int(self.bundle_layout["bundle_bytes"])
+        cached = (self.shape[0] - len(self.resident)) * self.shape[1] - len(self.core)
+        away = max(0, cached - (self.cache.backed_slots() - len(self.cache.ring_slots) - len(self.core)))
+        found = {"staged": self.stages_prompts(), "sweep_bytes": away * size}
+        if self._short_on_cpu():
+            times = self.miss_times
+            found["short"] = ("a short chunk's missed routes on the CPU tier where they cost under "
+                              f"{CPU_WINS:g} of their experts' copies: {times.get('compute', times['cpu']):.0f} us "
+                              f"a route there, {times['link']:.0f} us a bundle over the link")
+            found["short_cpu_routes"] = self.cache.prompt_cpu_routes
+        link = self.link_us or (self.miss_times or {}).get("link")
+        if link:
+            found.update(link_us=round(link, 1), link_gib_s=round(size / link * 1e6 / GIB, 2),
+                         sweep_seconds=round(away * link / 1e6, 3))
+        return found
 
     # -- the routed layer -------------------------------------------------------------------------------------------
     def forward(self, layer, x, ids, weights, rows=None, prompt=None):
@@ -908,7 +1346,7 @@ class ExpertOffload:
         if prompt is None:
             prompt = ids.shape[0] > int(self.options["max_tokens"])
         if prompt:
-            if self._prompt_open and self._last_layer is not None and layer <= self._last_layer:
+            if self._prompt_open and self._last_layer is not None and layer < self._last_layer:
                 self.end_step(True)   # the next prompt step began without a frame from Core
             self._prompt_forward(ids.shape[0])
             self._prompt_open, self._last_layer = True, layer
@@ -916,6 +1354,14 @@ class ExpertOffload:
             # cache gives by releasing slots, and the chunk's experts must not be staged in them yet.
             self._a4(layer)
             self.part.prepare(ids.shape[0], ids.shape[1], self.shape[1], x.device, self._prompt_arithmetic())
+            if self._short_on_cpu():
+                # A short chunk where the CPU tier computes misses in the rows' own order: its missed routes go
+                # where they cost less by what open() measured, the CPU tier or the link.
+                # (a chunk's many routes share one way to the host and back: a route costs its computing alone)
+                times = self.miss_times
+                slots = self.cache.prompt_cpu(layer, ids, times.get("compute", times["cpu"]), times["link"], CPU_WINS)
+                if slots is not None:
+                    return self.dispatch.forward(layer, x, ids, weights, self.cache.store, slots)
             store, slots = self.cache.prompt(layer, ids)
             return self._rows(layer, x, ids, weights, store, slots, self._prompt_arithmetic())
         if self._prompt_open:
@@ -928,6 +1374,12 @@ class ExpertOffload:
         slots = self.cache.plan(layer, ids, rows=rows)
         return self._rows(layer, x, ids, weights, self.cache.store, slots, "tensor")
 
+    def _short_on_cpu(self):
+        """Whether a short prompt chunk's misses may go to the CPU tier: it computes decode misses, prompt rows keep
+        its order (declared: who computes a route then never changes a bit), and open() timed both ways."""
+        return (self.dispatch is not None and self.misses == "cpu" and bool(self.miss_times)
+                and self._prompt_arithmetic() == "declared")
+
     def _asked_arithmetic(self):
         """The prompt_arithmetic option, declared or tensor. auto is the faster one that keeps the level the engine
         asks of its prompt rows (crit_plugins.kernels.asks, the configuration's exactness): tensor where it asks
@@ -935,6 +1387,8 @@ class ExpertOffload:
         rows'), declared where it asks exact or declared (the CPU's integer order, the decode rows' bits) and where it
         asks nothing, as before the option had auto."""
         chosen = self._option("prompt_arithmetic")
+        if self.shape is not None and self.shape[2] == "gguf":
+            return "declared"   # gguf-rows' prompt rows are its decode rows' order: the CPU tier's
         if chosen == "auto":
             chosen = "tensor" if self.asked in ("repeatable", "row-exact") else "declared"
         return chosen
@@ -975,7 +1429,22 @@ class ExpertOffload:
             found = self._identity_table = torch.arange(n, dtype=torch.int32, device=self.device)
         return found
 
+    def stages_prompts(self):
+        """Whether a prompt chunk brings its layers' experts to the device (the ram and disk tiers: a long chunk every
+        expert of every layer that is not resident, over the link). A model plugin then runs a prompt's spans layer
+        by layer, every chunk of a span through one layer before the next layer: the layer's experts are staged once
+        for the span (the cache serves the layer's later chunks from what its first staged), where chunk by chunk
+        every layer's would cross the link again for each chunk. False for experts that fit on the device, and
+        before open()."""
+        return self.cache is not None and bool(self.cache.ring_slots)
+
     # -- rounds -----------------------------------------------------------------------------------------------------
+    @property
+    def round_counters(self):
+        """The round counters its cache adds each row's expert reads and hits to (crit_plugins.rounds.Rounds gives a
+        round the counters its parts name); none where every expert is on the device, which counts nothing."""
+        return self.cache.round_counters if self.cache is not None else ()
+
     def start_round(self, view):
         if self.cache is not None:
             self.cache.start_round(view)
@@ -987,7 +1456,11 @@ class ExpertOffload:
     def round_problems(self):
         if self.part is None:
             return ["open() the experts before capturing rounds"]
-        return self.cache.round_problems() if self.cache is not None else []
+        found = self.cache.round_problems() if self.cache is not None else []
+        if self.dispatch is not None and not self.dispatch.in_stream:
+            found.append("the CPU tier computes these misses in torch on the host: their rows join the device's after "
+                         "a synchronization, outside a capture")
+        return found
 
     # -- what serves, and how it runs -------------------------------------------------------------------------------
     def routes(self):
@@ -1009,7 +1482,7 @@ class ExpertOffload:
         if self.cache is not None:
             out.update({"slots": self.slots, "elastic": getattr(self.cache, "elastic", None) is not None,
                         "prompt_bytes": dict(sorted(self._peaks.items())), "shrinks": self.shrinks,
-                        "policy": self.policy, "settings": bool(self.settings)})
+                        "policy": self.policy, "settings": bool(self.settings), "prompts": self.prompts()})
         return {"expert_offload": out}
 
     def telemetry(self):
@@ -1017,11 +1490,17 @@ class ExpertOffload:
         if self.miss_times:
             out["miss_times_us"] = {k: round(v, 1) for k, v in self.miss_times.items()}
             out["miss_times_from"] = self.miss_source
+            if self.miss_trials:
+                out["miss_trials_us"] = self.miss_trials
         if self.cache is not None:
             out["expert_cache"] = self.cache.telemetry()
+            out["prompts"] = self.prompts()
             if self._elastic():   # the cache's size now, the times it gave memory back, what a prompt token takes
                 out["elastic"] = {"slots": self.cache.backed_slots(), "shrinks": self.shrinks,
-                                  "prompt_bytes": dict(sorted(self._peaks.items()))}
+                                  "prompt_bytes": dict(sorted(self._peaks.items())),
+                                  # the reserve kept beyond the margin while a prompt step runs, the looks that
+                                  # found the device had taken more, and those at which the cache gave memory
+                                  "reserve_bytes": self._reserve(), "looks": self.looks, "extends": self.extends}
         if getattr(self.store, "left", None):    # experts in one place: what the host store does not hold
             out["host_store"] = {"left": len(self.store.left), "left_bytes": int(self.store.left_bytes)}
         if isinstance(self.store, FileStore):   # the disk tier: the host tier's hits, the file's reads

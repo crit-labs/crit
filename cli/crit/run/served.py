@@ -22,6 +22,20 @@ SERVED = (JSON_CAPABILITY, RESIDENT_CAPABILITY, STREAM_CAPABILITY)
 QUALITY = (SCORE_CAPABILITY, LOGPROBS_CAPABILITY)
 
 
+def run_cache(root):
+    """The run's folder for files its engines' plugins can build again (crit_core.engine.PLUGIN_CACHE, read by the
+    engine's host process, which inherits this one's environment): .plugin-cache in the run's folder, outside its
+    records and its work, so a candidate's later loads reopen what its first one built (an expert store of tens of
+    gigabytes takes minutes to build from the checkpoint). crit run stop removes it. A value the environment holds
+    already is the user's and stays, an empty one for no cache."""
+    from crit_core.engine import PLUGIN_CACHE
+    if os.environ.get(PLUGIN_CACHE) in (None, run_cache.given):
+        os.environ[PLUGIN_CACHE] = run_cache.given = str(root / ".plugin-cache")
+
+
+run_cache.given = None
+
+
 class Served:
     """The candidate served through crit serve. `name` names the measurement in its deadline's message, and `log`
     receives a line when an engine loads and stops; `timeout` bounds each request."""
@@ -44,6 +58,7 @@ class Served:
         from crit_api.engine import ServedEngine
         from crit_api.server import Api, Server
         tokens = tokens or self.kv_tokens
+        self.opened_at = tokens   # the context the engine is open at (or opening at) now
         with self.lock:
             current = self.current
         if current is not None and current[1] is not None and not self.expired:
@@ -56,6 +71,7 @@ class Served:
                 raise
             return engine, server.api, server.server_address[1]
         self.stop()  # an engine that failed to open
+        run_cache(self.store.directory(self.run_id))
         engine = ServedEngine(self.store.root, self.run_id, self.candidate_id, project=self.store.project,
                               timeout=self.timeout, attempt=self.attempt,
                               kv_tokens=None if tokens == self.kv_tokens else tokens, configuration=configuration)
@@ -162,7 +178,9 @@ def serve(store, run_id, candidate_id, host="127.0.0.1", port=8000, seconds=None
     Settles the attempt and returns its result; crit serve serves the candidate once it is sealed."""
     from .external import candidate_spec, serving
     root = store.directory(run_id)
-    folder = unsealed(root, candidate_id, "The candidate is sealed: serve it with crit serve")
+    folder = unsealed(root, candidate_id, "The candidate is sealed and takes no attempt: crit serve serves it "
+                      f'(crit serve --workspace "{store.root}" --run {run_id} --project "{store.project}" '
+                      f"--candidate {candidate_id})")
     if data is not None and not check:
         raise ValueError("--data is for crit run serve --check: the gate pre-check runs beside the serving checks")
     manifest = packaged(folder, "serving", "crit run serve serves")
@@ -175,7 +193,11 @@ def serve(store, run_id, candidate_id, host="127.0.0.1", port=8000, seconds=None
     external = candidate_spec(folder) is not None
     with attempt.running() as log:
         tested = _plugin_tests(folder, log) if check and plugin_tests and not external else []
-        served = serving(store, run_id, candidate_id, attempt, kv_tokens, log, "crit run serve", address=(host, port))
+        # With --check crit serve's own bound on a request is the attempt's deadline, as for Eval: the full-context
+        # check's prefill can outlast any fixed one, and each check bounds its own requests (checks.CHECK_SECONDS).
+        served = serving(store, run_id, candidate_id, attempt, kv_tokens, log, "crit run serve",
+                         **({"timeout": min(86400, max(1.0, remaining(attempt.deadline_at)))} if check else {}),
+                         address=(host, port))
         with served.until(attempt.deadline_at):
             with _probed(check and not external):
                 engine, _, bound = served.open()
@@ -183,19 +205,27 @@ def serve(store, run_id, candidate_id, host="127.0.0.1", port=8000, seconds=None
             if ready is not None:
                 ready(bound)
             if check:
-                from .checks import full_context_checks, serve_checks
-                variables = (read_json(folder / "candidate.json")["configuration"].get("recon") or {}).get(
-                    "template_variables") or {}
-                report = tested + serve_checks(bound, engine.spec()["capabilities"], variables, served.timeout, log)
+                from .checks import CHECK_SECONDS, full_context_checks, serve_checks
+                candidate = read_json(folder / "candidate.json")
+                variables = (candidate["configuration"].get("recon") or {}).get("template_variables") or {}
+                planned = None   # the prompt activations the candidate's plan declared, where it has a plan
+                if candidate.get("plan_id") and not external:
+                    from . import plans
+                    planned = plans.load(root, run, candidate["plan_id"]).get("prompt_activations")
+                report = tested + serve_checks(bound, engine.spec()["capabilities"], variables, CHECK_SECONDS, log,
+                                               planned_activations=planned)
                 if not external:
                     from crit_api.residency import CANCEL_GRACE_SECONDS
                     report += full_context_checks(bound, engine, kv_tokens,
                                                   run["spec"]["hardware_constraints"]["vram_headroom_bytes"],
-                                                  CANCEL_GRACE_SECONDS, served.timeout, log)
-                if smoke:
-                    report += _smoke(served, bound, log)
+                                                  CANCEL_GRACE_SECONDS, CHECK_SECONDS, log,
+                                                  left=lambda: remaining(attempt.deadline_at))
+                # The pre-check first: it ends at the lower context, where smoke's second pass then starts, so the
+                # engine is opened again twice for both rather than three times.
                 if data is not None:
                     report += _precheck(served, run, data, bound, log)
+                if smoke:
+                    report += _smoke(served, bound, log)
                 log("crit run serve --check: stopping the engine")
             try:
                 while not check and not served.expired and not (stop is not None and stop.wait(.25)):
@@ -258,9 +288,10 @@ SMOKE_LOWER_FRACTION, SMOKE_GRANULARITY, SMOKE_LOWER_FLOOR = 0.25, 1024, 5120
 
 
 def _smoke(served, port, log):
-    """crit smoke (smoke/README.md) on the served engine at the run's context, then reopened at the lower context in
-    the same resident host and back, its items in the serving checks' shape: smoke_TEST, and smoke_TEST@TOKENS at the
-    lower context. A package that offers none of what the suite reads skips it at once, without reopening."""
+    """crit smoke (smoke/README.md) on the served engine at the run's context and at the lower context, reopened in
+    the same resident host, its items in the serving checks' shape: smoke_TEST, and smoke_TEST@TOKENS at the lower
+    context. It starts at the context the engine is open at (the lower one after the gate pre-check) and leaves it at
+    the run's. A package that offers none of what the suite reads skips it at once, without reopening."""
     try:
         from crit_smoke import Client, run
     except ImportError:   # a checkout installed before smoke/ existed
@@ -270,22 +301,27 @@ def _smoke(served, port, log):
         from crit_smoke import Client, run
     lower = max(int(served.kv_tokens * SMOKE_LOWER_FRACTION) // SMOKE_GRANULARITY * SMOKE_GRANULARITY,
                 SMOKE_LOWER_FLOOR)
-    items, contexts = [], [served.kv_tokens] + ([lower] if lower < served.kv_tokens else [])
+    at = getattr(served, "opened_at", None) or served.kv_tokens
+    contexts = [served.kv_tokens] + ([lower] if lower < served.kv_tokens else [])
+    if at == lower and len(contexts) == 2:
+        contexts.reverse()
+    items = []
     for tokens in contexts:
         suffix = "" if tokens == served.kv_tokens else f"@{tokens}"
         try:
-            if suffix:
+            if tokens != at:
                 log(f"crit smoke: reopening at {tokens:,} tokens of context")
                 _, _, port = served.open(tokens)
+                at = tokens
             found = run(Client(f"http://127.0.0.1:{port}", timeout=min(served.timeout, 120)),
                         log=lambda line: log("crit smoke" + suffix + ": " + line.strip()))
         except Exception as error:   # an engine that cannot open or answer fails the suite, the item says why
             found = [{"name": "open", "state": "failed",
                       "detail": f"at {tokens:,} tokens: {type(error).__name__}: {error}"[:2000]}]
         items += [dict(item, name=f"smoke_{item['name']}{suffix}") for item in found]
-        if not suffix and all(item["state"] == "skipped" for item in found):
-            break
-    if any(item["name"].endswith(f"@{lower}") for item in items):
+        if all(item["state"] == "skipped" for item in found):
+            break   # the package offers none of what the suite reads: it skips at every context
+    if at != served.kv_tokens:
         log(f"crit smoke: reopening at {served.kv_tokens:,} tokens of context")
         try:
             served.open()   # back at the run's context for what follows

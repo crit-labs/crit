@@ -2,7 +2,7 @@
 decoders as the reference), on the device on crit's kernel gguf-rows.
 
 A model plugin reads a matrix's stored bytes with crit_core.model.gguf_blocks.GgufTensors and loads it here as format
-"gguf:<TYPE>" (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, MXFP4) with tensors {"weight": uint8 [N][row bytes]}, or a stack of
+"gguf:<TYPE>" (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, TQ1_0, TQ2_0, MXFP4, Q1_0, Q2_0) with tensors {"weight": uint8 [N][row bytes]}, or a stack of
 experts [E][N][row bytes] (matmul_experts); a GGUF file's dense tensors (F32, F16, BF16) load as "bf16". Decode rows
 (calls of up to DECODE_ROWS rows) run gguf-rows' gemv: int8 activations per 32 values against the stored blocks, each
 row's bits its own. Prompt rows (longer calls, or prompt=True) take the `prompt` option: dequantize (the matrix
@@ -19,6 +19,15 @@ DECODE_ROWS = 8
 PROMPTS = ("auto", "dequantize", "exact")
 
 
+def _mm(x16, w):
+    """x16 [M][K] times w [N][K]^T, both BF16, in FP32: cuBLAS's FP32 sums on CUDA; on the CPU the BF16 values (exact in
+    FP32) multiplied in FP32."""
+    import torch
+    if x16.is_cuda:
+        return torch.mm(x16, w.t(), out_dtype=torch.float32)
+    return torch.mm(x16.float(), w.float().t())
+
+
 class GgufMatrix:
     """A loaded matrix: format "gguf" with the kernel's matrix (`kernel`) or the host-decoded BF16 values (`dense`,
     the fallback), or format "bf16" with `dense`."""
@@ -30,7 +39,9 @@ class GgufMatrix:
 
 class GgufProjections:
     def __init__(self, context, options):
-        self.device = getattr(context, "device", None) or "cuda"
+        import torch
+        # the context's device, else CUDA where the host has it and the CPU (the fallback) where it does not
+        self.device = getattr(context, "device", None) or ("cuda" if torch.cuda.is_available() else "cpu")
         self.prompt = options.get("prompt", "auto")
         if self.prompt not in PROMPTS:
             raise ValueError(f"gguf-projections: prompt is one of {', '.join(PROMPTS)}, not {self.prompt!r}")
@@ -39,7 +50,10 @@ class GgufProjections:
             # The fastest prompt path that keeps the level the engine asks of its prompt rows: cuBLAS's GEMM over the
             # decoded matrix follows the row count (repeatable); gguf-rows' gemm has the decode rows' bits.
             self.prompt = "dequantize" if asks("prompt") in (None, "repeatable") else "exact"
-        self.kernel = load_kernel("gguf-rows", folder=Path(__file__).parent)
+        import torch
+        # gguf-rows on a CUDA device; on the CPU the fallback (the host-decoded values through torch)
+        cuda = torch.device(self.device).type == "cuda"
+        self.kernel = load_kernel("gguf-rows", folder=Path(__file__).parent) if cuda else None
         self.formats = set()
         self.shapes = set()   # (N, K, format) of every matrix loaded, for crit kernels sweep --matrices
 
@@ -105,11 +119,11 @@ class GgufProjections:
             if self.prompt == "exact":
                 return self.kernel.gemm(x.to(torch.bfloat16), matrix.kernel).to(dtype)
             dense = self.kernel.dequantize(matrix.kernel)
-            return torch.mm(x.to(torch.bfloat16), dense.t(), out_dtype=torch.float32).to(dtype)
+            return _mm(x.to(torch.bfloat16), dense).to(dtype)
         w, x16 = matrix.dense, x.to(torch.bfloat16)
         if decode and x.shape[0] > 1:   # one row a call: each row's bits its own
             return torch.cat([self.matmul(x16[r:r + 1], matrix, out_dtype) for r in range(x.shape[0])])
-        return torch.mm(x16, w.t(), out_dtype=torch.float32).to(dtype)
+        return _mm(x16, w).to(dtype)
 
     def matmul_experts(self, x, matrix, ids, out_dtype=None):
         """Row t times expert ids[t] of a stack loaded from [experts][N][row bytes] (up to DECODE_ROWS rows), each
@@ -122,8 +136,7 @@ class GgufProjections:
             ids32 = ids.to(device=x.device, dtype=torch.int32).contiguous()
             return self.kernel.gemv(x.to(torch.bfloat16), matrix.kernel, ids32).to(dtype)
         x16 = x.to(torch.bfloat16)
-        return torch.cat([torch.mm(x16[t:t + 1], matrix.dense[int(e)].t(), out_dtype=torch.float32)
-                          for t, e in enumerate(ids.tolist())]).to(dtype)
+        return torch.cat([_mm(x16[t:t + 1], matrix.dense[int(e)]) for t, e in enumerate(ids.tolist())]).to(dtype)
 
     def exactness(self):
         """The level the loaded matrices' rows keep (crit_kernels.exactness; Core compares it with the level the

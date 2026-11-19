@@ -11,6 +11,7 @@ HERE = Path(__file__).resolve().parent
 
 def create(context, options, parts):
     from . import arithmetic, cache, dispatch, grouped, prefill, quantized, tier
+    from .offload import gguf_experts
     code = {"cache": import_module(f"{cache.__name__}.expert_cache"),
             "store": import_module(f"{cache.__name__}.expert_store"),
             "dispatch": import_module(f"{dispatch.__name__}.device_dispatch"),
@@ -18,5 +19,5 @@ def create(context, options, parts):
             "tier_bundles": import_module(f"{tier.__name__}.bundles"),
             "grouped_bundles": import_module(f"{grouped.__name__}.bundles"),
             "reference": import_module(f"{prefill.__name__}.reference"),
-            "arithmetic": arithmetic, "quantized": Path(quantized.__path__[0]), "folder": HERE}
+            "gguf": gguf_experts, "arithmetic": arithmetic, "quantized": Path(quantized.__path__[0]), "folder": HERE}
     return offload.ExpertOffload(parts["expert_source"], parts.get("placement"), options, code, context)

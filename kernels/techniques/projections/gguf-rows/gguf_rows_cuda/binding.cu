@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <optional>
+#include <vector>
 
 #include "gguf_rows.h"
 #include "crit_kcore/gguf.cuh"
@@ -20,15 +21,19 @@ int kind_of(const torch::Tensor& t, const char* what) {
     return 2;
 }
 
-// blocks: uint8 [N][row_bytes] or [experts][N][row_bytes], contiguous, on a CUDA device.
+// blocks: uint8 [N][row_bytes], contiguous, or [experts][N][row_bytes] with contiguous rows and any stride between
+// experts (a stack read in place where each expert lies in a slot of its own, beside other bytes), on a CUDA device.
 gr::Matrix matrix(const torch::Tensor& blocks, int64_t type, int64_t k) {
     TORCH_CHECK(gg::supported(static_cast<int>(type)), "GGUF type ", type, " is not one of Q4_0 (2), Q4_1 (3), "
                 "Q5_0 (6), Q5_1 (7), Q8_0 (8), Q2_K (10), Q3_K (11), Q4_K (12), Q5_K (13), Q6_K (14), IQ2_XXS (16), IQ2_XS (17), "
                 "IQ3_XXS (18), IQ1_S (19), IQ4_NL (20), IQ3_S (21), IQ2_S (22), IQ4_XS (23), IQ1_M (29), "
-                "MXFP4 (39)");
-    TORCH_CHECK(blocks.is_cuda() && blocks.is_contiguous() && blocks.scalar_type() == torch::kUInt8 &&
-                    (blocks.dim() == 2 || blocks.dim() == 3),
-                "blocks are contiguous uint8 [N][row bytes] or [experts][N][row bytes] on a CUDA device");
+                "TQ1_0 (34), TQ2_0 (35), MXFP4 (39), Q1_0 (41), Q2_0 (42)");
+    TORCH_CHECK(blocks.is_cuda() && blocks.scalar_type() == torch::kUInt8 && (blocks.dim() == 2 || blocks.dim() == 3),
+                "blocks are uint8 [N][row bytes] or [experts][N][row bytes] on a CUDA device");
+    const bool rows = blocks.stride(-1) == 1 && blocks.stride(-2) == blocks.size(-1);
+    TORCH_CHECK(blocks.dim() == 2 ? blocks.is_contiguous() : rows && blocks.stride(0) >= blocks.size(1) * blocks.size(2),
+                "blocks are contiguous [N][row bytes], or [experts][N][row bytes] with contiguous rows and experts "
+                "that do not overlap");
     const int values = gg::block_values(static_cast<int>(type));
     TORCH_CHECK(k > 0 && k % values == 0, "K is a multiple of the format's ", values, " values a block");
     gr::Matrix w;
@@ -39,7 +44,7 @@ gr::Matrix matrix(const torch::Tensor& blocks, int64_t type, int64_t k) {
     w.row_bytes = k / values * gg::block_bytes(w.type);
     TORCH_CHECK(blocks.size(-1) == w.row_bytes, "a row of K = ", k, " values holds ", w.row_bytes, " bytes, not ",
                 blocks.size(-1));
-    w.expert_stride = int64_t(w.N) * w.row_bytes;
+    w.expert_stride = blocks.dim() == 3 ? blocks.stride(0) : int64_t(w.N) * w.row_bytes;
     return w;
 }
 }  // namespace
@@ -136,6 +141,88 @@ void gemm(const torch::Tensor& blocks, int64_t type, int64_t k, const torch::Ten
                              static_cast<int>(m), static_cast<int>(parts),
                              static_cast<char*>(y.data_ptr()) + n0 * y.element_size(), kind, y.stride(0), stream);
         TORCH_CHECK(e == cudaSuccess, "gemm: ", cudaGetErrorString(e));
+    }
+}
+
+// The grouped prompt GEMM over a stack of experts (blocks [experts][N][row bytes], experts at any stride): the rows
+// of xq (by sub-block, [K / 32][M][32]) in groups of counts[g] rows in order, group g's rows times expert experts[g].
+// Groups are staged a batch at a time within the staging budget, one launch each for the staging and the GEMM.
+void gemm_experts(const torch::Tensor& blocks, int64_t type, int64_t k, const std::vector<int64_t>& experts,
+                  const std::vector<int64_t>& counts, const torch::Tensor& xq, const torch::Tensor& xd,
+                  const torch::Tensor& xs, int64_t parts, torch::Tensor& y) {
+    const gr::Matrix w = matrix(blocks, type, k);
+    TORCH_CHECK(blocks.dim() == 3, "gemm_experts: a stack of experts [experts][N][row bytes]");
+    TORCH_CHECK(experts.size() == counts.size() && !experts.empty(), "gemm_experts: one count an expert");
+    TORCH_CHECK(xq.dim() == 3 && xq.size(0) == k / 32 && xq.size(2) == 32, "gemm_experts: xq is the quantized rows by "
+                "sub-block [K / 32][M][32] (quantize's by_subblock)");
+    const int64_t m = xq.size(1);
+    int64_t total = 0;
+    for (size_t g = 0; g < counts.size(); ++g) {
+        TORCH_CHECK(counts[g] >= 1, "gemm_experts: every group has rows");
+        TORCH_CHECK(experts[g] >= 0 && experts[g] < blocks.size(0), "gemm_experts: expert ", experts[g], " of ",
+                    blocks.size(0));
+        total += counts[g];
+    }
+    TORCH_CHECK(total == m, "gemm_experts: the groups' ", total, " rows are not xq's ", m);
+    TORCH_CHECK(xq.is_cuda() && xq.is_contiguous() && xq.device() == blocks.device() && xd.is_contiguous() &&
+                    xd.numel() == m * (k / 32) && xs.is_contiguous() && xs.numel() == m * (k / 32),
+                "gemm_experts: xq [K / 32][M][32], xd and xs [K / 32][M], contiguous on the stack's device");
+    TORCH_CHECK(y.is_cuda() && y.dim() == 2 && y.stride(1) == 1 && y.size(0) == m && y.size(1) == w.N,
+                "gemm_experts: y is [M][N] with contiguous rows");
+    const c10::cuda::CUDAGuard guard(blocks.device());
+    const int64_t J = k / 32, planes = w.type == gg::Q2_K ? 3 : 2;
+    const int64_t group_codes = J * w.N * 32, group_scales = planes * J * w.N;
+    const int64_t per_group = group_codes + 4 * group_scales;
+    const int64_t batch = std::max<int64_t>(1, std::min<int64_t>(65535, kStageBytes / per_group));
+    const int64_t key_m = std::max<int64_t>(1, m / int64_t(counts.size()));   // a group's rows, on average
+    const int tile = gr::gemm_tile_rows(w.N, w.K, static_cast<int>(key_m));
+    TORCH_CHECK(tile > 0, "gemm_experts: no gemm configuration for this matrix");
+    const auto opts = blocks.options();
+    const int64_t groups_here = std::min<int64_t>(batch, int64_t(counts.size()));
+    torch::Tensor codes = torch::empty({groups_here * group_codes}, opts.dtype(torch::kInt8));
+    torch::Tensor scales = torch::empty({groups_here * group_scales}, opts.dtype(torch::kFloat32));
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const int kind = kind_of(y, "y");
+    int64_t start = 0;
+    for (size_t g0 = 0; g0 < counts.size(); g0 += size_t(batch)) {
+        const size_t g1 = std::min(counts.size(), g0 + size_t(batch));
+        // the batch's experts, tiles (group, first row) and ends, in one host tensor copied once
+        std::vector<int32_t> table;
+        for (size_t g = g0; g < g1; ++g) table.push_back(static_cast<int32_t>(experts[g]));
+        const size_t ends_at = table.size();
+        int64_t row = start;
+        for (size_t g = g0; g < g1; ++g) {
+            row += counts[g];
+            table.push_back(static_cast<int32_t>(row));
+        }
+        const size_t tiles_at = table.size();
+        row = start;
+        for (size_t g = g0; g < g1; ++g) {
+            for (int64_t t = 0; t < counts[g]; t += tile) {
+                table.push_back(static_cast<int32_t>(g - g0));
+                table.push_back(static_cast<int32_t>(row + t));
+            }
+            row += counts[g];
+        }
+        const int tile_count = static_cast<int>((table.size() - tiles_at) / 2);
+        torch::Tensor device = torch::from_blob(table.data(), {int64_t(table.size())}, torch::kInt32)
+                                   .to(blocks.device(), /*non_blocking=*/false);
+        const int32_t* base = device.data_ptr<int32_t>();
+        cudaError_t e = gr::enqueue_stage_experts(w, base, static_cast<int>(g1 - g0), codes.data_ptr<int8_t>(),
+                                                  scales.data_ptr<float>(), group_codes, group_scales, stream);
+        TORCH_CHECK(e == cudaSuccess, "gemm_experts: staging: ", cudaGetErrorString(e));
+        gr::Staged staged;
+        staged.codes = codes.data_ptr<int8_t>();
+        staged.scales = scales.data_ptr<float>();
+        staged.rows = w.N;
+        staged.K = w.K;
+        staged.type = w.type;
+        e = gr::enqueue_gemm_grouped(staged, group_codes, group_scales, base + tiles_at, tile_count, base + ends_at,
+                                     w.N, static_cast<int>(key_m), xq.data_ptr<int8_t>(), xd.data_ptr<float>(),
+                                     xs.data_ptr<int32_t>(), static_cast<int>(m), static_cast<int>(parts), y.data_ptr(),
+                                     kind, y.stride(0), stream);
+        TORCH_CHECK(e == cudaSuccess, "gemm_experts: ", cudaGetErrorString(e));
+        start = row;
     }
 }
 

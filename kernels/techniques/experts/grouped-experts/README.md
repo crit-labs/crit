@@ -9,6 +9,10 @@ sort beyond), runs every routed expert's gate/up rows, SwiGLU and down rows once
 cores, and sums each token's routes in route order. No host synchronization: every grid is launched at its largest
 size and exits on the device's item count, so a call at a fixed token count is captured in a CUDA graph.
 
+The gate is the layout's (`Layout.activation`, the module's `ACTIVATIONS`): SiLU, or GELU in its tanh form, one
+branch in the gate/up rows' epilogue (`crit_kcore`'s `silu_mul` and `gelu_tanh_mul`). The declared intermediate
+(W4A4) is defined for SiLU and refuses another gate.
+
 **A route's bits never depend on the rows beside it**: a warp owns rows of one expert and every route of its item,
 and each output is one chain of MMAs over k in ascending 64-element blocks whatever the item size, the chunk or the
 other routes. Decode rows (items of 8 routes: 8 inter rows a warp, 4-bit codes decoded through a shared byte table,

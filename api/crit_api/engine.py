@@ -29,6 +29,9 @@ from .options import (MAX_CHAT_RECORD, RequestError, TOOL_STREAM_CAPABILITY, sam
 
 MAX_CONVERSATION = 8 * 1024 * 1024
 LOAD_BYTES_PER_SECOND = 200e6  # model bytes per second assumed by the default load bound (the engine's own load)
+# Past its bound a load goes on while the work its plugins report (LoadContext.working: a store being built) last
+# advanced under this many seconds ago: a first load that builds tens of gigabytes is long, not hung.
+LOAD_STALL_SECONDS = 300.0
 VERIFY_BYTES_PER_SECOND = 50e6  # with --verify-model: read, hash and copy every model file, then the engine load
 # What a tokenize request (chat-tokenize-v1) returns for each operation.
 TOKENIZED = {"tokenize": ("tokens",), "render": ("prompt", "tokens"), "detokenize": ("prompt",)}
@@ -534,8 +537,11 @@ class ServedEngine:
 
     def _load_default(self, spec, stop):
         """Load the default candidate's engine, as open and reopen do: ValueError when it does not load."""
+        bound = self.load_seconds(spec)
         result = self.runtime.call("load", {"spec": spec}, _CommandStop(stop or threading.Event(), self._stopping),
-                                   self.load_seconds(spec))
+                                   bound, stall=LOAD_STALL_SECONDS)
+        if result["status"] == "timed_out":
+            raise ValueError(self.load_timed_out(bound))
         if result["status"] != "completed":
             raise ValueError(result["error"] or "Engine loading failed")
         self._loaded(self.default, result)
@@ -569,6 +575,15 @@ class ServedEngine:
             return self.load_timeout
         rate = VERIFY_BYTES_PER_SECOND if spec.get("verify_model") else LOAD_BYTES_PER_SECOND
         return 600 + sum(row["bytes"] for row in spec["model_manifest"]) / rate
+
+    def load_timed_out(self, bound):
+        """What a load that ran out of time says: its bound, where it comes from and what the load last reported."""
+        work = self.runtime.last_work
+        from .residency import work_line
+        within = f"{bound:,.0f}" if bound >= 10 else f"{bound:g}"
+        return (f"The engine did not load within {within} s (--load-timeout, else 600 s plus the model's bytes at "
+                f"{LOAD_BYTES_PER_SECOND / 1e6:.0f} MB/s; a load whose plugins report their work goes on while it "
+                f"advances)" + (f"; it last reported: {work_line(work)}" if work else "; it reported no work"))
 
     def _release(self):
         try:
@@ -818,7 +833,7 @@ class ServedEngine:
         """Load the candidate's engine on the host: None once loaded, else "cancelled" or "timed_out"."""
         try:
             loaded = self.runtime.call("load", {"spec": spec}, _CommandStop(stop, self._stopping),
-                                       self.load_seconds(spec))
+                                       self.load_seconds(spec), stall=LOAD_STALL_SECONDS)
             if loaded["status"] in {"cancelled", "timed_out"}:
                 self.lock.invalidate()
                 self._check_stopping()

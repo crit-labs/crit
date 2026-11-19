@@ -125,6 +125,20 @@ def _needs_when(value, where):
     return out
 
 
+def _requires_when(value, where):
+    """requires_when: fact -> slots (as `requires`) the plugin's code calls only where the engine or another plugin
+    provides the fact: a model plugin of several architectures requires the recurrence slot only for a hybrid one
+    (the fact of a hybrid model type mapped to ["recurrence", "router", "experts"])."""
+    if not isinstance(value, dict):
+        raise PluginError(f"{where}: requires_when maps a fact to the slots it requires")
+    out = {}
+    for fact, slots in value.items():
+        if not isinstance(fact, str) or not FACT.fullmatch(fact):
+            raise PluginError(f"{where}: requires_when's key {fact!r} is a fact")
+        out[fact] = _strings(slots, "requires_when", SLOT, where, empty=False)
+    return out
+
+
 def _sources(value, folder, where):
     """sources: name -> folder of code the plugin imports as the subpackage `.name`: its own code folder, or another
     plugin's or technique's, which crit plugins add copies into the engine with it."""
@@ -186,7 +200,7 @@ def load_manifest(folder):
         raise PluginError(f"{where} is a JSON object")
     required = {"schema", "id", "title", "fills", "entry"}
     optional = {"provides", "needs", "needs_when", "conflicts", "options", "reference", "test_with", "sources",
-                "tests", "description", "requires", "devices", "kernels"}
+                "tests", "description", "requires", "requires_when", "devices", "kernels"}
     missing, unknown = required - set(data), set(data) - required - optional
     if missing or unknown:
         raise PluginError(f"{where}: " + "; ".join(
@@ -208,12 +222,14 @@ def load_manifest(folder):
         "needs_when": _needs_when(data.get("needs_when", {}), where),
         "conflicts": _strings(data.get("conflicts", []), "conflicts", FACT, where),
         "requires": _strings(data.get("requires", []), "requires", SLOT, where),
+        "requires_when": _requires_when(data.get("requires_when", {}), where),
         "devices": _strings(data.get("devices", []), "devices", SLOT, where),
         "folder": folder,
     }
     if "model" in manifest["fills"] and manifest["fills"] != ["model"]:
         raise PluginError(f"{where}: a model plugin fills only model; the slots its step calls are plugins of their own")
-    if set(manifest["requires"]) & set(manifest["fills"]):
+    required = set(manifest["requires"]) | {slot for slots in manifest["requires_when"].values() for slot in slots}
+    if required & set(manifest["fills"]):
         raise PluginError(f"{where}: requires names the other slots the plugin calls, not its own")
     unknown = [d for d in manifest["devices"] if d not in DEVICES + (HOST,)]
     if unknown:

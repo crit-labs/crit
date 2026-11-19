@@ -20,7 +20,8 @@
 //     k0 + 16 t4 .. + 15 of a block, the same permutation in both operands), one accumulator chain per output; fp8 128 x
 //     128 block scales multiply each 128-k block's sum into the running one (fmaf);
 //   - per-row factors (1 / global scale, channel scale, 1 / input scale) multiply the sums; crit's declared SwiGLU
-//     (IEEE operations only); the intermediate in BF16 or, with a4, quantized as the inputs at the down's input scale;
+//     (IEEE operations only), or for a block gated by GELU its tanh form (Layout::activation; the CUDA math
+//     library's tanhf, a function of its argument alone); the intermediate in BF16 or, with a4, quantized as the inputs at the down's input scale;
 //   - the down rows' FP32 outputs unweighted per route, then each token's routes summed in route order with
 //     fmaf(weight, output, sum).
 // No atomics, no split of a reduction by the row count. A baseline to replace: measured against providers in README.md.
@@ -45,6 +46,9 @@ struct Layout {
     int hidden = 0, inter = 0;
     Format format = Format::bf16;
     int group = 0;                                         // int4_zp: inputs a scale and zero point cover
+    // The block's gated product: 0 silu(gate) * up (SwiGLU, crit's declared one), 1 gelu(gate) * up with GELU's tanh
+    // form (the tensor arithmetic only: the declared order's host twin computes SwiGLU).
+    int activation = 0;
 };
 
 // The items of a call: item u is the slot of one expert and `width` of its routes (route = token * top + j, in

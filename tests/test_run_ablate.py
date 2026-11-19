@@ -204,7 +204,7 @@ class AblateTests(run_measure.MeasureFixture, unittest.TestCase):
     def test_a_level_variant_serves_the_engine_asking_that_level_of_its_rows(self):
         # An in-process A/B of the engine's exactness: the attention plugin takes its slow, exact way where the engine
         # asks exact prompt rows and its fast one otherwise, as a plugin whose option is auto does, and says what its
-        # rows keep. The run is in speed, so the candidate as built asks repeatable rows.
+        # rows keep. The candidate as built asks exact prompt rows, as its run's quality mode gives them.
         engine = ENGINE.replace("        self.parts = assemble(",
                                 "        from crit_plugins.kernels import use_exactness\n"
                                 "        use_exactness(context.configuration.get('exactness'))\n"
@@ -224,20 +224,21 @@ class AblateTests(run_measure.MeasureFixture, unittest.TestCase):
         selection = {"use": {**USE, "attention": "attn-level", "drafter": "draft-three"},
                      "base": {"attention": "attn-plain", "drafter": None}}
         candidate = self.plugin_package(engine=engine, selection=selection)
-        fast = {"decode": "repeatable", "prompt": "repeatable"}
-        self.assertEqual(read_json(self.folder / "candidate.json")["configuration"]["exactness"], fast)
+        exact = {"decode": "row-exact", "prompt": "exact"}
+        self.assertEqual(read_json(self.folder / "candidate.json")["configuration"]["exactness"], exact)
         result = ablate(self.store, self.run_id, candidate, repetitions=2, smoke=False, noise=0.10,
-                        sets=["exactness.prompt=exact"])
-        self.assertEqual([row["name"] for row in result["variants"]], ["full", "set:exactness.prompt=exact"])
+                        sets=["exactness.prompt=repeatable"])
+        self.assertEqual([row["name"] for row in result["variants"]], ["full", "set:exactness.prompt=repeatable"])
         report = read_json(self.directory / result["report"])
-        full, exact = report["variants"]
-        self.assertEqual((full["state"], exact["state"]), ("measured", "measured"), report["variants"])
-        self.assertEqual(full["exactness"], {"asked": fast, "prompt": "repeatable",
+        full, fast = report["variants"]
+        self.assertEqual((full["state"], fast["state"]), ("measured", "measured"), report["variants"])
+        self.assertEqual(full["exactness"], {"asked": exact, "prompt": "exact",
+                                             "plugins": {"attn-level": {"prompt": "exact"}}})
+        self.assertEqual(fast["exactness"], {"asked": {"decode": "row-exact", "prompt": "repeatable"},
+                                             "prompt": "repeatable",
                                              "plugins": {"attn-level": {"prompt": "repeatable"}}})
-        self.assertEqual(exact["exactness"], {"asked": {"decode": "repeatable", "prompt": "exact"}, "prompt": "exact",
-                                              "plugins": {"attn-level": {"prompt": "exact"}}})
         (row,) = report["blame"]
-        self.assertEqual((row["plugin"], row["verdict"]), ("set:exactness.prompt=exact", "slows"), row)
+        self.assertEqual((row["plugin"], row["verdict"]), ("set:exactness.prompt=repeatable", "pays"), row)
         with self.assertRaisesRegex(Exception, "exactness is one of declared, exact, row-exact, repeatable"):
             ablate(self.store, self.run_id, candidate, smoke=False, sets=["exactness=bitwise"])
 

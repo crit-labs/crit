@@ -1,6 +1,6 @@
 // GGUF projections: y = x W^T for W [N][K] stored in a GGUF block format (crit_kcore/gguf.cuh: Q4_0, Q4_1, Q5_0,
 // Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS,
-// MXFP4), read at its stored bits.
+// TQ1_0, TQ2_0, MXFP4, Q1_0, Q2_0), read at its stored bits.
 //
 // The declared order, the same bits on every GPU and for any rows beside a row:
 //  1. quantize: each row's 32-value blocks of x become int8 q = rint(x / d) (d = max |x| / 127 in FP32, q = 0 where
@@ -27,7 +27,7 @@ struct Matrix {
     int type = 0;                            // GGUF type id
     int N = 0, K = 0;
     int64_t row_bytes = 0;                   // K / block_values * block_bytes
-    int64_t expert_stride = 0;               // bytes between experts (N row_bytes)
+    int64_t expert_stride = 0;               // bytes between experts (N row_bytes, or more: experts in slots)
 };
 
 // x [M][K] (FP32, BF16 or FP16 by kind 0, 1, 2) -> xq [M][K] int8, xd [M][K / 32] FP32, xs [M][K / 32] int32; or,
@@ -55,6 +55,18 @@ cudaError_t enqueue_stage(const Matrix& w, int n0, int rows, int8_t* codes, floa
 // whole matrix's N, which the tuning looks up.
 cudaError_t enqueue_gemm(const Staged& w, int key_n, const int8_t* xq, const float* xd, const int32_t* xs, int M,
                          int parts, void* y, int kind, int64_t ld, cudaStream_t stream);
+// The grouped prompt GEMM, a mixture of experts' prompt rows: the rows sorted into groups, group g's rows (up to
+// ends[g], each group's rows after the last's) times group g's staged matrix (enqueue_stage_experts: expert experts[g]
+// of a stack, its codes at g group_codes and scales at g group_scales past w's). tiles int32 [tile_count][2]: (group,
+// first row) of each tile of gemm_tile_rows(key_n, K, key_m) rows (key_m the rows the tuning is looked up at). Each
+// output has the bits enqueue_gemm gives the same row times its group's matrix.
+cudaError_t enqueue_stage_experts(const Matrix& w, const int32_t* experts, int groups, int8_t* codes, float* scales,
+                                  int64_t group_codes, int64_t group_scales, cudaStream_t stream);
+int gemm_tile_rows(int key_n, int K, int rows);
+cudaError_t enqueue_gemm_grouped(const Staged& w, int64_t group_codes, int64_t group_scales, const int32_t* tiles,
+                                 int tile_count, const int32_t* ends, int key_n, int key_m, const int8_t* xq,
+                                 const float* xd, const int32_t* xs, int M, int parts, void* y, int kind, int64_t ld,
+                                 cudaStream_t stream);
 // y [M][N] (kind) = the parts of yp added in part order, rounded once.
 cudaError_t enqueue_sum(const float* yp, int splits, int M, int N, void* y, int kind, int64_t ld, cudaStream_t stream);
 // out [N][K] (kind) = W's stored values (one rounding for BF16 and FP16; FP32 exact). expert: which of w's experts.

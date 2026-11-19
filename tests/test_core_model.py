@@ -528,6 +528,17 @@ class ModelConfigTests(unittest.TestCase):
         vl = mc.parse_model_config({"rope_scaling": {"type": "mrope", "mrope_section": [16, 24, 24]}})
         self.assertEqual(vl.rope.mrope_section, (16, 24, 24))
 
+    def test_routed_layers_follow_the_dense_layers_the_step_and_the_mlp_only_layers(self):
+        moe = {"num_experts": 8, "num_experts_per_tok": 2}
+        self.assertEqual(mc.routed_layers({"num_hidden_layers": 3, **moe}), (0, 1, 2))
+        self.assertEqual(mc.routed_layers({"num_hidden_layers": 6, **moe, "decoder_sparse_step": 2,
+                                           "mlp_only_layers": [3]}), (1, 5))
+        self.assertEqual(mc.routed_layers({"num_hidden_layers": 4, "n_routed_experts": 8, "first_k_dense_replace": 1}),
+                         (1, 2, 3))
+        self.assertEqual(mc.routed_layers({"num_hidden_layers": 4}), ())
+        parsed = mc.parse_model_config({"model_type": "x", "text_config": {"num_hidden_layers": 2, **moe}})
+        self.assertEqual(parsed.routed_layers(), (0, 1))
+
     def test_layer_kinds_cover_types_intervals_and_defaults(self):
         self.assertEqual(mc.layer_kinds({"num_hidden_layers": 4, "layer_types": [
             "attention", "mamba", "chunked_attention", "linear_attention"]}),

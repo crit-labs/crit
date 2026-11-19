@@ -11,10 +11,19 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <atomic>
+
 // Knobs (kernel.json, structure gemv; crit_tuning.h picks them per N, K and row count):
 //   WARPS   warps a block, one output column (and part) a warp
 //   SPLITS  contiguous parts of a row's sub-blocks, added in part order (0: enough warps for 32 a multiprocessor,
 //           at least 32 sub-blocks a part): changes the sums' order, so one value a matrix (an order knob)
+//   COLS    output columns a warp (1, 2, 4): a lane loads a sub-block's quantized activations once and multiplies
+//           them with that sub-block of each of its columns, each column's terms in its own order (no bit changes);
+//           the low-bit IQ formats only (cols_format), whose activations outweigh their weights several times
+//   GRID    1: the format's grid (gguf_grids.cuh, the same table word for word) copied into shared memory once a block
+//           and read from there, the blocks persistent (as many as fit on the device at once, each warp taking the
+//           column units its index, plus the grid's warps, ...): the low-bit IQ formats only (cols_format); 0: the
+//           device table through L1
 // structure gemm (the prompt rows): WN warps across weight rows (16 each), WT warps across tokens, TB 8-token tiles
 // a warp, RUN sub-blocks of a lane a stage, STAGES stages copied ahead; none of them changes an output's bits.
 
@@ -25,7 +34,7 @@ namespace gg = crit::kcore::gguf;
 // Every format the kernels take (gguf.cuh's), for the launches' switches.
 #define CRIT_GGUF_FORMATS(X) \
     X(Q4_0) X(Q4_1) X(Q5_0) X(Q5_1) X(Q8_0) X(Q2_K) X(Q3_K) X(Q4_K) X(Q5_K) X(Q6_K) X(IQ2_XXS) X(IQ2_XS) X(IQ3_XXS) \
-    X(IQ1_S) X(IQ4_NL) X(IQ3_S) X(IQ2_S) X(IQ4_XS) X(IQ1_M) X(MXFP4)
+    X(IQ1_S) X(IQ4_NL) X(IQ3_S) X(IQ2_S) X(IQ4_XS) X(IQ1_M) X(TQ1_0) X(TQ2_0) X(MXFP4) X(Q1_0) X(Q2_0)
 
 __device__ __forceinline__ float load(const void* p, int kind, int64_t i) {
     if(kind == 0) return static_cast<const float*>(p)[i];
@@ -66,12 +75,11 @@ __global__ void quantize_kernel(const void* x, int kind, int64_t ld, int M, int 
     }
 }
 
-// The term of one sub-block for one row: its exact integer dots weighted as gguf_rows.h declares.
+// The term of one sub-block for one row (its quantized activations a, b): its exact integer dots weighted as
+// gguf_rows.h declares.
 template <int F>
-__device__ __forceinline__ float term(const int32_t q[8], float s0, float s1, float m, const int8_t* xq, float d,
-                                      int32_t sum) {
-    const int4 a = reinterpret_cast<const int4*>(xq)[0];
-    const int4 b = reinterpret_cast<const int4*>(xq)[1];
+__device__ __forceinline__ float term(const int32_t q[8], float s0, float s1, float m, const int4 a, const int4 b,
+                                      float d, int32_t sum) {
     int lo = __dp4a(q[0], a.x, 0);
     lo = __dp4a(q[1], a.y, lo);
     lo = __dp4a(q[2], a.z, lo);
@@ -92,10 +100,8 @@ __device__ __forceinline__ float term(const int32_t q[8], float s0, float s1, fl
 
 // Q2_K's term (gguf.cuh's q2k_scaled): the scaled codes' exact dot isum and the minimums' imin = mn0 first + mn1
 // (sum - first), first the activations' sum of their first 16 codes; fmul(d_x, fsub(fmul(d, isum), fmul(dmin, imin))).
-__device__ __forceinline__ float q2k_term(const int32_t q[8], float dw, float dmin, int mn0, int mn1, const int8_t* xq,
-                                          float d, int32_t sum) {
-    const int4 a = reinterpret_cast<const int4*>(xq)[0];
-    const int4 b = reinterpret_cast<const int4*>(xq)[1];
+__device__ __forceinline__ float q2k_term(const int32_t q[8], float dw, float dmin, int mn0, int mn1, const int4 a,
+                                          const int4 b, float d, int32_t sum) {
     int dot = __dp4a(q[0], a.x, 0);
     dot = __dp4a(q[1], a.y, dot);
     dot = __dp4a(q[2], a.z, dot);
@@ -118,28 +124,81 @@ struct Decoded {
     int32_t q[8];
     float s0, s1, m;
     int mn0, mn1;
-    __device__ __forceinline__ void decode(const uint8_t* block, int ib) {
+    __device__ __forceinline__ void decode(const uint8_t* block, int ib, const uint64_t* grid = nullptr) {
         if constexpr(F == gg::Q2_K) {
             gg::q2k_scaled(block, ib, q, s0, s1, mn0, mn1);
         } else {
-            gg::subblock<F>(block, ib, q, s0, s1, m);
+            gg::subblock<F>(block, ib, q, s0, s1, m, grid);
         }
     }
+    __device__ __forceinline__ float term(const int4 a, const int4 b, float d, int32_t sum) const {
+        if constexpr(F == gg::Q2_K) return q2k_term(q, s0, s1, mn0, mn1, a, b, d, sum);
+        else return gguf_rows::term<F>(q, s0, s1, m, a, b, d, sum);
+    }
     __device__ __forceinline__ float term(const int8_t* xq, float d, int32_t sum) const {
-        if constexpr(F == gg::Q2_K) return q2k_term(q, s0, s1, mn0, mn1, xq, d, sum);
-        else return gguf_rows::term<F>(q, s0, s1, m, xq, d, sum);
+        return term(reinterpret_cast<const int4*>(xq)[0], reinterpret_cast<const int4*>(xq)[1], d, sum);
     }
 };
+
+// The formats COLS applies to: the 1- and 2-bit IQ formats, whose sub-blocks hold 6 to 10 bytes against the 40 of
+// their quantized activations.
+__host__ __device__ constexpr bool cols_format(int type) {
+    return type == gg::IQ1_S || type == gg::IQ1_M || type == gg::IQ2_XXS || type == gg::IQ2_XS || type == gg::IQ2_S;
+}
+
+// COLS > 1 (plain matrices): one warp COLS output columns n0 .. n0 + COLS - 1 and a part, all M rows. Lane l takes
+// the part's sub-blocks start + l, start + l + 32, ...: each one's activations loaded once, its terms added to each
+// column's sums in that order, then each column's lanes reduced by the butterfly as the one-column warp reduces them.
+template <int F, int M, int COLS>
+__device__ __forceinline__ void gemv_columns(const Matrix& w, const int8_t* xq, const float* xd, const int32_t* xs,
+                                             int rows, float* yp, int parts, int n0, int lane, int p,
+                                             const uint64_t* grid) {
+    constexpr int per_block = gg::block_values(F) / 32;
+    const int J = w.K / 32;
+    const int start = int(int64_t(J) * p / parts), end = int(int64_t(J) * (p + 1) / parts);
+    float acc[COLS][M];
+#pragma unroll
+    for(int c = 0; c < COLS; ++c)
+#pragma unroll
+        for(int r = 0; r < M; ++r) acc[c][r] = 0.0f;
+    const uint8_t* row0 = w.blocks + int64_t(n0) * w.row_bytes;
+    for(int j = start + lane; j < end; j += 32) {
+        Decoded<F> s[COLS];
+        const int64_t at = int64_t(j / per_block) * gg::block_bytes(F);
+#pragma unroll
+        for(int c = 0; c < COLS; ++c)
+            if(n0 + c < w.N) s[c].decode(row0 + int64_t(c) * w.row_bytes + at, j % per_block, grid);
+#pragma unroll
+        for(int r = 0; r < M; ++r) {
+            if(r < rows) {
+                const int4* x = reinterpret_cast<const int4*>(xq + int64_t(r) * w.K + 32 * j);
+                const int4 a = x[0], b = x[1];
+                const float d = xd[int64_t(r) * J + j];
+                const int32_t sum = xs[int64_t(r) * J + j];
+#pragma unroll
+                for(int c = 0; c < COLS; ++c)
+                    if(n0 + c < w.N) acc[c][r] = __fadd_rn(acc[c][r], s[c].term(a, b, d, sum));
+            }
+        }
+    }
+#pragma unroll
+    for(int c = 0; c < COLS; ++c) {
+#pragma unroll
+        for(int r = 0; r < M; ++r) {
+#pragma unroll
+            for(int off = 16; off; off >>= 1)
+                acc[c][r] = __fadd_rn(acc[c][r], __shfl_xor_sync(0xffffffffu, acc[c][r], off));
+            if(lane == 0 && r < rows && n0 + c < w.N) yp[(int64_t(p) * rows + r) * w.N + n0 + c] = acc[c][r];
+        }
+    }
+}
 
 // One warp an (output column, part); all M rows (or, gathered, the rows whose expert this is not: each row its own
 // expert's matrix). Lane l takes the part's sub-blocks start + l, start + l + 32, ...
 template <int F, int M>
-__global__ void gemv_kernel(Matrix w, const int8_t* xq, const float* xd, const int32_t* xs, const int32_t* ids,
-                            int rows, float* yp, int parts) {
-    const int lane = threadIdx.x & 31;
-    const int n = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
-    const int p = blockIdx.y;
-    if(n >= w.N) return;
+__device__ __forceinline__ void gemv_column(const Matrix& w, const int8_t* xq, const float* xd, const int32_t* xs,
+                                            const int32_t* ids, int rows, float* yp, int parts, int n, int lane, int p,
+                                            const uint64_t* grid) {
     constexpr int per_block = gg::block_values(F) / 32;
     const int J = w.K / 32;
     const int start = int(int64_t(J) * p / parts), end = int(int64_t(J) * (p + 1) / parts);
@@ -150,7 +209,7 @@ __global__ void gemv_kernel(Matrix w, const int8_t* xq, const float* xd, const i
         const uint8_t* row = w.blocks + int64_t(n) * w.row_bytes;
         for(int j = start + lane; j < end; j += 32) {
             Decoded<F> s;
-            s.decode(row + int64_t(j / per_block) * gg::block_bytes(F), j % per_block);
+            s.decode(row + int64_t(j / per_block) * gg::block_bytes(F), j % per_block, grid);
 #pragma unroll
             for(int r = 0; r < M; ++r) {
                 if(r < rows) {
@@ -166,7 +225,7 @@ __global__ void gemv_kernel(Matrix w, const int8_t* xq, const float* xd, const i
             const uint8_t* row = w.blocks + int64_t(ids[r]) * w.expert_stride + int64_t(n) * w.row_bytes;
             for(int j = start + lane; j < end; j += 32) {
                 Decoded<F> s;
-                s.decode(row + int64_t(j / per_block) * gg::block_bytes(F), j % per_block);
+                s.decode(row + int64_t(j / per_block) * gg::block_bytes(F), j % per_block, grid);
                 acc[r] = __fadd_rn(acc[r], s.term(xq + int64_t(r) * w.K + 32 * j,
                                                    xd[int64_t(r) * J + j], xs[int64_t(r) * J + j]));
             }
@@ -177,6 +236,40 @@ __global__ void gemv_kernel(Matrix w, const int8_t* xq, const float* xd, const i
 #pragma unroll
         for(int off = 16; off; off >>= 1) acc[r] = __fadd_rn(acc[r], __shfl_xor_sync(0xffffffffu, acc[r], off));
         if(lane == 0 && r < rows) yp[(int64_t(p) * rows + r) * w.N + n] = acc[r];
+    }
+}
+
+// Warp g of the grid (block x, warp in block) takes column units g, g + the grid's warps, ... of part blockIdx.y: a
+// unit one column (gemv_column) or, with COLS > 1 (plain matrices; a gathered call takes one column a warp), COLS
+// columns (gemv_columns). Without GRID the grid holds a warp a unit, so each warp takes one; with GRID the block first
+// copies the format's grid into shared memory (every thread, before any warp leaves) and decodes from that copy.
+template <int F, int M, int COLS = 1, bool GRID = false>
+__global__ void gemv_kernel(Matrix w, const int8_t* xq, const float* xd, const int32_t* xs, const int32_t* ids,
+                            int rows, float* yp, int parts) {
+    const int lane = threadIdx.x & 31;
+    const int p = blockIdx.y;
+    const uint64_t* grid = nullptr;
+    if constexpr(GRID) {
+        constexpr int entries = gg::grid_entries(F);
+        static_assert(entries > 0 && entries % 2 == 0, "GRID takes a format with a 64-bit grid");
+        __shared__ __align__(16) uint64_t table[entries];
+        const uint4* from = reinterpret_cast<const uint4*>(gg::grid_table<F>());
+        for(int i = threadIdx.x; i < entries / 2; i += blockDim.x) reinterpret_cast<uint4*>(table)[i] = from[i];
+        __syncthreads();
+        grid = table;
+    }
+    const int warps = blockDim.x / 32;
+    const int units = (w.N + COLS - 1) / COLS;
+    const auto unit = [&](int u) {
+        if constexpr(COLS > 1) gemv_columns<F, M, COLS>(w, xq, xd, xs, rows, yp, parts, u * COLS, lane, p, grid);
+        else gemv_column<F, M>(w, xq, xd, xs, ids, rows, yp, parts, u, lane, p, grid);
+    };
+    const int first = blockIdx.x * warps + threadIdx.x / 32;
+    if constexpr(GRID) {
+        for(int u = first; u < units; u += gridDim.x * warps) unit(u);
+    } else {
+        if(first >= units) return;   // without GRID the grid holds a warp a unit
+        unit(first);
     }
 }
 
@@ -192,9 +285,16 @@ __global__ void gemv_kernel(Matrix w, const int8_t* xq, const float* xd, const i
 // into the tree's partial sums (fold32's binary counter). The parts add in order; the sum rounds once. Every output
 // has gemv's bits for the same row, whatever the chunk, the tile, RUN and STAGES.
 template <int F>
-__global__ void stage_kernel(Matrix w, int n0, int rows, int8_t* codes, float* scales) {
-    // One thread a sub-block: (row r, sub-block j), j fastest.
+__global__ void stage_kernel(Matrix w, int n0, int rows, int8_t* codes, float* scales, const int32_t* experts,
+                             int64_t group_codes, int64_t group_scales) {
+    // One thread a sub-block: (row r, sub-block j), j fastest. With experts, grid row g stages expert experts[g] of
+    // the stack into group g's codes and scales.
     const int J = w.K / 32;
+    if(experts != nullptr) {
+        w.blocks += int64_t(experts[blockIdx.y]) * w.expert_stride;
+        codes += int64_t(blockIdx.y) * group_codes;
+        scales += int64_t(blockIdx.y) * group_scales;
+    }
     const int64_t s = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if(s >= int64_t(rows) * J) return;
     const int r = int(s / J), j = int(s % J);
@@ -273,12 +373,22 @@ struct Visit {
 template <int SC, int WN, int WT, int TB, int RUN, int STAGES>
 __global__ void __launch_bounds__(32 * WN * WT, 1) gemm_kernel(Staged w, const int8_t* xq, const float* xd,
                                                                const int32_t* xs, int M, int parts, void* y, int kind,
-                                                               int64_t ld) {
+                                                               int64_t ld, const int32_t* tiles, const int32_t* ends,
+                                                               int64_t group_codes, int64_t group_scales) {
     using S = GemmSmem<SC, WN, WT, TB, RUN, STAGES>;
     constexpr int BN = S::BN, BT = S::BT, kThreads = 32 * WN * WT, planes = S::planes;
     extern __shared__ __align__(16) uint8_t smem[];
     const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, gid = lane >> 2, tig = lane & 3;
-    const int n0 = blockIdx.y * BN, t0 = blockIdx.x * BT;   // token tiles along x: CTAs beside each other share a weight tile
+    const int n0 = blockIdx.y * BN;   // token tiles along x: CTAs beside each other share a weight tile
+    // A grouped call: tile x is (group g, its first row), its rows up to the group's end, times group g's staging.
+    int t0 = blockIdx.x * BT, rows_end = M;
+    if(tiles != nullptr) {
+        const int g = tiles[2 * blockIdx.x];
+        t0 = tiles[2 * blockIdx.x + 1];
+        rows_end = ends[g];
+        w.codes += int64_t(g) * group_codes;
+        w.scales += int64_t(g) * group_scales;
+    }
     const int wn = (warp / WT) * 16, wt = (warp % WT) * 8 * TB;
     const int J = w.K / 32;
 
@@ -301,14 +411,14 @@ __global__ void __launch_bounds__(32 * WN * WT, 1) gemm_kernel(Staged w, const i
         uint8_t* tq = smem + S::tokens + at * RUN * BT * 32;
         for(int e = tid; e < count * BT * 2; e += kThreads) {
             const int u = e / (BT * 2), r = e / 2 % BT, half = e % 2;
-            const int t = min(t0 + r, M - 1), j = v.j0 + 32 * u;
+            const int t = min(t0 + r, rows_end - 1), j = v.j0 + 32 * u;
             crit::kcore::cp_async16(tq + (u * BT + r) * 32 + 4 * swizzled(r, 4 * half),
                                     xq + (int64_t(j) * M + t) * 32 + 16 * half);
         }
         float* ts = reinterpret_cast<float*>(smem + S::token_scales) + at * 2 * RUN * BT;
         for(int e = tid; e < count * 2 * BT; e += kThreads) {
             const int u = e / (2 * BT), which = e / BT % 2, r = e % BT;
-            const int t = min(t0 + r, M - 1), j = v.j0 + 32 * u;
+            const int t = min(t0 + r, rows_end - 1), j = v.j0 + 32 * u;
             const void* src = which ? static_cast<const void*>(xs + int64_t(j) * M + t)
                                     : static_cast<const void*>(xd + int64_t(j) * M + t);
             crit::kcore::cp_async_ca<4>(ts + (which * RUN + u) * BT + r, src);
@@ -428,7 +538,7 @@ __global__ void __launch_bounds__(32 * WN * WT, 1) gemm_kernel(Staged w, const i
 #pragma unroll
         for(int i = 0; i < 4; ++i) {
             const int n = n0 + wn + gid + 8 * (i >> 1), t = t0 + wt + 8 * b + 2 * tig + (i & 1);
-            if(n < w.rows && t < M) store(y, kind, int64_t(t) * ld + n, out[b][i]);
+            if(n < w.rows && t < rows_end) store(y, kind, int64_t(t) * ld + n, out[b][i]);
         }
 }
 
@@ -458,35 +568,106 @@ __global__ void dequantize_kernel(Matrix w, int expert, void* out, int kind) {
     for(int e = 0; e < 32; ++e) store(out, kind, n * w.K + 32 * j + e, gg::value(q, e, s0, s1, m, m1));
 }
 
+// The blocks of `kernel` (threads a block) that fit on the current device at once: its multiprocessors times the
+// occupancy calculator's blocks a multiprocessor, cached per device and block size (a property of the device and the
+// kernel, not a tuned number).
+template <typename Kernel>
+int resident_blocks(Kernel kernel, int threads) {
+    constexpr int kDevices = 64;
+    static std::atomic<int> cache[kDevices][4];   // 64, 128, 256, 512 threads (WARPS 2, 4, 8, 16); 0: not yet asked
+    int device = 0;
+    if(cudaGetDevice(&device) != cudaSuccess) return 0;
+    const int slot = threads <= 64 ? 0 : threads <= 128 ? 1 : threads <= 256 ? 2 : 3;
+    if(device < kDevices) {
+        const int known = cache[device][slot].load(std::memory_order_relaxed);
+        if(known > 0) return known;
+    }
+    int per_sm = 0, sms = 0;
+    if(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, threads, 0) != cudaSuccess ||
+       cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess)
+        return 0;
+    const int blocks = per_sm * sms;
+    if(device < kDevices && blocks > 0) cache[device][slot].store(blocks, std::memory_order_relaxed);
+    return blocks;
+}
+
+template <int F, int M, int COLS, bool GRID>
+cudaError_t launch_columns(const Matrix& w, const int8_t* xq, const float* xd, const int32_t* xs, int rows,
+                           const int32_t* ids, float* yp, int parts, int warps, cudaStream_t stream) {
+    const auto kernel = gemv_kernel<F, M, COLS, GRID>;
+    const int columns = warps * COLS;
+    int blocks = (w.N + columns - 1) / columns;
+    if constexpr(GRID) {
+        // Persistent: at most the blocks that fit at once (shared by the parts), each warp looping over its units.
+        const int resident = resident_blocks(kernel, 32 * warps);
+        if(resident <= 0) return cudaErrorInvalidConfiguration;
+        const int per_part = (resident + parts - 1) / parts;
+        if(blocks > per_part) blocks = per_part;
+    }
+    kernel<<<dim3(blocks, parts), 32 * warps, 0, stream>>>(w, xq, xd, xs, ids, rows, yp, parts);
+    return cudaGetLastError();
+}
+
+template <int F, int M, bool GRID>
+cudaError_t launch_cols(const Matrix& w, const int8_t* xq, const float* xd, const int32_t* xs, int rows,
+                        const int32_t* ids, float* yp, int parts, int warps, int cols, cudaStream_t stream) {
+    if constexpr(cols_format(F)) {
+        if(ids == nullptr && cols >= 4)
+            return launch_columns<F, M, 4, GRID>(w, xq, xd, xs, rows, ids, yp, parts, warps, stream);
+        if(ids == nullptr && cols >= 2)
+            return launch_columns<F, M, 2, GRID>(w, xq, xd, xs, rows, ids, yp, parts, warps, stream);
+    }
+    return launch_columns<F, M, 1, GRID>(w, xq, xd, xs, rows, ids, yp, parts, warps, stream);
+}
+
+// COLS (the knob rounded down to 1, 2 or 4) for plain matrices of the low-bit IQ formats, one column a warp else;
+// GRID for the low-bit IQ formats (plain and gathered), the device table else.
 template <int F, int M>
 cudaError_t launch_rows(const Matrix& w, const int8_t* xq, const float* xd, const int32_t* xs, int rows,
-                        const int32_t* ids, float* yp, int parts, int warps, cudaStream_t stream) {
-    const dim3 grid((w.N + warps - 1) / warps, parts);
-    gemv_kernel<F, M><<<grid, 32 * warps, 0, stream>>>(w, xq, xd, xs, ids, rows, yp, parts);
-    return cudaGetLastError();
+                        const int32_t* ids, float* yp, int parts, int warps, int cols, int grid, cudaStream_t stream) {
+    if constexpr(cols_format(F)) {
+        if(grid) return launch_cols<F, M, true>(w, xq, xd, xs, rows, ids, yp, parts, warps, cols, stream);
+    }
+    return launch_cols<F, M, false>(w, xq, xd, xs, rows, ids, yp, parts, warps, cols, stream);
 }
 
 template <int F>
 cudaError_t launch_format(const Matrix& w, const int8_t* xq, const float* xd, const int32_t* xs, int M,
-                          const int32_t* ids, float* yp, int parts, int warps, cudaStream_t stream) {
-    if(M <= 1) return launch_rows<F, 1>(w, xq, xd, xs, M, ids, yp, parts, warps, stream);
-    if(M <= 2) return launch_rows<F, 2>(w, xq, xd, xs, M, ids, yp, parts, warps, stream);
-    if(M <= 4) return launch_rows<F, 4>(w, xq, xd, xs, M, ids, yp, parts, warps, stream);
-    return launch_rows<F, 8>(w, xq, xd, xs, M, ids, yp, parts, warps, stream);
+                          const int32_t* ids, float* yp, int parts, int warps, int cols, int grid,
+                          cudaStream_t stream) {
+    if(M <= 1) return launch_rows<F, 1>(w, xq, xd, xs, M, ids, yp, parts, warps, cols, grid, stream);
+    if(M <= 2) return launch_rows<F, 2>(w, xq, xd, xs, M, ids, yp, parts, warps, cols, grid, stream);
+    if(M <= 4) return launch_rows<F, 4>(w, xq, xd, xs, M, ids, yp, parts, warps, cols, grid, stream);
+    return launch_rows<F, 8>(w, xq, xd, xs, M, ids, yp, parts, warps, cols, grid, stream);
 }
 
+// The gemm's token tile (8 TB WT rows) for the configuration the tuning picks at (key_n, K, rows).
+int tile_rows(int key_n, int K, int rows) {
+    switch(crit_lookup_gemm(key_n, K, rows)) {
+#define CRIT_GGUF_TILE(index, wn, wt, tb, run, stages) \
+    case index: return 8 * tb * wt;
+        CRIT_CONFIGS_gemm(CRIT_GGUF_TILE)
+#undef CRIT_GGUF_TILE
+        default: return 0;
+    }
+}
+
+// A plain call (tiles null: M rows in tiles along x) or a grouped one (tile_count tiles, each its group's).
 template <int SC>
-cudaError_t launch_gemm(const Staged& w, int key_n, const int8_t* xq, const float* xd, const int32_t* xs, int M,
-                        int parts, void* y, int kind, int64_t ld, cudaStream_t stream) {
-    switch(crit_lookup_gemm(key_n, w.K, M)) {
+cudaError_t launch_gemm(const Staged& w, int key_n, int key_m, const int8_t* xq, const float* xd, const int32_t* xs,
+                        int M, int parts, void* y, int kind, int64_t ld, const int32_t* tiles, int tile_count,
+                        const int32_t* ends, int64_t group_codes, int64_t group_scales, cudaStream_t stream) {
+    switch(crit_lookup_gemm(key_n, w.K, key_m)) {
 #define CRIT_GGUF_GEMM(index, wn, wt, tb, run, stages)                                                               \
     case index: {                                                                                                    \
         constexpr int bytes = GemmSmem<SC, wn, wt, tb, run, stages>::bytes;                                          \
         const auto kernel = gemm_kernel<SC, wn, wt, tb, run, stages>;                                                \
         const cudaError_t e = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);      \
         if(e != cudaSuccess) return e;                                                                               \
-        const dim3 grid((M + 8 * tb * wt - 1) / (8 * tb * wt), (w.rows + 16 * wn - 1) / (16 * wn));                  \
-        kernel<<<grid, 32 * wn * wt, bytes, stream>>>(w, xq, xd, xs, M, parts, y, kind, ld);                         \
+        const unsigned along = tiles ? unsigned(tile_count) : unsigned((M + 8 * tb * wt - 1) / (8 * tb * wt));      \
+        const dim3 grid(along, (w.rows + 16 * wn - 1) / (16 * wn));                                                  \
+        kernel<<<grid, 32 * wn * wt, bytes, stream>>>(w, xq, xd, xs, M, parts, y, kind, ld, tiles, ends,             \
+                                                      group_codes, group_scales);                                    \
         return cudaGetLastError();                                                                                   \
     }
         CRIT_CONFIGS_gemm(CRIT_GGUF_GEMM)
@@ -514,9 +695,9 @@ cudaError_t enqueue_quantize(const void* x, int kind, int64_t ld, int M, int K, 
 int splits(const Matrix& w, int multiprocessors) {
     int knob = 0;
     switch(crit_lookup_gemv(w.N, w.K, 1)) {
-#define CRIT_GGUF_PLAN(index, warps, split_knob) \
-    case index:                                  \
-        knob = split_knob;                       \
+#define CRIT_GGUF_PLAN(index, warps, split_knob, cols_knob, grid_knob) \
+    case index:                                                        \
+        knob = split_knob;                                             \
         break;
         CRIT_CONFIGS_gemv(CRIT_GGUF_PLAN)
 #undef CRIT_GGUF_PLAN
@@ -534,11 +715,13 @@ int splits(const Matrix& w, int multiprocessors) {
 cudaError_t enqueue_gemv(const Matrix& w, const int8_t* xq, const float* xd, const int32_t* xs, int M,
                          const int32_t* ids, float* yp, int parts, cudaStream_t stream) {
     if(!valid(w) || M < 1 || M > kMaxRows || parts < 1 || parts > 65535) return cudaErrorInvalidValue;
-    int warps = 4;
+    int warps = 4, cols = 1, grid = 0;
     switch(crit_lookup_gemv(w.N, w.K, M)) {
-#define CRIT_GGUF_CASE(index, warp_knob, split_knob) \
-    case index:                                      \
-        warps = warp_knob;                           \
+#define CRIT_GGUF_CASE(index, warp_knob, split_knob, cols_knob, grid_knob) \
+    case index:                                                            \
+        warps = warp_knob;                                                 \
+        cols = cols_knob;                                                  \
+        grid = grid_knob;                                                  \
         break;
         CRIT_CONFIGS_gemv(CRIT_GGUF_CASE)
 #undef CRIT_GGUF_CASE
@@ -547,7 +730,7 @@ cudaError_t enqueue_gemv(const Matrix& w, const int8_t* xq, const float* xd, con
     }
     switch(w.type) {
 #define CRIT_GGUF_GEMV(F) \
-    case gg::F: return launch_format<gg::F>(w, xq, xd, xs, M, ids, yp, parts, warps, stream);
+    case gg::F: return launch_format<gg::F>(w, xq, xd, xs, M, ids, yp, parts, warps, cols, grid, stream);
         CRIT_GGUF_FORMATS(CRIT_GGUF_GEMV)
 #undef CRIT_GGUF_GEMV
         default: return cudaErrorInvalidValue;
@@ -560,7 +743,24 @@ cudaError_t enqueue_stage(const Matrix& w, int n0, int rows, int8_t* codes, floa
     const unsigned grid = static_cast<unsigned>((count + 127) / 128);
     switch(w.type) {
 #define CRIT_GGUF_STAGE(F) \
-    case gg::F: stage_kernel<gg::F><<<grid, 128, 0, stream>>>(w, n0, rows, codes, scales); break;
+    case gg::F: stage_kernel<gg::F><<<grid, 128, 0, stream>>>(w, n0, rows, codes, scales, nullptr, 0, 0); break;
+        CRIT_GGUF_FORMATS(CRIT_GGUF_STAGE)
+#undef CRIT_GGUF_STAGE
+        default: return cudaErrorInvalidValue;
+    }
+    return cudaGetLastError();
+}
+
+cudaError_t enqueue_stage_experts(const Matrix& w, const int32_t* experts, int groups, int8_t* codes, float* scales,
+                                  int64_t group_codes, int64_t group_scales, cudaStream_t stream) {
+    if(!valid(w) || groups < 1 || groups > 65535) return cudaErrorInvalidValue;
+    const int64_t count = int64_t(w.N) * (w.K / 32);
+    const dim3 grid(static_cast<unsigned>((count + 127) / 128), static_cast<unsigned>(groups));
+    switch(w.type) {
+#define CRIT_GGUF_STAGE(F)                                                                                            \
+    case gg::F:                                                                                                       \
+        stage_kernel<gg::F><<<grid, 128, 0, stream>>>(w, 0, w.N, codes, scales, experts, group_codes, group_scales); \
+        break;
         CRIT_GGUF_FORMATS(CRIT_GGUF_STAGE)
 #undef CRIT_GGUF_STAGE
         default: return cudaErrorInvalidValue;
@@ -574,10 +774,32 @@ cudaError_t enqueue_gemm(const Staged& w, int key_n, const int8_t* xq, const flo
        (w.rows + 15) / 16 > 65535)
         return cudaErrorInvalidValue;
     switch(scale_kind(w.type)) {
-        case kOneScale: return launch_gemm<kOneScale>(w, key_n, xq, xd, xs, M, parts, y, kind, ld, stream);
-        case kTwoScales: return launch_gemm<kTwoScales>(w, key_n, xq, xd, xs, M, parts, y, kind, ld, stream);
-        case kScaledCodes: return launch_gemm<kScaledCodes>(w, key_n, xq, xd, xs, M, parts, y, kind, ld, stream);
-        default: return launch_gemm<kMinimum>(w, key_n, xq, xd, xs, M, parts, y, kind, ld, stream);
+#define CRIT_GGUF_KIND(SC) launch_gemm<SC>(w, key_n, M, xq, xd, xs, M, parts, y, kind, ld, nullptr, 0, nullptr, 0, 0, stream)
+        case kOneScale: return CRIT_GGUF_KIND(kOneScale);
+        case kTwoScales: return CRIT_GGUF_KIND(kTwoScales);
+        case kScaledCodes: return CRIT_GGUF_KIND(kScaledCodes);
+        default: return CRIT_GGUF_KIND(kMinimum);
+#undef CRIT_GGUF_KIND
+    }
+}
+
+int gemm_tile_rows(int key_n, int K, int rows) { return tile_rows(key_n, K, rows); }
+
+cudaError_t enqueue_gemm_grouped(const Staged& w, int64_t group_codes, int64_t group_scales, const int32_t* tiles,
+                                 int tile_count, const int32_t* ends, int key_n, int key_m, const int8_t* xq,
+                                 const float* xd, const int32_t* xs, int M, int parts, void* y, int kind, int64_t ld,
+                                 cudaStream_t stream) {
+    if(!gg::supported(w.type) || w.rows < 1 || w.K < 32 || w.K % 32 || M < 1 || parts < 1 || tile_count < 1 ||
+       tiles == nullptr || ends == nullptr || (w.rows + 15) / 16 > 65535)
+        return cudaErrorInvalidValue;
+    switch(scale_kind(w.type)) {
+#define CRIT_GGUF_KIND(SC) launch_gemm<SC>(w, key_n, key_m, xq, xd, xs, M, parts, y, kind, ld, tiles, tile_count, ends, \
+                                           group_codes, group_scales, stream)
+        case kOneScale: return CRIT_GGUF_KIND(kOneScale);
+        case kTwoScales: return CRIT_GGUF_KIND(kTwoScales);
+        case kScaledCodes: return CRIT_GGUF_KIND(kScaledCodes);
+        default: return CRIT_GGUF_KIND(kMinimum);
+#undef CRIT_GGUF_KIND
     }
 }
 

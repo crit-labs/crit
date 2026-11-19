@@ -26,26 +26,30 @@ runs:
                 environment.write(f'{name}={temporary}\n')
         print(f'Temporary fixtures: {temporary}')
         PY
+    - name: Install uv
+      # uv installs the same pinned wheels as pip, several times faster: torch's alone took pip most of a minute on
+      # Windows. Its cache folder is kept between runs (actions/cache below).
+      shell: bash
+      run: |
+        python -m pip install --disable-pip-version-check uv==0.13.8
+        echo "UV_CACHE_DIR=$RUNNER_TEMP/uv-cache" >> "$GITHUB_ENV"
+    - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      with:
+        path: ${{ runner.temp }}/uv-cache
+        key: uv-${{ runner.os }}-${{ inputs.python-version }}-${{ hashFiles('.github/actions/setup/action.yml') }}
     - name: Install pinned runtime dependencies
+      # torch for the CPU: every plugin that computes on a device speaks its slot's device form in torch, the CPU
+      # included, and the toy engine the host tests and Core's concurrency check load runs on torch's CPU tensors.
+      # numpy: torch's CPU wheel does not require it, but crit reads host tensors through it (the prompt batches'
+      # pinned staging in crit_plugins.device, lookup-table-rows, the expert stores and Core's torch-file reader); 2.4.6
+      # is the newest numpy with wheels for every Python CI runs (3.11 to 3.14; 2.5 requires 3.12). transformers: the
+      # supported range is pyproject's reference extra (transformers>=5.20,<6); the routing and reference fixtures
+      # compare crit with it and skip without it, so CI runs them on one version of the range.
       shell: bash
-      run: python -m pip install tokenizers==0.23.3 jinja2==3.1.6
-    - name: Install torch for the CPU
-      # Every plugin that computes on a device speaks its slot's device form in torch, the CPU included: the toy engine
-      # the host tests and Core's concurrency check load runs on torch's CPU tensors.
-      shell: bash
-      run: python -m pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cpu
-    - name: Install numpy
-      # torch's CPU wheel does not require numpy, but crit reads host tensors through it: the prompt batches' pinned
-      # staging (crit_plugins.device), lookup-table-rows, the expert stores and Core's torch-file reader. 2.4.6 is the
-      # newest numpy with wheels for every Python CI runs (3.11 to 3.14; 2.5 requires 3.12).
-      shell: bash
-      run: python -m pip install numpy==2.4.6
-    - name: Install transformers
-      # The supported range is pyproject's reference extra (transformers>=5.20,<6); the routing and reference
-      # fixtures compare crit with it and skip without it, so CI runs them on one version of the range.
-      shell: bash
-      run: python -m pip install transformers==5.20.2
+      run: |
+        python -m uv pip install --system tokenizers==0.23.3 jinja2==3.1.6 numpy==2.4.6 transformers==5.20.2
+        python -m uv pip install --system torch==2.14.1 --index-url https://download.pytorch.org/whl/cpu
     - name: Install crit Eval from its repository
       # crit eval and crit run's Eval steps import crit_eval, and crit's tests reuse its fixtures (tests/) beside this checkout.
       shell: bash
-      run: git clone --depth 1 https://github.com/crit-labs/crit-eval ../crit-eval && python -m pip install --no-deps -e ../crit-eval
+      run: git clone --depth 1 https://github.com/crit-labs/crit-eval ../crit-eval && python -m uv pip install --system --no-deps -e ../crit-eval

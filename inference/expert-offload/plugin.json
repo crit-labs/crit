@@ -2,7 +2,7 @@
   "schema": "crit-plugin-v1",
   "id": "expert-offload",
   "title": "Routed experts of any size against the device: placed, cached and computed by a decision tree",
-  "description": "One plugin for a mixture of experts larger than the device. The model plugin calls the experts slot as for experts that fit: begin(layers, experts, format, hidden, inter, device_bytes) once, load() per expert, open() after its own pools, forward(layer, x, ids, weights, rows=None, prompt=None) per routed layer. The plugin decides the tier (every expert on the device; a mapped bundle store in host memory behind a device expert cache in every byte left; a store file on disk read on the host when host memory does not hold them), who computes a miss (the CPU tier in the device's bits, while the link copies the missed expert into the cache beside the round so it serves from the next one, in the slot of the expert routed longest ago; or, where the CPU tier cannot compute them, every miss copied over the link before its layer reads it, with the device's rows in the kernel's tensor arithmetic), and how prompt chunks run (their misses staged through the cache's ring). Its facts say what it decided and why; its telemetry carries a one-line diagnosis. Inside it: device-expert-cache's ExpertCache, expert-tensors' BundleStore, host-expert-tier's CpuTier and heterogeneous-expert-dispatch's DeviceDispatch, grouped-experts' kernel.",
+  "description": "One plugin for a mixture of experts larger than the device. The model plugin calls the experts slot as for experts that fit: begin(layers, experts, format, hidden, inter, device_bytes) once, load() per expert, open() after its own pools, forward(layer, x, ids, weights, rows=None, prompt=None) per routed layer. The plugin decides the tier (every expert on the device; a mapped bundle store in host memory behind a device expert cache in every byte left; a store file on disk read on the host when host memory does not hold them), who computes a miss (the CPU tier in the device's bits, while the link copies the missed expert into the cache beside the round so it serves from the next one, in the slot of the expert routed longest ago; or, where the CPU tier cannot compute them, every miss copied over the link before its layer reads it, with the device's rows in the kernel's tensor arithmetic), and how prompt chunks run (their misses staged through the cache's ring). Its facts say what it decided and why; its telemetry carries a one-line diagnosis. Experts a GGUF checkpoint stores (format gguf: each layer's formats as the file has them, IQ1_S to Q8_0, Q2_0 included) are cached and streamed as their stored bytes and computed by crit's gguf-rows kernel in the slots they are in; the CPU tier computes their misses in gguf-rows' declared order on the host (in torch, outside a capture). Inside it: device-expert-cache's ExpertCache, expert-tensors' BundleStore, host-expert-tier's CpuTier and heterogeneous-expert-dispatch's DeviceDispatch, grouped-experts' kernel.",
   "fills": [
     "experts"
   ],
@@ -13,6 +13,7 @@
     "experts-reference"
   ],
   "test_with": [
+    "attention-state",
     "expert-tensors"
   ],
   "devices": [
@@ -20,7 +21,9 @@
   ],
   "provides": [
     "experts:offload",
-    "rounds:experts"
+    "experts:activations",
+    "rounds:experts",
+    "experts:gguf"
   ],
   "sources": {
     "offload": "code",
@@ -36,6 +39,10 @@
     {
       "name": "grouped-experts",
       "fallback": "none: the plugin refuses to load without crit's grouped-experts kernel"
+    },
+    {
+      "name": "gguf-rows",
+      "fallback": "none: GGUF experts are refused without crit's gguf-rows kernel"
     }
   ],
   "entry": "plugin.py:create",
@@ -107,7 +114,7 @@
         "declared",
         "tensor"
       ],
-      "description": "a prompt chunk's rows when the CPU computes decode misses: auto (the default), the faster arithmetic that keeps the level the engine's configuration asks of its prompt rows (exactness, docs/PLUGINS.md#exactness): tensor where it asks repeatable or row-exact, declared where it asks exact, declared or nothing; declared, the CPU's integer order (the decode rows' bits: exact honesty, slower prefill); tensor, the kernel's tensor cores (a speed engine's choice). With misses over the link every row is the tensor arithmetic"
+      "description": "a prompt chunk's rows when the CPU computes decode misses: auto (the default), the faster arithmetic that keeps the level the engine's configuration asks of its prompt rows (exactness, docs/PLUGINS.md#exactness): tensor where it asks repeatable or row-exact, declared where it asks exact, declared or nothing; declared, the CPU's integer order (the decode rows' bits: exact honesty, slower prefill); tensor, the kernel's tensor cores (for an engine that asks repeatable or row-exact prompt rows). With misses over the link every row is the tensor arithmetic"
     },
     "reserve_mib": {
       "type": "int",
@@ -119,7 +126,7 @@
       "type": "int",
       "default": 256,
       "min": 0,
-      "description": "device memory an elastic cache leaves free at every moment: the run's VRAM headroom (crit plugins offload writes it). After the warm requests the cache takes every other free byte but a short prompt's room; a prompt step gets the room a chunk of its size was measured to take, from the blocks torch's allocator kept of earlier prompts and, for what they lack, from the cache's coldest slots; the cache grows back when no prompt is in flight"
+      "description": "device memory an elastic cache leaves free at every moment: the run's VRAM headroom (crit plugins offload writes it). After the warm requests the cache takes every other free byte but a short prompt's room; a prompt step gets the room a chunk of its size was measured to take, from the blocks torch's allocator kept of earlier prompts and, for what they lack, from the cache's coldest slots, and while it runs the cache looks at it before every routed layer and keeps a reserve free beyond the margin (what such steps took between two looks), so a step that outgrows its room is given more before it takes it; the cache grows back when no prompt is in flight"
     },
     "elastic": {
       "type": "bool",
@@ -141,7 +148,7 @@
     "store_dir": {
       "type": "str",
       "default": "",
-      "description": "a folder for the bundle store file (built once per checkpoint and layout, reopened without the loads after); empty: anonymous host memory, built at every load (the disk tier needs a folder)"
+      "description": "a folder for the bundle store file (built once per checkpoint and layout, reopened without the loads after); empty: the host's plugin cache where it gives one (context.cache: crit run gives every run one; one store a checkpoint there, keyed by the package's plugin code too, kept only on a local disk with twice its size free), else anonymous host memory, built at every load (the disk tier needs a file)"
     },
     "store_path": {
       "type": "str",

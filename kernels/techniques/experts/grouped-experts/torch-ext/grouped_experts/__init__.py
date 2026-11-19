@@ -4,8 +4,9 @@ engine's tuning or the default knobs.
 
 An expert is one bundle in crit's experts:bundles layout; a call names each bundle's components by byte offset (a
 layout: [format, bytes, gate_up, gate_up_scale, gate_up_inverse, down, down_scale, down_inverse, input, hidden,
-inter], and for int4_zp its group last: INT4 with a zero point a group, AWQ and GPTQ in crit's rows, FP16 scales in
-*_scale and the zero points in *_inverse), the store holding the bundles ([slots][bytes] uint8) and each expert's slot (slots [experts] int32: >= 0 a
+inter], for int4_zp its group after them (INT4 with a zero point a group, AWQ and GPTQ in crit's rows, FP16 scales in
+*_scale and the zero points in *_inverse), and for a block not gated by SiLU the group (0 for none) and then its
+activation (ACTIVATIONS), the store holding the bundles ([slots][bytes] uint8) and each expert's slot (slots [experts] int32: >= 0 a
 slot, negative skipped). The routes are grouped by expert on the device (no host synchronization), every expert's
 gate/up and down rows run on BF16 tensor cores with the weights decoded exactly, and each token's routes are summed in
 route order. A route's result is the same bits whatever rows, chunk or item size share its call, so decode rows and
@@ -24,10 +25,13 @@ import torch
 
 from ._ops import ops
 
-__all__ = ["ARITHMETICS", "FORMATS", "MAX_EXPERTS", "MAX_ITEMS", "SMALL_PLAN", "Workspace", "combine", "forward",
-           "quantize_e2m1x2", "route_outputs", "width_for"]
+__all__ = ["ACTIVATIONS", "ARITHMETICS", "FORMATS", "MAX_EXPERTS", "MAX_ITEMS", "SMALL_PLAN", "Workspace", "combine",
+           "forward", "quantize_e2m1x2", "route_outputs", "width_for"]
 
 FORMATS = {"bf16": 0, "fp8:channel": 1, "fp8:block": 2, "nvfp4": 3, "int4": 4, "mxfp4": 5, "int4_zp": 6}
+# A block's gated product, a layout's 13th integer (after the int4_zp group, 0 for none): silu(gate) * up, crit's
+# declared SwiGLU and the default, or gelu(gate) * up with GELU's tanh form (the tensor arithmetic only).
+ACTIVATIONS = {"silu": 0, "gelu_tanh": 1}
 SMALL_PLAN = 1024   # routes the one-block plan takes; larger calls group their routes from a stable sort
 MAX_ITEMS = 65535   # a call's items (the launches' second grid dimension)
 MAX_EXPERTS = 65535   # the experts a call may name, in either plan
@@ -115,6 +119,9 @@ def route_outputs(x, ids, store, slots, layout, ws, a4=False, arithmetic="tensor
     _plan(ids, slots, ws)
     items = (ws.item_slot, ws.item_routes, ws.item_count)
     if arithmetic == "declared":
+        if len(layout) == 13 and layout[12]:
+            raise ValueError("the declared arithmetic is SwiGLU's (its host twin computes no other gate): a block "
+                             "gated by GELU runs the tensor arithmetic")
         d = ws.declared(layout)
         ops.declared_inputs(x, ws.top, store, list(layout), *items, d["x"], d["xs"])
         ops.declared_rows(d["x"], d["xs"], store, list(layout), True, *items, d["gu"])

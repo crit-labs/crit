@@ -30,6 +30,9 @@ CANDIDATE_STATES = ("created", "build_failed", "packaged", "check_failed", "serv
 RUN_STEPS = ("resume", "recon", "finish_recon", "capture", "resolve", "plan", "candidate", "build", "serve_check",
              "seal", "eval", "eval_resume", "record_checks", "measure", "wait", "stop", "hand_off", "done")
 FROM_EVAL = "crit run check --from-eval"
+# A sealed candidate takes no attempt, so what the next plan wants measured on this engine is measured before its seal.
+SWEEP_FIRST = ("A sealed candidate takes no attempt: sweep the options the next plan needs measured on this engine "
+               "(ablate --candidate {cid} --set ...) before its seal")
 
 
 def _attempts(folder):
@@ -168,7 +171,7 @@ def _candidate_step(step, root, run, row):
                         "Its rung takes the full Eval, which certifies it", cid)
         return step("eval", f"eval --candidate {cid} --data EVAL_DATA --baseline FIRST_RESULT",
                     f"Its rung takes at most a {row['scope']} Eval; or seal it built to skip it "
-                    f"(seal --candidate {cid} --lifecycle built)", cid)
+                    f"(seal --candidate {cid} --lifecycle built). {SWEEP_FIRST.format(cid=cid)}", cid)
     folder = safe_path(root, f"candidates/{cid}")
     if not _checks(folder, FROM_EVAL):
         return step("record_checks", f"check --candidate {cid} --from-eval",
@@ -178,7 +181,7 @@ def _candidate_step(step, root, run, row):
     if missing:
         return step("measure", f"measure --candidate {cid}", f"Benchmark the run's cases ({', '.join(missing)})", cid)
     return step("seal", f"seal --candidate {cid} --lifecycle completed", "Its Eval, checks and benchmarks are "
-                "recorded: seal it completed", cid)
+                f"recorded: seal it completed. {SWEEP_FIRST.format(cid=cid)}", cid)
 
 
 def _plan_step(step, root, run, bounds):

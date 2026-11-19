@@ -146,9 +146,12 @@ def _asked_rows(evidence):
 def with_exactness(configuration, mode):
     """A plugin package's configuration with the exactness of its rows stated in full, {"decode": level, "prompt":
     level} (crit_kernels.exactness): the levels the configuration asks, and for a phase it leaves out the level of
-    the run's quality mode (preserve: exact; speed: repeatable, the fastest way of every plugin). So every candidate
+    the run's quality mode (exact in both: a prompt row has the bits of the same token decoded). So every candidate
     says the level it was built and measured at, and Core holds the engine to it wherever it is served
-    (docs/PLUGINS.md#exactness). An external engine's configuration, which Core does not load, is left as it is."""
+    (docs/PLUGINS.md#exactness). It also states the run's quality mode, whatever it named itself (a run's mode is
+    never changed): the plugins' precision options left to choose follow it (docs/PLUGINS.md#precision: in speed
+    quantized-projections holds the output head in FP8). An external engine's configuration, which Core does not
+    load, is left as it is."""
     from .external import spec_of
     if not isinstance(configuration, dict) or spec_of(configuration) is not None:
         return configuration
@@ -158,9 +161,22 @@ def with_exactness(configuration, mode):
         raise ValueError('configuration.exactness is a level (declared, exact, row-exact, repeatable) or '
                          '{"decode": level, "prompt": level}')
     try:
-        return {**configuration, "exactness": setting(asked, mode)}
+        return {**configuration, "exactness": setting(asked, mode), "quality_mode": mode}
     except ValueError as exc:
         raise ValueError(f"configuration.exactness: {exc}") from None
+
+
+# What crit completes in a candidate's configuration: the recon's frozen block, the exactness of its rows in full and
+# the run's quality mode.
+COMPLETED = ("recon", "exactness", "quality_mode")
+
+
+def before_completion(supplied, configuration):
+    """Whether `supplied` (a configuration.json a candidate's source carries) is the candidate's `configuration` as
+    it was written, before crit completed it: equal in every key but COMPLETED."""
+    def written(value):
+        return {key: item for key, item in value.items() if key not in COMPLETED}
+    return isinstance(supplied, dict) and isinstance(configuration, dict) and written(supplied) == written(configuration)
 
 
 def configuration_text(configuration):
@@ -531,7 +547,10 @@ class RunStore:
             if "plan_id" not in proposal:
                 raise ValueError("Every candidate has a plan: record it with crit run ... plan --record plan.json after "
                                  "the parent's Eval (or seal) and before any code, and name its plan_id in the proposal")
-            plan = plans.check_link(root, run, proposal["plan_id"], proposal.get("parent_candidate_id"))
+            if "parent_candidate_id" not in proposal:   # the plan names the parent: a proposal need not repeat it
+                proposal = {**proposal,
+                            "parent_candidate_id": plans.load(root, run, proposal["plan_id"])["parent_candidate_id"]}
+            plan = plans.check_link(root, run, proposal["plan_id"], proposal["parent_candidate_id"])
             plans.check_fates(plan, proposal.get("lever_fates", {}))
             if len(list((root / "candidates").glob("candidate-*"))) >= MAX_CANDIDATES:
                 raise ValueError("Candidate limit exceeded")
@@ -707,7 +726,9 @@ class RunStore:
                 raise ValueError("Package configuration.json differs from the candidate configuration"
                                  + (f" in {', '.join(differs)}" if differs else "") + ": the package carries "
                                  "candidate.json's configuration, which crit completed with the recon's frozen block "
-                                 "and the exactness of its rows, or no configuration.json (crit then writes it)")
+                                 "and the exactness of its rows, or no configuration.json (crit then writes it). "
+                                 "Leave the file out of the package (crit run ... build --drop configuration.json "
+                                 "for a file the build made or changed), or write the candidate's into it")
             destination = safe_path(folder, "package")
             manifest_path = safe_path(folder, "package/manifest.json")
             with staging(root, "package") as staged:
@@ -938,6 +959,16 @@ class RunStore:
         root = self._recording(run_id)
         with lease(root):
             data = self.get(run_id)
+            # An attempt still reserved may still own an engine's processes, and the stop removes the plugin cache
+            # that engine has mapped: its actual outcome is settled first.
+            for reservation in self.attempts(root):
+                owner = (f"candidates/{reservation['candidate_id']}" if reservation["candidate_id"]
+                         else f"segments/{reservation['segment_id']}")
+                at = f"{owner}/attempts/{reservation['attempt_id']}"
+                if not safe_path(root, f"{at}/result.json").exists():
+                    raise ValueError(f"{at} is reserved and has no result: wait for it, or stop its process and "
+                                     f"record its actual outcome and cleanup (crit run ... settle --reservation "
+                                     f"{at}/reservation.json --record result.json) before the stop")
             headroom = headroom_record(headroom, reason)
             if reason == "satisfied" and not data["state"]["target_satisfied"]:
                 raise ValueError("Selection has not satisfied every fixed target/gate")
@@ -965,6 +996,9 @@ class RunStore:
             self._state(root, phase="stopped", stopping_reason=reason, critique=critique, opportunities=opportunities or [], cleanup=cleanup, message=message)
             self._event(root, "run_stopped", detail={"reason": reason, "cleanup": cleanup, "critique": critique, "opportunities": opportunities or [],
                                                         "headroom": headroom})
+            # What the run's engines kept to load sooner (served.run_cache: an expert store of tens of gigabytes)
+            # goes with the run's last segment; a resumed run's first load builds it again.
+            shutil.rmtree(root / ".plugin-cache", ignore_errors=True)
         return self.get(run_id)
 
     @store_operation
@@ -1023,10 +1057,21 @@ class RunStore:
                 "so each prompt row has the bits of the same token decoded and every plugin takes its exact path. Ask "
                 "a lower level for a phase (\"prompt\": \"row-exact\" or \"repeatable\") only with its drift measured "
                 "inside the budget" if mode == "preserve" else
-                "so every plugin takes its fastest way. Ask a higher level for a phase (\"prompt\": \"row-exact\" or "
-                "\"exact\") where the drift costs more than the speed gains") +
+                "so each prompt row has the bits of the same token decoded, which crit smoke judges without a "
+                "tolerance. A lower level for a phase (\"prompt\": \"row-exact\" or \"repeatable\") is a lever: take "
+                "it where an ablation measures its speed and serve --check still passes (an engine whose rows "
+                "multiply quantized activations fails causal or decode_matches_prefill below exact)") +
             ". crit writes the levels into the candidate's configuration, the engine's facts state what each plugin "
             "keeps, and Core refuses an engine that keeps less than it asks (docs/PLUGINS.md#exactness).",
+            "- Precision (configuration.quality_mode, which crit writes into every candidate): load the output head "
+            "with role head and write no head option of your own. quantized-projections' head option, left on "
+            "auto, " + (
+                "keeps it as stored in this mode; set it to fp8 only with the drift measured inside the budget"
+                if mode == "preserve" else
+                "holds it in FP8 in this mode (half the bytes every decode step reads)" + (
+                    "; set it to stored here, because an FP8 head re-encodes target weights and this run's weights "
+                    "policy is as_stored" if policy == "as_stored" else "")) +
+            ". Count the head in the memory plan at the bytes it is held in (docs/PLUGINS.md#precision).",
             f"- Context: every candidate serves {capacity:,} tokens of prompt plus output, {context}. Pass --context "
             f"{capacity} to the crit eval commands you run yourself.",
             "- Weights policy: " + ({"as_stored": "the target weights are used as stored; declare weights in every "

@@ -16,6 +16,9 @@ class PromptCopyDrafter:
     def __init__(self, options):
         self.options, self.indices = options, {}
         self.copies, self._threshold = None, options["override"]
+        # Whether this drafter, as configured, asks the model's draft head: copy drafts alone never do, so a model
+        # that loads a draft layer for it keeps that layer up for nothing (a model plugin reads this to refuse it).
+        self.uses_head = bool(self._threshold)
 
     def start(self, sequence, tokens):
         window = self.options["window"]

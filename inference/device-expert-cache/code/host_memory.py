@@ -3,8 +3,11 @@ memory (read-only where the device allows it), its device address, and tensors o
 bytes; a CUDA tensor over the device address, through __cuda_array_interface__, that torch's kernels read over the
 link). Host code over libc and the CUDA runtime through ctypes; no kernel.
 
-Registering a mapped file takes seconds where allocating and filling tens of GB of pinned memory took minutes on one
-machine. The device address of registered memory is cudaHostGetDevicePointer's: with unified addressing it is the host
+Registering memory whose pages are there takes a second for 16 GiB. A mapped file's pages are the OS's page cache: a
+registration faults them in one by one, and where the OS has dropped them (or never read them) they come off the
+disk a page at a time, 40 MB/s measured on a drive that reads 5 GB/s. So what is registered whole is anonymous
+memory, filled by reads of the caller's own (expert_store.BundleStore); map a file only for memory whose pages
+are read as they are used. The device address of registered memory is cudaHostGetDevicePointer's: with unified addressing it is the host
 address, but not on every system (under WSL it differs), so callers use device_address, never the host pointer, on the
 device. A copy-engine copy from registered memory (torch's copy_ from the CPU tensor, non_blocking) reads the host
 address."""
@@ -14,7 +17,7 @@ import os
 PROT_READ, PROT_WRITE = 0x1, 0x2
 MAP_SHARED, MAP_PRIVATE, MAP_FIXED, MAP_ANONYMOUS, MAP_NORESERVE = 0x01, 0x02, 0x10, 0x20, 0x4000
 FILLER_BYTES = 4 << 20   # the shared memory mapped over ranges a mapping leaves out, piece by piece
-MADV_RANDOM, MADV_WILLNEED, MADV_HUGEPAGE = 1, 3, 14
+MADV_HUGEPAGE = 14
 REGISTER_PORTABLE, REGISTER_MAPPED, REGISTER_READ_ONLY = 0x01, 0x02, 0x08
 CAPTURE_RELAXED = 2   # cudaStreamCaptureModeRelaxed
 ATTRIBUTE_READ_ONLY = 113   # cudaDevAttrHostRegisterReadOnlySupported
@@ -88,6 +91,22 @@ def map_anonymous(size):
     return mapping
 
 
+MLOCK_ONFAULT = 0x01
+
+
+def lock(mapping):
+    """Keeps a mapping's pages in host memory from the moment each is first written (mlock2 with MLOCK_ONFAULT):
+    memory that is filled over minutes and registered at the end is otherwise the first thing a host under
+    pressure moves to its swap, beside a page cache it could have dropped. Returns whether the OS took it (it
+    refuses a process without the right to lock that much: the pages then stay as they were)."""
+    try:
+        lock2 = _c().mlock2
+    except (AttributeError, HostMemoryUnavailable):
+        return False
+    lock2.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint)
+    return lock2(mapping.address, mapping.size, MLOCK_ONFAULT) == 0
+
+
 def whole_pages(ranges, size):
     """The whole pages inside byte ranges [first, end) of `size` bytes, as merged spans [(first, end)] in order."""
     page = os.sysconf("SC_PAGE_SIZE")
@@ -102,40 +121,11 @@ def whole_pages(ranges, size):
     return [tuple(span) for span in spans]
 
 
-def read_in(mapping, spans):
-    """A mapped file's pages outside `spans` (whole_pages: what leave_out took out of the mapping) read into the
-    OS's page cache, and none of the others. A mapping's faults read ahead, megabytes at a time, in blocks that
-    lie across the left-out ranges, and the OS will not drop part of such a block again; so the kept ranges are
-    asked for first (POSIX_FADV_WILLNEED, in pieces of the device's read-ahead size: a request for more is cut to
-    it) and the mapping's own read-ahead is turned off (MADV_RANDOM). The faults of a registration then find every
-    kept page there and read nothing beside it. Where the OS cannot be asked the faults read each page alone:
-    slower, the same bytes."""
-    if not spans or mapping.path is None or not hasattr(os, "posix_fadvise"):
-        return
-    mapping.advise(MADV_RANDOM)
-    fd = os.open(mapping.path, os.O_RDONLY)
-    try:
-        device = os.fstat(fd).st_dev
-        try:
-            with open(f"/sys/class/bdi/{os.major(device)}:{os.minor(device)}/read_ahead_kb") as found:
-                piece = int(found.read()) << 10
-        except (OSError, ValueError):
-            piece = 0
-        piece = max(piece, 128 << 10)
-        at = 0
-        for first, end in list(spans) + [(mapping.size, mapping.size)]:
-            for start in range(at, first, piece):
-                os.posix_fadvise(fd, start, min(piece, first - start), os.POSIX_FADV_WILLNEED)
-            at = end
-    finally:
-        os.close(fd)
-
-
 def leave_out(mapping, ranges):
     """Takes byte ranges [first, end) of a mapping out of host memory: the whole pages inside each are mapped anew,
     onto one small piece of shared memory (FILLER_BYTES, zero) again and again. The mapping stays one range of
     addresses, so it is registered once and read through one device address, and the ranges cost the filler alone:
-    a file's pages there are never read (read_in reads the others in) and anonymous pages there go back. What they
+    anonymous pages there go back, and a caller that fills the mapping from a file reads the others only. What they
     held is gone from the mapping, so the caller keeps it elsewhere (a device cache that holds those bundles for
     good). Before the mapping is registered: a registration holds the pages it found. Returns the bytes left
     out."""
@@ -156,7 +146,6 @@ def leave_out(mapping, ranges):
                                          f"vm.max_map_count bounds a process's mappings): {os.strerror(error)}")
     finally:
         os.close(fd)
-    read_in(mapping, spans)
     return sum(end - first for first, end in spans)
 
 

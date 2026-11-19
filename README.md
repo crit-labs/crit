@@ -6,7 +6,7 @@
   crit
 </h1>
 
----
+
 
 ### Agentic toolkit for building and optimizing high-performance inference engines tailored to your GPU and desired LLM.
 
@@ -18,14 +18,14 @@
   <a href="https://github.com/crit-labs/crit/blob/main/LICENSE"><img src="https://raw.githubusercontent.com/crit-labs/.github/main/brand/button-license.svg" alt="License" height="34" /></a>
 </p>
 
-[Summary](#summary) • [Quick start](#quick-start) • [What `crit` solves](#what-crit-solves) • [Case studies](#case-study) •
-[How `crit` works](#how-crit-works) • [API](#api) • [CLI](#cli) • [MCP](#mcp) • [crit-hub](#crit-hub) • [Limitations](#limitations) • [Documentation](#documentation)
 
 </div>
 
 ---
 
-<a id="summary"></a>
+<br>
+<br>
+<br>
 
 ## Summary
 
@@ -42,8 +42,6 @@
 
 ---
 
-<a id="quick-start"></a>
-
 ## Quick start
 
 Give one of these prompts to your coding agent and specify your target LLM or target engine:
@@ -56,8 +54,6 @@ Use github.com/crit-labs/crit to optimize my own inference engine in <engine_ref
 ```
 
 ---
-
-<a id="what-crit-solves"></a>
 
 ## What `crit` solves
 
@@ -78,8 +74,6 @@ Use github.com/crit-labs/crit to optimize my own inference engine in <engine_ref
 > how close your engine gets, with quality and correctness checks along the way.
 
 ---
-
-<a id="case-study"></a>
 
 ## Case Studies
 
@@ -299,8 +293,6 @@ in its transcript ended with a job it had started, so its 3h 44m is the whole ru
 
 ---
 
-<a id="how-crit-works"></a>
-
 ## How `crit` works
 
 An agent builds the engine as a series of candidates. Each candidate is a complete,
@@ -329,8 +321,6 @@ flowchart LR
 > transcripts ([run records](https://github.com/crit-labs/crit/blob/main/docs/RUN_RECORDS.md)).
 
 ---
-
-<a id="core"></a>
 
 <details>
 <summary><strong>📗 Core</strong> → <a href="core/README.md">Full guide</a></summary>
@@ -362,8 +352,6 @@ Try the [plugin engine walkthrough](https://github.com/crit-labs/crit/blob/main/
 </details>
 
 ---
-
-<a id="inference"></a>
 
 <details>
 <summary><strong>📕 Inference</strong> → <a href="inference/README.md">Full guide</a></summary>
@@ -410,8 +398,6 @@ All entries are in the [full guide](https://github.com/crit-labs/crit/blob/main/
 
 ---
 
-<a id="kernels"></a>
-
 <details>
 <summary><strong>📘 Kernels</strong> → <a href="kernels/README.md">Full guide</a></summary>
 
@@ -423,8 +409,6 @@ crit's kernels cover the operations that decide an engine's speed: projections, 
 and norms. Each one is a template built from a shared kernel core; `crit kernels sweep` tunes its knobs on the
 model's own shapes, checks every configuration against an FP64 reference and times it against the best library.
 Nothing is downloaded or shipped prebuilt. Wherever one of these kernels covers an operation, your agent uses it.
-
-<a id="kernels-list"></a>
 
 | Family | Kernels |
 | --- | --- |
@@ -442,8 +426,6 @@ Nothing is downloaded or shipped prebuilt. Wherever one of these kernels covers 
 | `bench.py` | The sweep's shapes, inputs, reference check and timing |
 | `torch-ext/`, `<id>_cuda/` | The kernel's Triton and CUDA source, built from [the kernel core](https://github.com/crit-labs/crit/blob/main/kernels/core/README.md) |
 | `tests/`, `README.md` | Tests against the FP64 reference; design, measured speed against the yardstick, what is left |
-
-<a id="kernels-libraries"></a>
 
 **If no crit kernel covers an operation, your agent takes it from one of these libraries:**
 
@@ -471,8 +453,6 @@ beyond one model and GPU is a welcome contribution as a crit kernel.
 </details>
 
 ---
-
-<a id="eval"></a>
 
 <details>
 <summary><strong>📚 Eval</strong> → <a href="https://github.com/crit-labs/crit-eval">Full guide</a></summary>
@@ -502,9 +482,6 @@ beyond one model and GPU is a welcome contribution as a crit kernel.
 
 ---
 
-<a id="api"></a>
-<a id="serving"></a>
-
 <details>
 <summary><strong>🔌 API</strong> → <a href="api/README.md">Overview</a> · <a href="docs/SERVING.md">Full guide</a></summary>
 
@@ -522,8 +499,6 @@ server, so the numbers you read are the numbers you get. Engines implement the
 
 ---
 
-<a id="cli"></a>
-
 <details>
 <summary><strong>📓 CLI</strong> → <a href="cli/README.md">Overview</a></summary>
 
@@ -539,8 +514,6 @@ through it, so each plan, candidate, Eval and seal is checked as it is recorded.
 </details>
 
 ---
-
-<a id="mcp"></a>
 
 <details>
 <summary><strong>🧩 MCP</strong> → <a href="mcp/README.md">Full guide</a></summary>
@@ -576,8 +549,6 @@ privacy.
 
 ---
 
-<a id="crit-hub"></a>
-
 <details>
 <summary><strong>🔭 crit-hub</strong> → <a href="https://github.com/crit-labs/crit-hub">Repository</a></summary>
 
@@ -598,8 +569,6 @@ card for a pull request ([Benchmark your machine](https://github.com/crit-labs/c
 
 ---
 
-<a id="limitations"></a>
-
 <details>
 <summary><strong>🚫 Limitations</strong></summary>
 
@@ -615,8 +584,6 @@ card for a pull request ([Benchmark your machine](https://github.com/crit-labs/c
 </details>
 
 ---
-
-<a id="documentation"></a>
 
 ## Documentation
 

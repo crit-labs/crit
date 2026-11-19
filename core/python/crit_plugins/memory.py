@@ -75,7 +75,8 @@ tier sized to every free byte costs no request its memory.
 
     memory.give("expert-offload", release=lambda n: freed_bytes, regrow=lambda room: taken_bytes, keep=margin)
     memory.need(nbytes)          # before the allocation, outside a capture
-    memory.settle()              # the device is quiet: each giver regrows into free memory, less what it keeps
+    memory.settle()              # the device is quiet: each giver regrows into free memory, less what it keeps;
+                                 # for SETTLE_S at most, and memory.owed says more is left for a later settle
     memory.relieve()             # between steps: another program took memory, the givers hand theirs back now
 
 The device is not the engine's alone: a desktop, a browser tab or a second engine takes memory while this one
@@ -100,6 +101,14 @@ storage of this device for the plugin whose code made the object holding it. rep
 an engine's telemetry: free, torch's allocator, each elastic range, each plugin, and what is neither (the CUDA
 context, other processes).
 
+A test may take a share of the device away (a ballast), so that an engine loads and serves as it would on a device
+that much smaller, or beside another program that holds it: an elastic range owned by "ballast", backed from the
+device and never given back, which every reading of free memory (this object's, the driver's, the card's) counts as
+taken, as it counts another program's memory. CRIT_VRAM_BALLAST makes one in each process when the process first
+asks for the device's object: "leave:SIZE" holds all but SIZE of what the device has free then, "take:SIZE" holds
+SIZE (SIZE in bytes, or with KiB, MiB or GiB). memory.ballast(take=None, leave=None) makes one in code, and its
+close() gives the bytes back.
+
 A captured graph's temporaries live in a memory pool of its own, which torch keeps for the graph's replays.
 pool(owner, name) makes one and lists it as owner/name, so the device's readings say which graph holds what; a
 driver captures inside capturing(pool). After record(), the device also notes which code made each allocation:
@@ -120,6 +129,8 @@ _OUT_OF_MEMORY = 2   # CUDA_ERROR_OUT_OF_MEMORY
 SCRATCH_BYTES = 16 << 30        # the address space of an engine's scratch: what one call may take
 POISON = "CRIT_SCRATCH_POISON"  # "1": every take of a scratch is filled with 0xFF bytes first (the plugin tests)
 RECORDED = 1 << 17   # allocation events torch keeps while a device records: several captures' worth
+BALLAST = "CRIT_VRAM_BALLAST"   # "leave:SIZE" or "take:SIZE": a test's share of the device taken away (ballast)
+_UNITS = {"": 1, "b": 1, "kib": 1 << 10, "mib": 1 << 20, "gib": 1 << 30}
 
 
 class _Location(ctypes.Structure):
@@ -255,6 +266,14 @@ class ElasticRange:
             i = j
         return len(new) * self.gran
 
+    def unbacked(self, spans):
+        """The bytes backing `spans` ([(first, end)] byte ranges) would map: the whole granules holding them that are
+        not backed yet, each counted once."""
+        granules = set()
+        for first, end in spans:
+            granules.update(range(max(0, int(first)) // self.gran, -(-min(self.size, int(end)) // self.gran)))
+        return len(granules - set(self.handles)) * self.gran
+
     def _map(self, first, end, host=False):
         """Back the granules holding [first, end) that are not backed, until the device (host: the host) is out of
         memory: the granules newly backed. Any other failure raises (a thread without the device's context, say),
@@ -352,7 +371,10 @@ class Paged:
         units = min(self.units, int(units))
         if units <= self.backed:
             return True
-        grow = sum((min(units, most) - min(self.backed, most)) * per for _, per, most in self.planes)
+        spans = [(first + self.backed * per, first + min(units, most) * per)
+                 for first, per, most in self.planes if per and self.backed < most]
+        # what backing them maps: whole granules a plane, so up to one more a plane than the units' own bytes
+        grow = self.range.unbacked(spans)
         if host:
             from .host import memory_bytes
             if (self.range.host_mapped + grow > self.host_bytes
@@ -362,9 +384,8 @@ class Paged:
             self.memory.need(grow)
             if self.memory.free() < grow:
                 return False
-        for first, per, most in self.planes:
-            if per and self.backed < most:
-                self.range.back(first + self.backed * per, first + min(units, most) * per, host=host)
+        for first, end in spans:
+            self.range.back(first, end, host=host)
         self.backed = units
         return True
 
@@ -468,6 +489,58 @@ class Scratch:
             buffer.close()
 
 
+_NVML = {}   # the management library and each device's handle, found once (None: not there)
+
+
+class _NvmlMemory(ctypes.Structure):   # nvmlMemory_v2_t
+    _fields_ = [("version", ctypes.c_uint), ("total", ctypes.c_uint64), ("reserved", ctypes.c_uint64),
+                ("free", ctypes.c_uint64), ("used", ctypes.c_uint64)]
+
+
+def card_free(index):
+    """The bytes CUDA device `index` has left with every program's memory and the driver's reserve taken off, as
+    the card's management library counts them (NVML, which nvidia-smi reads: through ctypes, the device found by
+    its UUID); None where it cannot be asked."""
+    if "lib" not in _NVML:
+        _NVML["lib"] = None
+        for name in ("libnvidia-ml.so.1", "nvml.dll"):
+            try:
+                lib = ctypes.CDLL(name)
+            except OSError:
+                continue
+            if lib.nvmlInit_v2() == 0:
+                _NVML["lib"] = lib
+            break
+    lib = _NVML["lib"]
+    if lib is None:
+        return None
+    if index not in _NVML:
+        handle = ctypes.c_void_p()
+        found = 1
+        try:
+            import torch
+            uuid = ("GPU-" + str(torch.cuda.get_device_properties(index).uuid)).encode()
+            found = lib.nvmlDeviceGetHandleByUUID(ctypes.c_char_p(uuid), ctypes.byref(handle))
+        except Exception:   # a torch without the property: the card of the same number
+            found = 1
+        if found != 0 and lib.nvmlDeviceGetHandleByIndex_v2(ctypes.c_uint(index), ctypes.byref(handle)) != 0:
+            handle = None
+        _NVML[index] = handle
+    handle = _NVML[index]
+    if handle is None:
+        return None
+    info = _NvmlMemory(version=ctypes.sizeof(_NvmlMemory) | (2 << 24))
+    try:
+        if lib.nvmlDeviceGetMemoryInfo_v2(handle, ctypes.byref(info)) == 0:
+            return int(info.free)
+    except AttributeError:           # an older library
+        pass
+    old = (ctypes.c_uint64 * 3)()    # total, free, used
+    if lib.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(old)) != 0:
+        return None
+    return int(old[1])
+
+
 class _Torch:
     """A CUDA device's readings through torch: what DeviceMemory reads and releases (a test gives its own)."""
 
@@ -484,8 +557,13 @@ class _Torch:
         return int(torch.cuda.get_device_properties(self.index).total_memory)
 
     def free(self):
+        """The bytes this process may still take: the driver's reading, and never more than the card has left. On
+        some drivers (Windows, and Linux under WSL) the driver's reading is this process's own budget and does not
+        fall when another program takes memory, so what the card has left is read from the card as well (NVML,
+        card_free) and the lesser is the answer; where the card cannot be read, the driver's reading alone."""
         import torch
-        return int(torch.cuda.mem_get_info(self.index)[0])
+        free, left = int(torch.cuda.mem_get_info(self.index)[0]), card_free(self.index)
+        return free if left is None else min(free, left)
 
     def torch(self):
         import torch
@@ -589,6 +667,12 @@ class _Unreadable:
 
 HOST_HEADROOM = 2 << 30   # host memory left available when a range backs units from it
 RELIEVE_S = 0.2        # relieve() reads the device at most this often
+# A settle grows the givers back for at most this long, SETTLE_SLICE bytes at a time: backing device memory costs
+# the driver time by the granule (half a millisecond each under WSL, a second for two gigabytes), a settle runs
+# inside a step's frames, and a step must end inside the server's cancel grace. What is left is owed: the next
+# settles go on, and Core's watch asks the engine for a step of its own while memory is owed.
+SETTLE_S = 0.05
+SETTLE_SLICE = 64 << 20
 HOLD_S = 5.0           # after another program's memory grew, the givers wait this long before they grow back
 OUTSIDE_SLACK = 32 << 20   # growth of what others hold below this is the process's own (a workspace, a context)
 
@@ -604,6 +688,7 @@ class DeviceMemory:
         self.givers = {}       # name -> (release, regrow, keep)
         self.held = None       # the last census: {"plugins": {plugin: bytes}, "graphs": bytes, "unattributed": bytes}
         self.serving = False   # the engine on this device serves (its load is over): settle() lets the givers grow
+        self.owed = False      # a settle ran out of time with free memory the givers may still take
         self.pools = {}        # a captured graph's memory pool (torch's id) -> "owner/name"
         self.recorded = None   # while recording: {pool: Counter{(bytes, the code that made it): allocations,
                                # "read": the last one's time}}
@@ -652,6 +737,35 @@ class DeviceMemory:
 
     def peak(self):
         return self.readings.peak()
+
+    # -- a ballast: a test's share of the device taken away ---------------------------------------------------------------
+    def ballast(self, take=None, leave=None):
+        """An elastic range owned by "ballast" holding `take` bytes, or all but `leave` of the bytes free now (whole
+        granules), which no giver is asked for and every free-memory reading counts as taken. Its close() gives them
+        back. Refused where the device has no elastic ranges or too little free."""
+        if (take is None) == (leave is None):
+            raise ValueError("a ballast takes `take` bytes or leaves `leave` bytes free")
+        if not self.elastic_ranges:
+            raise ValueError(f"a ballast is an elastic range, which {self.device} does not have")
+        free = self.free(release=True)
+        nbytes = int(take) if take is not None else free - int(leave)
+        if nbytes <= 0 or nbytes > free:
+            raise ValueError(f"a ballast of {nbytes / 2**30:.2f} GiB on a device with {free / 2**30:.2f} GiB free")
+        found = self.elastic("ballast", "test", nbytes, initial=nbytes)
+        if found.mapped < nbytes - found.gran:
+            found.close()
+            raise MemoryError(f"the device backed {found.mapped / 2**30:.2f} of the ballast's {nbytes / 2**30:.2f} GiB")
+        return found
+
+    def _ballast_from(self, spec):
+        """The ballast CRIT_VRAM_BALLAST asks for ("leave:SIZE" or "take:SIZE"), made once a process."""
+        kind, _, size = spec.strip().partition(":")
+        number = size.strip().lower()
+        unit = number.lstrip("0123456789.")
+        if kind not in ("leave", "take") or unit not in _UNITS or not number[:len(number) - len(unit)]:
+            raise ValueError(f"{BALLAST} is leave:SIZE or take:SIZE (SIZE in bytes, KiB, MiB or GiB), not {spec!r}")
+        nbytes = int(float(number[:len(number) - len(unit)]) * _UNITS[unit])
+        return self.ballast(**{kind: nbytes})
 
     # -- elastic ranges -----------------------------------------------------------------------------------------------
     @property
@@ -783,17 +897,27 @@ class DeviceMemory:
                 self._hold = now + HOLD_S
         return released
 
-    def settle(self):
-        """The device is quiet: each giver may regrow into the free memory less what it keeps free. Returns the
-        bytes taken; nothing while the engine still loads (serve() ends the load), and nothing for HOLD_S after
-        relieve() gave memory to another program."""
+    def settle(self, seconds=SETTLE_S):
+        """The device is quiet: each giver may regrow into the free memory less what it keeps free, SETTLE_SLICE
+        bytes at a time for `seconds` at most (None: until nothing is left to take). Returns the bytes taken;
+        nothing while the engine still loads (serve() ends the load), and nothing for HOLD_S after relieve() gave
+        memory to another program. `owed` says whether it ran out of time with memory a giver may still take: the
+        next settle goes on from there."""
         taken = 0
         if self.serving and self.clock() >= self._hold:
+            deadline = None if seconds is None else time.perf_counter() + float(seconds)
+            self.owed = False
             for _, regrow, keep in list(self.givers.values()):
-                free = self.readings.free()
-                room = 0 if free is None else free - _kept(keep)
-                if regrow is not None and room > 0:
-                    taken += int(regrow(room) or 0)
+                while regrow is not None and not self.owed:
+                    free = self.readings.free()
+                    room = 0 if free is None else free - _kept(keep)
+                    got = int(regrow(min(room, SETTLE_SLICE)) or 0) if room > 0 else 0
+                    if not got and room > SETTLE_SLICE:   # a giver whose unit is larger than a slice
+                        got = int(regrow(room) or 0)
+                    taken += got
+                    if not got:
+                        break
+                    self.owed = deadline is not None and time.perf_counter() >= deadline and room - got > 0
             if self.givers:
                 self._floor = max(_kept(keep) for _, _, keep in self.givers.values())
                 self._seen = self.readings.free()
@@ -805,16 +929,17 @@ class DeviceMemory:
         last saw (what the givers kept then, and the bytes free then; it calls nothing of a giver's). ask() makes
         the engine run a step of its own, where relieve() gives the memory back; it is called once per fall, not
         while the device stays short. also: another reason the engine must run a step of its own, a callable read
-        each time (a host handoff that failed: the engine's next step ends it). unwatch() ends the thread. One
-        watch a device."""
+        each time (a host handoff that failed: the engine's next step ends it). While a settle left memory owed
+        to the givers it asks too, every time it looks, so the givers grow back a settle a step although Core
+        launches the engine's rounds without it. unwatch() ends the thread. One watch a device."""
         self.unwatch()
         stop = threading.Event()
 
         def run():
             asked = None
             while not stop.wait(every):
-                if also is not None and also():
-                    ask()
+                if (also is not None and also()) or (self.owed and self.serving and self.clock() >= self._hold):
+                    ask()   # memory owed to the givers: the engine's own step settles some more
                 floor, seen = self._floor, self._seen
                 if not self.serving or not self.givers or floor is None or seen is None:
                     continue
@@ -844,11 +969,12 @@ class DeviceMemory:
 
     def serve(self):
         """The load is over (Core calls it once the warm requests ran): torch's unused blocks go back to the driver
-        and the givers take what is free, less what they keep. Returns the bytes they took."""
+        and the givers take what is free, less what they keep, all of it at once (no step waits on this settle).
+        Returns the bytes they took."""
         self.readings.release()
         self.serving = True
         self._hold, self._others = float("-inf"), self._other()
-        return self.settle()
+        return self.settle(None)
 
     # -- the census ---------------------------------------------------------------------------------------------------
     def holdings(self, plugins):
@@ -995,7 +1121,9 @@ def of(device="cuda"):
             if index is None:   # "cuda": the current device, without initializing CUDA for the question
                 index = torch.cuda.current_device() if torch.cuda.is_initialized() else 0
             if index not in _DEVICES:
-                _DEVICES[index] = DeviceMemory(f"cuda:{index}", _Torch(index))
+                made = _DEVICES[index] = DeviceMemory(f"cuda:{index}", _Torch(index))
+                if os.environ.get(BALLAST):   # a test's share of the device taken away, before anyone plans
+                    made.ballasted = made._ballast_from(os.environ[BALLAST])
             return _DEVICES[index]
     return _DEVICES.setdefault(name, DeviceMemory(name))
 

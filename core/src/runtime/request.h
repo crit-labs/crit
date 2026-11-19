@@ -95,10 +95,13 @@ inline std::uint32_t valid_vocabulary(const ModelInfo& info) {
 // Valid-vocabulary checks pass a message that names the valid vocabulary.
 void validate_tokens(std::span<const Token> tokens, std::uint32_t vocabulary,
                      const char* message = "token outside declared vocabulary");
+// The prefill pass a row holds before a step (ModelInfo's prefill_pass_tokens): its prompt tokens past the frontier,
+// and the steps in a row that consumed no prompt token.
+struct Pass { std::uint32_t tokens = 0, steps = 0; };
 // The contract of one row's progress.
 // This only validates: frontier changes, mixed work accounting and publication stay with the caller.
 void validate_progress(const Progress& p, const WorkBudget& budget, std::uint32_t frontier,
-                       const Request& request, const char* message);
+                       const Request& request, const ModelInfo& info, Pass pass, const char* message);
 inline bool has_sampling(const SamplingOptions& s) {
     return s.temperature || s.top_p || s.top_k || s.seed || s.min_p || s.repetition_penalty || s.frequency_penalty ||
            s.presence_penalty || !s.logit_bias.empty() || s.min_tokens;

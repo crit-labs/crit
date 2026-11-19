@@ -102,12 +102,14 @@ class KernelRoutes:
 
     SCRATCH_ROUTES = 1 << 16   # the routes a call's rows take from the scratch; a larger call has its own buffers
 
-    def __init__(self, kernel, layout, kernel_layout, format, hidden, inter, a4=None, scratch=None):
+    def __init__(self, kernel, layout, kernel_layout, format, hidden, inter, a4=None, scratch=None,
+                 activation="silu"):
         self.kernel, self.format = kernel, format
         # W4A4 at the bundles' input scales: the tier's nvfp4 bundles carry them; a4=False runs weight-only W4A16 rows
         # (tensor arithmetic only: the declared order is W4A4)
         self.a4 = format == "nvfp4" if a4 is None else bool(a4)
-        self.layout = kernel_layout(layout)
+        # activation: the blocks' gate (silu: SwiGLU; gelu_tanh in the tensor arithmetic only)
+        self.layout = kernel_layout(layout) if activation == "silu" else kernel_layout(layout, activation)
         self.hidden, self.inter = hidden, inter
         self.workspaces = {}
         self.scratch = scratch
@@ -331,7 +333,7 @@ class DeviceDispatch:
         keys = (flat[cpu] + int(layer) * self.stride).to(torch.int32).cpu()
         tokens = (cpu // ids.shape[1]).to(torch.int32).cpu()
         rows = self.tier.compute(keys, tokens, x.bfloat16().float().cpu())
-        y[cpu] = rows.to(y.device)
+        y[cpu] = rows.to(device=y.device, dtype=y.dtype)   # the device part's rows: FP32, or BF16 (GGUF)
 
     def calibrate(self, split, bundles, layers, tokens=1, misses=(1, 2, 3, 4), repeats=5, graph_layers=8):
         """The CPU/link split of a layer's misses at `tokens` tokens an expert, measured here through captured layers

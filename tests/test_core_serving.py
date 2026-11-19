@@ -174,6 +174,26 @@ class ResidentChatTests(unittest.TestCase):
                 adapter.generate(refused, threading.Event())
         self.assertEqual(len(engine.calls), generated)  # refused before generating, so the engine stays loaded
 
+    def test_a_request_takes_the_models_sampling_for_the_fields_it_leaves_out(self):
+        # The fixture's generation_config.json samples by default at temperature 0.6: the served default.
+        engine = Decoder(self.context, self.model)
+        engine.generate(request(), threading.Event())
+        self.assertEqual(engine.calls[-1][2], {"temperature": 0.6})
+        engine.generate(request(sampling={"seed": 7}), threading.Event())
+        self.assertEqual(engine.calls[-1][2], {"temperature": 0.6, "seed": 7})
+        engine.generate(request(sampling={"temperature": 0}), threading.Event())   # greedy: exactly what it sent
+        self.assertEqual(engine.calls[-1][2], {"temperature": 0})
+        # A run's frozen recon is the served default (only the fields this decoder applies reach it).
+        def context(sampling):
+            return types.SimpleNamespace(configuration={"recon": {"sampling": sampling}}, limits={"kv_tokens": 4096})
+        engine = Decoder(context({"do_sample": True, "temperature": 0.9, "top_p": 0.95}), self.model)
+        engine.generate(request(), threading.Event())
+        self.assertEqual(engine.calls[-1][2], {"temperature": 0.9})
+        # A model that does not sample by default is decoded greedily, whatever temperature its files name.
+        engine = Decoder(context({"temperature": 0.9}), self.model)
+        engine.generate(request(), threading.Event())
+        self.assertEqual(engine.calls[-1][2], {})
+
     def test_reply_stream_sampling_tools_and_telemetry(self):
         engine = Decoder(self.context, self.model)
         emitted = []

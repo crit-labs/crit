@@ -59,7 +59,7 @@ Eval reads the same `settings.toml` as the run.
 | `package` | `--candidate ID --source DIR --record recipe.json`; runnable files and manifest |
 | `check`, `benchmark` | `--candidate ID --record payload.json`; appends evidence. `check --candidate ID --from-eval [ATTEMPT]` instead records every case's arithmetic, functional and resources check from the candidate's retained Eval result (default its newest; [Check](#check)) |
 | `measure` | `--candidate ID [--seconds N] [--exploratory]`; after `check --from-eval`: reserves a benchmark attempt, serves the packaged candidate through `crit serve`, streams every resident case's chat request to it, settles it and records one benchmark per case ([measured benchmarks](#measured-benchmarks)). Refuses, before reserving, a candidate whose checks would leave its benchmarks exploratory; `--exploratory` measures it anyway |
-| `serve` | `--candidate ID [--host HOST] [--port 8000] [--seconds N] [--check [--data DATA]] [--no-smoke] [--no-plugin-tests]`; reserves a check attempt, serves the packaged, not yet sealed candidate through `crit serve` at `http://HOST:PORT/v1` until Ctrl+C or the reservation's deadline, for the checks a candidate passes before sealing, and settles the attempt (log `logs/serve-ATTEMPT.log`); with `--check` crit first runs the package's plugin tests (`crit plugins test`, cached; `--no-plugin-tests` leaves them out), then the standard serving checks itself (consecutive greedy requests, a system message, streaming, a stop string, a client cancelling, a tool call and its result, log-probabilities, a template switch, each where declared, and stopping the engine) and [crit smoke](../smoke/README.md) at the run's context and again with the engine reopened at a quarter of it (`--no-smoke` leaves it out), with `--data` crit-eval's gate pre-check, keeps their report as `logs/serve-check-ATTEMPT.json` and records a functional check per case: the one check before a candidate's Eval or seal; `crit serve` serves the candidate once it is sealed. An [external engine](#external-engines) is started from its launch command instead and has no plugin tests |
+| `serve` | `--candidate ID [--host HOST] [--port 8000] [--seconds N] [--check [--data DATA]] [--no-smoke] [--no-plugin-tests]`; reserves a check attempt, serves the packaged, not yet sealed candidate through `crit serve` at `http://HOST:PORT/v1` until Ctrl+C or the reservation's deadline, for the checks a candidate passes before sealing, and settles the attempt (log `logs/serve-ATTEMPT.log`); with `--check` crit first runs the package's plugin tests (`crit plugins test`, cached; `--no-plugin-tests` leaves them out), then the standard serving checks itself (consecutive greedy requests, a system message, streaming, a stop string, a client cancelling, a tool call and its result, log-probabilities, a template switch, each where declared, the prompt activations the candidate's plan declared against the ones the engine's facts say it serves, and stopping the engine) and [crit smoke](../smoke/README.md) at the run's context and again with the engine reopened at a quarter of it (`--no-smoke` leaves it out), with `--data` crit-eval's gate pre-check, keeps their report as `logs/serve-check-ATTEMPT.json` and records a functional check per case: the one check before a candidate's Eval or seal; `crit serve` serves the candidate once it is sealed. An [external engine](#external-engines) is started from its launch command instead and has no plugin tests |
 | `ablate` | `--candidate ID [--variant NAME ...] [--set ...] [--repetitions 3] [--no-smoke] [--smoke-test TEST ...] [--seconds N]`; reserves a check attempt, serves the packaged, not yet sealed candidate built from plugins through `crit serve`, builds it again in the same resident host with each variant of its plugins, benches the run's resident cases and runs crit smoke on each, and keeps the report as `logs/ablation-ATTEMPT.json` ([ablation](#ablation)); an [external engine](#external-engines) is served A/B on the options it declares only |
 | `kernels` | `--candidate ID [--nvcc PATH] [--seconds N]`; an [external engine](#external-engines) only: reserves a check attempt, starts it with crit-eval's CUPTI tracer in its environment, sends each resident case once to warm and once traced, and keeps the kernels per phase as `logs/kernels-ATTEMPT.json`; where tracing is not possible (not Linux, no CUDA toolkit with CUPTI, no kernel recorded) the report says why. A plugin package is traced in process with `crit eval kernels --package` |
 | `eval` | `--candidate ID --data EVAL_DATA_DIR [--only PART] [--baseline RESULT] [--label TEXT] [--seconds N] [--stage 1|2|3|full] [--certify] [--budget-minutes N] [--resume [ATTEMPT]]`; on the [candidate ladder](#the-candidate-ladder) measures as far as the candidate's rung allows and refuses candidate 1; reserves a benchmark attempt, serves the packaged candidate through `crit serve`, scores the data's quality texts on the run's model unless stored, runs Eval over the chat API with the run's quality terms and `kv_tokens`, settles it and retains the result as `candidates/ID/eval/ATTEMPT.json` beside its journal `ATTEMPT.journal.jsonl` ([Eval evidence](#eval-evidence)); for a candidate created from a plan it writes the plan's [outcome](#outcome), and it prints the priorities the result's fractions give. `--resume` goes on from an attempt that stopped (default the newest with a journal) in a new attempt |
@@ -130,6 +130,10 @@ decode rows and one for the prompt rows, taking the configuration's own where it
 `preserve` asks `exact` (decode rows `row-exact`, each prompt row the bits of the same token decoded), `speed` asks
 `repeatable` (every plugin's fastest way). The package carries the completed configuration, so the engine is held to
 the level it was measured at wherever it is served.
+
+It gives the precision the plugins start from as well ([precision](PLUGINS.md#precision)): crit writes the mode into
+every candidate's configuration as `quality_mode`, whatever the configuration named, and a plugin's precision option
+left on `auto` follows it. In `speed` quantized-projections holds the output head in FP8, in `preserve` as stored.
 
 Every run record, Eval result and crit-hub result states its mode, and one that states none, or another (the speed
 mode's former name `as_quantized` among them), is refused. Results compare only within one mode. The mode is a choice
@@ -221,7 +225,7 @@ Provider spend limits are the caller's responsibility.
 | Payload | Fields |
 | --- | --- |
 | Inputs | Nonempty `hardware_manifest`, `environment_manifest`; `case_manifests` mapping **every** fixed case ID to an ordered nonempty list of `{path, bytes, sha256}` under the run's `captured/`. In a run with an origin engine, crit adds `origin_checkpoint`: whether the model is the exact checkpoint the engine was measured on |
-| Proposal | `label`, `rationale`, `strategy`, `configuration` object, `store_decisions` object; `plan_id` (the [plan](#plan) it is built from); `lever_fates` (every lever of the plan `built`, `pruned` or `deferred`, with the reason unless built); optional `parent_candidate_id`, `origin_candidate_id` (earlier retained candidates); `weights` (`as_stored` or `transformed`, required when `weights_policy` is `as_stored`); `lineage` (`origin-engine`: the candidate is the origin engine's source as imported, in a run created with `--from-engine`). A run whose model is a folder needs `work/recon.json` (`recon`) before its first candidate; crit adds its `frozen` block as `configuration.recon` (a supplied `recon` must equal it) and `extensions.recon` with its path and SHA-256. crit also completes a plugin package's `configuration.exactness` to `{"decode": level, "prompt": level}`: the levels it states, and the [quality mode's](#quality-modes) for a phase it leaves out |
+| Proposal | `label`, `rationale`, `strategy`, `configuration` object, `store_decisions` object; `plan_id` (the [plan](#plan) it is built from); `lever_fates` (every lever of the plan `built`, `pruned` or `deferred`, with the reason unless built); optional `parent_candidate_id` (the plan's parent where the proposal leaves it out; another one is refused), `origin_candidate_id` (earlier retained candidates); `weights` (`as_stored` or `transformed`, required when `weights_policy` is `as_stored`); `lineage` (`origin-engine`: the candidate is the origin engine's source as imported, in a run created with `--from-engine`). A run whose model is a folder needs `work/recon.json` (`recon`) before its first candidate; crit adds its `frozen` block as `configuration.recon` (a supplied `recon` must equal it) and `extensions.recon` with its path and SHA-256. crit also completes a plugin package's `configuration.exactness` to `{"decode": level, "prompt": level}`: the levels it states, and the [quality mode's](#quality-modes) for a phase it leaves out; and it writes the run's mode as `configuration.quality_mode` |
 | Package recipe | `build: {toolchain: {...}, dependencies: [...], command: [...]}`, nothing else: Core's loader runs the package and says what it serves |
 
 In an `as_stored` run, a candidate declaring `transformed` weights (requantized,
@@ -245,7 +249,7 @@ quality gates).
 never recycled; labels don't determine paths or ordering.
 
 For `plan_id` crit checks that the plan exists, is not superseded, is not linked to another
-candidate (other than a sealed draft that never reached the ladder: [budget counts](#budget-counts)), has `"decision": "build"` and starts from the proposal's `parent_candidate_id`, and keeps
+candidate (other than a sealed draft that never reached the ladder: [budget counts](#budget-counts)), has `"decision": "build"` and starts from the proposal's `parent_candidate_id` where it names one, and keeps
 `plan_id` in `candidate.json`. `rationale` and `strategy` stay; they may summarize the plan.
 
 `lever_fates` maps lever ids of that plan to `{fate, detail}`: `fate` is `built`, `pruned` or
@@ -338,7 +342,7 @@ There is one set of plan rules. Every run follows it, whatever crit release crea
 | `supersedes` | Optional: the plan this one replaces ([revisions](#revisions)) |
 | `decision` | `build` or `stop` |
 | `needed` | `{"decode": {"needed": bool, "evidence": text}, "prefill": {...}}` |
-| `gaps` | `[{kpi, gap, answer, detail}]` with optional `evidence` (a file in the run) and `cause_terms`. `gap` is an Eval gap's `name`, or one of crit's own: `limit` (why the rest of a family's limit is out of reach, answer `cause`), `activation:FORMAT` (a prompt activation format rejected on a quality measurement) or `placement:cpu` (the CPU expert tier rejected). `answer` is `cause` (its physical cause) or `rejected` (measured and rejected) |
+| `gaps` | `[{kpi, gap, answer, detail}]` with optional `evidence` (a file in the run) and `cause_terms`. `gap` is an Eval gap's `name`, or one of crit's own: `limit` (why the rest of a family's limit is out of reach, answer `cause`), `activation:FORMAT` (a prompt activation format rejected on a quality measurement), `activation:served` (answer `cause`: what the parent served beside its plan's `prompt_activations`, none at `bf16`, and why) or `placement:cpu` (the CPU expert tier rejected). `answer` is `cause` (its physical cause) or `rejected` (measured and rejected) |
 | `strategy` | `{current: {name, ceiling, evidence}, alternative: {name, ceiling, evidence, limits?}, choice, reason}`; `ceiling` is text: a number, its unit and where it comes from; `choice` is `current` or `alternative`; `limits` below |
 | `levers` | `[{id, technique, description, changes, group, confidence, provider, yardstick?, kind?, serves?}]`. `changes` maps KPIs (`decode`, `prefill`, `ttft`, `context_decode`, `context_ttft`) to `{change, source}`: the projected relative change in the KPI's improving direction (0.12 = 12% better), its source `measured:PATH` (a file of the run that measured it, such as an ablation report of the lever as an option variant), `eval-gap:NAME` or `estimate`. `group` names levers that only pay together; `confidence` is `low`, `medium` or `high`. `provider` says what supplies a speed lever's code: `inference:ENTRY`, `hub:ORG/NAME`, `lib:NAME` ([Kernels' sources](../kernels/SOURCES.md)) or `own: ...`, which carries `yardstick` `{evidence, detail}`: the measured best existing provider for the operation, or the providers checked and why none fits. `kind` `requirement` marks work a rule requires that Eval does not score, with `serves` naming it (`gate:NAME` or `check:NAME` for the repair of a gate or check the parent failed); its `changes` may be empty |
 | `rejected` | `[{name, reason, bound_by?, evidence?}]`: alternatives considered and not planned; `bound_by` `{family, term}` names the round term that bound the measurement |
@@ -431,7 +435,9 @@ fails refuses the plan with what to fix:
     forecast, what each lever delivered and the lesson. The parent's largest p1 lever, pruned or deferred, is planned
     again or rejected on a measurement of another kernel structure or a vendor library at the same arithmetic.
 13. `speed` runs declare `prompt_activations`; no quantized format starts at `bf16` without a rejection of the stored
-    format (`activation:stored`); the parent served what its plan declared.
+    format (`activation:stored`); the parent served what its plan declared, or, serving no format at `bf16`, the
+    plan states what it served and why (`activation:served`, answer `cause`; a format with no kernel for its
+    stored activations, say).
 14. A `limit` gap rests on the parent's `round` account: its terms and idle time add up to the measured round within
     10%, `cause_terms` names the terms that bind it, and every other term of 10% of the round or more runs at least
     at half its floor's rate (idle time too).
@@ -443,7 +449,9 @@ fails refuses the plan with what to fix:
 18. `supersedes` names a plan of the same segment and parent, neither linked to a candidate nor superseded.
 
 A gate repair (a requirement lever that `serves` `gate:NAME` for a gate the parent's Eval failed, or `check:NAME`
-for a [check](#check) crit run requires that the parent failed) is built for the repair whatever it forecasts:
+for a [check](#check) crit run requires that the parent failed; `check:resources` also repairs a parent whose
+benchmark kept less free host or device memory than the run's headroom, which fails the resources gate by its own
+samples and cites the benchmark) is built for the repair whatever it forecasts:
 checks 5, 6, 7's improvement, 11 and the warnings below do not apply to it. The run's first plan skips the checks
 that need a parent's Eval and may import a baseline as is.
 
@@ -484,7 +492,7 @@ Required: `outcome`, `ended_at`, `exit_code`, `cleanup_settled` (boolean), `logs
 settled cleanup and an end within the reservation. Every attempt counts against the
 limit; the candidate's lifecycle follows its latest attempt, and earlier failures stay
 recorded. Reservations only record deadlines; the caller supervises processes and
-descendant cleanup. A published reservation must be settled before `seal` or `resume`.
+descendant cleanup. A published reservation must be settled before `seal`, `stop` or `resume`.
 
 Settlement, candidate projections and recovery apply the same result validation,
 including retained log hashes. `logs` must be a list, even when empty. A supplied

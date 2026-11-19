@@ -82,7 +82,10 @@ def ablate(store, run_id, candidate_id, seconds=None, names=None, repetitions=RE
     noise = ablation.NOISE if noise is None else noise
     root = store.directory(run_id)
     run = load_run(root)
-    folder = unsealed(root, candidate_id, "The candidate is sealed: ablate its plugins before sealing it")
+    folder = unsealed(root, candidate_id, "The candidate is sealed and takes no attempt: ablate a candidate before "
+                      "its seal (crit run ... next says so at the step before it). To sweep this engine's options "
+                      "now, create the next candidate from its plan with this one's source and ablate that one "
+                      "before its Eval")
     packaged(folder, "ablating", "crit run ablate serves")
     from .external import candidate_spec
     spec = candidate_spec(folder)

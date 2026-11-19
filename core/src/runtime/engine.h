@@ -30,6 +30,7 @@ struct Engine::Impl : std::enable_shared_from_this<Engine::Impl> {
         std::unique_ptr<Session> session;
         std::uint32_t frontier = 0;
         std::uint32_t prefill_wait_steps = 0;
+        detail::Pass pass;   // the prefill pass the model holds for it (ModelInfo's prefill_pass_tokens)
         bool prefilled = false, terminal = false;
         Finish finish = Finish::length;
     };

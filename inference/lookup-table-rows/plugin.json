@@ -2,7 +2,7 @@
   "schema": "crit-plugin-v1",
   "id": "lookup-table-rows",
   "title": "Lookup-table rows from a file or host memory, gathered for the device",
-  "description": "Host form: lookup-table-rows' RowTable: the table stays on disk as FP32 rows, opened for random access (no read-ahead), the rows a step asks for read with positioned reads in parallel (workers), a hot-row LRU of cache_rows in host memory; within FP32 rounding of the in-memory table. Device form (embeddings:host, rounds:embeddings, prompts:embeddings: a padded prompt bucket's lookup captures like a round's, the padding reading row 0; a captured lookup keeps its buffer set out of the eager ring; a table the Python reader serves is refused through round_problems()): store(rows) keeps a table on the device; open(source, width, dtype, device) keeps it in host memory (a tensor's rows copied once into registered memory, or a file mapped and registered with mapped=True) gathered over the link by torch's index_select, or in files (one or many, rows in id order) read by the native row reader: a persistent pool of `readers` positioned reads, POSIX_FADV_RANDOM, a hot-row cache of prefetch_rows rows that prefetch(ids) fills in the background; lookup(ids) puts the gather on the stream as a host function between a copy of the ids to pinned memory and a copy of the rows to the device, so it captures in a CUDA graph. Rows are bytes as stored: exact.",
+  "description": "Host form: lookup-table-rows' RowTable: the table stays on disk as FP32 rows, opened for random access (no read-ahead), the rows a step asks for read with positioned reads in parallel (workers), a hot-row LRU of cache_rows in host memory; within FP32 rounding of the in-memory table. Device form (embeddings:host, rounds:embeddings, prompts:embeddings: a padded prompt bucket's lookup captures like a round's, the padding reading row 0; a captured lookup keeps its buffer set out of the eager ring; a table the Python reader serves is refused through round_problems()): store(rows) keeps a table on the device; open(source, width, dtype, device) keeps it in host memory (a tensor's rows copied once into registered memory, or a file mapped and registered with mapped=True) gathered over the link by torch's index_select, or in files (one or many, rows in id order) read by the native row reader: a persistent pool of `readers` positioned reads, POSIX_FADV_RANDOM, a hot-row cache of prefetch_rows rows that prefetch(ids) fills in the background; lookup(ids) puts the gather on the stream as a host function between a copy of the ids to pinned memory and a copy of the rows to the device, so it captures in a CUDA graph. Rows are bytes as stored: exact. A table may be stored NVFP4, or in a GGUF block format (gguf:<TYPE>, embeddings:gguf): its rows are gathered as stored and decoded on the device by crit's kernel gguf-rows' dequantize (Core's host decoders where it does not build).",
   "fills": [
     "embeddings"
   ],
@@ -62,6 +62,13 @@
   "provides": [
     "embeddings:host",
     "rounds:embeddings",
-    "prompts:embeddings"
+    "prompts:embeddings",
+    "embeddings:gguf"
+  ],
+  "kernels": [
+    {
+      "name": "gguf-rows",
+      "fallback": "a GGUF table's rows decoded on the host by Core's decoders (crit_core.model.gguf_blocks), which a captured round cannot run"
+    }
   ]
 }

@@ -292,7 +292,8 @@ class ReconTests(unittest.TestCase):
                                "budget_minutes": 1, "kv_tokens": 8192})["run"]["run_id"]
         self.store, self.run_id, self.directory = store, run_id, store.directory(run_id)
         self.assertEqual(self.candidate({"batch": 1})["configuration"],
-                         {"batch": 1, "plugins": selection(), "exactness": {"decode": "repeatable", "prompt": "repeatable"}})
+                         {"batch": 1, "plugins": selection(), "exactness": {"decode": "row-exact", "prompt": "exact"},
+                          "quality_mode": "speed"})
 
 
 if __name__ == "__main__":

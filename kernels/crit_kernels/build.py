@@ -471,7 +471,8 @@ def warn_foreign_tuning(kernel_id, reason, kept=False):
 
 
 def cache_root():
-    return Path(os.environ.get("CRIT_KERNEL_CACHE") or Path.home() / ".cache" / "crit" / "kernels")
+    from crit_core import cache_home
+    return Path(os.environ.get("CRIT_KERNEL_CACHE") or cache_home("kernels"))
 
 
 def _generator_digest():

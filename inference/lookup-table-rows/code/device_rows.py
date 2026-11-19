@@ -17,7 +17,11 @@ store() and open() return a Table, a handle with lookup, prefetch, drain, stats 
 tables through one plugin (token rows and per-layer n-gram rows); the plugin's own lookup and prefetch read the last
 table stored or opened. A table's rows are of one dtype, or stored NVFP4 (format "nvfp4": E2M1 codes, element 2k in
 the low nibble of byte k, from `source`, one E4M3 scale per 16 values from `scales`, times `scale`, the table's global
-scale as a multiplier) decoded on the device by torch into rows of `dtype`.
+scale as a multiplier) or FP8 (format "fp8": E4M3 codes, one byte a value, times `scale`, the table's one
+multiplier), decoded on the device by torch into rows of `dtype`, or stored in a GGUF block format (format
+"gguf:<TYPE>", Core's crit_core.model.gguf_blocks.TYPES: a row its blocks as the file stores them) decoded on the
+device by crit's kernel gguf-rows (its dequantize: the format's own values, one rounding to `dtype`), or where that
+kernel does not build by Core's host decoders, which a captured round cannot run (round_problems says so).
 
 A lookup's rows stay valid until `ring` later lookups of the same size: each size has `ring` sets of pinned and device
 buffers, allocated at its first lookup (outside a capture), used in turn.
@@ -143,7 +147,17 @@ class _PythonReader:
 
 
 E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
-FORMATS = (None, "nvfp4")
+FORMATS = (None, "nvfp4", "fp8")   # and "gguf:<TYPE>" (gguf_type)
+
+
+def gguf_type(format):
+    """The GGUF type id of format "gguf:<TYPE>", None for another format; ValueError for a type Core cannot decode."""
+    if not isinstance(format, str) or not format.startswith("gguf:"):
+        return None
+    from crit_core.model.gguf_blocks import TYPES
+    if format[5:] not in TYPES:
+        raise ValueError(f"a GGUF table's type is one of {', '.join(TYPES)}, not {format[5:]!r}")
+    return TYPES[format[5:]]
 
 
 class _Part:
@@ -296,11 +310,13 @@ class Table:
     """One table's rows for a device step: lookup(ids) -> [tokens][width] of dtype on the device, prefetch(ids),
     drain(), stats(), close()."""
 
-    def __init__(self, parts, width, dtype, device, format=None, scale=1.0):
+    def __init__(self, parts, width, dtype, device, format=None, scale=1.0, kernel=None):
         self.parts, self.width, self.dtype, self.device = parts, int(width), dtype, device
         self.format, self.scale = format, float(scale)
         self.rows_count = min(p.rows_count for p in parts)
         self._lut = None
+        self.gguf = gguf_type(format)
+        self.kernel = kernel if self.gguf is not None and getattr(device, "type", "cpu") == "cuda" else None
         if format == "nvfp4":   # made now: a captured lookup does no first-call work
             import torch
             self._lut = torch.tensor(E2M1, dtype=torch.float32, device=device)
@@ -337,8 +353,25 @@ class Table:
             raise IndexError("a row outside the table")
         if self.format is None:
             return self.parts[0].gather(ids, capturing).view(self.dtype).view(-1, self.width)
+        if self.gguf is not None:
+            return self._gguf(self.parts[0].gather(ids, capturing))
+        if self.format == "fp8":
+            return self._fp8(self.parts[0].gather(ids, capturing))
         codes, scales = (p.gather(ids, capturing) for p in self.parts)
         return self._nvfp4(codes, scales)
+
+    def _gguf(self, raw):
+        """Stored rows [n][row bytes] as their values [n][width] of dtype: gguf-rows' dequantize on the device (the
+        format's FP32 values, one rounding), else Core's host decoders."""
+        import torch
+        raw = raw.reshape(-1, self.parts[0].row_bytes)
+        if not raw.shape[0]:
+            return torch.empty(0, self.width, dtype=self.dtype, device=raw.device)
+        if self.kernel is not None:
+            return self.kernel.dequantize(self.kernel.GgufMatrix(raw.contiguous(), self.gguf, self.width), self.dtype)
+        from crit_core.model.gguf_blocks import stored_values
+        values = stored_values(raw.cpu().numpy(), self.gguf, self.width)
+        return torch.from_numpy(values).to(device=raw.device, dtype=self.dtype)
 
     def _nvfp4(self, codes, scales):
         """E2M1 codes [n][width / 2] (element 2k the low nibble of byte k) times their E4M3 scale [n][width / 16] times
@@ -351,6 +384,15 @@ class Table:
         values = self._lut[nibbles].view(n, self.width // 16, 16)
         factors = scales.view(torch.float8_e4m3fn).float().view(n, self.width // 16, 1)
         out = (values * factors).view(n, self.width)
+        if self.scale != 1.0:
+            out = out * self.scale
+        return out.to(self.dtype)
+
+    def _fp8(self, codes):
+        """E4M3 codes [n][width] times the table's scale, in FP32 (an E4M3 value times an FP32 scale rounds once),
+        then rounded to dtype."""
+        import torch
+        out = codes.view(torch.uint8).view(-1, self.width).view(torch.float8_e4m3fn).float()
         if self.scale != 1.0:
             out = out * self.scale
         return out.to(self.dtype)
@@ -375,6 +417,9 @@ class Table:
         if any(p.mode == "file" and not p.native for p in self.parts):
             return ["the table is read by Python threads (the native row reader did not build, or native is off), "
                     "which a CUDA graph cannot run"]
+        if self.gguf is not None and self.kernel is None:
+            return [f"the table's {self.format[5:]} rows are decoded on the host (crit's kernel gguf-rows is not "
+                    "built here), which a CUDA graph cannot run"]
         return []
 
     def stats(self):
@@ -390,9 +435,10 @@ class Table:
 
 
 class HostRows:
-    def __init__(self, readers=64, cache_rows=262144, ring=4, memory=None, native=True):
+    def __init__(self, readers=64, cache_rows=262144, ring=4, memory=None, native=True, gguf_kernel=None):
         self.readers, self.cache_rows, self.ring = int(readers), int(cache_rows), int(ring)
         self.memory, self.use_native = memory, native
+        self.gguf_kernel = gguf_kernel   # () -> gguf-rows' package or None: loaded at the first GGUF table
         self.tables, self.last = [], None
 
     def _need_memory(self):
@@ -403,16 +449,25 @@ class HostRows:
     @staticmethod
     def _sizes(width, dtype, format):
         import torch
+        type_id = gguf_type(format)
+        if type_id is not None:
+            from crit_core.model.gguf_blocks import row_bytes
+            return [row_bytes(type_id, width)]
         if format not in FORMATS:
-            raise ValueError(f"a table's format is one of {FORMATS}, not {format!r}")
+            raise ValueError(f"a table's format is one of {FORMATS} or gguf:<TYPE>, not {format!r}")
         if format == "nvfp4":
             if width % 16:
                 raise ValueError("NVFP4 rows hold a multiple of 16 values")
             return [width // 2, width // 16]
+        if format == "fp8":
+            return [width]
         return [width * torch.empty(0, dtype=dtype).element_size()]
 
     def _table(self, parts, width, dtype, device, format, scale):
-        table = Table(parts, width, dtype, device, format, scale)
+        kernel = None
+        if gguf_type(format) is not None and self.gguf_kernel is not None:
+            kernel = self.gguf_kernel()
+        table = Table(parts, width, dtype, device, format, scale, kernel)
         self.tables.append(table)
         self.last = table
         return table
@@ -420,8 +475,10 @@ class HostRows:
     def store(self, rows, format=None, scales=None, scale=1.0, dtype=None, device=None):
         """A table on the device: rows [ids][width] (of its dtype), or format "nvfp4": rows the codes [ids][width / 2]
         uint8, scales the E4M3 scales [ids][width / 16] (uint8 or float8), dtype the rows' decoded dtype (BF16 by
-        default), scale the global scale (a multiplier). device: the device it serves, by default the one rows are on.
-        Returns the Table."""
+        default), scale the global scale (a multiplier); format "fp8": rows the E4M3 codes [ids][width] (uint8 or
+        float8_e4m3fn), scale the table's multiplier, dtype the decoded rows' (BF16 by default); or format
+        "gguf:<TYPE>": rows the stored blocks uint8 [ids][row bytes]. device: the device it serves, by default the one
+        rows are on. Returns the Table."""
         import torch
         if rows.dim() != 2 or rows.shape[0] < 1:
             raise ValueError("a table of rows of one width")
@@ -430,10 +487,18 @@ class HostRows:
             scales = scales.to(device) if scales is not None else None
         if format is None:
             width, dtype, sources = rows.shape[1], rows.dtype, [rows]
+        elif gguf_type(format) is not None:
+            from crit_core.model.gguf_blocks import BLOCKS
+            values, size = BLOCKS[gguf_type(format)]
+            if rows.dtype != torch.uint8 or rows.shape[1] % size:
+                raise ValueError(f"{format} rows are uint8, whole {size}-byte blocks")
+            width, dtype, sources = rows.shape[1] // size * values, dtype or torch.bfloat16, [rows]
+        elif format == "fp8":
+            width, dtype, sources = rows.shape[1], dtype or torch.bfloat16, [rows.view(torch.uint8)]
         else:
             width, dtype, sources = rows.shape[1] * 2, dtype or torch.bfloat16, [rows, scales]
         sizes = self._sizes(width, dtype, format)
-        if format is not None and (scales is None or scales.shape[0] != rows.shape[0]
+        if format == "nvfp4" and (scales is None or scales.shape[0] != rows.shape[0]
                                    or scales.numel() != rows.shape[0] * sizes[1]):
             raise ValueError("NVFP4 rows need their scales, one per 16 values of each row")
         parts = []
@@ -448,13 +513,15 @@ class HostRows:
         the next rows in id order) or {"paths": [...], "offsets": [...], "rows": [...]}; width values of dtype a row.
         mapped: a file source mapped read-only and registered whole (it must fit in host memory) instead of read.
         format "nvfp4": source holds the code rows (width / 2 bytes each), scales the E4M3 scale rows (width / 16 bytes)
-        in the same kinds of source, scale the global scale (a multiplier); rows decode to dtype. Returns the Table."""
+        in the same kinds of source, scale the global scale (a multiplier); format "fp8": source holds E4M3 code rows
+        (width bytes each), scale the table's multiplier; format "gguf:<TYPE>": source holds the stored rows (whole
+        blocks of the type for width values); rows decode to dtype. Returns the Table."""
         import torch
         device = torch.device(device)
         sizes = self._sizes(width, dtype, format)
-        if format is not None and scales is None:
+        if format == "nvfp4" and scales is None:
             raise ValueError("NVFP4 rows need their scales")
-        sources = [source] if format is None else [source, scales]
+        sources = [source, scales] if format == "nvfp4" else [source]
         parts = []
         try:
             for item, size in zip(sources, sizes):

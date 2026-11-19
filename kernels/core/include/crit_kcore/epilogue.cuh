@@ -36,6 +36,15 @@ __device__ __forceinline__ float swiglu_declared(float gate, float up) {
     return __fmul_rn(__fdiv_rn(gate, __fadd_rn(1.0f, exp_declared(-gate))), up);
 }
 
+// gelu(gate) * up with GELU's tanh form, 0.5 x (1 + tanh(sqrt(2 / pi) (x + 0.044715 x^3))): the CUDA math library's
+// tanhf (within its ulp bound: one function of its argument on a device, not declared bits), every other operation
+// rounded, so a row's bits are its own whatever shares its launch.
+__device__ __forceinline__ float gelu_tanh_mul(float gate, float up) {
+    const float cube = __fmul_rn(__fmul_rn(gate, gate), gate);
+    const float inner = __fmul_rn(0.79788456f, __fmaf_rn(0.044715f, cube, gate));
+    return __fmul_rn(__fmul_rn(__fmul_rn(0.5f, gate), __fadd_rn(1.0f, tanhf(inner))), up);
+}
+
 // ------------------------------------------------------------------------------------------- activations
 // The CUDA math library's functions (expf: within its ulp bound, not declared bits).
 

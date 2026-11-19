@@ -49,6 +49,21 @@ step must consume prompt tokens or produce output. Core also checks row
 membership and mixed token-work accounting, and validates every row of a group
 before staging any output.
 
+**Prefill passes.** A cancel settles between steps, so a step must stay short,
+and some work on a prompt pays off only over a long span of it: a model whose
+layers' weights do not all fit on the device brings each layer's to the device
+once for the whole span when it runs the span one layer after another, where
+chunk after chunk it would bring every layer's again for each chunk. Such a
+model declares `ModelInfo::prefill_pass_tokens`, the most prompt tokens a
+request holds in a pass, and `prefill_pass_steps`, the most steps in a row its
+prefill takes without consuming a prompt token. A step of a pass reports the
+span in `Progress::pass_tokens` and consumes nothing; the step that ends the
+pass reports the span's tokens as consumed, past that step's own grant by the
+pass the row held. Core schedules, cancels and retires such a request as any
+other between its steps, and a row that passes more steps than declared, or
+consumes nothing without reporting a pass, breaks the progress contract. What
+a pass is made of (layers, weights, where they live) is the model's alone.
+
 ## Request release
 
 When `Handle::wait()` or `wait_output()` returns (with a result, a cancellation
@@ -237,7 +252,7 @@ library exports ([step_library.cpp](step_library.cpp)) and `crit_core.native` re
 engine with the model plugin's step callbacks (`crit_engine_open_steps`, `crit_engine_open_steps_rounds`), reports
 `ModelInfo` merged with the model's facts (`crit_engine_info`), runs requests and scores, and closes it. Errors return
 -1 with the message from `crit_engine_last_error()`; nothing throws across the boundary. `crit_core.native` refuses a
-library of another ABI version (7): rebuild it against this crit's headers.
+library of another ABI version (8): rebuild it against this crit's headers.
 
 A request is opened with `crit_engine_request_open(engine, prompt, count, output_tokens, options)` and waited on
 with `crit_engine_request_wait` (tokens to a callback that can cancel) or `crit_engine_request_wait_output`; it has
@@ -277,9 +292,9 @@ Core's loader is what constructs one, over an assembly whose model plugin it che
 
 | Model method | Called with | Returns |
 | --- | --- | --- |
-| `info()` | | Facts plus Core's settings: `vocabulary` and `context` (required), `max_concurrency` (2 or more), `max_pending`, `max_batch_tokens` (mixed batches; 0 separates prefill and decode steps), `prefill_chunk`, `prefill_work_quantum` (prompt work granted in its multiples: the prefill chunk keeps a prompt's chunk boundaries whatever shares its steps, which a model whose chunked kernels give other bits at other boundaries declares), `batch_policy`, `max_row_tokens` (most tokens a row reports), `sampling`, `token_logprobs`, `max_top_logprobs`, `scoring`, `score_paths` |
+| `info()` | | Facts plus Core's settings: `vocabulary` and `context` (required), `max_concurrency` (2 or more), `max_pending`, `max_batch_tokens` (mixed batches; 0 separates prefill and decode steps), `prefill_chunk`, `prefill_work_quantum` (prompt work granted in its multiples: the prefill chunk keeps a prompt's chunk boundaries whatever shares its steps, which a model whose chunked kernels give other bits at other boundaries declares), `prefill_pass_tokens` and `prefill_pass_steps` ([prefill passes](#model-progress): the most prompt tokens a request holds in a pass, and the most steps in a row its prefill takes without consuming a prompt token), `batch_policy`, `max_row_tokens` (most tokens a row reports), `sampling`, `token_logprobs`, `max_top_logprobs`, `scoring`, `score_paths` |
 | `open(request)` | `StepRequest`: key, prompt, output limit, set sampling fields, effective stop tokens, `logprobs`, `replay`, `plain` | A session object |
-| `step(rows)` | One `StepRow` per scheduled request: session, prefill grant, output allowance, token work, prefill complete, and a constrained request's `allowed` | One `StepResult` per row: prompt tokens consumed, tokens produced, prefill complete, reused prefix, token work, log-probability rows, and for a decode row the drafts its round verified (`drafted`) |
+| `step(rows)` | One `StepRow` per scheduled request: session, prefill grant, output allowance, token work, prefill complete, and a constrained request's `allowed` | One `StepResult` per row: prompt tokens consumed, tokens produced, prefill complete, reused prefix, token work, log-probability rows, for a decode row the drafts its round verified (`drafted`), and the prompt tokens the row holds in a prefill pass after the step (`pass_tokens`) |
 | `commit(decisions)` | Core's `StepDecision` per row of the last step (tokens kept, terminal, cancelled) | |
 | `retire(session, finish)` | `length`, `stop`, `cancelled` or `failed` | |
 | `request_facts(session)` | Optional, as the session retires | A dict of the request's facts (`verify_ms`, `draft_ms`, the expert reads and hits of rounds it ran in `step()`, ...) |

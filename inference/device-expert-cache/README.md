@@ -39,11 +39,26 @@ cache.telemetry()                                      # slots, resident, lent, 
   the layer into ring slots by the copy engine on a side stream, consecutive keys in one copy, and stages the next
   layer of the step under the current one; a segment is handed to a layer only after
   its copies' event and reused only after the layer that read it ran. A shorter chunk plans its routed misses into
-  ring slots on the device. The ring (`ring_slots`, twice the experts of a layer by default, or once, or none, as the
+  ring slots on the device. A chunk of fewer than eight times `stage_routes` routes that routes at most 85% of the
+  layer's non-resident experts (a few dozen to a few hundred tokens of ordinary text keep to the experts their topic
+  uses) has only the experts it routes staged, a later chunk of its span the ones it routes beyond them, and once a
+  span's chunks together route more than that share the later layers are staged whole: staged whole, a short prompt
+  paid for every expert off the device, about the same seconds whatever its length. `telemetry()` counts the prompt
+  steps' chunk sizes decided so (`routed_chunks`). The ring (`ring_slots`, twice the experts of a layer by default, or once, or none, as the
   own slots allow) is borrowed from the own slots for a prompt step and given back by `end_prompt()`, which the model
   calls at the end of every step that called `prompt()` (an eager decode plan ends a step left open; `ring: fixed`
   keeps the ring apart). A step plans all its routed layers with `plan()` or all with `prompt()` (a step of prompt
-  chunks and decode rows uses `prompt()`), on one stream. Without a CPU tier the own slots less the ring hold at
+  chunks and decode rows uses `prompt()`), on one stream. A staged layer serves every chunk that reads it: a model
+  that runs a span of a prompt layer by layer calls `prompt(layer, ...)` once a chunk for the same layer, and the
+  calls after the first read the layer's experts where the first found them, so the layer's experts cross the link
+  once for the span and not once a chunk. Such a span takes several steps: `end_prompt(hold=True)` ends a step and
+  keeps the ring with what is staged in it, decode plans (captured rounds too) run meanwhile in the slots beside
+  it, and the next step's first `prompt()` reads the residency again and stages only what left the cache since
+  (in the ring slots of the layer staged ahead, which is staged again in its turn). With a CPU tier a short
+  chunk's misses may go to it instead: `prompt_cpu(layer, ids, cpu_us, link_us)` gives a table that marks the
+  experts not resident -2, as a plan's that sends a miss to the CPU tier, copies nothing and borrows no ring, where
+  the chunk's missed routes cost less on the CPU tier than their experts over the link by the caller's two measured
+  times, and None where the link is the sooner (the caller then asks `prompt()`). Without a CPU tier the own slots less the ring hold at
   least a layer's every expert (and ranked residency's swaps), so a plan always finds a victim: a cache that could
   lose a route is refused when it is made.
 - **Lent slots.** With `lend`, the pool calls back before it hands out a page at or past the lowest lent slot's
@@ -73,9 +88,8 @@ cache.telemetry()                                      # slots, resident, lent, 
   `BundleStore` on a file takes `leave(keys)` before it is sealed and maps a filler over those bundles' pages
   ([host_memory.py](code/host_memory.py)'s `leave_out`: one small piece of shared memory mapped again and again),
   so the store stays one range of addresses with one registration and one device address, and host memory holds
-  each of those experts not at all: the kept bundles are read in before the registration and the mapping's own
-  read-ahead is off (`read_in`), since a fault's read-ahead would pull the left-out pages into the OS's cache
-  in blocks it does not drop again. `read()`, `bundle()` and `peek()` give such a bundle from the file, past
+  each of those experts not at all: a store read from its file reads the kept bundles alone, and one just built
+  gives the left ones' pages back. `read()`, `bundle()` and `peek()` give such a bundle from the file, past
   the OS's page cache at a queue depth (Core's host reads); `pin()` reads each once, from the file straight
   into its slot. `trace_replay.recent(..., pinned=keys)` replays the rule
   with a core, and `telemetry()` counts it (`pinned`).
@@ -92,9 +106,13 @@ cache.telemetry()                                      # slots, resident, lent, 
   round holds has its ids set to -1 by the model before `plan()`. `round_problems()` names what keeps a round from
   being captured (a file tier).
 - **Stores**: [expert_store.py](code/expert_store.py)'s `BundleStore` (expert-tensors' `open_store`): bundles put into
-  anonymous memory or a file, then registered mapped (a file read-only where the device allows), with a CUDA view of
-  its device address ([host_memory.py](code/host_memory.py): under WSL the device address differs from the host
-  pointer). A store file is bound to its checkpoint's `identity` and opens complete only for it and its layout; a
+  anonymous memory of the store's own, registered mapped, with a CUDA view of its device address
+  ([host_memory.py](code/host_memory.py): under WSL the device address differs from the host pointer). With a path
+  every bundle is also written to a file, and a complete file is read into the store's memory instead of being
+  built again, by direct reads at a queue depth (Core's host reads). The file is never what the device reads: a
+  file's mapping is the OS's page cache, which a registration faults in a page at a time and the OS may drop
+  meanwhile, and a 65 GiB store then took 27 minutes to register where reading it into memory takes 20 seconds
+  (4.5 GB/s) and registering that 4 (measured, an RTX 5090 host under WSL2). A store file is bound to its checkpoint's `identity` and opens complete only for it and its layout; a
   path one open store maps is refused to another. A file tier without a device-readable region (ssd-expert-materialization) is filled through `read()` on the
   host, so a plan over it synchronizes and cannot be captured. Such a store may keep what the cache evicts: where
   it sets `retains`, a plan copies each bundle its copies replace back to the host first and hands it over
@@ -145,10 +163,10 @@ often over several shards, or stacks a layer's experts in one tensor.
 bundle the same size, each component 16-byte aligned. Beside it goes an index with each
 component's offset and the checkpoint's fingerprint, so an unchanged source is not packed again.
 Name each component's tensor by a template over `{group}` and `{expert}`; a template without
-`{expert}` slices a stacked tensor. Pin the file instead of allocating pinned memory and
-copying into it: `open_store(...).register()` registers a read-only mapping of the file in
-one call where the device allows read-only registration, through torch's cudart. (For scale only: on one machine, `cudaHostAlloc` of a
-68 GB store took about 8 minutes under WSL; registering a mapped file takes seconds.)
+`{expert}` slices a stacked tensor. Register memory the store filled itself (anonymous memory read
+from the file past the page cache, `BundleStore`): its pages are there, and `cudaHostRegister` takes about a
+second for 16 GiB. (For scale only: on one machine, `cudaHostAlloc` of a 68 GB store took about 8 minutes under
+WSL, and registering a mapping of the file 27 minutes once the OS had dropped its pages.)
 
 **Feeding the expert arithmetic.** The routed experts' GEMMs come from a provider's grouped
 GEMM (CUTLASS's ptr-array grouped GEMM, `cublasGemmGroupedBatchedEx`, or a block-scaled grouped

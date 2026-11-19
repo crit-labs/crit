@@ -92,9 +92,10 @@ def test_a_real_kernels_prompt_structures_by_level():
 
 def test_a_setting_takes_what_it_leaves_out_from_the_quality_mode():
     assert exactness.for_quality_mode("preserve") == {"decode": "exact", "prompt": "exact"}
-    assert exactness.for_quality_mode("speed") == {"decode": "repeatable", "prompt": "repeatable"}
+    assert exactness.for_quality_mode("speed") == {"decode": "exact", "prompt": "exact"}
     assert exactness.setting(quality_mode="preserve") == {"decode": "row-exact", "prompt": "exact"}
-    assert exactness.setting(quality_mode="speed") == {"decode": "repeatable", "prompt": "repeatable"}
+    assert exactness.setting(quality_mode="speed") == {"decode": "row-exact", "prompt": "exact"}
+    assert exactness.setting({"prompt": "repeatable"}, "speed") == {"decode": "row-exact", "prompt": "repeatable"}
     assert exactness.setting("declared") == {"decode": "declared", "prompt": "declared"}
     assert exactness.setting({"prompt": "repeatable"}, "preserve") == {"decode": "row-exact", "prompt": "repeatable"}
     assert exactness.setting({"decode": "row-exact", "prompt": "exact"}) == {"decode": "row-exact", "prompt": "exact"}

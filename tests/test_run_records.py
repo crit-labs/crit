@@ -148,12 +148,13 @@ class RunRecordTests(RunFixture, unittest.TestCase):
 
     def test_a_candidate_states_the_exactness_of_its_rows(self):
         """crit completes a candidate's configuration with the exactness of its rows: what it asks, and the run's
-        quality mode's level for a phase it leaves out (speed: repeatable, every plugin's fastest way)."""
-        fast = {"decode": "repeatable", "prompt": "repeatable"}
+        quality mode's level for a phase it leaves out (exact in speed as in preserve: a prompt row has the bits of
+        the same token decoded, and a lower level is asked for)."""
+        exact = {"decode": "row-exact", "prompt": "exact"}
         first = self.candidate()
-        self.assertEqual(first["configuration"]["exactness"], fast)
-        asked = self.candidate(configuration={"batch": 2, "exactness": {"prompt": "exact"}})
-        self.assertEqual(asked["configuration"]["exactness"], {"decode": "repeatable", "prompt": "exact"})
+        self.assertEqual(first["configuration"]["exactness"], exact)
+        asked = self.candidate(configuration={"batch": 2, "exactness": {"prompt": "repeatable"}})
+        self.assertEqual(asked["configuration"]["exactness"], {"decode": "row-exact", "prompt": "repeatable"})
         whole = self.candidate(configuration={"batch": 3, "exactness": "exact"})   # a decode row's exact is row-exact
         self.assertEqual(whole["configuration"]["exactness"], {"decode": "row-exact", "prompt": "exact"})
         for wrong, said in (("bitwise", "not one of"), ({"verify": "exact"}, "per phase"), (3, "is a level"),
@@ -176,18 +177,27 @@ class RunRecordTests(RunFixture, unittest.TestCase):
         with patch("crit.run.external.spec_of", lambda configuration: object()):
             self.assertEqual(with_exactness(external, "preserve"), external)
         brief = (self.directory / "agent_request.md").read_text(encoding="utf-8")
-        self.assertIn("decode rows repeatable and prompt rows repeatable, so every plugin takes its fastest way", brief)
+        self.assertIn("decode rows row-exact and prompt rows exact, so each prompt row has the bits of the same token "
+                      "decoded, which crit smoke judges without a tolerance", brief)
+        # It states the run's quality mode too, whatever it named: the plugins' precision options follow it.
+        self.assertEqual(first["configuration"]["quality_mode"], "speed")
+        named = self.candidate(configuration={"batch": 5, "quality_mode": "preserve"})
+        self.assertEqual(named["configuration"]["quality_mode"], "speed")
+        self.assertIn("quantized-projections' head option, left on auto, holds it in FP8 in this mode", brief)
 
     def test_a_preserve_run_asks_exact_rows_of_a_candidate_that_sets_none(self):
         run = self.store.create(self.data | {"quality_mode": "preserve"})["run"]
         self.run, self.run_id, self.directory = run, run["run_id"], self.store.directory(run["run_id"])
         kept = {"decode": "row-exact", "prompt": "exact"}
-        self.assertEqual(self.candidate()["configuration"]["exactness"], kept)
+        first = self.candidate()
+        self.assertEqual(first["configuration"]["exactness"], kept)
+        self.assertEqual(first["configuration"]["quality_mode"], "preserve")
         lower = self.candidate(configuration={"batch": 2, "exactness": {"prompt": "repeatable"}})
         self.assertEqual(lower["configuration"]["exactness"], {"decode": "row-exact", "prompt": "repeatable"})
         brief = (self.directory / "agent_request.md").read_text(encoding="utf-8")
         self.assertIn("decode rows row-exact and prompt rows exact, so each prompt row has the bits of the same token "
                       "decoded", brief)
+        self.assertIn("quantized-projections' head option, left on auto, keeps it as stored in this mode", brief)
 
     def test_a_candidate_and_its_package_are_plugin_packages(self):
         """crit run takes an engine only as Core's loader runs it: plugins/ and a configuration whose plugins
@@ -520,8 +530,12 @@ class RunRecordTests(RunFixture, unittest.TestCase):
                             # The long-context goals join when Eval measured the required context.
                             {**decode, "kpi": "context_decode", "reached": 151.0, "limit": 240.0},
                             {**decode, "kpi": "context_ttft", "reached": 41000.0, "limit": 30500.0}]}
+        kept = self.directory / ".plugin-cache" / "expert-offload" / "experts-0.bin"   # what its engines kept
+        kept.parent.mkdir(parents=True)
+        kept.write_bytes(b"store")
         result = self.store.stop(self.run_id, "search_exhausted", critique="critique", headroom=account)
         self.assertEqual(result["state"]["stopping_reason"], "search_exhausted")
+        self.assertFalse((self.directory / ".plugin-cache").exists())   # a stopped run keeps no rebuildable files
 
     def test_candidate_budget_replaces_the_time_budget(self):
         data = {key: value for key, value in self.data.items() if key != "budget_minutes"} | {"candidate_budget": 2}
@@ -737,6 +751,17 @@ class RunRecordTests(RunFixture, unittest.TestCase):
                        lambda: self.store.reserve(self.run_id, candidate["candidate_id"], "check")):
             with self.assertRaises(ValueError):
                 action()
+
+    def test_a_stop_waits_for_every_reserved_attempt_to_be_settled(self):
+        candidate = self.candidate()
+        reservation = self.store.reserve(self.run_id, candidate["candidate_id"], "build")
+        at = f"candidates/{candidate['candidate_id']}/attempts/{reservation['attempt_id']}"
+        with self.assertRaisesRegex(ValueError, f"{at} is reserved and has no result"):
+            self.store.stop(self.run_id, "cancelled")
+        self.assertIsNone(self.store.get(self.run_id)["state"]["stopping_reason"])
+        self.store.settle(self.run_id, reservation, {"outcome": "cancelled", "ended_at": now(), "exit_code": 130,
+                                                     "cleanup_settled": True, "logs": [], "failure": "stopped"})
+        self.assertEqual(self.store.stop(self.run_id, "cancelled")["state"]["stopping_reason"], "cancelled")
 
     def test_failed_build_retains_source_logs_and_has_no_invented_series(self):
         candidate = self.candidate()

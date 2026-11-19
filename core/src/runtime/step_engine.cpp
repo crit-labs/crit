@@ -81,6 +81,10 @@ Settings settings(std::string_view configuration) {
     // prefill chunk as the quantum, a prompt's chunks start at the same positions whatever shares its steps.
     i.prefill_work_quantum = count(e, "prefill_work_quantum", 1);
     if(!i.prefill_work_quantum) throw std::invalid_argument("step engine prefill_work_quantum must be positive");
+    // Prefill passes (ModelInfo): the most prompt tokens a request holds in one, and the most steps in a row its
+    // prefill takes without consuming a prompt token.
+    i.prefill_pass_tokens = count(e, "prefill_pass_tokens", 0);
+    i.prefill_pass_steps = count(e, "prefill_pass_steps", 0);
     if(const auto* sampling = e.find("sampling"); sampling && !sampling->is_null()) {
         auto& support = i.sampling;
         support = {flag(*sampling, "temperature"), flag(*sampling, "top_p"), flag(*sampling, "top_k"), flag(*sampling, "seed"),
@@ -451,8 +455,12 @@ class StepModel final : public Model {
             progress.prompt_tokens = p.prompt_tokens;
             progress.reused_prompt_tokens = p.reused_prompt_tokens;
             progress.prefill_complete = p.prefill_complete != 0;
+            progress.pass_tokens = p.pass_tokens;
             progress.tokens = session.tokens;
-            if(mixed) progress.token_work = p.token_work ? p.token_work : std::max(p.prompt_tokens - p.reused_prompt_tokens, p.tokens);
+            // Unreported token work is the prompt tokens computed or one per token, within the row's grant: the
+            // tokens of a pass that ends here were computed over the steps of the pass.
+            if(mixed) progress.token_work = p.token_work ? p.token_work
+                : std::min(std::max(p.prompt_tokens - p.reused_prompt_tokens, p.tokens), items[i].budget.token_work);
             if(logprobs && session.logprobs) {
                 session.token_logprobs.assign(logprobs_.begin() + std::ptrdiff_t(i * row), logprobs_.begin() + std::ptrdiff_t(i * row + p.tokens));
                 session.top.clear();

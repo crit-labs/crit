@@ -269,12 +269,17 @@ class RoundView:
 
     def counter(self, name):
         """The [rows] column of view.counters that counts `name` (one of the engine's round counters), to add into."""
+        if name not in self.counter_names:
+            raise PluginError(f"the round has no counter {name!r} (its counters: "
+                              f"{', '.join(self.counter_names) or 'none'}): a part that adds to one in count_round "
+                              "names it in its round_counters, or the model plugin gives the driver counters=")
         return self.counters[:, self.counter_names.index(name)]
 
     def columns(self):
-        """The verify columns' input tokens: the pending token, then the drafts ([rows, width + 1])."""
+        """The verify columns' input tokens: the pending token, then the drafts ([rows, width + 1]). A cut draft
+        (-1, which no prediction matches) is token 0 here: every column holds an id a table has a row for."""
         import torch
-        return torch.cat([self.pending[:, None], self.drafts[:, :self.width]], dim=1)
+        return torch.cat([self.pending[:, None], self.drafts[:, :self.width].clamp(min=0)], dim=1)
 
 
 class FixedWidth:
@@ -1170,20 +1175,27 @@ class Rounds(SpeculativeRounds):
     continuation, counters, widths and width_policy as SpeculativeRounds'; sampled: rounds that draw (the sampler's
     laws() hold the drafts' laws).
 
+    A part that adds to counters in its count_round names them in `round_counters` (an attribute: a tuple of names; an
+    experts plugin with a cache names expert_reads and expert_hits), and the driver has them beside the model's own
+    `counters`, in that order (self.counter_names), so a model plugin need not know what the plugins of its slots
+    count.
+
     A model plugin serving its rows through it declares max_row_tokens and decode_token_work of widest + 1 in its info
     (a round emits and computes up to widest + 1 columns a row; Core counts a native round's work as its width + 1,
-    and refuses an engine whose grants cannot hold its widths), and round_counters naming `counters`."""
+    and refuses an engine whose grants cannot hold its widths), and round_counters naming the driver's counter_names."""
 
     def __init__(self, model, sampler, *, rows, widest, device, drafter=None, verifier=None, head=None, pools=(),
                  extra_parts=(), parts=None, uses=None, logprobs=0, stops=4, continuation=0, vocabulary=None,
                  sampled=False, share_pool=None, counters=(), widths=None, width_policy=None):
+        if isinstance(pools, dict):
+            raise ValueError("pools is a list of the round's pools")
+        counters = self._counters(counters, (model, sampler, drafter, head, verifier, *pools, *extra_parts,
+                                             *self._used(parts, uses)))
         super().__init__(None, rows, widest, device, stops=stops, continuation=continuation, logprobs=logprobs,
                          share_pool=share_pool, counters=counters, widths=widths, width_policy=width_policy)
         self._engine_pool = getattr(getattr(parts, "context", None), "graphs", None)
         if drafter is not None and head is None:
             raise ValueError("a drafter drafts from the model's draft head (draft:head-device): give the head")
-        if isinstance(pools, dict):
-            raise ValueError("pools is a list of the round's pools")
         self.model, self.sampler, self.drafter, self.verifier, self.head = model, sampler, drafter, verifier, head
         self.pools = [(pool, _arguments(pool.bind)) for pool in pools]
         for pool, _ in self.pools:
@@ -1226,6 +1238,30 @@ class Rounds(SpeculativeRounds):
             self.draft_laws = laws(rows, widest)
         self.sampled = bool(sampled)
 
+    @staticmethod
+    def _used(parts, uses):
+        """The plugins of the slots the round uses that the driver holds in no role of its own."""
+        if parts is None or not callable(getattr(parts, "get", None)):
+            return []
+        if uses is None and callable(getattr(parts, "slots", None)):
+            uses = [slot for slot in parts.slots() if parts.plugin(slot) and slot not in POLICY_SLOTS]
+        return [parts.get(slot) for slot in (uses or ()) if slot not in ROLE_SLOTS]
+
+    @staticmethod
+    def _counters(counters, parts):
+        """The model's counters, then those the round's parts name (round_counters), each once."""
+        from .observe import unwrap
+        found = list(counters)
+        for part in parts:
+            names = getattr(unwrap(part), "round_counters", None) if part is not None else None
+            if names is None:
+                continue
+            if isinstance(names, str) or not all(isinstance(name, str) and name for name in names):
+                raise PluginError(f"{type(unwrap(part)).__name__}'s round_counters is a tuple of counter names, not "
+                                  f"{names!r}")
+            found += list(names)
+        return tuple(dict.fromkeys(found))
+
     def _parts(self):
         """Every part of the round once (a part in two roles is called once per hook): the driver's own, the model's
         extra parts, and the plugins of the slots the round uses that the driver holds in no role (an experts plugin
@@ -1233,13 +1269,8 @@ class Rounds(SpeculativeRounds):
         from .observe import unwrap
         found = {}
         parts, uses, _ = self._checked
-        used = []
-        if parts is not None and callable(getattr(parts, "get", None)):
-            if uses is None and callable(getattr(parts, "slots", None)):
-                uses = [slot for slot in parts.slots() if parts.plugin(slot) and slot not in POLICY_SLOTS]
-            used = [parts.get(slot) for slot in (uses or ()) if slot not in ROLE_SLOTS]
         for part in (self.model, self.sampler, self.drafter, self.head, self.verifier, *(p for p, _ in self.pools),
-                     *self.extra_parts, *used):
+                     *self.extra_parts, *self._used(parts, uses)):
             if part is not None:
                 found.setdefault(id(unwrap(part)), part)
         return list(found.values())
@@ -1329,7 +1360,9 @@ class Rounds(SpeculativeRounds):
         rows, width = view.rows, view.width
         self.inputs[:rows, 0] = view.pending
         if width:
-            self.inputs[:rows, 1:width + 1] = view.drafts[:, :width]
+            # A cut draft (-1: no prediction matches it, so nothing past it is kept) is token 0 in the batch: the
+            # model looks every column up, and a lookup inside a capture cannot check its ids.
+            self.torch.clamp(view.drafts[:, :width], min=0, out=self.inputs[:rows, 1:width + 1])
         view.batch = self.batch.fill(rows, width, view.frontier, self.inputs)
         logits = self._logits = self.model.verify(view, view.batch)
         if tuple(logits.shape[:2]) != (rows, width + 1) or logits.dim() != 3:

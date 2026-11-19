@@ -60,7 +60,10 @@ Knowledge that is shared across model families is fine to put in crit. Examples 
 published checkpoint formats (NVFP4 in ModelOpt or compressed-tensors layout), config
 conventions used by several model families, tool syntaxes several families write, and
 layer kinds such as Mamba-2 state or sliding-window attention that several
-architectures use. Keep that knowledge in data, such as tables, declared formats and
+architectures use. Such layer kinds are blocks of the library's model plugin
+([model-template](../inference/model-template/README.md)), and a family's arrangement of them is
+one of its layouts: a JSON file, not a code path. A block one family alone uses stays in that
+family's engine, passed to the template's compose(). Keep that knowledge in data, such as tables, declared formats and
 registries, rather than in branches spread through the code, and keep one copy of it.
 When Python and C++ both need the same table, they read one source.
 

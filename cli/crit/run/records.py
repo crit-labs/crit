@@ -941,13 +941,17 @@ def _gate(checks, cases=None):
     return "passed" if checks and all(c["status"] == "passed" for c in checks) and covered else "unverified"
 
 
+def memory_met(run, metrics):
+    """Whether a benchmark's free device and host memory stayed at or above the run's headrooms."""
+    return all(key in metrics and min(metrics[key]["samples"]) >= run["spec"]["hardware_constraints"][kind + "_headroom_bytes"]
+               for kind, key in (("vram", "minimum_free_vram_bytes"), ("ram", "minimum_free_ram_bytes")))
+
+
 def series_gates(run, bound_checks, metrics):
     """A benchmark series' gates: each required gate by the checks the benchmark cites, and resources failed too when
     its free memory fell below the run's headroom."""
     gates = {gate: _gate([c for c in bound_checks if c["gate"] == gate]) for gate in run["spec"]["correctness"]["required_gates"]}
-    memory_met = all(key in metrics and min(metrics[key]["samples"]) >= run["spec"]["hardware_constraints"][kind + "_headroom_bytes"]
-                     for kind, key in (("vram", "minimum_free_vram_bytes"), ("ram", "minimum_free_ram_bytes")))
-    gates["resources"] = "failed" if not memory_met else gates["resources"]
+    gates["resources"] = "failed" if not memory_met(run, metrics) else gates["resources"]
     return gates
 
 

@@ -360,6 +360,24 @@ class EngineSelectionTests(unittest.TestCase):
         self.assertEqual(found["attention"], [("attn", []), ("attn-rocm", ["runs on rocm"])])
         self.assertEqual(found["embeddings"], [])
 
+    def test_a_slot_required_with_a_fact_is_required_only_where_the_fact_holds(self):
+        # A model plugin of several architectures calls the recurrence slot only for the hybrid one: requires_when.
+        model = {k: v for k, v in ENGINE["model-x"].items() if k != "requires"}
+        root = write_plugins(self.root.parent / "requires-when", {
+            **ENGINE, "model-x": {**model, "requires_when": {"model_type:x_text": ["recurrence"]}}})
+        registry = Registry.discover(root)
+        self.assertEqual(registry["model-x"]["requires_when"], {"model_type:x_text": ["recurrence"]})
+        bare = {"use": {k: v for k, v in WHOLE["use"].items() if k != "recurrence"}}
+        check(bare, registry, facts=["model_type:x"], device="cuda")
+        with self.assertRaisesRegex(PluginError, "model-x requires recurrence where the engine provides "
+                                                 "model_type:x_text, which the selection leaves empty"):
+            check(bare, registry, facts=["model_type:x_text"], device="cuda")
+        check(WHOLE, registry, facts=["model_type:x_text"], device="cuda")
+        with self.assertRaisesRegex(PluginError, "requires names the other slots"):
+            write_plugins(self.root.parent / "own-slot", {
+                **ENGINE, "model-x": {**model, "requires_when": {"model_type:x": ["model"]}}})
+            Registry.discover(self.root.parent / "own-slot")
+
     def test_a_plugin_on_a_device_speaks_its_slots_device_form(self):
         # A host form on a device is an oracle no engine serves: assembling on cuda refuses it as it is created.
         root = write_plugins(self.root.parent / "host-only", {**ENGINE, "proj": {**ENGINE["proj"], "device_form": False}})

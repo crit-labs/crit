@@ -21,15 +21,20 @@ void validate_tokens(std::span<const Token> tokens, std::uint32_t vocabulary,
         throw std::invalid_argument(message);
 }
 void validate_progress(const Progress& p, const WorkBudget& budget, std::uint32_t frontier,
-                       const Request& request, const char* message) {
+                       const Request& request, const ModelInfo& info, Pass pass, const char* message) {
     const auto next_frontier = frontier + std::uint64_t(p.prompt_tokens);
-    if(p.reused_prompt_tokens > p.prompt_tokens || p.prompt_tokens - p.reused_prompt_tokens > budget.prefill_tokens ||
+    // The tokens of the pass a row held count in the step that ends it, beyond that step's own grant. A step that
+    // consumes and produces nothing is progress only while it reports a pass, for prefill_pass_steps steps in a row.
+    const bool idle = !p.prompt_tokens && p.tokens.empty();
+    if(p.reused_prompt_tokens > p.prompt_tokens ||
+       p.prompt_tokens - p.reused_prompt_tokens > std::uint64_t(budget.prefill_tokens) + pass.tokens ||
        (p.reused_prompt_tokens && !request.phases.reuse_allowed()) ||
-       next_frontier > request.prompt.size() || (budget.prefill_complete && p.prompt_tokens) ||
+       next_frontier + p.pass_tokens > request.prompt.size() || p.pass_tokens > info.prefill_pass_tokens ||
+       (budget.prefill_complete && (p.prompt_tokens || p.pass_tokens)) ||
        (budget.prefill_complete && !p.prefill_complete) ||
        p.prefill_complete != (next_frontier == request.prompt.size()) ||
        (!p.prefill_complete && !p.tokens.empty()) || p.tokens.size() > budget.output_tokens ||
-       (!p.prompt_tokens && p.tokens.empty()))
+       (idle && !(p.pass_tokens && pass.steps < info.prefill_pass_steps)))
         throw std::runtime_error(message);
 }
 bool logprob_value(float x) { return !std::isnan(x) && x <= logprob_tolerance; }

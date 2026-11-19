@@ -78,6 +78,7 @@ tests_of.__test__ = False   # a helper, not a test (pytest collects module funct
 
 
 class LibraryTests(unittest.TestCase):
+    maxDiff = None   # a failing plugin's whole test output, not a diff cut to its first characters
     @classmethod
     def setUpClass(cls):
         cls.registry = library()
@@ -186,11 +187,12 @@ class LibraryTests(unittest.TestCase):
         self.assertEqual(set(ENGINE_SERVICES) & (techniques | sourced), set())
         self.assertEqual(sorted(techniques | sourced | set(ENGINE_SERVICES)), ENTRIES)
         self.assertEqual(sorted(sourced - techniques), ["async-expert-contributions", "expert-streamed-prefill"])
-        self.assertEqual((len(techniques), len(ENTRIES)), (23, 33))
+        self.assertEqual((len(techniques), len(ENTRIES)), (24, 34))
         self.assertEqual(list(INFERENCE.glob("*/plugins/*/plugin.json")), [])
 
 
 class AddTests(unittest.TestCase):
+    maxDiff = None   # a failing plugin's whole test output, not a diff cut to its first characters
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -377,7 +379,7 @@ class AddTests(unittest.TestCase):
 
     def test_needs_no_plugin_of_the_engine_provides_are_reported(self):
         report = add(self.dest, ["draft-trees", "experts-reference"])
-        self.assertEqual(report["unmet"]["draft:head"], [])
+        self.assertEqual(report["unmet"]["draft:head"], ["model-template"])   # the model's: the library's provides it
         self.assertNotIn("experts:source", report["unmet"])    # its tests bring expert-tensors
         report = add(self.dest, ["heterogeneous-expert-dispatch"])
         self.assertEqual(report["unmet"], {})
@@ -402,8 +404,9 @@ class AddTests(unittest.TestCase):
                 fitted = [plugin.strip() for plugin in fitting.split(":", 1)[1].split(",")]
                 self.assertEqual("quantized-projections" in fitted, fits, text)
                 self.assertEqual("not quantized-projections: needs cuda:fp4" in text, not fits, text)
-                # No library plugin implements llama yet: the model plugin is the one to write.
-                self.assertIn("nothing fits model", text)
+                # The library's model plugin composes llama from its decoder layout.
+                fitting = next(line for line in text.splitlines() if line.startswith("model (required)"))
+                self.assertEqual(fitting.split(":", 1)[1].strip(), "model-template", text)
 
     def test_the_cli_lists_the_library_and_adds_from_it(self):
         def run(*args):
