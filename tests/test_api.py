@@ -279,6 +279,29 @@ class ApiTests(ServeFixture, unittest.TestCase):
         self.assertEqual(json.loads(data)["label"], "Engine B")
         self.assertEqual(json.loads(self.call("GET", "/health")[1])["status"], "ok")
 
+    def test_a_candidate_that_does_not_verify_leaves_the_lists_and_is_refused_by_name(self):
+        """A sealed candidate an older crit packaged fails verification under this one: the model lists leave it out
+        instead of failing for every client, and a request naming it is refused with the reason."""
+        from unittest.mock import patch
+        verify, broken = self.served._verify, self.b
+
+        def refuse(candidate_id, **options):
+            if candidate_id == broken:
+                raise ValueError("crit serve runs plugin packages only: an older manifest")
+            return verify(candidate_id, **options)
+
+        self.served.specs.pop(broken, None)
+        with patch.object(self.served, "_verify", side_effect=refuse):
+            response, data = self.call("GET", "/v1/models")
+            self.assertEqual(response.status, 200)
+            self.assertEqual([m["id"] for m in json.loads(data)["data"]], [self.run_id + "/" + self.a])
+            response, data = self.call("GET", "/api/tags")
+            self.assertEqual(response.status, 200)
+            self.assertEqual(len(json.loads(data)["models"]), 1)
+            response, value = self.chat(model=self.run_id + "/" + broken)
+            self.assertEqual(response.status, 409, value)
+            self.assertIn("an older manifest", json.dumps(value))
+
     def test_completion_returns_the_reply_usage_and_measured_telemetry(self):
         response, value = self.chat(max_tokens=50, user="fixture")
         self.assertEqual(response.status, 200, value)
