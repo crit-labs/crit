@@ -776,14 +776,20 @@ class Api:
     def servable(self):
         """engine.candidates() less those that do not verify (a package an older crit sealed, a model file gone):
         they cannot be served, and a request naming one is refused with the reason (409), so the model lists leave
-        them out instead of failing for every client."""
+        them out instead of failing for every client. The answer is kept as long as engine.candidates() keeps its
+        list, so a candidate that fails is not verified again on every listing."""
+        listed = self.engine.candidates()
+        kept = getattr(self, "_servable", None)
+        if kept is not None and kept[0] is listed:
+            return kept[1]
         found = []
-        for candidate in self.engine.candidates():
+        for candidate in listed:
             try:
                 self.engine.spec(candidate["candidate_id"])
             except (ValueError, EngineError):
                 continue
             found.append(candidate)
+        self._servable = (listed, found)
         return found
 
     def models(self):

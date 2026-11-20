@@ -281,12 +281,14 @@ class ApiTests(ServeFixture, unittest.TestCase):
 
     def test_a_candidate_that_does_not_verify_leaves_the_lists_and_is_refused_by_name(self):
         """A sealed candidate an older crit packaged fails verification under this one: the model lists leave it out
-        instead of failing for every client, and a request naming it is refused with the reason."""
+        instead of failing for every client, and is not verified again on every listing; a request naming it is
+        refused with the reason."""
         from unittest.mock import patch
-        verify, broken = self.served._verify, self.b
+        verify, broken, tried = self.served._verify, self.b, []
 
         def refuse(candidate_id, **options):
             if candidate_id == broken:
+                tried.append(candidate_id)
                 raise ValueError("crit serve runs plugin packages only: an older manifest")
             return verify(candidate_id, **options)
 
@@ -298,6 +300,7 @@ class ApiTests(ServeFixture, unittest.TestCase):
             response, data = self.call("GET", "/api/tags")
             self.assertEqual(response.status, 200)
             self.assertEqual(len(json.loads(data)["models"]), 1)
+            self.assertEqual(len(tried), 1)   # the second listing kept the first one's answer
             response, value = self.chat(model=self.run_id + "/" + broken)
             self.assertEqual(response.status, 409, value)
             self.assertIn("an older manifest", json.dumps(value))
