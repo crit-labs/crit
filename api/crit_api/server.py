@@ -773,8 +773,27 @@ class Api:
             raise RequestError("Cannot serve " + model + ": " + str(exc), 409, param="model") from exc
         return candidate
 
+    def servable(self):
+        """engine.candidates() less those that do not verify (a package an older crit sealed, a model file gone):
+        they cannot be served, and a request naming one is refused with the reason (409), so the model lists leave
+        them out instead of failing for every client. The answer is kept as long as engine.candidates() keeps its
+        list, so a candidate that fails is not verified again on every listing."""
+        listed = self.engine.candidates()
+        kept = getattr(self, "_servable", None)
+        if kept is not None and kept[0] is listed:
+            return kept[1]
+        found = []
+        for candidate in listed:
+            try:
+                self.engine.spec(candidate["candidate_id"])
+            except (ValueError, EngineError):
+                continue
+            found.append(candidate)
+        self._servable = (listed, found)
+        return found
+
     def models(self):
-        return [self.card(candidate) for candidate in self.engine.candidates()]
+        return [self.card(candidate) for candidate in self.servable()]
 
     def capacity(self):
         """The default model's max_concurrent_requests (ServedEngine.capacity), None when it cannot be told (no
@@ -1375,10 +1394,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/metrics":
             return self.send_text(200, self.api.metrics.render(self.api.engine), "text/plain; version=0.0.4; charset=utf-8")
         if path == "/api/tags":
-            return self.send_json(200, {"models": [self.api.api_chat_card(c) for c in self.api.engine.candidates()]})
+            return self.send_json(200, {"models": [self.api.api_chat_card(c) for c in self.api.servable()]})
         if path == "/api/ps":
             status = self.api.engine.status()
-            loaded = [c for c in self.api.engine.candidates() if self.api.engine.loaded(c["candidate_id"], status)]
+            loaded = [c for c in self.api.servable() if self.api.engine.loaded(c["candidate_id"], status)]
             return self.send_json(200, {"models": [self.api.api_chat_card(c, status) for c in loaded]})
         self.unknown(path)
 

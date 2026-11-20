@@ -9,6 +9,29 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- A model plugin can name its model's own tool-call syntax: `tool_format` in its manifest, `FILE.py:NAME`, a
+  `crit_core.text.ToolFormat` (docs/PLUGINS.md). crit serve then declares `chat-tools-v1` (and
+  `chat-tool-stream-v1`) from the manifest without running plugin code, and `crit_core.engine.ResidentEngine` sets
+  `ResidentChat.tool_format` from it (`crit_core.engine.tool_format`), so calls parse for a model such as Gemma 4,
+  whose `<|tool_call>call:NAME{...}<tool_call|>` crit does not register. Before, `ResidentChat.tool_format` had no way
+  in from a package, and a request with `tools` to such an engine got HTTP 400. Forced calls stay undeclared: a
+  grammar cannot write a syntax crit does not register.
+- A model plugin can name its model's reasoning markers the same way: `reasoning_format`, a
+  `crit_core.text.ReasoningFormat` (`crit_core.engine.reasoning_format`). crit serve then splits the reasoning from
+  the reply and declares `chat-thinking-budget-v1`. Before, Gemma 4's `<|channel>thought ...<channel|>` reached clients
+  as reply text without its special-token markers (a stray "thought" before every reply).
+
+### Fixed
+
+- crit serve's `/v1/models`, `/api/tags` and `/api/ps` leave out a sealed candidate that does not verify (a
+  package an older crit sealed, a model file gone) instead of failing for every client: a run that kept candidates
+  from before a crit release dropped the connection on `GET /v1/models`, so crit Eval's `--url` client and other
+  clients that list models first could not reach the candidates that do verify. A request naming such a candidate
+  is still refused with the reason (409).
+
+
 ## [0.21.0] - 2026-11-18
 
 ### Overview

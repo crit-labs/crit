@@ -200,7 +200,8 @@ def load_manifest(folder):
         raise PluginError(f"{where} is a JSON object")
     required = {"schema", "id", "title", "fills", "entry"}
     optional = {"provides", "needs", "needs_when", "conflicts", "options", "reference", "test_with", "sources",
-                "tests", "description", "requires", "requires_when", "devices", "kernels"}
+                "tests", "description", "requires", "requires_when", "devices", "kernels", "tool_format",
+                "reasoning_format"}
     missing, unknown = required - set(data), set(data) - required - optional
     if missing or unknown:
         raise PluginError(f"{where}: " + "; ".join(
@@ -247,6 +248,9 @@ def load_manifest(folder):
     if ".." in Path(file).parts or not (folder / file).is_file():
         raise PluginError(f"{where}: entry names {file}, which is no file of the plugin")
     manifest["entry"] = (file, function)
+    manifest["tool_format"] = _text_format("tool_format", data.get("tool_format"), manifest, folder, where)
+    manifest["reasoning_format"] = _text_format("reasoning_format", data.get("reasoning_format"), manifest, folder,
+                                                where)
     options = data.get("options", {})
     if not isinstance(options, dict):
         raise PluginError(f"{where}: options is an object of option specs")
@@ -270,6 +274,26 @@ def load_manifest(folder):
         if fact in manifest["conflicts"]:
             raise PluginError(f"{where}: {fact} is both provided and in conflicts")
     return manifest
+
+
+TEXT_FORMATS = {"tool_format": ("ToolFormat", "tool calls"), "reasoning_format": ("ReasoningFormat", "reasoning")}
+
+
+def _text_format(key, value, manifest, folder, where):
+    """A model plugin's own syntax for tool calls (tool_format) or reasoning (reasoning_format), FILE.py:NAME: NAME
+    is a crit_core.text.ToolFormat or ReasoningFormat in FILE, a module that imports only the standard library and
+    crit_core, for a model whose chat template writes a syntax crit_core.text does not register."""
+    if value is None:
+        return None
+    kind, what = TEXT_FORMATS[key]
+    if manifest["fills"] != ["model"]:
+        raise PluginError(f"{where}: {key} is a model plugin's: the model's syntax for {what}")
+    if not isinstance(value, str) or not ENTRY.fullmatch(value):
+        raise PluginError(f"{where}: {key} is FILE.py:NAME, the {kind} the model writes {what} in")
+    file, name = value.rsplit(":", 1)
+    if ".." in Path(file).parts or not (folder / file).is_file():
+        raise PluginError(f"{where}: {key} names {file}, which is no file of the plugin")
+    return (file, name)
 
 
 def options_for(manifest, given, where=None):

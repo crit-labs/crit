@@ -328,10 +328,10 @@ def _find_plugins():
         sys.meta_path.insert(0, _PluginFinder)
 
 
-def load_module(manifest):
-    """The plugin's entry module, imported as a submodule of a package for its folder, so its relative imports
-    resolve inside the plugin. A module already imported (the same folder, an engine opened again) is reused. No
-    module of a plugin package writes bytecode (_SourceLoader)."""
+def load_module(manifest, file=None):
+    """The plugin's entry module (or its module `file`, FILE.py in its folder), imported as a submodule of a package
+    for its folder, so its relative imports resolve inside the plugin. A module already imported (the same folder, an
+    engine opened again) is reused. No module of a plugin package writes bytecode (_SourceLoader)."""
     _find_plugins()
     folder = Path(manifest["folder"]).resolve()
     tag = hashlib.sha256(str(folder).encode()).hexdigest()[:12]
@@ -346,7 +346,7 @@ def load_module(manifest):
             sub.__package__ = sub.__name__
             sys.modules[sub.__name__] = sub
             setattr(module, name, sub)
-    file = manifest["entry"][0]
+    file = file or manifest["entry"][0]
     name = package + "." + file[:-3].replace("/", ".")
     if name not in sys.modules:
         spec = importlib.util.spec_from_file_location(name, folder / file, loader=_SourceLoader(name, str(folder / file)))

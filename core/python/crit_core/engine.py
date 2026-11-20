@@ -357,9 +357,43 @@ def capabilities(package, model, configuration=None):
     kept = constrains(text, text.generation.stop_token_ids)
     registry = registry_of(package)
     images = IMAGES in registry[chosen["use"]["model"]]["provides"]
+    # a model plugin's own tool-call and reasoning syntax, declared in its manifest: read, never imported, here
+    declared = registry[chosen["use"]["model"]].get("tool_format")
+    reasoning = registry[chosen["use"]["model"]].get("reasoning_format")
     return serving_capabilities(text, sampling_fields(registry, chosen["use"]), concurrent=True, logprobs=True,
                                 score=True, plain=speculative, grammars=kept, constraints=kept, images=images,
-                                completion=True, prompt_cache=True)
+                                completion=True, prompt_cache=True,
+                                tool_format=":".join(declared) if declared else None,
+                                reasoning_format=":".join(reasoning) if reasoning else None)
+
+
+def _text_format(package, configuration, key, kind):
+    from crit_plugins.assemble import load_module
+    configuration = read_configuration(package) if configuration is None else configuration
+    manifest = registry_of(package)[selection(configuration)["use"]["model"]]
+    if not manifest.get(key):
+        return None
+    file, name = manifest[key]
+    found = getattr(load_module(manifest, file), name, None)
+    if not isinstance(found, kind):
+        raise PluginError(f"{manifest['id']}: {key} {file}:{name} is no crit_core.text.{kind.__name__}")
+    return found
+
+
+def tool_format(package, configuration=None):
+    """The crit_core.text.ToolFormat the package's model plugin names as its `tool_format` (FILE.py:NAME in its
+    manifest), imported from the plugin, or None when it names none: the calls crit serve parses for a model whose
+    chat template writes a syntax crit_core.text.tools does not register."""
+    from crit_core.text.tools import ToolFormat
+    return _text_format(package, configuration, "tool_format", ToolFormat)
+
+
+def reasoning_format(package, configuration=None):
+    """The crit_core.text.ReasoningFormat the package's model plugin names as its `reasoning_format` (FILE.py:NAME),
+    imported from the plugin, or None when it names none: the markers crit serve splits reasoning from the reply by,
+    for a model whose chat template uses markers crit_core.text.reasoning does not register."""
+    from crit_core.text.reasoning import ReasoningFormat
+    return _text_format(package, configuration, "reasoning_format", ReasoningFormat)
 
 
 def constrains(text, stop_tokens):
@@ -947,6 +981,10 @@ class ResidentEngine(ResidentChat):
         self.prompt_cache = True   # a request may turn the model plugin's prompt cache off (chat-prompt-cache-v1)
         self.grammars = self.constraints = constrains(self.text, self.stop_ids)
         self.images = bool(self.facts.get("images"))
+        self.tool_format = tool_format(package, self.configuration)   # None: the template's registered syntax
+        found = reasoning_format(package, self.configuration)
+        if found is not None:
+            self.reasoning_format = found   # else ResidentChat's: the templates' registered markers
         self._vocabulary = {"lock": threading.Lock(), "ready": False}   # the requests' copies share it
 
     def create_request(self, request):

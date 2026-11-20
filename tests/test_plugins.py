@@ -422,6 +422,11 @@ class EngineSelectionTests(unittest.TestCase):
             ("model-x", {"requires": ["model"]}, "requires names the other slots the plugin calls, not its own"),
             ("attn", {"devices": ["tpu"]}, "devices holds tpu"),
             ("attn", {"devices": ["host"]}, "attention computes on the device the engine serves on"),
+            ("attn", {"tool_format": "plugin.py:FORMAT"}, "tool_format is a model plugin's"),
+            ("model-x", {"tool_format": "calls"}, "tool_format is FILE.py:NAME"),
+            ("model-x", {"tool_format": "missing.py:FORMAT"}, "tool_format names missing.py, which is no file"),
+            ("attn", {"reasoning_format": "plugin.py:THINKING"}, "reasoning_format is a model plugin's"),
+            ("model-x", {"reasoning_format": "x.py"}, "reasoning_format is FILE.py:NAME"),
         ]
         for plugin_id, changes, message in cases:
             with self.subTest(message=message):

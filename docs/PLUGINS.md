@@ -87,6 +87,8 @@ plugins/
 | `test_with` | The other plugins its tests assemble beside it, which must be in the engine too |
 | `sources` | Folders of code it imports, by name: `{"sampling": "code"}` makes the plugin's `code/` folder the subpackage `.sampling`, so `plugin.py` reads `from .sampling import sampling`; `"../token-sampling/code"` imports another technique's |
 | `kernels` | crit's kernels its code loads, each `{name, fallback}` and optionally `backend` ([kernels and plugins](#kernels-and-plugins)) |
+| `tool_format` | A `model` plugin's only: `FILE.py:NAME`, the `crit_core.text.ToolFormat` its model writes tool calls in, for a chat template whose syntax `crit_core.text.tools` does not register. crit serve declares tools from the manifest alone; the resident engine imports `FILE.py` (standard library and `crit_core` only) and parses calls with it. A grammar cannot write such a syntax, so forced calls (`tool_choice` required or named) stay undeclared |
+| `reasoning_format` | A `model` plugin's only: `FILE.py:NAME`, the `crit_core.text.ReasoningFormat` (opening and closing markers) its model writes its thinking between, where `crit_core.text.reasoning` registers no format the chat template uses. crit serve splits the reasoning from the reply by it (`reasoning_content`) and declares the thinking budget |
 | `tests` | Its test folder (default `tests`) |
 
 The factory gets the engine's `context` (crit serve's [model context](SERVING.md#cores-resident-adapter), so
