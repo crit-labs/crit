@@ -9,7 +9,8 @@ import threading
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "smoke"))
+for _folder in ("core/python", "smoke"):   # the suite reads Core's exactness levels
+    sys.path.insert(0, str(ROOT / _folder))
 
 from crit_smoke import Client, run  # noqa: E402
 from crit_smoke.texts import PROMPTS, PROSE, WORDS  # noqa: E402
@@ -27,10 +28,15 @@ class Toy:
     (prefill rows past position 2000 see later tokens, as a sparse mask past a threshold might).
     Two plant a change of the size a W4A4 engine's rounding leaves, 0.2 to 0.3 nats a row with the same top-1:
     decode_rounding (decode rows against prefill, as GEMV against GEMM) and length_rounding (the rows of prompts
-    under 129 tokens, as a GEMM whose kernel cuBLAS picks by row count)."""
+    under 129 tokens, as a GEMM whose kernel cuBLAS picks by row count).
+    `known` is how sure the model is of PROSE's word pairs (a low one: a noisy checkpoint, which reads the prose at a
+    high perplexity itself), and `jitter` moves every logit by up to that much, as an engine's rounding does.
+    A score asking decode_via_prompt decodes with the prompt rows' arithmetic: decode_rounding's change goes, a
+    fault (offset, which reads the wrong position) stays."""
 
-    def __init__(self, bug=None):
+    def __init__(self, bug=None, known=9.0, jitter=0.0):
         self.bug, self.words, self.last = bug, {}, 0
+        self.known_boost, self.jitter = known, jitter
         for word in PROSE.split() + WORDS + " ".join(PROMPTS + ("user: assistant:",)).split():
             self.id(word)
         prose = self.encode(PROSE)
@@ -48,21 +54,24 @@ class Toy:
     def encode(self, text, special=False):
         return ([BOS] if special else []) + [self.id(w) for w in text.split()]
 
-    def logits(self, ids, p, seen, decode, extra=None):
+    def logits(self, ids, p, seen, decode, extra=None, via_prompt=False):
         last = ids[p]
         values = [((t * 2654435761 + last * 97) % 1000) / 2000 for t in range(VOCAB)]
         q = p - 1 if decode and self.bug == "offset" and p >= 3 else p
         key = tuple(ids[max(0, q - 2):q + 1])
         if not (self.bug == "long" and p > 1500):
             if key[-2:] in self.known:
-                values[self.known[key[-2:]]] += 9
+                values[self.known[key[-2:]]] += self.known_boost
             if key in seen:
                 values[seen[key]] += 9
         if extra:
             values[extra % VOCAB] += 12
+        if self.jitter:
+            values = [v + self.jitter * (((t * 7919 + p * 104729) % 1000) / 500 - 1) for t, v in enumerate(values)]
         if self.bug == "flat":
             values = [v * 0.05 for v in values]
-        if self.bug == "decode_rounding" and decode or self.bug == "length_rounding" and len(ids) < 129:
+        if (self.bug == "decode_rounding" and decode and not via_prompt
+                or self.bug == "length_rounding" and len(ids) < 129):
             values = [v * (0.9 if decode else 0.8) for v in values]
         return values
 
@@ -72,12 +81,13 @@ class Toy:
         ranked = sorted(range(VOCAB), key=lambda t: -values[t])[:top]
         return [token, values[token] - total, [[t, values[t] - total] for t in ranked]]
 
-    def walk(self, ids, top, decode_from, start=0, extra=None):
-        """Rows for positions start..len(ids)-2 (row p scores ids[p+1]); positions from decode_from decode."""
+    def walk(self, ids, top, decode_from, start=0, extra=None, via_prompt=False):
+        """Rows for positions start..len(ids)-2 (row p scores ids[p+1]); positions from decode_from decode (with the
+        prompt rows' arithmetic where via_prompt)."""
         seen, rows = {}, []
         for p in range(len(ids) - 1):
             if p >= start:
-                values = self.logits(ids, p, seen, p >= decode_from, extra)
+                values = self.logits(ids, p, seen, p >= decode_from, extra, via_prompt)
                 if (self.bug == "leak" or self.bug == "leak_long" and p > 2000) and p < decode_from:
                     for later in ids[p + 2:p + 6]:
                         values[later] += 4
@@ -86,9 +96,9 @@ class Toy:
                 seen[tuple(ids[p - 2:p + 1])] = ids[p + 1]
         return rows
 
-    def score(self, prompt, continuation, top, prompt_rows):
+    def score(self, prompt, continuation, top, prompt_rows, via_prompt=False):
         ids = prompt + continuation
-        rows = self.walk(ids, top, len(prompt), 0 if prompt_rows else len(prompt) - 1)
+        rows = self.walk(ids, top, len(prompt), 0 if prompt_rows else len(prompt) - 1, via_prompt=via_prompt)
         if not prompt_rows:
             return [], rows
         return rows[:len(prompt) - 1], rows[len(prompt) - 1:]
@@ -105,6 +115,18 @@ class Toy:
             rows.append([token, dict((t, p) for t, p in values)[token], values])
             ids.append(token)
         return rows
+
+
+def toy_reference(toy, words=120):
+    """A smoke reference (crit_smoke.reference) as recon records it from crit Eval's: one conversation, a prompt
+    and PROSE's first words as its written answer, with the checkpoint `toy`'s log-probability of each answer token."""
+    prompt = toy.encode("user: " + PROMPTS[0] + " assistant:", True)
+    ids = prompt + toy.encode(" ".join(PROSE.split()[:words]))
+    rows, _ = toy.score(ids, [], 5, True)
+    target = [row[1] for row in rows[len(prompt) - 1:]]
+    return {"source": {"data": "fixture"}, "perplexity": math.exp(-sum(target) / len(target)), "tokens": len(target),
+            "texts": [{"id": "toy-conversation", "set": "conversations", "prompt_tokens": len(prompt), "ids": ids,
+                       "target": target}]}
 
 
 def serve(toy, capabilities, facts=None, concurrency=1):
@@ -136,8 +158,10 @@ def serve(toy, capabilities, facts=None, concurrency=1):
                     tokens = toy.encode(body["prompt"], body.get("add_special_tokens", True))
                 return self.answer({"tokens": tokens, "count": len(tokens)})
             if self.path == "/v1/crit/score":
+                if body.get("decode_via_prompt") and not (facts or {}).get("decode_via_prompt"):
+                    return self.send_error(400)
                 prompt, continuation = toy.score(body["prompt_ids"], body["continuation_ids"], body["top_logprobs"],
-                                                 body.get("prompt_rows", True))
+                                                 body.get("prompt_rows", True), body.get("decode_via_prompt", False))
                 return self.answer({"prompt": prompt, "continuation": continuation})
             if self.path == "/v1/chat/completions":
                 prompt = toy.encode("user: " + body["messages"][-1]["content"] + " assistant:", True)
@@ -159,12 +183,13 @@ ALL = ["chat-score-v1", "chat-logprobs-v1", "chat-tokenize-v1", "chat-plain-v1"]
 
 
 class SmokeTests(unittest.TestCase):
-    def results(self, bug=None, facts=None, capabilities=ALL, only=None, budget=300, profile="loose"):
-        server = serve(Toy(bug), capabilities, facts)
+    def results(self, bug=None, facts=None, capabilities=ALL, only=None, budget=300, profile="loose", toy=None,
+                reference=None):
+        server = serve(toy or Toy(bug), capabilities, facts)
         try:
             # 2600 tokens reach past the toy's thresholds while keeping its pure-Python passes short.
             items = run(Client(f"http://127.0.0.1:{server.server_port}/v1"), only, profile=profile, long=2600,
-                        log=lambda line: None, budget=budget)
+                        log=lambda line: None, budget=budget, reference=reference)
         finally:
             server.shutdown()
             server.server_close()
@@ -203,6 +228,28 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(moved["state"], "failed", moved)
         self.assertIn("prefix of 17 tokens", moved["detail"])
 
+    def test_a_failed_decode_test_tells_rounding_from_a_fault_through_the_prompt_path(self):
+        """An engine whose facts say decode_via_prompt decodes a failed comparison's tokens again through its prompt
+        arithmetic: a planted rounding difference (decode rows rounded otherwise, strict) vanishes there, a planted
+        fault (decode reading the position before) stays."""
+        hook = {"decode_via_prompt": True}
+        decode = {"decode_matches_prefill", "decode_long"}
+        # (The toy's long rows are confident enough that its rounding passes decode_long even strictly.)
+        rounded = self.results("decode_rounding", facts=hook, only={"decode_matches_prefill"},
+                               profile="strict")["decode_matches_prefill"]
+        self.assertEqual(rounded["state"], "failed", rounded)
+        self.assertIn("; rounding: decoded through the prompt path the rows match prefill", rounded["detail"])
+        fault = self.results("offset", facts=hook, only=decode)
+        for name in decode:
+            with self.subTest(test=name):
+                self.assertEqual(fault[name]["state"], "failed", fault)
+                self.assertIn("; fault: decoded through the prompt path the rows still move", fault[name]["detail"])
+        # Without the hook the item says so, and a working engine with it passes without asking.
+        unknown = self.results("offset", only={"decode_matches_prefill"})["decode_matches_prefill"]
+        self.assertIn("offers no decode_via_prompt", unknown["detail"])
+        working = self.results(facts=hook, only=decode)
+        self.assertEqual({i["state"] for i in working.values()}, {"passed"}, working)
+
     def test_an_engine_that_asks_exact_rows_is_judged_by_them(self):
         """The level an engine asks of its rows (its facts' exactness.asked) decides where smoke is strict: decode
         against prefill for exact prompt rows, prefill against prefill from row-exact up; lower levels by the profile."""
@@ -237,6 +284,38 @@ class SmokeTests(unittest.TestCase):
         self.assertIn("up to 512 tokens on its exact scan", hint)
         self.assertEqual(row_paths({"row_invariance": {"prompt_rows": True},
                                     "recurrence_prompts": {"pools": [{"chunked": "fla", "scan_rows": 0}]}}), "")
+
+    def test_fluent_is_judged_against_the_checkpoints_own_reference(self):
+        """A noisy checkpoint (its own reference reads the prose at a perplexity far above smoke's absolute limit)
+        fails every engine without a reference; against it, an engine that rounds as engines do passes, and one that
+        regressed still fails."""
+        from crit_smoke.reference import ABSOLUTE_PERPLEXITY, quantile, validate
+        noisy = 2.3
+        reference = validate(toy_reference(Toy(known=noisy)))
+        self.assertGreater(reference["perplexity"], 60)
+        engine = Toy(known=noisy, jitter=0.05)   # the checkpoint's engine, with rounding
+        alone = self.results(toy=engine, only={"fluent"})["fluent"]
+        self.assertEqual(alone["state"], "failed", alone)
+        self.assertIn(f"absolute limit {ABSOLUTE_PERPLEXITY:g}: no reference", alone["detail"])
+        judged = self.results(toy=engine, only={"fluent"}, reference=reference)["fluent"]
+        self.assertEqual(judged["state"], "passed", judged)
+        for words in ("against the reference's", "drift per target median", "p90", "max"):
+            self.assertIn(words, judged["detail"])
+        for regressed in (Toy("flat", known=noisy), Toy(known=noisy / 3), Toy(known=noisy, jitter=1.5)):
+            with self.subTest(bug=regressed.bug, known=regressed.known_boost, jitter=regressed.jitter):
+                found = self.results(toy=regressed, only={"fluent"}, reference=reference)["fluent"]
+                self.assertEqual(found["state"], "failed", found)
+        # strict judges rounding that loose passes.
+        rounded = Toy(known=noisy, jitter=0.4)
+        self.assertEqual(self.results(toy=rounded, only={"fluent"}, reference=reference)["fluent"]["state"], "passed")
+        self.assertEqual(self.results(toy=rounded, only={"fluent"}, reference=reference,
+                                      profile="strict")["fluent"]["state"], "failed")
+        # A working checkpoint's reference passes its own engine; the nearest-rank quantiles are what is reported.
+        working = self.results(only={"fluent"}, reference=toy_reference(Toy()))["fluent"]
+        self.assertEqual(working["state"], "passed", working)
+        self.assertEqual((quantile([3, 1, 2, 4], 0.5), quantile(range(10), 0.9)), (2, 8))
+        with self.assertRaisesRegex(ValueError, "target must hold"):
+            validate({"texts": [dict(reference["texts"][0], target=[0.0])]})
 
     def test_a_suite_past_its_budget_stops_as_failed(self):
         results = self.results(only={"rows_valid", "fluent"}, budget=0)

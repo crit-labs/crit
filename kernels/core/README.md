@@ -107,6 +107,17 @@ and `softmax_merge` (a partial (max, sum) into a running one, -inf safe). Triton
 pairwise tree of adjacent elements: the same bits for every layout and warp count, unlike tl.sum) and
 `sum_partials` (partials added in part order).
 
+## radix (`radix.cuh`, `python/crit_kcore/radix.py`)
+
+What a selection that finds a boundary key without sorting shares: `radix_key` / `radix_key_bits` (a float as a uint32
+key of the same order, -0 just below +0, a NaN as 0, below every number) and `radix_float` (its inverse);
+`digit_from_top<BINS>(mass, target, reach, cum)` (a pass's digit: the highest bin at which the running total from the
+top reaches the target, bins of no mass skipped, the total above it kept; a count or a sum of weights, added in bin
+order); `warp_digit_256(bins, need, clamp)` (one warp's search of a 256-bin count histogram for the need-th largest
+key, a lane 8 bins, no word from other warps). Users: sparse-indexer's selects (CUDA and Triton) and token-sampling's
+full law (its prefix searches). topk-routing keeps repeated warp argmax (`reduce.cuh`): a router row's few experts
+are one warp's registers and its picks are wanted in selection order, which a radix select would sort afterwards.
+
 ## epilogue (`epilogue.cuh`, `python/crit_kcore/epilogue.py`)
 
 `exp_declared` and `swiglu_declared` (crit's declared functions: every step rounded, the same bits on every device
@@ -184,6 +195,17 @@ four partial sums (folded with reduce's `fold16`, the bits of 16 lanes kept to t
 zero-accumulator E4M3 MMA in crit's fragment order), `block_sum_s8` + `biased_sum` (the s8 MMA on a biased
 accumulator: the exact block sum is one FP32 subtraction), `step` (the declared fma), `nibbles_to_s8x4` (four E2M1 x 2
 or INT4 codes to int8 in three byte permutes) and `pair_slot` (rows g and g + 8 side by side for 8-byte scale loads).
+
+## declared_staged (`declared_staged.cuh`)
+
+The declared block order's staged prompt GEMM, its mainloop once for every format: `StagedShape` (a CTA's BM rows x BN
+tokens, WM x WN warps, G lanes and RUN blocks a visit, STAGES of the cp.async ring, the technique's sub-stage layout)
+and `declared_staged`, the ring of GroupVisits, the stage decoded one iteration ahead, the declared step a block and
+lane, the lanes folded by fold16 as they finish; `declared_staged_store` writes a tile's outputs times the row's post.
+A technique gives three callables: the asynchronous copies of a block into a sub-stage, the conversions of a landed
+one (codes to the MMA's operand type, scale words to FP32 in pair_slot order) and the warp's block sums as FP32 (one
+e4m3 MMA from zero, or the s8 MMA onto blockscaled_mma.cuh's exact-sum bias). fp8-block-rows' and int-block-experts'
+`gemm-staged` are its two users: each output keeps the declared order's bits.
 
 ## tile (`tile.cuh`)
 

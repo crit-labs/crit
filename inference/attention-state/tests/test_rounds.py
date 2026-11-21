@@ -301,10 +301,12 @@ class KeyRowsTests(PluginTestCase):
         pool.open("a")
         keys = torch.randn(10, 2, 32, device=self.dev)
         pool.write(1, pool.reserve(StepBatch.build([("a", 0, 10)], self.dev)), keys, keys)
-        stored = pool.k[1].view(-1, 2, 32)[torch.tensor(pool.table("a"), device=self.dev).repeat_interleave(16)[:10] * 16
-                                           + torch.arange(10, device=self.dev) % 16]
+        # Read as bytes, as pages.py moves FP8 pages: torch indexes no FP8 tensor on the CPU (index_cpu).
+        stored = pool.k[1].view(torch.uint8).view(-1, 2, 32)[
+            torch.tensor(pool.table("a"), device=self.dev).repeat_interleave(16)[:10] * 16
+            + torch.arange(10, device=self.dev) % 16]
         want = (keys / torch.full_like(keys, 0.25)).clamp(-448, 448).to(torch.float8_e4m3fn)
-        self.assertTrue(torch.equal(stored.view(torch.uint8), want.view(torch.uint8)))
+        self.assertTrue(torch.equal(stored, want.view(torch.uint8)))
 
 
 class ElasticRoundSlotTests(RoundSlotTests):

@@ -8,8 +8,9 @@ the dense layouts over the library's base plugins; crit's tests/test_model_templ
 mixture-of-experts, hybrid, streams and drafting layouts. The engines run on CUDA where torch has it and on the CPU
 otherwise (CRIT_TEMPLATE_DEVICE names one): there the norms are torch-norms', decoding goes through step() (captured
 rounds are a GPU's) and no span is timed, the arithmetic checked against transformers is the same. Needs
-transformers, safetensors and Core's crit_core_steps; each class skips where transformers lacks its architecture or
-its plugins do not run on the device."""
+transformers, safetensors and Core's crit_core_steps: without them the engines skip unchecked, which fails crit plugins
+test (crit_plugins.testing.unchecked). Each class skips plainly where transformers lacks its architecture or its plugins
+do not run on the device."""
 from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import json
@@ -19,14 +20,17 @@ import shutil
 import tempfile
 import unittest
 
-from crit_plugins.testing import PluginTestCase
+from crit_plugins.testing import PluginTestCase, core_runtime, unchecked
 
 try:
     import torch
+except ImportError:
+    torch = None
+try:
     import transformers
     import safetensors.torch  # noqa: F401
 except ImportError:
-    torch = transformers = None
+    transformers = None
 
 HERE = Path(__file__).resolve().parents[1]
 GREEDY = {"temperature": 0.0}
@@ -81,9 +85,12 @@ class Engines(PluginTestCase):
         cls.device = engine_device()
         if cls.device not in cls.devices:
             raise unittest.SkipTest(f"its plugins run on {', '.join(cls.devices)}, the engines here on {cls.device}")
-        from crit_core.native import step_library
-        if step_library() is None:
-            raise unittest.SkipTest("Core's crit_core_steps (crit core build)")
+        # The engines run here, so what keeps them from running leaves the template's correctness unchecked: Core's
+        # runtime, and transformers, the reference its scores and continuations are compared with.
+        core_runtime()
+        if transformers is None:
+            raise unchecked("transformers and safetensors, the reference the engines are compared with "
+                            "(crit's reference extra)")
         try:
             from crit.plugins import add
         except ImportError:
@@ -185,6 +192,19 @@ class Engines(PluginTestCase):
 class Layout(Engines):
     """The checks every layout's engine passes."""
 
+    def test_the_kv_it_resolves_before_any_load_is_the_kv_it_loads(self):
+        # Core asks the plugins what the engine will be before a load (their resolve()): the layout's pools from the
+        # checkpoint's headers alone, priced by the kv_cache plugin, are the pools the load makes, so a plan's
+        # kv_bytes_per_token is checked before any load (and the loader refuses an engine that is not what it
+        # resolved).
+        from crit_core.engine import resolve_package
+        resolved = resolve_package(self.package, self.model, device=self.device)
+        stated = self.engine.info().get("kv_bytes_per_token")
+        self.assertIsNotNone(stated)
+        self.assertEqual(resolved["facts"].get("kv_bytes_per_token"), stated)
+        self.assertEqual(resolved["by"]["kv_bytes_per_token"], "model-template")
+        self.assertEqual(self.engine.telemetry()["load"]["resolved"]["kv_bytes_per_token"], stated)
+
     def test_scores_follow_transformers_log_probabilities(self):
         (ids,) = self.prompts(1, 150)   # three prompt spans, the KV and any recurrent state carried between them
         self.assertScores(self.engine, ids)
@@ -265,7 +285,12 @@ class Layout(Engines):
             self.skipTest("spans are timed and rounds captured on a GPU")
         facts = self.engine.model.facts()
         self.assertTrue(facts["spans"]["calibrated"], facts["spans"])
-        self.assertEqual(set(facts["spans"]["costs"]), {"c", "a", "b", "m"})
+        self.assertEqual(set(facts["spans"]["costs"]), {"c", "a", "b"})
+        # the calibration's steps are Core's measured steps: their peak bytes a row, from Core's allocator, state
+        # the deepest prompt chunk Core's arena holds (info's step_bytes)
+        model = self.engine.model
+        self.assertGreater(facts["spans"]["row_bytes"], 0)
+        self.assertEqual(model.info()["step_bytes"], int(facts["spans"]["row_bytes"] * model.chunk))
         self.assertEqual(facts["rounds"]["problems"], [])
         self.assertIsNotNone(self.engine.model.rounds.native)
 
@@ -295,21 +320,71 @@ class DecoderTests(Layout):
         short.close()
         self.engines.remove(short)
 
-    def test_a_score_asks_the_device_for_each_slice_of_logits_before_it_takes_it(self):
-        # A score's logits are its rows' FP32 [rows][vocabulary] beside their log-softmax and, for top_k, the sorted
-        # row and its int64 order: on a large vocabulary hundreds of megabytes a slice, which no prompt step of its
-        # size takes. The ledger hears of each slice first (an elastic expert cache then makes room for it), so the
-        # device's free memory never falls under what the cache keeps.
+    def test_a_score_s_slices_of_logits_live_in_the_step_arena_it_states(self):
+        # A score's logits are its rows' FP32 [rows][vocabulary] beside their log-softmax and, for top_k, a mask of
+        # the entries at or past each row's k-th value (crit_plugins.ranking: no sorted vocabulary row): on a large
+        # vocabulary hundreds of megabytes a slice, which no prompt step of its size takes. Core's warm requests
+        # score a text of a full chunk with 20 alternatives at load, its arena holds what that took, and a score's
+        # segments come out of it: no slice passes the arena.
+        from crit_plugins import memory
         model = self.engine.model
-        asked = []
-        model._need = asked.append
+        if model.device.type != "cuda":
+            self.skipTest("Core allocates a CUDA device's step memory; this engine runs on the CPU")
+        device = memory.of(model.device)
+        overflows = device.steps()["overflows"]
         (ids,) = self.prompts(1, 300)
         self.engine.score(ids, 1, "prefill", top_k=4)
-        del model._need
-        per_row = model._score_bytes(1, top_k=4)
-        self.assertEqual(per_row, model.vocabulary * (8 + 12))
-        self.assertEqual(sum(asked), (len(ids) - 1) * per_row)   # every scored row, slice by slice
-        self.assertLessEqual(max(asked), 128 * per_row)
+        steps = device.steps()
+        if steps.get("unaccounted"):
+            self.skipTest(steps["unaccounted"])
+        self.assertGreater(steps["most"].get("score", 0), 0)
+        self.assertEqual(steps["overflows"], overflows)
+        self.assertGreaterEqual(device.arena, steps["most"]["score"])
+
+    def test_a_request_asking_decode_via_prompt_decodes_as_one_token_prompt_chunks(self):
+        # The debug hook crit smoke tells a decode gap's rounding from a fault by (StepRequest.decode_via_prompt): a
+        # replay's decode rows multiply as one-token prompt chunks where they would multiply as decode rows, and
+        # score what the prompt path scores. (The head multiplies every logits row as a decode row on both paths.)
+        model = self.engine.model
+        self.assertIs(model.info()["decode_via_prompt"], True)
+        groups, matmul = [], model.rows.matmul
+
+        def spy(x, matrix, found, out_dtype=None):
+            if matrix is not model.head:
+                groups.append(list(found))
+            return matmul(x, matrix, found, out_dtype)
+        model.rows.matmul = spy
+        prompt, continuation = self.prompts(2, 21)
+        continuation = continuation[:12]
+
+        def replay(via_prompt):
+            rows = []
+            groups.clear()
+            tokens, _ = self.engine.generate(prompt, len(continuation), stop_tokens=[], replay=continuation,
+                                             sampling=GREEDY, logprobs=1, decode_via_prompt=via_prompt,
+                                             on_tokens=lambda _tokens, found: rows.extend(found))
+            self.assertEqual(tokens, continuation)
+            return [logprob for logprob, _ in rows], [g for found in groups for g in found if g[1] - g[0] == 1]
+        def rounds():   # decode rounds Core ran in its captured rounds (none where the model has no rounds)
+            return ((model.telemetry() or {}).get("drafts") or {}).get("rounds") or 0
+        try:
+            began = rounds()
+            plain, plain_rows = replay(False)
+            plain_rounds = rounds() - began
+            via, via_rows = replay(True)
+            via_rounds = rounds() - began - plain_rounds
+        finally:
+            model.rows.matmul = matmul
+        # Plain decode rows multiply as decode rows: eagerly (the spy sees them), or inside Core's captured rounds,
+        # whose replays no Python spy sees (a replayed request decodes there too since rounds mask), never as prompt
+        # chunks. Through the hook they are one-token prompt chunks, run eagerly, in no round.
+        self.assertFalse(any(prompt for _, _, prompt in plain_rows), plain_rows)
+        self.assertTrue(plain_rows or plain_rounds >= len(continuation) - 1, (plain_rows, plain_rounds))
+        self.assertTrue(via_rows and all(prompt for _, _, prompt in via_rows), via_rows)
+        self.assertEqual(via_rounds, 0)
+        scored = self.engine.score(prompt + continuation, len(prompt), "prefill").target
+        self.assertLess(max(abs(a - b) for a, b in zip(via, scored)), 0.25, (via, scored))
+        self.assertLess(max(abs(a - b) for a, b in zip(via, plain)), 0.25, (via, plain))
 
     def test_a_selection_without_a_slot_the_layout_calls_is_refused_before_load(self):
         from crit_plugins import PluginError
@@ -355,6 +430,7 @@ class GgufEngines:
     under the names its blocks read, and the reference computes the values the file stores. Put it before the
     layout's class: class GgufX(GgufEngines, XTests), with `arch` the GGUF architecture."""
     arch = None
+    dense = ()   # Hugging Face name endings of matrices the file keeps F32 (write_gguf's dense)
 
     @classmethod
     def checkpoint(cls, root):
@@ -364,7 +440,7 @@ class GgufEngines:
         if path is None:
             return None
         fixture = gguf_fixture()
-        gguf, values = fixture.write_gguf(path, root / "gguf", cls.arch)
+        gguf, values = fixture.write_gguf(path, root / "gguf", cls.arch, dense=cls.dense)
         fixture.stored_reference(cls.reference, values)
         cls.model = gguf.parent
         return cls.model
@@ -386,6 +462,44 @@ class GgufDecoderTests(GgufEngines, DecoderTests):
         found = self.engine.facts
         self.assertIn("Q8_0", found["gguf_formats"], found)
         self.assertEqual(self.engine.model.embed.format, "gguf:Q8_0")   # stored rows, never decoded whole
+
+
+@unittest.skipIf(torch is None, "torch")
+class GgufDenseDecoderTests(GgufEngines, DecoderTests):
+    """The decoder layout over a Llama checkpoint written as GGUF with some matrices kept F32 (the attention's output
+    and the MLP's down projection), as GGUF files keep routers and small gates: gguf-projections loads them dense
+    beside the Q8_0 ones, and an engine of the run's preserve mode, which asks exact prompt rows, is taken by Core's
+    loader and serves."""
+    arch = "llama"
+    dense = ("self_attn.o_proj.weight", "mlp.down_proj.weight")
+    library = BASE + ["gguf-projections", "lookup-table-rows"]
+    use = {**GGUF_USE, "embeddings": "lookup-table-rows"}
+
+    def test_a_preserve_mode_engine_keeps_the_exact_rows_it_asks(self):
+        from crit_core.engine import load
+        found = self.engine.facts
+        self.assertIn("Q8_0", found["gguf_formats"], found)
+        self.assertIn("bf16", found["gguf_formats"], found)   # the F32 matrices, dense
+        engine = load(self.package, self.model, {"plugins": self.selection(), "quality_mode": "preserve"},
+                      device=self.device)
+        self.engines.append(engine)
+        facts = engine.facts
+        self.assertEqual(facts["row_invariance"]["prompt_exact"], True, facts)
+        # Its prompt rows have its decode rows' bits: each greedy reply is the top token its own prefill gives at
+        # every position. The engine without a mode multiplies other bits on CUDA (prompt rows cuBLAS's GEMM over
+        # the decoded matrices, the exact path's decode rows int8 activations), so its reply may part from this one
+        # only where the reference has a near-tie; its scores are the reference's.
+        prompts = self.prompts(2, 40)
+        for p in prompts:
+            reply = engine.generate(p, 6, stop_tokens=[], sampling=GREEDY)[0]
+            scored = engine.score(p + reply, 1, "prefill", top_k=1)
+            self.assertEqual([scored.top[len(p) - 1 + k][0][0] for k in range(len(reply))], reply)
+            other = self.engine.generate(p, 6, stop_tokens=[], sampling=GREEDY)[0]
+            if other != reply:
+                at = next(k for k, (a, b) in enumerate(zip(reply, other)) if a != b)
+                logp = self.logits(p + reply[:at])[len(p) - 1 + at].log_softmax(-1)
+                self.assertLess(abs(float(logp[reply[at]]) - float(logp[other[at]])), 0.5, (reply, other))
+        self.assertScores(engine, prompts[0])
 
 
 if __name__ == "__main__":

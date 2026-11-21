@@ -1,0 +1,40 @@
+{
+  "schema": "crit-kernel-v1",
+  "id": "cpu-routes",
+  "family": "experts",
+  "title": "A routed layer's CPU share joined inside a CUDA stream: the CPU tier's routes posted into a slot of one of the host's handoffs by one kernel, the CPU's rows scattered into the device part's route rows after the join by another, capture-safe",
+  "package": "cpu_routes",
+  "language": "cuda",
+  "host_include": true,
+  "operations": [
+    "cpu-route-handoff"
+  ],
+  "sources": [
+    "routes_cuda/cpu_routes.cu",
+    "torch-ext/torch_binding.cpp"
+  ],
+  "capabilities": [
+    "8.0",
+    "8.6",
+    "8.9",
+    "9.0",
+    "10.0",
+    "10.3",
+    "11.0",
+    "12.0",
+    "12.1"
+  ],
+  "libraries": [],
+  "structures": {
+    "post": {
+      "what": "one block of 256 threads a layer call: the routes' ids and slots read into shared memory, thread 0 lists the CPU routes (slot -2) in route order and the tokens they read in first-use order, every thread copies those tokens' rows into the payload (as BF16-rounded FP32, the declared arithmetic's input), a system-scope fence, then thread 0 posts the slot or answers it itself when there is no CPU route",
+      "call": "post",
+      "exactness": "declared"
+    },
+    "scatter": {
+      "what": "a block a CPU route after the join: the slot's status read once a block that has a route, the CPU's FP32 row copied into the device part's route row, NaN rows where the CPU failed (never a silent partial sum), the status word for the caller",
+      "call": "scatter",
+      "exactness": "declared"
+    }
+  }
+}

@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from .client import Client
+from .reference import load
 from .suite import TESTS, run
 
 
@@ -28,10 +29,15 @@ def main(argv=None):
     parser.add_argument("--budget", type=float, default=300,
                         help="Seconds the suite may run before it stops as failed: an engine that needs longer is too "
                              "slow or slows down as it serves (default %(default)s)")
+    parser.add_argument("--reference", type=Path, metavar="RECON_JSON",
+                        help="The checkpoint's reference: a run's work/recon.json recorded with recon --data. fluent is "
+                             "then judged against it; without one, by an absolute perplexity on smoke's prose")
     parser.add_argument("--out", type=Path, help="Write the items as JSON here")
     args = parser.parse_args(argv)
+    reference = load(args.reference) if args.reference else None
     client = Client(args.url, args.model, args.api_key, args.timeout)
-    items = run(client, set(args.only or ()), "strict" if args.strict else "loose", args.long, budget=args.budget)
+    items = run(client, set(args.only or ()), "strict" if args.strict else "loose", args.long, budget=args.budget,
+                reference=reference)
     total = sum(i["seconds"] for i in items)
     counts = {s: sum(i["state"] == s for i in items) for s in ("passed", "failed", "skipped")}
     print(f"{counts['passed']} passed, {counts['failed']} failed, {counts['skipped']} skipped in {total:.1f}s")

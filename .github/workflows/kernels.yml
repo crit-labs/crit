@@ -7,9 +7,13 @@ name: Kernels for every architecture
 on:
   push:
     branches: [main]
-    paths: ['kernels/**', '.github/workflows/kernels.yml']
+    paths: ['kernels/**', 'inference/*/operations.json', 'inference/*/code/*.cu', 'inference/*/code/*.cuh',
+            'inference/*/code/*.h', 'core/python/crit_plugins/host/*.cu', 'core/python/crit_plugins/host/*.cuh',
+            'core/python/crit_plugins/host/*.h', '.github/workflows/kernels.yml']
   pull_request:
-    paths: ['kernels/**', '.github/workflows/kernels.yml']
+    paths: ['kernels/**', 'inference/*/operations.json', 'inference/*/code/*.cu', 'inference/*/code/*.cuh',
+            'inference/*/code/*.h', 'core/python/crit_plugins/host/*.cu', 'core/python/crit_plugins/host/*.cuh',
+            'core/python/crit_plugins/host/*.h', '.github/workflows/kernels.yml']
   workflow_dispatch:
 
 permissions:
@@ -106,6 +110,47 @@ jobs:
           MAX_JOBS: '4'
           CRIT_KERNEL_CACHE: ${{ runner.temp }}/kernels
         run: crit kernels gates "${{ matrix.kernel }}" --limits-only
+
+  outside:
+    # The CUDA crit builds outside kernels/ (Core's
+    # host handoff: built by crit_plugins.native at load) for every architecture the kernels claim, within the
+    # register and spill limits (python -m crit_kernels.outside), with no GPU.
+    name: CUDA outside kernels/ / every architecture
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+      - name: torch, the CUDA toolkit, ninja
+        # PyPI's torch 2.14.1 for Linux, built with CUDA 13.0 (its runtime libraries come with it), and beside it in
+        # its own folder the CUDA 13.1 toolkit's wheels (nvcc, the headers and libraries an extension links) and
+        # cuobjdump (13.2, the oldest on PyPI; it reads 13.1's binaries). 13.1, not 13.0: 13.0's nvcc fails with an
+        # internal error on pinned-gemm against Ubuntu 24.04's GCC 13 headers. The wheels name their libraries with the
+        # major version only and keep them in lib/, so the linker's plain names are added beside them and lib64/
+        # (where nvcc links its static runtime from) points at lib/. uv installs them: pip took about a minute and
+        # a half.
+        run: |
+          python -m pip install --disable-pip-version-check uv==0.13.8
+          python -m uv pip install --system torch==2.14.1 ninja==1.13.0
+          python -m uv pip install --target "$RUNNER_TEMP/cuda" \
+            "cuda-toolkit[nvcc,cudart,cccl,crt,cublas,cusparse,cusolver,curand,cufft]==13.1.2" nvidia-cuda-cuobjdump==13.2.86
+          cuda="$RUNNER_TEMP/cuda/nvidia/cu13"
+          (cd "$cuda/lib" && for f in *.so.[0-9]*; do plain="${f%%.so.*}.so"; [ -e "$plain" ] || ln -s "$f" "$plain"; done)
+          [ -e "$cuda/lib64" ] || ln -s lib "$cuda/lib64"
+          echo "CUDA_HOME=$cuda" >> "$GITHUB_ENV"
+          echo "$cuda/bin" >> "$GITHUB_PATH"
+          "$cuda/bin/nvcc" --version
+      - name: crit, as documented
+        run: python -m pip install -e core/python -e .
+      - name: Compile for every architecture and check its limits
+        run: python -m crit_kernels.outside
 
   host:
     # The kernel library's host-side tests: tunings, tables and gates' bookkeeping, with no GPU.

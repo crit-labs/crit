@@ -98,11 +98,6 @@ INTERFACES = {
                    "flattened) over steps {query, key, value, log_decay, beta}; geometry {keys, values, epsilon, "
                    "query_scale, normalize_keys, normalize_queries}",
     },
-    "graphs": {
-        "choose": "choose(shape, offers, free_bytes, uses=1) -> offer name: shape {phase, tokens, rows, identity}, "
-                  "each offer {name, mode (eager, full, partial), shape, run_ns, workspace_bytes, resident_bytes, "
-                  "setup_ns, setup_peak_bytes, ready}",
-    },
     "embeddings": {
         "load": "load(table): the lookup table, one [width] row per id (token or hashed n-gram embeddings)",
         "rows": "rows(ids) -> [row]: the table rows of the ids, in request order",

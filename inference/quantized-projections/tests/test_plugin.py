@@ -71,7 +71,7 @@ class QuantizedProjectionsTests(PluginTestCase):
             self.assertEqual((p.head, p.head_by), (head, by), (mode, option))
         kernels.use_quality_mode("speed")   # auto is the default
         self.assertEqual(self.assemble()["projections"].head, "fp8")
-        with self.assertRaisesRegex(ValueError, "quality mode 'fast' is not one of speed, preserve"):
+        with self.assertRaisesRegex(ValueError, "quality mode 'fast' is not one of preserve, speed"):
             kernels.use_quality_mode("fast")
 
     def test_the_formats_differ(self):

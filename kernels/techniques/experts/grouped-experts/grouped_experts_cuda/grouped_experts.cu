@@ -26,17 +26,19 @@ constexpr int kPad = 8;   // BF16 elements of padding per staged route row (16 b
 
 template <int F>
 constexpr bool kZp = F == int(Format::int4_zp);   // INT4 with a zero point: two BF16 parts a value, two MMAs
+template <int F>   // E4M3 codes a byte a weight: the FP8 formats, MXFP8's exponent a 32 beside them
+constexpr bool kFp8 = F == int(Format::fp8_channel) || F == int(Format::fp8_block) || F == int(Format::mxfp8);
 
 template <int F>
 struct Raw {
-    uint32_t w[F == int(Format::bf16) ? 8 : (F == int(Format::fp8_channel) || F == int(Format::fp8_block)) ? 4 : 2];
+    uint32_t w[F == int(Format::bf16) ? 8 : kFp8<F> ? 4 : 2];
     uint32_t s;
 };
 
 template <int F, int TILES>
 __host__ __device__ constexpr int depth() {   // 64-k blocks of weights in flight per warp (deeper with fewer rows)
     return F == int(Format::bf16) ? (TILES == 1 ? 3 : 2)
-           : (F == int(Format::fp8_channel) || F == int(Format::fp8_block)) ? (TILES == 1 ? 4 : 3)
+           : kFp8<F> ? (TILES == 1 ? 4 : 3)
            : (TILES == 1 ? 6 : 4);
 }
 
@@ -47,7 +49,7 @@ __device__ __forceinline__ uint32_t load_scale(const std::uint8_t* scales, int r
     if constexpr(kZp<F>) {
         const long long at = static_cast<long long>(row) * (K / group) + k / group;
         return uint32_t(__ldg(reinterpret_cast<const uint16_t*>(scales) + at)) | (uint32_t(__ldg(zeros + at)) << 16);
-    } else if constexpr(F == int(Format::mxfp4)) {
+    } else if constexpr(F == int(Format::mxfp4) || F == int(Format::mxfp8)) {
         return __ldg(scales + static_cast<long long>(row) * (K / 32) + k / 32);
     } else {
         return __ldg(scales + static_cast<long long>(row) * (K / 16) + k / 16);
@@ -65,10 +67,10 @@ __device__ __forceinline__ Raw<F> load_raw(const std::uint8_t* codes, const std:
         r.w[0] = a.x; r.w[1] = a.y; r.w[2] = a.z; r.w[3] = a.w;
         r.w[4] = b.x; r.w[5] = b.y; r.w[6] = b.z; r.w[7] = b.w;
         r.s = 0;
-    } else if constexpr(F == int(Format::fp8_channel) || F == int(Format::fp8_block)) {
+    } else if constexpr(kFp8<F>) {
         const uint4 a = __ldg(reinterpret_cast<const uint4*>(codes + static_cast<long long>(row) * K + k));
         r.w[0] = a.x; r.w[1] = a.y; r.w[2] = a.z; r.w[3] = a.w;
-        r.s = 0;
+        r.s = F == int(Format::mxfp8) ? load_scale<F>(scales, row, K, k) : 0;
     } else {
         const uint2 a = __ldg(reinterpret_cast<const uint2*>(codes + static_cast<long long>(row) * (K / 2) + k / 2));
         r.w[0] = a.x; r.w[1] = a.y;
@@ -92,9 +94,14 @@ __device__ __forceinline__ void decode(const Raw<F>& r, uint32_t* f) {
     if constexpr(F == int(Format::bf16)) {
 #pragma unroll
         for(int i = 0; i < 8; ++i) f[i] = r.w[i];
-    } else if constexpr(F == int(Format::fp8_channel) || F == int(Format::fp8_block)) {
+    } else if constexpr(kFp8<F>) {
 #pragma unroll
         for(int i = 0; i < 4; ++i) kc::e4m3x4_to_bf16x2(r.w[i], f + 2 * i);
+        if constexpr(F == int(Format::mxfp8)) {   // times a power of two: exact in BF16
+            const bf162 s2 = kc::e8m0_bf16x2(r.s);
+#pragma unroll
+            for(int i = 0; i < 8; ++i) f[i] = kc::u32_of(__hmul2(kc::bf162_of(f[i]), s2));
+        }
     } else if constexpr(F == int(Format::int4)) {
         const bf16 s = __float2bfloat16_rn(kc::e4m3_value(r.s));
         const bf162 s2 = __halves2bfloat162(s, s);
@@ -524,6 +531,9 @@ __global__ void __launch_bounds__(WARPS * 32) expert_kernel(Pass p) {
                 for(int t = 0; t < TILES; ++t)
                     hv[t] = L.activation == 1
                         ? kc::gelu_tanh_mul(__fmul_rn(acc[t][n][c], fg[t]), __fmul_rn(acc[t][n][2 + c], fu[t]))
+                        : L.activation == 2
+                        ? kc::softcapped_swiglu(__fmul_rn(acc[t][n][c], fg[t]), __fmul_rn(acc[t][n][2 + c], fu[t]),
+                                                L.gate_cap, L.up_cap)
                         : kc::swiglu_declared(__fmul_rn(acc[t][n][c], fg[t]), __fmul_rn(acc[t][n][2 + c], fu[t]));
                 if constexpr(A4) {   // a 16-row block of inter rows of this route: one block of the down's input
                     // Tiles 2q and 2q + 1 (rows r0 + 16q .. + 15) are one block; with one tile a warp, the block's other
@@ -930,6 +940,7 @@ cudaError_t formats(const Pass& p, bool a4, const Items& items, cudaStream_t str
             CRIT_GX_CASE(Format::int4)
             CRIT_GX_CASE(Format::mxfp4)
             CRIT_GX_CASE(Format::int4_zp)
+            CRIT_GX_CASE(Format::mxfp8)
             default:
                 return cudaErrorInvalidValue;
         }
@@ -989,7 +1000,8 @@ cudaError_t dispatch(const Pass& p, bool a4, const Items& items, int tokens, cud
 
 bool valid(const Layout& L) {
     return L.bytes > 0 && L.bytes % 16 == 0 && L.hidden >= 64 && L.inter >= 64 && L.hidden % 64 == 0 &&
-           L.inter % 64 == 0 && L.gate_up >= 0 && L.down >= 0 && (L.activation == 0 || L.activation == 1) &&
+           L.inter % 64 == 0 && L.gate_up >= 0 && L.down >= 0 &&
+           (L.activation == 0 || L.activation == 1 || (L.activation == 2 && L.gate_cap > 0.0f && L.up_cap > 0.0f)) &&
            (L.format != Format::int4_zp ||
             (L.group >= 16 && L.group % 16 == 0 && L.hidden % L.group == 0 && L.inter % L.group == 0 &&
              L.gate_up_scale >= 0 && L.gate_up_inverse >= 0 && L.down_scale >= 0 && L.down_inverse >= 0));

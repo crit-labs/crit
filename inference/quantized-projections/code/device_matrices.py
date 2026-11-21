@@ -8,6 +8,8 @@ Formats, by the tensors a checkpoint stores (roles, not names):
     fp8:tensor   weight [out][in] E4M3, scale [] (one for the matrix)
     mxfp8        weight [out][in] E4M3, scale [out][in / 32] E8M0 bytes (W = weight * 2^(scale - 127), MXFP8 as
                  modelopt stores it)
+    fp8:block    weight [out][in] E4M3, scale FP32 [ceil(out / b0)][in / b1], block (b0, b1) (W = weight * the scale of
+                 its b0 x b1 block: an FP8 block checkpoint's 128 x 128), stored as is on fp8-block-rows (_fp8_block)
     nvfp4        weight [out][in / 2] packed E2M1 (code 2i in the low nibble of byte i), scale [out][in / 16] E4M3
                  block scales, global_scale [] or [out] (W = e2m1 * scale / global_scale, nvfp4.py's divisor
                  convention; one per output row for matrices stacked by rows) and input_scale [] (the activations'
@@ -61,7 +63,10 @@ import math
 # mma-rows, pinned-gemm): quantized-projections' plugin.py sets it.
 KERNEL_FOLDER = None
 
-FORMATS = ("bf16", "fp8:channel", "fp8:tensor", "mxfp8", "nvfp4", "awq", "gptq")
+FORMATS = ("bf16", "fp8:channel", "fp8:tensor", "mxfp8", "nvfp4", "fp8:block", "awq", "gptq")
+# fp8:block matrices' activations: E4M3 per this many inputs at amax / 448 (fp8-block-rows' declared quantizer), the
+# FP8 block checkpoints' own activation granularity (DeepSeek-V3's 128)
+FP8_BLOCK_GROUP = 128
 # INT4 with a zero point a group, as AWQ and GPTQ checkpoints store it (loaded into crit's rows, format int4_zp):
 #     awq   qweight int32 [in][out / 8] (AWQ's nibble order 0, 2, 4, 6, 1, 3, 5, 7), qzeros int32 [in / group][out / 8]
 #           (the same order), scales FP16 [in / group][out]
@@ -214,9 +219,10 @@ def load(tensors, format, device=None, activations="nvfp4", prompt="bf16", gemm=
                          f"not {gemv!r}")
     if decode not in DECODES:
         raise ValueError(f"decode rows take {', '.join(DECODES)} activations, not {decode!r}")
-    if gemm == "auto":   # crit's prompt GEMM where it measured at least the provider's speed (NATIVE_AUTO)
-        gemm = "native" if NATIVE_AUTO.get(_auto_kind(format, activations, prompt, fp8_activations,
-                                                      mx_activations)) else "provider"
+    if gemm == "auto":   # crit's prompt GEMM or the provider's, by what the sweep measured (_auto_gemm)
+        stored = tensors["qweight" if format in INT4_FORMATS else "weight"]
+        gemm = _auto_gemm(_auto_kind(format, activations, prompt, fp8_activations, mx_activations),
+                          *_stored_shape(tensors, format), torch.device(device) if device is not None else stored.device)
     if not 8 <= decode_rows <= GEMV_ROWS:
         raise ValueError(f"a decode call takes 8 to {GEMV_ROWS} rows, not {decode_rows}")
     if gemv not in GEMVS:
@@ -261,6 +267,8 @@ def load(tensors, format, device=None, activations="nvfp4", prompt="bf16", gemm=
         matrix.native = device_nvfp4.native(device) if gemv == "native" and w.shape[1] % 8 == 0 else None
         matrix.path = "gemv" if matrix.native is not None else "torch"
         return _finish(matrix, decode_rows, device, tile, tile_rows, modules)
+    if format == "fp8:block":
+        return _fp8_block(tensors, device, gemm, decode_rows, modules)
     if format == "mxfp8":
         w = weight.to(device).view(torch.float8_e4m3fn).contiguous()
         exponents = tensors["scale"].to(device).view(torch.uint8).contiguous()
@@ -326,6 +334,7 @@ def load(tensors, format, device=None, activations="nvfp4", prompt="bf16", gemm=
              "inverse": inverse[None, :], "inverse_rows": inverse,
              "input_scale": _scalar(tensors["input_scale"], "input scale")}
     found["input_rcp"] = torch.tensor(1.0 / found["input_scale"], dtype=torch.float32, device=device)
+    found["inverse_input"] = (inverse / found["input_scale"]).contiguous()   # the native GEMV's epilogue factor
     matrix = Matrix(format, rows, columns, found, activations)
     matrix.runs = _runs(found, rows, columns, device)
     matrix.gemm = gemm if gemm in ("pinned", "pinned_cublaslt", "tile", "native") else "provider"
@@ -333,6 +342,70 @@ def load(tensors, format, device=None, activations="nvfp4", prompt="bf16", gemm=
     matrix.native = device_nvfp4.native(device) if gemv == "native" and columns % 32 == 0 else None
     matrix.path = "gemv" if matrix.native is not None else "cublaslt" if decode == "prompt" else "torch"
     return _finish(matrix, decode_rows, device, tile, tile_rows, modules)
+
+
+def _fp8_block(tensors, device, gemm, decode_rows, modules):
+    """An fp8:block matrix (FP8 in b0 x b1 blocks of FP32 scales) stored as is, on crit's fp8-block-rows: W8A8
+    against activations quantized per FP8_BLOCK_GROUP inputs by its declared quantizer (amax / 448). Decode rows (up
+    to decode_rows, 8 a job) on its declared rows; prompt rows on its declared staged GEMM (gemm-staged: every output
+    the bits of its row decoded, whatever rows share the call: prompt_exact), or, with prompt_gemm native (and auto),
+    its tensor-core GEMM (gemm-native-blocks: faster, not the declared order nor row invariant). The job tables are
+    made here, so a captured call copies nothing from the host."""
+    import torch
+    from . import device_nvfp4
+    w = tensors["weight"].to(device).view(torch.uint8).contiguous()
+    rows, columns = w.shape
+    b0, b1 = (int(b) for b in tensors["block"])
+    scale = tensors["scale"].to(device=device, dtype=torch.float32).contiguous()
+    if b0 < 1 or b1 % 32 or columns % b1 or columns % FP8_BLOCK_GROUP or \
+            tuple(scale.shape) != (-(-rows // b0), columns // b1):
+        raise ValueError(f"an fp8:block matrix of {rows} x {columns} in {b0} x {b1} blocks has "
+                         f"{-(-rows // b0)} x {columns // max(b1, 1)} FP32 scales, its blocks a multiple of 32 "
+                         f"columns and its columns a multiple of {FP8_BLOCK_GROUP}, not {tuple(scale.shape)}")
+    module = device_nvfp4.fp8_block(device)
+    if module is None:
+        raise ValueError("an fp8:block matrix multiplies on crit's fp8-block-rows, which is not here (a CUDA device "
+                         "where the kernel builds)")
+    table = module.matrix_table([(w, scale, b0, b1, 1.0)])
+    m = Matrix("fp8:block", rows, columns, {"weight": w, "scale": scale, "table": table, "block": (b0, b1)}, "fp8")
+    m.fb, m.decode, m.decode_rows = module, "prompt", min(decode_rows, GEMV_ROWS)
+    m.row_jobs = {n: module.row_jobs([(0, list(range(a, min(a + 8, n))), list(range(a, min(a + 8, n))))
+                                      for a in range(0, n, 8)], device) for n in range(1, m.decode_rows + 1)}
+    m.gemm_job = module.gemm_jobs([(0, 0, 1)], device)   # its count filled on the device before each prompt call
+    native = gemm in ("native", "pinned")
+    m.gemm = "native" if native else "staged"
+    m.path, m.mma, m.mma_acts, m.tile_rows, m.gemv_rows, m.modules = "fp8-block-rows rows", None, None, 0, 0, modules
+    m.pinned = m.native_gemm = m.pin_rows = None
+    m.prompt_kernel = "fp8-block-rows gemm-native-blocks" if native else "fp8-block-rows gemm-staged"
+    m.prompt_invariant = m.prompt_exact = not native
+    m.invariant_rows = m.decode_rows
+    if device.type == "cuda":   # every launch once, at load: nothing compiles or allocates first inside a capture
+        x = torch.zeros(m.decode_rows + 1, columns, dtype=torch.bfloat16, device=device)
+        for n in (1, m.decode_rows, m.decode_rows + 1):
+            _fp8_block_matmul(x[:n], m, None)
+    return m
+
+
+def _fp8_block_matmul(x, m, out_dtype):
+    """y = x W^T of an fp8:block matrix: the rows quantized per FP8_BLOCK_GROUP, then its decode rows or prompt GEMM."""
+    import torch
+    fb, table = m.fb, m.tensors["table"]
+    n = x.shape[0]
+    codes, scales = fb.quantize(x if x.dtype in (torch.float32, torch.bfloat16) else x.float(), FP8_BLOCK_GROUP,
+                                fb.AMAX)
+    if n <= m.decode_rows:
+        out = torch.empty(n, m.rows, dtype=torch.float32, device=x.device)
+        fb.rows(table, m.row_jobs[n], m.rows, codes, scales, FP8_BLOCK_GROUP, out)
+    else:
+        m.gemm_job.view(torch.int32)[2:3].fill_(n)
+        if m.gemm == "native":
+            dtype = torch.float32 if out_dtype == torch.float32 else torch.bfloat16
+            out = torch.empty(n, m.rows, dtype=dtype, device=x.device)
+            fb.gemm_native(table, m.gemm_job, m.rows, n, codes, scales, FP8_BLOCK_GROUP, out, mx=False)
+        else:
+            out = torch.empty(n, m.rows, dtype=torch.float32, device=x.device)
+            fb.gemm_staged(table, m.gemm_job, m.rows, n, codes, scales, FP8_BLOCK_GROUP, out)
+    return out.to(out_dtype or torch.bfloat16)
 
 
 def _runs(found, rows, columns, device):
@@ -518,9 +591,8 @@ def _tile_plan(matrix, device, tile_rows, fp4):
 
 
 # gemv crossover: the decode GEMVs' structure in decode-gemv's sweep report (gemv-cuda, keyed by the same weights
-# code as mma-rows' decode-tile; a report made before gemv-cuda keys the per-format structures by the matrix's format).
+# code as mma-rows' decode-tile).
 GEMV_STRUCTURE = "gemv-cuda"
-GEMV_STRUCTURES = {"nvfp4": "gemv-nvfp4", "fp8": "gemv-fp8", "mxfp8": "gemv-fp8", "bf16": "gemv-bf16"}
 TILE_WEIGHTS = {"nvfp4": 0, "fp8": 1, "mxfp8": 2, "bf16": 3, "int4_zp": 4}
 _REPORTS = {}
 
@@ -541,14 +613,14 @@ def _report(name):
     return _REPORTS[str(path)]
 
 
-def _times(found, structure, key, device):
-    """{rows: tuned microseconds} of a structure's report rows at the shape `key`, where the tuning was swept on this
-    device's model ({} otherwise)."""
+def _times(found, structure, key, device, library=False):
+    """{rows: tuned microseconds} of a structure's report rows at the shape `key` (its yardstick library's with
+    library), where the tuning was swept on this device's model ({} otherwise): crit_kernels.select.times."""
     import torch
+    from crit_kernels import select
     if found is None or found[0].get("device") not in (None, torch.cuda.get_device_name(device)):
         return {}
-    return {int(e["rows"]): float(e["tuned_us"]) for e in found[1].get("structures", {}).get(structure, [])
-            if all(int(e["shape"].get(f, -1)) == int(v) for f, v in key.items())}
+    return select.times(found[1], structure, key, library)
 
 
 def _crossover(m, device):
@@ -562,18 +634,12 @@ def _crossover(m, device):
     if m.mma is None or getattr(m, "native", None) is None or m.mma_acts["decode"] != "bf16":
         return 0
     fmt = "fp8" if m.format.startswith("fp8") else m.format
-    gemv = (_times(_report("decode-gemv"), GEMV_STRUCTURE, {"weights": TILE_WEIGHTS[fmt], "N": m.rows,
-                                                            "K": m.columns}, device) or
-            (_times(_report("decode-gemv"), GEMV_STRUCTURES[fmt], {"N": m.rows, "K": m.columns}, device)
-             if fmt in GEMV_STRUCTURES else {}))
+    gemv = _times(_report("decode-gemv"), GEMV_STRUCTURE, {"weights": TILE_WEIGHTS[fmt], "N": m.rows, "K": m.columns},
+                  device)
     tile = _times(_report("mma-rows"), "decode-tile", {"weights": TILE_WEIGHTS[fmt], "N": m.rows, "K": m.columns},
                   device)
-    best = 0
-    for rows in sorted(set(gemv) & set(tile)):
-        if rows > m.decode_rows or gemv[rows] > tile[rows]:
-            break
-        best = rows
-    return best
+    from crit_kernels import select
+    return select.crossover(gemv, tile, m.decode_rows)
 
 
 def _dot_plan(m, device):
@@ -945,6 +1011,37 @@ def _prompt_kernel(m):
     return "provider"
 
 
+# The structure each prompt arithmetic's native GEMM runs (prompt_gemm native), whose sweep report the selector reads:
+# its tuned time and its yardstick's (the provider path's library) at the matrix's shape.
+NATIVE_STRUCTURES = {"fp8_rows": ("fp8-block-rows", "gemm-native-channel"), "mx": ("fp8-block-rows", "gemm-native"),
+                     "nvfp4": ("int-block-experts", "gemm-native"), "bf16": ("fixed-tile-gemm", "cuda-mm-split"),
+                     "fp8_decoded": ("fp8-block-rows", "gemm-native-channel")}
+
+
+def _stored_shape(tensors, format):
+    """(rows, columns) of a matrix's stored tensors (None, None for INT4's, whose prompt GEMM is crit's tile)."""
+    if format in INT4_FORMATS:
+        return None, None
+    weight = tensors["weight"]
+    rows, columns = int(weight.shape[0]), int(weight.shape[1])
+    return rows, columns * 2 if format == "nvfp4" else columns
+
+
+def _auto_gemm(kind, rows, columns, device):
+    """prompt_gemm auto for a matrix (crit_kernels.select): native where the sweep's report of the kind's native GEMM
+    (NATIVE_STRUCTURES, swept on this device) measured it at least as fast as its yardstick, the provider's library,
+    over the prompt row counts both timed at the matrix's shape; provider where the library was faster; NATIVE_AUTO,
+    the measured rule, where the reports do not cover the shape."""
+    from crit_kernels import select
+    default = "native" if NATIVE_AUTO.get(kind) else "provider"
+    target = NATIVE_STRUCTURES.get(kind)
+    if target is None or rows is None or device.type != "cuda":
+        return default
+    found, key = _report(target[0]), {"N": rows, "K": columns}
+    return select.fastest([("native", _times(found, target[1], key, device)),
+                           ("provider", _times(found, target[1], key, device, library=True))], None, default)
+
+
 def _auto_kind(format, activations, prompt, fp8_activations, mx_activations):
     """A matrix's prompt arithmetic, the key of NATIVE_AUTO: fp8_rows (W8A8 FP8), mx (MXFP8 with MXFP8 activations),
     nvfp4 (W4A4), bf16 (16-bit operands: BF16 matrices and the BF16-decoded chunks of weight-only ones), fp8_decoded
@@ -1115,6 +1212,8 @@ def matmul(x, m, out_dtype=None, prompt=False):
         return matmul(padded, m, out_dtype)[:x.shape[0]]
     if m.format == "int4_zp":
         return _int4_matmul(x, m, out_dtype)
+    if m.format == "fp8:block":
+        return _fp8_block_matmul(x, m, out_dtype)
     if m.format == "mxfp8" and m.activations == "mxfp8" and (
             m.decode == "prompt" if x.shape[0] <= m.decode_rows else
             m.native_gemm is None or (x.shape[0] <= m.tile_rows and _tiled(x, m, "prompt"))):
@@ -1219,13 +1318,14 @@ def _decode_rows(x, m, out_dtype):
     if m.format == "nvfp4":
         # W4A4: the activations as the prompt rows quantize them (e2m1 x block scale, exact in BF16, over the input
         # scale) or 16-bit; the weights' blocked scales as stored.
+        # The input scale folds into the GEMV's row factor (inverse_input: 1 / (global scale x input scale), made at
+        # load), so the GEMV's epilogue writes the output: no division or cast after it.
         rows = nvfp4_values(x, t["input_scale"]) if quantized else x16
-        y = device_nvfp4.gemv(rows, t["codes"], t["scale"], t["inverse_rows"], dtype=torch.float32, native=m.native,
-                              blocked=True)
-        return _out(y / t["input_scale"] if quantized else y, out_dtype)
+        return _out(device_nvfp4.gemv(rows, t["codes"], t["scale"], t["inverse_input"] if quantized else
+                                      t["inverse_rows"], dtype=dtype, native=m.native, blocked=True), out_dtype)
     out = torch.empty(x.shape[0], m.rows, dtype=torch.float32 if quantized else dtype, device=x.device)
     if quantized:   # FP8: each row in E4M3 by its own scale, as the prompt rows; the row scale after the sum
-        q, row_scale = fp8_rows(x)
+        q, row_scale = quantized_fp8_rows(x, m.modules["quantize"])   # one kernel where mma-rows is here
         device_nvfp4.gemv_fp8(q.to(torch.bfloat16), t["weight"], t["scale"], out, m.native)
         return _out(out * row_scale[:, None], out_dtype)
     device_nvfp4.gemv_fp8(x16, t["weight"], t["scale"], out, m.native)
@@ -1468,6 +1568,10 @@ def dense(m):
         return _int4_values(m, 0, m.rows)
     if m.format == "mxfp8":
         return torch.ldexp(m.tensors["weight"].float(), m.tensors["scale"].int().repeat_interleave(32, dim=1) - 127)
+    if m.format == "fp8:block":
+        b0, b1 = m.tensors["block"]
+        scale = m.tensors["scale"].repeat_interleave(b0, 0)[:m.rows].repeat_interleave(b1, 1)
+        return m.tensors["weight"].view(torch.float8_e4m3fn).float() * scale
     if m.format.startswith("fp8"):
         return m.tensors["weight"].float() * m.tensors["scale"][:, None]
     if m.activations == "bf16":
@@ -1610,6 +1714,18 @@ def release(device):
     import torch
     if torch.device(device).type == "cuda":
         torch.cuda.empty_cache()
+
+
+def encoding_problem(encode, rows, columns):
+    """Why a matrix of `rows` x `columns` is not held re-encoded to `encode`, or None: fp8 multiplies through
+    cuBLASLt, which takes rows and columns in multiples of 16; nvfp4 holds a block scale per 16 columns."""
+    base = str(encode).split(":")[0]
+    if base == "fp8" and (rows % 16 or columns % 16):
+        return (f"fp8 multiplies through cuBLASLt, which takes rows and columns in multiples of 16, not "
+                f"{rows} x {columns}")
+    if base == "nvfp4" and columns % 16:
+        return f"nvfp4 holds a block scale per 16 columns, not {columns} columns"
+    return None
 
 
 def reencode(tensors, format, encode, device=None):

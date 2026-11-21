@@ -107,7 +107,7 @@ inline bool has_sampling(const SamplingOptions& s) {
            s.presence_penalty || !s.logit_bias.empty() || s.min_tokens;
 }
 inline bool has_generation_options(const RequestOptions& o) {
-    return has_sampling(o.sampling) || o.stop_tokens || o.logprobs;
+    return has_sampling(o.sampling) || o.stop_tokens || o.logprobs || o.priority;
 }
 // Generation log-probabilities: a value never NaN or +inf and at most zero within the tolerance (-inf is a
 // zero probability). Ranked rows of `width` alternatives hold distinct valid ids in non-increasing order.

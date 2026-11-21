@@ -22,7 +22,9 @@
       "model_type:qwen4_exp_text",
       "model_type:deepseek_v3",
       "model_type:gemma4",
-      "model_type:gemma4_text"
+      "model_type:gemma4_text",
+      "model_type:inkling2_loop",
+      "model_type:inkling2_loop_text"
     ]
   ],
   "requires": [
@@ -72,6 +74,16 @@
     "model_type:deepseek_v3": [
       "router",
       "experts"
+    ],
+    "model_type:inkling2_loop": [
+      "recurrence",
+      "router",
+      "experts"
+    ],
+    "model_type:inkling2_loop_text": [
+      "recurrence",
+      "router",
+      "experts"
     ]
   },
   "devices": [
@@ -105,14 +117,14 @@
       "default": 4,
       "min": 2,
       "max": 64,
-      "description": "requests decoding at once (Core's max_concurrency); each holds one recurrent state where the model has gated-delta layers"
+      "description": "the most requests the model steps at once: Core's lanes are at most this (crit_plugins.steps, Steps.lanes; under crit serve's --max-concurrency fewer), and each lane holds one recurrent state where the model has gated-delta layers"
     },
     "pending": {
       "type": "int",
       "default": 2,
       "min": 0,
       "max": 64,
-      "description": "Core's max_pending"
+      "description": "the most requests that wait for a lane in Core's runtime (Steps.pending: at most this, within crit serve's --max-concurrency)"
     },
     "context": {
       "type": "int",
@@ -137,7 +149,15 @@
         "fp8",
         "fp8:row"
       ],
-      "description": "KV page precision: auto takes fp8 with the checkpoint's static k_scale / v_scale where it stores them, else bf16"
+      "description": "KV page precision: auto takes fp8 with the checkpoint's static k_scale / v_scale where it stores them, else bf16",
+      "approximates": {
+        "exact": [
+          "auto",
+          "bf16",
+          "fp8"
+        ],
+        "what": "fp8:row quantizes keys and values to FP8 with a scale per position and KV head at runtime, where the checkpoint stores no static KV scales: every attention read changes"
+      }
     },
     "prefill_chunk": {
       "type": "int",
@@ -151,7 +171,7 @@
       "default": 0.75,
       "min": 0.0,
       "max": 60.0,
-      "description": "the time a prompt step may take at any position: spans are timed at load (a short and a full chunk at position 0, a full chunk at the deepest position served) and each position takes the longest span predicted within it. crit serve retires an engine whose cancel does not settle within one second, and a cancel settles between steps, so the default is three quarters of that: a step's fixed part (an experts plugin's copies of a chunk's experts) is paid once a step, and a smaller budget pays it for fewer tokens. Where that part alone passes the budget, spans are the ones that prefill fastest (the facts' spans.over_budget). 0: every span the prefill chunk, untimed"
+      "description": "the time a prompt step may take at any position: spans are timed at load (a short and a full chunk at position 0, a full chunk at the deepest position served) and each position takes the longest span predicted within it. crit serve retires an engine whose cancel does not settle within one second, and a cancel settles between steps, so the default and the most Core takes is three quarters of that (Steps.seconds; Core calibrates the spans, Steps.calibrated): a step's fixed part (an experts plugin's copies of a chunk's experts) is paid once a step, and a smaller budget pays it for fewer tokens. Where that part alone passes the budget, spans are the ones that prefill fastest (the facts' spans.over_budget). 0: every span the prefill chunk, untimed"
     },
     "passes": {
       "type": "choice",
@@ -166,26 +186,19 @@
       "max": 65536,
       "description": "the most device memory a pass's chunks keep their residual states in between layers (an elastic expert cache gives it and takes it back after the pass): what bounds a pass's tokens, a prefill chunk at least"
     },
-    "headroom_mib": {
-      "type": "int",
-      "default": 0,
-      "min": 0,
-      "max": 65536,
-      "description": "device memory a prompt step leaves free at its peak beyond the placement's own reserve: the run's VRAM headroom where the placement keeps none (expert-offload keeps its own margin)"
-    },
     "activations_mib": {
       "type": "int",
       "default": 768,
       "min": 0,
       "max": 65536,
-      "description": "MiB planned on the device for a step's activations and scoring temporaries"
+      "description": "MiB the model plans on the device for a step's activations and scoring temporaries before Core measures them (Steps.activations); once the warm requests ran, Core keeps its measured step arena free and the device's givers take the rest"
     },
     "release_below_mib": {
       "type": "int",
       "default": 640,
       "min": 0,
       "max": 65536,
-      "description": "MiB of free device memory under which torch's cached blocks go back when a prompt or a score ends"
+      "description": "no longer read: when torch's cached blocks go back as a prompt or a score ends is Core's (Steps.threshold: the configuration's release_below_mib, else the device's headroom and the step arena); kept so packages that set it still load"
     },
     "prompt_cache": {
       "type": "int",

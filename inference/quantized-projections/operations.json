@@ -51,6 +51,26 @@
       },
       "verify": "on the target GPU, first check that the tensor core's block sum depends only on an output's own row and token (rows and tokens moved across tile positions and companions give the same bits: the matched pair's own fixture does this); then the kernel's decode rows and prompt GEMM against a reference kernel written in the declared order on the same quantized activations, every output bit for bit across jobs that give a token different companions, each output within 2^-9 of project_fp64 relative to the products' magnitude, and its quantizer against quantize_group bit for bit, ties and saturation included",
       "invariance": "decode rows and the prompt GEMM give every output the same bits, whatever tokens share a job; the same bits on a repeat"
+    },
+    {
+      "id": "int4-group-projection",
+      "what": "rows times INT4 weights with a scale per group of inputs (signed codes, or unsigned codes and a zero point a group: AWQ's and GPTQ's), decoded (code - zero) x scale exactly in FP32: decode GEMVs and row tiles with 16-bit activations (W4A16)",
+      "reference": {
+        "path": "inference/quantized-projections/code/implementation.py",
+        "symbol": "quantize, dequantize, project"
+      },
+      "verify": "on the target, project the same rows with the kernel and with project on the same codes and scales: within FP32 accumulation of the exact products and one rounding into the output; a row's bits the same alone and among others",
+      "invariance": "a row's result independent of the rows beside it; the same bits on a repeat"
+    },
+    {
+      "id": "exl3-projection",
+      "what": "rows times a matrix stored as EXL3 trellis codes (W = diag(su) H Q H diag(sv): the tiles, the normalized 128-point Hadamard, the sign vectors, 1 to 8 bits a weight) in the values the format decodes to, the rotated rows in FP16",
+      "reference": {
+        "path": "inference/quantized-projections/code/implementation.py",
+        "symbol": "project"
+      },
+      "verify": "on the target, decode the kernel's tiles against the format's decoder bit for bit, then project rows with the kernel and with project's exact sums over the decoded matrix: within FP16 rotated rows' rounding (2^-11 of the products' magnitudes) and one rounding into the output; a prompt row the bits of the same token decoded",
+      "invariance": "a row's result independent of the rows beside it, a prompt row equal to the same row decoded; the same bits on a repeat"
     }
   ]
 }

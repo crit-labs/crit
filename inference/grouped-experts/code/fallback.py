@@ -131,10 +131,11 @@ def _matrix(operand, vectors, split=False):
     return out if factor is None else out * factor
 
 
-def route_outputs(x, ids, store, slots, found, a4, y, activation="silu"):
+def route_outputs(x, ids, store, slots, found, a4, y, activation="silu", caps=None):
     """Each route's unweighted output into y [tokens * top][hidden] FP32 (skipped routes keep y's rows): x [tokens]
     [hidden], ids [tokens][top], store uint8 [S][bytes], slots int32 [experts] or None (expert e in slot e). a4: NVFP4
-    inputs and intermediate (W4A4). activation: the block's gate, silu (crit's declared SwiGLU) or gelu_tanh."""
+    inputs and intermediate (W4A4). activation: the block's gate, silu (crit's declared SwiGLU), gelu_tanh or
+    softcapped_silu with caps (gate, up)."""
     import torch
     tokens, top = ids.shape
     n = tokens * top
@@ -164,8 +165,13 @@ def route_outputs(x, ids, store, slots, found, a4, y, activation="silu"):
             xin = quantize(xin, scales[:, 0])
             gu_f, dn_f = gu_f * scales[:, 2:3], dn_f * scales[:, 3:4]
         both = _matrix((gu, gu_f, gu_b), xin, split)
-        h = (swiglu(both[:, :inter], both[:, inter:]) if activation == "silu"
-             else torch.nn.functional.gelu(both[:, :inter], approximate="tanh") * both[:, inter:])
+        g, u = both[:, :inter], both[:, inter:]
+        if activation == "silu":
+            h = swiglu(g, u)
+        elif activation == "softcapped_silu":
+            h = caps[0] * torch.tanh(g / caps[0]) * torch.sigmoid(g) * (caps[1] * torch.tanh(u / caps[1]))
+        else:
+            h = torch.nn.functional.gelu(g, approximate="tanh") * u
         h = quantize(h, scales[:, 1]) if a4 else h.to(torch.bfloat16).float()
         out = _matrix((dn, dn_f, dn_b), h, split)
         count = min(C, n - c0)

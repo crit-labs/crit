@@ -196,15 +196,17 @@ class Experts:
     round_counters = ()
 
     def __init__(self, rec):
-        self.rec, self.shape, self.a4 = rec, None, {}
+        self.rec, self.shape, self.a4, self.begun = rec, None, {}, {}
 
     def activate(self, name):
         pass
 
-    def begin(self, layers, experts, format, hidden, inter, device_bytes=0, identity=None, device="cuda"):
+    def begin(self, layers, experts, format, hidden, inter, device_bytes=0, identity=None, device="cuda", **more):
         if format not in EXPERT_FORMATS:
             self.rec.refuse(f"expert-offload packs {', '.join(EXPERT_FORMATS)} experts, not {format!r}")
         self.shape = (layers, experts, format, hidden, inter)
+        self.begun = {"layers": layers, "experts": experts, "format": format,
+                      **{k: v for k, v in more.items() if k in ("decode_rows", "top")}}
 
     def load(self, layer, expert, gate_up, down, format="bf16"):
         if self.shape is None:
@@ -320,7 +322,8 @@ def _shapes_only(real):
 
 
 def plan(manifest, placement="tables-on", options=None):
-    """{model_type, layout, read, unread, formats, error} of model-template's load over `manifest`, with the first
+    """{model_type, layout, read, unread, formats, error, experts} of model-template's load over `manifest` (experts:
+    what expert-offload's begin() was given and each layer's W4A4 or not), with the first
     attention plugin of ATTENTION whose facts the layout's blocks accept."""
     from crit_plugins import encodings
     real = encodings.encode
@@ -380,6 +383,9 @@ def _plan(manifest, placement, options, attention):
                           if "model-template" in f.filename or "dry_template" in f.filename), "")
             report["error"] = f"{type(error).__name__}: {error} ({where})"
         report["formats"] = rec.formats
+        experts = instances.get("experts")
+        if experts is not None:   # what begin() was given, and which layers' nvfp4 experts carry input scales
+            report["experts"] = {**experts.begun, "a4": dict(experts.a4)}
         seen = ck.read | ck.opened
         report["read"] = len(seen)
         if report["error"] is None:

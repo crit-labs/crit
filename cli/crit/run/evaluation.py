@@ -18,7 +18,8 @@ measures in stages (crit-eval's protocol stages): as far as its budget allows at
 and the run's kv_tokens itself only with certify, for the candidate that will ship. On the candidate ladder
 (crit.run.ladder) the candidate's rung sets how far: none on candidate 1, at most stage 1 (the small Eval) on candidate
 2, at most stage 2 (the medium Eval) on candidates 3 and 4, and the certified Eval (the full one) from candidate 5 on
-and on the segment's last budgeted candidate. The attempt has no fixed process
+and on the segment's last budgeted candidate. When Eval refuses the run's model (crit-eval's reference cannot score
+it), crit run ... eval records the rung unreachable on the run and reserves nothing. The attempt has no fixed process
 cap, since Eval's work scales with the model and the device: it may run to the
 segment's deadline, and each request is bounded by the rates the engine measured in it (crit_eval.run.deadline), so a
 hung engine stops the attempt.
@@ -179,7 +180,7 @@ def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, secon
     (crit_eval.run.runner.run). resume: True or an attempt id: go on from that Eval attempt's journal (the newest's
     with True), which must have measured this package with the same options. Returns the retained result (path
     relative to the run, sha256) and its status."""
-    from crit_eval import VRAM_HEADROOM_GIB, load_json, machine_settings
+    from crit_eval import load_json, machine_settings
     from crit_eval.quality.prepare import PREPARED, model_identity, prepared_template
     from crit_eval.run.journal import path_for
     from crit_eval.run.runner import PARTS
@@ -193,8 +194,18 @@ def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, secon
                          "what stopped it and build the fix as a new candidate from the same plan; an Eval of a draft "
                          "would count it on the ladder")
     # The candidate ladder: the rung says how far Eval measures the candidate, and refuses more.
-    stage, certify = ladder.eval_options(ladder.scope_of(root, candidate_id), stage, certify, candidate_id)
+    rung = ladder.scope_of(root, candidate_id)
+    stage, certify = ladder.eval_options(rung, stage, certify, candidate_id)
     model, data = run["spec"]["model_path"], data.absolute()
+    # Eval's refusal of the run's model reaches no rung's Eval: the run records the rung unreachable, and goes on
+    # from the candidates sealed built, none of them certified.
+    refusal = ladder.eval_refusal(model)
+    if refusal:
+        found = store.rung_unreachable(run_id, candidate_id, rung, refusal)
+        raise ValueError(f"Eval cannot measure this run's model, so the run records {ladder.state_text(found)}. Seal "
+                         f"{candidate_id} built (crit run ... seal --candidate {candidate_id} --lifecycle built) once "
+                         "serve --check passed: it stands on the ladder, the next plan starts from it, and no "
+                         "candidate is certified")
     if not (data / PREPARED).is_file():
         raise ValueError(f"{data} holds no {PREPARED}: prepare it from the run's model first "
                          f"(crit eval prepare --model {model} --data {data})")
@@ -216,7 +227,9 @@ def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, secon
     options = dict(label=label, device=device, baseline=baseline, quality_budget=budget, exactness=exactness,
                    quality_mode=quality_mode(run["spec"]["correctness"]),
                    context_tokens=constraints["kv_tokens"], context_basis=basis,
-                   vram_headroom_bytes=round(settings.get("vram_headroom_gib", VRAM_HEADROOM_GIB) * (1 << 30)),
+                   # The run's VRAM headroom, which every candidate's configuration states and Core's loader leaves
+                   # free: Eval judges the engine's memory by the headroom it was built and served with.
+                   vram_headroom_bytes=constraints["vram_headroom_bytes"],
                    context_reserve_bytes=round(reserve * (1 << 30)) if reserve is not None else None,
                    stage=stage, certify=certify, budget_seconds=budget_seconds,
                    # What makes this attempt's measurements the ones a resumed attempt may answer from.

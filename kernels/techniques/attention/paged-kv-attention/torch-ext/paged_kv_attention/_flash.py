@@ -152,7 +152,7 @@ def _row_chunk(first, count, n_parts, chunk, BLOCK_N: tl.constexpr, DEV_CHUNK: t
     return found
 
 
-@triton.jit(do_not_specialize=["first0", "ffirst0"])
+@triton.jit(do_not_specialize=["first0", "ffirst0", "cols", "n_parts", "tab_width"])
 def _flash_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start_ptr, count_ptr, first_ptr, par_ptr,
                   off_ptr, po_ptr, pm_ptr, pl_ptr, out_ptr, lse_ptr, fk_ptr, fv_ptr, fshift_ptr, ffirst_ptr,
                   sink_ptr, stride_qt, stride_qh, stride_ot, stride_oh, stride_fk, stride_fv, stride_fr, tab_stride,
@@ -293,7 +293,7 @@ def _flash_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start_
             tl.store(pl_ptr + idx, l_i, mask=live)
 
 
-@triton.jit(do_not_specialize=["first0"])
+@triton.jit(do_not_specialize=["first0", "n_parts", "cols"])
 def _flash_merge_kernel(po_ptr, pm_ptr, pl_ptr, out_ptr, lse_ptr, start_ptr, count_ptr, first_ptr, off_ptr, sink_ptr,
                         n_parts, chunk, cols, first0, stride_ot, stride_oh, HQ: tl.constexpr, DV: tl.constexpr,
                         BLOCK_N: tl.constexpr, COUNTS: tl.constexpr, OFFSETS: tl.constexpr, LSE: tl.constexpr,

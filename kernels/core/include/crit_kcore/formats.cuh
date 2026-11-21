@@ -391,6 +391,39 @@ __device__ __forceinline__ float nvfp4_operand(float v, float g, float decoded) 
     return (q < 0.0f && code) ? -m : m;
 }
 
+// The same quantizer as codes, the operands of the block-scaled FP4 tensor cores: the block's UE4M3 scale code (the
+// code whose value nvfp4_block_scale decodes; 0x7F, the format's NaN, for a block whose maximum is not finite) ...
+__device__ __forceinline__ uint32_t nvfp4_scale_code(float amax, float g) {
+    if(!(amax <= 3.402823466e38f)) return 0x7Fu;
+    float wanted = __fdiv_rn(__fmul_rn(amax, g), 6.0f);
+    if(!isfinite(wanted)) wanted = 448.0f;
+    return e4m3_encode(wanted);
+}
+// ... and a value's signed E2M1 code under the decoded scale, e2m1(code) * decoded being nvfp4_operand's value (code 0
+// where the decoded scale is not positive).
+__device__ __forceinline__ uint32_t nvfp4_code(float v, float g, float decoded) {
+    if(!(decoded > 0.0f)) return 0u;
+    const float q = __fdiv_rn(__fmul_rn(v, g), decoded);
+    const uint32_t code = static_cast<uint32_t>(e2m1_code(fabsf(q)));
+    return (q < 0.0f && code) ? (code | 8u) : code;
+}
+// A 16-value block of maximum magnitude amax (abs_max) under global scale g: its 16 codes and its scale code.
+__device__ __forceinline__ void nvfp4_quantize16(const float* v, float amax, float g, uint32_t (&codes)[16],
+                                                 uint32_t& scale) {
+    scale = nvfp4_scale_code(amax, g);
+    const float decoded = scale == 0x7Fu ? 0.0f : e4m3_value(scale);
+#pragma unroll
+    for(int i = 0; i < 16; ++i) codes[i] = nvfp4_code(v[i], g, decoded);
+}
+// Two values of a block whose maximum magnitude is amax (a block spread over lanes): their codes and the scale code.
+__device__ __forceinline__ void nvfp4_quantize_pair(float v0, float v1, float amax, float g, uint32_t (&codes)[2],
+                                                    uint32_t& scale) {
+    scale = nvfp4_scale_code(amax, g);
+    const float decoded = scale == 0x7Fu ? 0.0f : e4m3_value(scale);
+    codes[0] = nvfp4_code(v0, g, decoded);
+    codes[1] = nvfp4_code(v1, g, decoded);
+}
+
 // ------------------------------------------------------------------------------------------- block-scale layouts
 
 // The byte of block-scale column j of matrix row n in cuBLASLt's blocked layout (VEC16_UE4M3 / VEC32_UE8M0): tiles of

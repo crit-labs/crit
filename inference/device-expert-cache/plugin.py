@@ -2,8 +2,10 @@
 under its clock policy or under its RankedSchedule (ranked_residency.py), or recent residency's rule
 (recent_residency.py), as the `policy` option chooses. Device form
 (the "experts:cache" extension): cache(...) -> expert_cache.ExpertCache, the directory on the device, misses filled from
-a bundle store in device-readable host memory, prompt chunks through a staging ring, a KV pool's unused pages lent."""
-from .cache import device_cache, expert_cache, ranked_residency, recent_residency
+a bundle store in device-readable host memory, prompt chunks through a staging ring, a KV pool's unused pages lent; and
+(the "experts:rows" extension) the same cache over opaque byte rows of the caller's own layout, row_store(...) and
+row_cache(...)."""
+from .cache import device_cache, expert_cache, expert_store, ranked_residency, recent_residency
 
 
 class _Device:
@@ -12,10 +14,11 @@ class _Device:
     def _setup(self, options):
         self.options, self.caches = options, []
 
-    def cache(self, layers, experts, layout, slots, device, source, lend=None):
+    def cache(self, layers, experts, layout, slots, device, source, lend=None, **extra):
         """ExpertCache over `layers` x `experts` bundles of `layout` (the experts plugin's layout()), `slots` own
         slots on `device`, misses from `source` (an expert_source's open_store(): region() or read()), and lend: a KV
-        pool to borrow unused pages from (attention-state's KVPool with spare bytes)."""
+        pool to borrow unused pages from (attention-state's KVPool with spare bytes); `extra`: ExpertCache's other
+        arguments (link_layers and link_slots)."""
         o = self.options
         cache = expert_cache.ExpertCache(
             layers, experts, layout, slots, device, source, lend, policy=o["policy"], admit_quota=o["admit_quota"],
@@ -24,9 +27,26 @@ class _Device:
             stage_routes=o["stage_routes"] or None, fill_blocks=o["fill_blocks"], fill_vector=int(o["fill_vector"]),
             decay=o["decay"], period=o["period"], max_swaps=o["max_swaps"], burst_swaps=o["burst_swaps"],
             kernel=o["native"], rows=o["round_rows"], record_routes=o["record_routes"],
-            side_swaps=o["side_swaps"], max_slots=o["max_slots"])
+            side_swaps=o["side_swaps"], max_slots=o["max_slots"], **extra)
         self.caches.append(cache)
         return cache
+
+    def row_store(self, groups, keys, row_bytes, device, rows, path=None, identity=None):
+        """A store of `groups` x `keys` opaque rows of `row_bytes` bytes in the caller's own layout (expert_store
+        open_rows), which row_cache() fills its slots from."""
+        return expert_store.open_rows(groups, keys, row_bytes, device, rows, path, identity)
+
+    def row_cache(self, groups, keys, row_bytes, slots, device, source, lend=None, **extra):
+        """ExpertCache over `groups` x `keys` opaque rows of `row_bytes` bytes (any count: each slot holds a row padded
+        to a multiple of 16 bytes), from `source`: row_store()'s, or any store with keys, bundle_bytes (the padded
+        row), layout, mapped and read(keys, into), a mapped one region() too. The cache plans, fills, stages prompt
+        chunks and counts as cache() does, by the plugin's options; what a row holds is the caller's, read back from
+        the slots by cache.rows()."""
+        slot = expert_store.row_slot_bytes(row_bytes)
+        if source.bundle_bytes != slot:
+            raise ValueError(f"rows of {row_bytes} bytes fill slots of {slot}; the source's are {source.bundle_bytes}")
+        return self.cache(groups, keys, {"bundle_bytes": slot, "row_bytes": int(row_bytes)}, slots, device, source,
+                          lend, **extra)
 
     def telemetry(self):
         """{"expert_cache": the cache's telemetry} (summed over caches when the model made several)."""

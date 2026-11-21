@@ -4,7 +4,9 @@ By default the host maps the run's model files in place after checking each file
 manifest; a source whose size or modification metadata changes later is refused, and on Windows the host's
 handle denies writes. With verify (crit serve --verify-model) it first reads and hashes every file against the
 manifest and serves engines without chat-model-file-v1 from a private read-only copy. Device allocation, actual
-byte accounting, synchronization and release are supplied by the engine backend.
+byte accounting, synchronization and release are supplied by the engine backend. The host-side stores plugins build
+from the checkpoint (crit_core.engine.LoadContext.keep) are the pool's too: kept while the model is loaded, so an
+engine built again in the host (another candidate, limits or configuration of the same model) finds them built.
 """
 from dataclasses import dataclass
 import hashlib
@@ -16,6 +18,7 @@ import time
 import uuid
 
 from crit.records import digest, file_identity, file_sha, keys, number, safe_path, sha, text
+from crit_core.kept import Kept
 
 
 def locked_read(path):
@@ -82,6 +85,7 @@ class ModelPool:
         self.blocked = False
         self.sources = {}
         self.paths = {}
+        self.kept = Kept()   # the plugins' host-side stores of this model (crit_core.kept)
 
     @staticmethod
     def fingerprint(path):
@@ -249,6 +253,13 @@ class ModelPool:
             raise ValueError("Quarantined device ownership requires runtime process retirement")
         if any(entry["users"] for entry in self.device.values()):
             raise ValueError("Cannot unload weights while engine leases remain active")
+        if self.kept.held():
+            raise ValueError("Cannot unload the model while engines hold its kept stores")
+        try:   # the plugins' host-side stores, before the device memory they may be registered with
+            self.kept.close()
+        except BaseException:
+            self.blocked = True
+            raise
         # Fence all allocations before freeing any; failed fences retain owners.
         try:
             for entry in self.device.values():
@@ -284,6 +295,7 @@ class ModelContext:
         self.pool, self.configuration = pool, configuration
         self.drafters = ()  # an installed engine's drafter downloads (crit pull), as folders
         self.leases, self.views = [], []
+        self.kept = []      # names of the pool's kept stores this engine asked for
         self.progress = progress
         self._worked = 0.0   # when working() last sent a status
 
@@ -335,7 +347,27 @@ class ModelContext:
             self.progress("loading_engine")
         return value
 
+    def keep(self, name, key, build, close=None, nbytes=None):
+        """A plugin's host-side store, kept in the pool for the model (crit_core.kept.Kept.keep): the model's
+        identity joins the key, and the store outlives this engine until the model unloads."""
+        if self.pool.blocked or self.pool.model_id is None:
+            raise ValueError("Load a healthy model before keeping a store for it")
+        value = self.pool.kept.keep(name, {"model": self.pool.model_id, "key": key}, build, close, nbytes)
+        self.kept.append(str(name))
+        return value
+
+    def keeping(self, name):
+        """The host bytes of the store the pool keeps as `name` and no engine holds (crit_core.kept.Kept.nbytes)."""
+        return self.pool.kept.nbytes(name)
+
+    def drop_kept(self, name):
+        """Close the store the pool keeps as `name` where no engine holds it (crit_core.kept.Kept.drop)."""
+        self.pool.kept.drop(name)
+
     def close(self):
+        for name in self.kept:
+            self.pool.kept.release(name)
+        self.kept.clear()
         for value in self.leases:
             value.close()
         for value in self.views:

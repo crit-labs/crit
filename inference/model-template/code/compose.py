@@ -17,14 +17,15 @@ from .residual import RESIDUALS
 LAYOUTS = Path(__file__).resolve().parent / "layouts"
 SCHEMA = "crit-model-layout-v1"
 KEYS = {"schema", "name", "description", "model_types", "norm_offset", "mixers", "ffn", "draft", "pre_norm",
-        "post_norm", "residual", "before", "defaults", "embed_scale", "logit_softcap", "routed_if", "requires"}
+        "post_norm", "residual", "before", "defaults", "embed_scale", "logit_softcap", "routed_if", "requires",
+        "names", "expert_caps", "head_rows"}
 
 # The options every composed model reads, with their defaults: the template plugin's plugin.json declares the same
 # (tests/test_plugin.py holds them equal), and an engine's own model plugin over compose() declares those it sets.
 DEFAULTS = {
     "layout": "", "concurrency": 4, "pending": 2, "context": 4096, "kv_margin": 8192, "kv": "auto",
-    "prefill_chunk": 512, "span_seconds": 0.75, "passes": "auto", "pass_mib": 1024, "headroom_mib": 0,
-    "activations_mib": 768, "release_below_mib": 640,
+    "prefill_chunk": 512, "span_seconds": 0.75, "passes": "auto", "pass_mib": 1024,
+    "activations_mib": 768, "release_below_mib": 640,   # release_below_mib: no longer read (Core's Steps.threshold)
     "prompt_cache": 1, "rounds": True, "prompt_buckets": "", "mtp": False, "width": 3, "widths": "",
     "width_policy": "fixed", "mtp_encode": "bf16", "mtp_kv": "bf16", "draft_head": "shared", "draft_head_slices": 8,
     "kernel_tuning": "",
@@ -68,6 +69,20 @@ def check(layout, where="layout", blocks=None):
                                                and isinstance(spec.get("layers"), (str, list)) for spec in before):
         problems.append(f"{where}: before lists blocks that add rows into the residual before a layer, each {{block, "
                         "layers: the layers' numbers from 1 or the config key that lists them}}")
+    names = layout.get("names", [])
+    if not isinstance(names, list) or not all(isinstance(rule, list) and len(rule) in (2, 3)
+                                              and all(isinstance(part, str) for part in rule[:2])
+                                              and (len(rule) == 2 or isinstance(rule[2], int)) for rule in names):
+        problems.append(f"{where}: names lists [pattern, replacement] rules that rename the checkpoint's tensors to the "
+                        "names the blocks read ([pattern, replacement, shift]: the first group's number shifted)")
+    else:
+        import re
+        for rule in names:
+            pattern = rule[0]
+            try:
+                re.compile(pattern)
+            except re.error as error:
+                problems.append(f"{where}: names pattern {pattern!r}: {error}")
     if not isinstance(layout.get("defaults", {}), dict):
         problems.append(f"{where}: defaults gives config values the family's reference assumes where config.json "
                         "is silent")
@@ -125,6 +140,25 @@ def compose(context, options, parts, layout=None, blocks=None, folder=None):
     options = {**DEFAULTS, **{k: v for k, v in dict(options).items()}}
     chosen = layout_for(context.config, options["layout"] or layout, folder, blocks)
     return ComposedModel(context, options, parts, chosen, blocks, folder)
+
+
+def resolve(context, options, dry, layout=None, blocks=None, folder=None):
+    """The model plugin's dry answer (Core's resolve(): crit_plugins.assemble.resolve), compose()'s twin: the
+    checkpoint's Shape over its headers alone (shape.py), its KV pools priced by the kv_cache plugin's position_bytes
+    (`dry`: the selection before any plugin exists). {"kv_bytes_per_token": ...}, or {} where the kv_cache plugin
+    prices no position. An engine's own model plugin over compose() resolves with the same layout and blocks."""
+    from crit_core.model import parse_model_config
+    from .checkpoint import open_checkpoint
+    from .shape import Shape
+    options = {**DEFAULTS, **{k: v for k, v in dict(options).items()}}
+    chosen = layout_for(context.config, options["layout"] or layout, folder, blocks)
+    handed = getattr(context, "checkpoint", None)
+    checkpoint = handed if handed is not None else open_checkpoint(context.model, context.config, chosen.get("names"))[0]
+    shape = Shape(parse_model_config(context.config), options, chosen, blocks, checkpoint,
+                  context_tokens=context.context_tokens, drafter=dry.plugin("drafter") is not None,
+                  steps=getattr(context, "steps", None))
+    price = getattr(dry.module("kv_cache"), "position_bytes", None)
+    return shape.kv_facts(price) if callable(price) else {}
 
 
 def tuning(options, folder):

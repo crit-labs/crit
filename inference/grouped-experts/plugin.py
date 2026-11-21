@@ -20,6 +20,9 @@ KERNEL = "grouped-experts"
 ANY_EXPERT = (1 << 30) - 1   # the id bound of a combine without a slot table
 PROMPT_KEEP = 2              # workspaces of prompt-sized calls kept, besides decode shapes and those a capture used
 DECLARED = ("nvfp4", "int4")  # the formats crit's integer block order computes (W4A4, W4A8)
+# The arithmetics on the formats' own tensor cores: (formats, what they need of the GPU)
+TENSOR_CORES = {"fp4": (("nvfp4",), "block-scaled FP4 tensor cores (the sm_120 family)"),
+                "fp8": (("fp8:channel", "fp8:block"), "E4M3 tensor cores (8.9 on)")}
 MAX_ITEMS = 65535            # route items in one kernel call (the kernel's MAX_ITEMS)
 PLAN_BYTES = 40              # a route's plan temporaries above 1,024 routes (sort keys and order, counts)
 KNOWN = tuple(f for f in bundles.FORMATS if f != "int4_zp") + ("int4_zp:<group>",)
@@ -44,7 +47,7 @@ class GroupedExperts:
     def __init__(self, context, options, parts):
         self.source = parts.get("expert_source")
         self.activations, self.arithmetic = options["activations"], options["arithmetic"]
-        self.activation = "silu"   # the blocks' gate (activate)
+        self.activation, self.caps = "silu", None   # the blocks' gate (activate)
         self.workspace_bytes = int(options["workspace_mib"]) << 20
         self.device = getattr(context, "device", None)
         self.layers = {}         # layer -> {"format", "bytes", "bundles": {expert: uint8}, "store", "captured"}
@@ -57,6 +60,11 @@ class GroupedExperts:
         if options["kernel"] and self._cuda():
             from crit_plugins.kernels import load_kernel
             self.kernel = load_kernel(KERNEL, folder=HERE)
+        if self.arithmetic in TENSOR_CORES:
+            probe = getattr(self.kernel, self.arithmetic + "_available", None) if self.kernel is not None else None
+            if probe is None or not probe(self.device):
+                raise ValueError(f"grouped-experts: arithmetic {self.arithmetic} runs only on crit's kernel {KERNEL} on "
+                                 f"a GPU with {TENSOR_CORES[self.arithmetic][1]}, which is not here")
         if self.arithmetic == "declared" and self.kernel is None:
             raise ValueError(f"grouped-experts: arithmetic declared runs only on crit's kernel {KERNEL}, which is "
                              f"not here ({self._no_kernel(options)}); it exists to give the CPU expert tier's bits, which "
@@ -78,15 +86,19 @@ class GroupedExperts:
         from crit_plugins.kernels import loaded
         return loaded().get(KERNEL, {}).get("reason") or "it did not load"
 
-    def activate(self, name):
-        """The gate of the blocks' product, act(gate) * up: silu (SwiGLU, the default) or gelu_tanh
-        (experts:activations), for every layer; before the first forward. The declared arithmetic is SwiGLU's."""
+    def activate(self, name, caps=None):
+        """The gate of the blocks' product, act(gate) * up: silu (SwiGLU, the default), gelu_tanh or softcapped_silu
+        with caps (gate, up) (experts:activations), for every layer; before the first forward. The declared
+        arithmetic is SwiGLU's."""
+        if (name == "softcapped_silu") != (caps is not None) or (caps is not None and (len(caps) != 2
+                                                                                         or min(caps) <= 0)):
+            raise ValueError("grouped-experts: softcapped_silu, and only it, takes two positive caps: (gate, up)")
         if name not in bundles.ACTIVATIONS:
             raise ValueError(f"grouped-experts gates a block by {' or '.join(bundles.ACTIVATIONS)}, not {name!r}")
         if name != "silu" and self.arithmetic == "declared":
             raise ValueError("grouped-experts: arithmetic declared computes SwiGLU blocks (the CPU expert tier's "
                              f"bits); a block gated by {name} runs arithmetic tensor")
-        self.activation = name
+        self.activation, self.caps = name, None if caps is None else (float(caps[0]), float(caps[1]))
 
     # -- host form ------------------------------------------------------------------------------------------------------
     def run(self, layer, x, ids, weights):
@@ -102,7 +114,7 @@ class GroupedExperts:
             return cache[expert]
 
         return reference.moe_block(x, ids, weights, lambda e: matrices(e)[0], lambda e: matrices(e)[1],
-                                   len(matrices(used[0])[0]) // 2, activation=self.activation)
+                                   len(matrices(used[0])[0]) // 2, activation=self.activation, caps=self.caps)
 
     # -- bundles --------------------------------------------------------------------------------------------------------
     def layout(self, format, hidden, inter):
@@ -127,6 +139,12 @@ class GroupedExperts:
         if self.arithmetic == "declared" and format not in DECLARED:
             raise ValueError(f"grouped-experts: arithmetic declared computes {' and '.join(DECLARED)} experts, not "
                              f"{format}")
+        if self.arithmetic == "fp8" and format not in TENSOR_CORES["fp8"][0]:
+            raise ValueError(f"grouped-experts: arithmetic fp8 runs FP8 experts W8A8 ({', '.join(TENSOR_CORES['fp8'][0])}), "
+                             f"not {format}")
+        if self.arithmetic == "fp4" and (format != "nvfp4" or self.activations != "nvfp4"):
+            raise ValueError("grouped-experts: arithmetic fp4 runs NVFP4 experts W4A4: nvfp4 bundles with activations "
+                             f"nvfp4, not {format} with activations {self.activations}")
         if self.arithmetic == "declared" and format == "nvfp4" and self.activations != "nvfp4":
             raise ValueError("grouped-experts: arithmetic declared runs NVFP4 experts W4A4: set activations nvfp4")
         if self.activations != "nvfp4" or format != "nvfp4":
@@ -135,6 +153,9 @@ class GroupedExperts:
         if carried[0] != carried[1]:
             raise ValueError("grouped-experts: an nvfp4 expert's gate/up and down matrices both carry input_scale (W4A4) "
                              "or neither does (W4A16), not one of them")
+        if self.arithmetic == "fp4" and not carried[0]:
+            raise ValueError("grouped-experts: arithmetic fp4 runs NVFP4 experts W4A4, which needs each matrix's "
+                             "input_scale")
         if self.arithmetic == "declared" and not carried[0]:
             raise ValueError("grouped-experts: arithmetic declared runs NVFP4 experts W4A4, which needs each matrix's "
                              "input_scale")
@@ -161,6 +182,12 @@ class GroupedExperts:
         weight = first.get("weight", first.get("qweight")) if isinstance(first, dict) else first
         device = self.device if self.device is not None else weight.device
         bundle = bundles.pack(gate_up, down, stored, device)
+        if layer not in self.layers:
+            # A new layer's first load: the layers loaded before it become their stores now, while the device still
+            # has the room for one layer's copy (built at its first forward, the copy would meet the engine's KV).
+            for other, found in self.layers.items():
+                if found["store"] is None and found["bundles"]:
+                    self._own(other)
         entry = self.layers.setdefault(layer, {"format": format, "bytes": bundle.numel(), "bundles": {}, "store": None,
                                                "captured": False})
         if entry["format"] != format or entry["bytes"] != bundle.numel():
@@ -266,6 +293,9 @@ class GroupedExperts:
                              f"{format}")
         slots = None if slots is None else (slots if slots.dtype == torch.int32 else slots.int()).contiguous()
         a4 = self._a4(layer, store, slots, found)
+        if self.arithmetic == "fp4" and not a4:
+            raise ValueError("grouped-experts: arithmetic fp4 runs NVFP4 experts W4A4: this layer's bundles carry no "
+                             "input scales")
         step = self._step(top, hidden, inter, experts, a4, declared, format)
         if tokens > step:   # a long prompt chunk in parts: every route keeps its bits whatever part it falls in
             y = torch.empty(tokens * top, hidden, dtype=torch.float32, device=x.device)
@@ -277,11 +307,12 @@ class GroupedExperts:
         if self.kernel is not None and x.is_cuda:
             xb = x if x.dtype == torch.bfloat16 and x.is_contiguous() else x.to(torch.bfloat16).contiguous()
             return self.kernel.route_outputs(xb, ids.contiguous(), store, slots,
-                                             bundles.kernel_layout(found, self.activation), ws, a4, self.arithmetic)
+                                             bundles.kernel_layout(found, self.activation, self.caps), ws, a4,
+                                             self.arithmetic)
         if declared:
             raise ValueError(f"grouped-experts: arithmetic declared runs on crit's kernel {KERNEL}: CUDA "
                              f"activations, not {x.device}")
-        return fallback.route_outputs(x, ids, store, slots, found, a4, ws.y, self.activation)
+        return fallback.route_outputs(x, ids, store, slots, found, a4, ws.y, self.activation, self.caps)
 
     def combine(self, y, ids, weights, slots=None):
         """out [tokens][hidden] FP32: each token's routes in route order, fmaf(weight, row, sum), over the routes with
@@ -332,6 +363,10 @@ class GroupedExperts:
         if declared:   # quantized inputs and their scales, gate/up rows FP32, the quantized intermediate and its scales
             block = 32 if format == "int4" else 16
             per_route += hidden + hidden // block * 4 + 8 * inter + inter + inter // block * 4
+        if self.arithmetic == "fp4":   # the inputs' and the intermediate's codes and scale bytes
+            per_route += (hidden + inter) // 2 + (hidden + inter) // 16
+        if self.arithmetic == "fp8":   # the inputs' and the intermediate's codes and FP32 group scales
+            per_route += (hidden + inter) + (hidden + inter) // 32
         by_bytes = self.workspace_bytes // (per_route * top)
         by_items = max(0, MAX_ITEMS - experts) * 8 // top   # items: ceil(routes / width) + min(experts, routes)
         return max(256, min(by_bytes, by_items) // 256 * 256)
@@ -391,7 +426,7 @@ class GroupedExperts:
                             "row_invariance": {"rows": True, "prompt_rows": True}}}
 
     def exactness(self):
-        """The level its rows keep (crit_kernels.exactness; Core compares it with the level the configuration asks).
+        """The level its rows keep (crit_plugins.exactness; Core compares it with the level the configuration asks).
         arithmetic declared is crit's integer block order, the CPU expert tier's bits, for every row. arithmetic
         tensor: decode rows row-exact and a prompt row the bits of the same route decoded (exact). On the kernel the
         prompt structures have the decode structure's bits; the torch arithmetic is one computation for both, which
@@ -400,7 +435,7 @@ class GroupedExperts:
             return {}
         if self.arithmetic == "declared":
             return {"decode": "declared", "prompt": "declared"}
-        return {"decode": "row-exact", "prompt": "exact"}
+        return {"decode": "row-exact", "prompt": "exact"}   # tensor and fp4: prompt structures with the decode's bits
 
     def _named(self, format, layer):
         if format != "nvfp4" or self.activations != "nvfp4":
@@ -434,6 +469,12 @@ class _KernelWithin:
 
     def declared(self, layout):
         return {k: v[:self.routes] for k, v in self.parent.declared(layout).items()}
+
+    def fp4(self):
+        return {k: v[:self.routes] for k, v in self.parent.fp4().items()}
+
+    def fp8(self):
+        return {k: v[:self.routes] for k, v in self.parent.fp8().items()}
 
 
 class _TorchWorkspace:

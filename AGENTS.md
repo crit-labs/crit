@@ -171,14 +171,18 @@ measures it:
 | 3, 4 | Crit rounds: improve with crit's toolkit, each technique measured against its floor | At most medium (stage 2) |
 | 5 on | Crit round, then critique rounds: the parent's two weakest terms improved beside other levers | Full, certified |
 
-The segment's last budgeted candidate always takes the full Eval, and only the full Eval qualifies a candidate. A
+The segment's last budgeted candidate always takes the full Eval, and only the full Eval qualifies a candidate.
+When Eval refuses the run's model, `crit run ... eval` records the run's [rung
+unreachable](docs/RUN_RECORDS.md#rung-unreachable) state: seal each candidate `built` after `serve --check`, plan
+from the newest one, and expect none certified. A
 candidate that fails to build or pass `serve --check` is a draft: seal it with what stopped it and build the fix
 from the same plan, at no cost to the budget. So check a candidate fully before its Eval: an Eval of a broken engine
 spends a candidate. `serve --check --data EVAL_DATA` is that check: the plugin tests, the serving checks, one
 request at the full context (its slowest prompt step against crit serve's one-second cancel grace, the least free
 device memory against the run's headroom), [crit smoke](smoke/README.md) at the run's context and at a quarter of it, and Eval's pre-check of the gates rounds
-most often fail on. Fix what it fails before spending a round. `crit smoke --url` runs the smoke suite against any
-served engine while you build.
+most often fail on, the quality texts' drift by the run's budget among them. Fix what it fails before spending a round. `crit smoke --url` runs the smoke suite against any
+served engine while you build. Once the data holds the reference's scores, `recon --data EVAL_DATA` records smoke's
+reference, so `fluent` judges the engine against its checkpoint rather than an absolute perplexity.
 
 Each round:
 
@@ -201,6 +205,7 @@ Each round:
    drop what slows or breaks the engine, drop what is neutral, and measure every option a plugin is given (a
    threshold, a width, a buffer size) the same way, never from a guess. Without `--data`, the run's own case (often
    one short prompt) judges a drafting plugin, and one that loses on long prompts or other languages looks neutral.
+   A change under the single pass's 3% noise is no result: measure it again with `--rounds 4` on just those variants.
 4. **Evaluate** on the rungs that have an Eval, with `--baseline` set to the run's first Eval result, then
    `crit eval kernels` and `crit eval status RESULT --baseline PARENT_RESULT --kernels KERNELS`. Read every report
    status gives before the next plan ([Eval's reports](docs/BUILDING_ENGINES.md#run-the-common-eval-suite)). A failed
@@ -244,13 +249,16 @@ How to judge a round:
   (accept with probability min(1, p/q), resample from max(p - q, 0) on the first rejection; a greedy draft is q
   one-hot) and sample on the device inside the captured round ([token-sampling](inference/token-sampling/README.md)'s
   `rounds:sampler`; its host oracle is [mtp-decode](inference/mtp-decode/README.md)). A drafter that only helps
-  greedy requests leaves the headline at one token per pass. A model plugin that drafts also decodes plainly on
-  request (`chat-plain-v1`).
+  greedy requests leaves the headline at one token per pass. Fill the sampler with
+  [token-constraints](inference/token-constraints/README.md) (token-sampling's law, each constrained row masked first):
+  JSON, grammar and forced-call requests then decode in the captured rounds too, not one Python step a token. A
+  model plugin that drafts also decodes plainly on request (`chat-plain-v1`).
 - **The context is a requirement.** Build every candidate for `kv_tokens`. Beyond weights and KV the engine gets
   `context_reserve_gib` (default 3 GiB) for activations, workspaces, graphs and speed techniques. Speed depends on
   the tokens held, never the capacity: Eval fails a candidate that is slower opened at a lower context. A prompt's
-  rows never depend on its length: pin the prompt GEMMs' kernels
-  ([recorded selection](inference/recorded-selection/README.md)), or smoke's `causal` fails it.
+  rows never depend on its length: pin the prompt GEMMs' kernels (crit's
+  [pinned-gemm](kernels/techniques/projections/pinned-gemm/README.md), quantized-projections' `prompt_gemm`), or
+  smoke's `causal` fails it.
 - **Quality is a budget to spend.** Spend `quality_budget` on speed; drift below it is no gain. In `speed`, the
   stored format's activations on quantized matrices, FP8 or 4-bit KV, an FP8 head and (where `weights_policy`
   allows) re-encoded dense weights are the starting arithmetic, judged together by the Eval, not levers to justify
@@ -268,7 +276,13 @@ How to judge a round:
   plugin's precision option left on `auto` follows it ([precision](docs/PLUGINS.md#precision)). Load the output head
   with role `head`: in `speed` quantized-projections then holds it in FP8, in `preserve` as stored. Write no head
   option of your own into the model plugin, and count the head in the memory plan at the bytes it is held in. Where
-  `weights_policy` is `as_stored`, set quantized-projections' `head` to `stored`.
+  `weights_policy` is `as_stored`, set quantized-projections' `head` to `stored`. The plan's `prompt_activations` are
+  written into the candidate's configuration: an activation option left on `auto` takes them, and Core refuses an
+  engine that serves others at load, naming the option that chose them. Budget the KV cache from what the engine
+  takes (`crit plugins resolve PACKAGE --model M --context N`: its plugins' answer from the checkpoint's headers,
+  in seconds, no load; every load is held to it), not from recon.md's figure, which is Eval's protocol price; state
+  it in the plan (`kv_bytes_per_token`): creating the candidate refuses a plan its engine does not match, and
+  `serve --check` fails `plan_kv` where the loaded pools take another.
 - **Output differences are bugs until explained.** A drop in plain-greedy equality against an earlier candidate,
   or a difference between repeated identical requests (Eval's `repeatable` and `request_history` gates), is a bug
   until its root cause is demonstrated: the differing kernel or state located and the difference reproduced. Never
@@ -315,7 +329,8 @@ distance. Effort, time and candidate count are not causes.
 
 Write `summary.md` at the run root and tell the user: target and workload; baseline versus recommended candidate;
 gains and tradeoffs; checks and limitations; techniques and kernels; Eval results and missing coverage; remaining
-work; source and package paths. Say when none qualified. Put toolkit feedback here, not into Core or Inference.
+work; source and package paths. Say when none qualified, and, with the rung unreachable, that no candidate is
+certified and why (`crit run ... next` says it). Put toolkit feedback here, not into Core or Inference.
 Record the cost with `crit run ... cost --transcript <your session transcript> --agent "<agent and model>"`, and name
 with `--idle FROM..UNTIL` each stretch your session was offline with nothing running (a restart, a lost
 connection), so the record gives the active hours beside the wall hours.

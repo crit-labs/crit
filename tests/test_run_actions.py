@@ -259,8 +259,10 @@ class ServeCheckTests(run_measure.MeasureFixture, unittest.TestCase):
                           "stop_string": "passed", "cancel": "passed", "draft_bytes": "passed", "stop_engine": "passed",
                           # The candidate's plan declared its prompt activations, and this engine has none to differ.
                           "plan_activations": "passed",
-                          # A scripted adapter's steps are not Core's, so nothing probes them.
-                          "full_context_prompt_step": "unverified", "full_context_device_memory": "unverified"})
+                          # A scripted adapter's steps are not Core's, so nothing probes them, no compile watch runs
+                          # and no request drafts.
+                          "full_context_prompt_step": "unverified", "full_context_device_memory": "unverified",
+                          "compiles_after_load": "unverified", "drafts_accepted": "passed", "step_memory": "unverified"})
         self.assertEqual(check["evidence"][1]["path"], f"candidates/{candidate}/logs/serve-attempt-0001.log")
         self.assertEqual(check["package_sha256"],
                          digest(read_json(self.directory / "candidates" / candidate / "package/manifest.json")))
@@ -338,6 +340,57 @@ class ServeCheckTests(run_measure.MeasureFixture, unittest.TestCase):
         # Below the headroom on a prompt step, or reporting no probe at all.
         self.assertEqual(run(fits, headroom=4 << 30)["full_context_device_memory"]["state"], "failed")
         self.assertEqual({i["state"] for i in run(None).values()}, {"unverified"})
+
+    def test_the_full_context_memory_is_judged_by_the_engine_not_by_what_others_on_the_card_hold(self):
+        # Core's probe samples [seconds, free at the step's peak, memory outside the engine]: another program that
+        # takes memory during a step lowers the device's reading but not the engine's verdict; an engine that leaves
+        # too little with the outside memory at its least still fails.
+        from crit.run import checks
+        gib, mib = 1 << 30, 1 << 20
+
+        class Client:
+            def __init__(self, port, timeout):
+                pass
+
+            def models(self):
+                return [{"id": "m"}]
+
+            def chat(self, body):
+                return {"usage": {"prompt_tokens": 7 + 30 * body["messages"][0]["content"].count(checks.FILLER)}}
+
+        def run(prompt, decode, headroom=1 * gib):
+            # A warm-up step of each kind before the request (outside memory at 1 GiB then): not judged.
+            warm = {kind: {"steps": 1, "recent": [[5.0, 0, 1 * gib]]} for kind in ("prompt", "decode")}
+            after = {kind: {"steps": 1 + len(samples), "recent": warm[kind]["recent"] + samples}
+                     for kind, samples in (("prompt", prompt), ("decode", decode))}
+            reads = iter([warm, after])
+            engine = SimpleNamespace(telemetry=lambda: {"core": {"probe": next(reads)}})
+            with patch.object(checks, "Client", Client):
+                found = {i["name"]: i for i in checks.full_context_checks(0, engine, 1000, headroom, 1, 60,
+                                                                            lambda line: None)}
+            return found["full_context_device_memory"]
+        decode = [[0.01, 3 * gib // 2, 2300 * mib]] * 4
+        # The outside memory swings by 600 MiB during the prompt: the card reads 0.9 GiB free at that step, under the
+        # 1 GiB headroom, but the engine itself held only 50 MiB more than at its other steps.
+        swings = [[0.4, 3 * gib // 2, 2300 * mib], [0.4, 3 * gib // 2 - 650 * mib, 2900 * mib],
+                  [0.4, 3 * gib // 2, 2300 * mib]]
+        found = run(swings, decode)
+        self.assertEqual(found["state"], "passed", found)
+        self.assertIn("prompt 1.45 GiB", found["detail"])
+        self.assertIn("held 2,300 to 2,900 MiB during the request", found["detail"])
+        self.assertIn("600 MiB above its least was subtracted", found["detail"])
+        self.assertIn("the device read 0.87 GiB free there", found["detail"])
+        # The same swing at another step, the engine leaving 0.9 GiB at its own peak with the outside memory at its
+        # least: the engine breaks the headroom.
+        breaks = swings + [[0.4, 9 * gib // 10, 2300 * mib]]
+        found = run(breaks, decode)
+        self.assertEqual(found["state"], "failed", found)
+        self.assertIn("prompt 0.90 GiB", found["detail"])
+        self.assertIn("0 MiB above its least was subtracted", found["detail"])
+        # A Core that samples no outside memory is judged by the device's reading, as before.
+        found = run([[0.4, 3 * gib // 2 - 600 * mib]], [[0.01, 3 * gib // 2]])
+        self.assertEqual(found["state"], "failed", found)
+        self.assertNotIn("outside the engine", found["detail"])
 
     def test_the_full_context_wait_fails_a_prefill_that_cannot_finish_in_the_time_left(self):
         import threading
@@ -437,41 +490,63 @@ class ServeCheckTests(run_measure.MeasureFixture, unittest.TestCase):
         self.assertTrue(quiet.aborted)
 
     def test_serve_check_runs_crit_smoke_at_the_run_context_and_a_quarter_of_it(self):
+        # Smoke's pass at the run's context comes right after the serving checks' short requests (before the full
+        # context's prompt grows the engine's pools) and its pass at the lower context after the gate pre-check,
+        # where the pre-check left the engine: one reopen for both.
         candidate = self.served()
         calls = []
 
-        def smoke(served_, port, log):
-            calls.append(served_.kv_tokens)
-            return [{"name": "smoke_causal", "state": "passed", "detail": "13 prefixes"},
-                    {"name": "smoke_causal@49152", "state": "failed", "detail": "prefix of 17 tokens"}]
-        with patch.object(served, "_smoke", smoke):
-            result = served.serve(self.store, self.run_id, candidate, port=0, check=True)
+        def smoke(served_, port, log, reference=None, full=True, lower=True):
+            calls.append(("run" if full else "") + ("lower" if lower else ""))
+            return ([{"name": "smoke_causal", "state": "passed", "detail": "13 prefixes"}] if full else []) + (
+                [{"name": "smoke_causal@49152", "state": "failed", "detail": "prefix of 17 tokens"}] if lower else [])
+
+        def precheck(*args):
+            calls.append("precheck")
+            return []
+
+        def full_context(*args, **options):
+            calls.append("full context")
+            return []
+        with patch.object(served, "_smoke", smoke), patch.object(served, "_precheck", precheck),                 patch("crit.run.checks.full_context_checks", full_context):
+            result = served.serve(self.store, self.run_id, candidate, port=0, check=True, data=self.directory)
         (check,) = result["checks"]
-        self.assertEqual(calls, [self.run["spec"]["hardware_constraints"]["kv_tokens"]])
+        self.assertEqual(calls, ["run", "full context", "precheck", "lower"])
         self.assertEqual(check["status"], "failed")
         self.assertIn("smoke_causal@49152 failed", check["rationale"])
+        calls.clear()
         with patch.object(served, "_smoke", smoke):
             result = served.serve(self.store, self.run_id, candidate, port=0, check=True, smoke=False)
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls, [])
         self.assertEqual(result["checks"][0]["status"], "passed", result["checks"][0]["rationale"])
 
-    def test_smoke_starts_at_the_context_the_engine_is_open_at_and_ends_at_the_runs(self):
-        # After the gate pre-check the engine is open at the lower context: smoke's second pass runs there first,
-        # and one reopen brings it back, where it ran full, lower, full before (two reopens beside the pre-check's).
+    def test_smoke_starts_at_the_context_the_engine_is_open_at_and_is_not_opened_again_to_go_back(self):
         opened = []
         fake = SimpleNamespace(kv_tokens=262144, opened_at=65536, timeout=60,
                                open=lambda tokens=None: opened.append(tokens) or (None, None, 9))
         ran = []
-        with patch("crit_smoke.run", lambda client, log=None: ran.append(client) or
+        with patch("crit_smoke.run", lambda client, log=None, reference=None: ran.append(reference) or
                    [{"name": "causal", "state": "passed", "detail": ""}]):
-            items = served._smoke(fake, 9, lambda line: None)
+            items = served._smoke(fake, 9, lambda line: None, {"texts": "recon's"})
         self.assertEqual([item["name"] for item in items], ["smoke_causal@65536", "smoke_causal"])
-        self.assertEqual(opened, [262144])
+        self.assertEqual(ran, [{"texts": "recon's"}] * 2)   # recon's smoke reference judges both passes
+        self.assertEqual(opened, [262144])                 # once, to the run's context; not back to the lower one
         fake.opened_at, opened[:] = 262144, []
-        with patch("crit_smoke.run", lambda client, log=None: [{"name": "causal", "state": "passed", "detail": ""}]):
+        with patch("crit_smoke.run", lambda client, log=None, reference=None: [{"name": "causal", "state": "passed",
+                                                                               "detail": ""}]):
             items = served._smoke(fake, 9, lambda line: None)
         self.assertEqual([item["name"] for item in items], ["smoke_causal", "smoke_causal@65536"])
-        self.assertEqual(opened, [65536, None])
+        self.assertEqual(opened, [65536])
+        # serve --check's two passes: the run's context where the engine is, then the lower one, opened once
+        fake.opened_at, opened[:] = 262144, []
+        with patch("crit_smoke.run", lambda client, log=None, reference=None: [{"name": "causal", "state": "passed",
+                                                                               "detail": ""}]):
+            first = served._smoke(fake, 9, lambda line: None, lower=False)
+            self.assertEqual(opened, [])
+            fake.opened_at = 65536     # the pre-check left it at the lower context
+            second = served._smoke(fake, 9, lambda line: None, full=False)
+        self.assertEqual([item["name"] for item in first + second], ["smoke_causal", "smoke_causal@65536"])
+        self.assertEqual(opened, [])
 
     def test_serve_check_with_data_adds_the_gate_precheck(self):
         candidate = self.served()
@@ -483,6 +558,22 @@ class ServeCheckTests(run_measure.MeasureFixture, unittest.TestCase):
         (check,) = result["checks"]
         self.assertEqual(check["status"], "failed")
         self.assertIn("precheck_long_honesty failed", check["rationale"])
+
+    def test_the_gate_precheck_judges_drift_by_the_runs_budget(self):
+        # The pre-check's quality item judges as crit run eval does: the run's budget over its mode's, not Eval's
+        # defaults.
+        from crit.run.records import load_run, quality_terms
+        root = self.store.directory(self.run_id)
+        data = root / "eval-data"
+        data.mkdir()
+        (data / "prepared.json").write_text("{}", encoding="utf-8")
+        asked = {}
+        with patch("crit_eval.run.precheck.run_precheck", lambda *args, **options: asked.update(options) or []):
+            served._precheck(SimpleNamespace(kv_tokens=4096, server=None), load_run(root), root, data, 9,
+                             lambda line: None)
+        run = load_run(root)
+        self.assertEqual(asked["quality_budget"], quality_terms(run["spec"]["correctness"])[0])
+        self.assertIn("kld_mean_max", asked["quality_budget"])
 
 
 if __name__ == "__main__":

@@ -130,6 +130,13 @@ RequestOptions request_options(const char* options_json) {
         replay->tokens = token_array(*v, "replay");
         options.context = std::move(replay);
     }
+    if(const auto* v = root.find("decode_via_prompt"); v && !v->is_null()) options.decode_via_prompt = v->boolean();
+    if(const auto* v = root.find("priority"); v && !v->is_null()) {
+        const auto priority = v->i64();
+        if(priority < std::numeric_limits<std::int32_t>::min() || priority > std::numeric_limits<std::int32_t>::max())
+            throw std::invalid_argument("priority is a 32-bit signed integer");
+        options.priority = std::int32_t(priority);
+    }
     const auto* plain = root.find("plain");
     const bool is_plain = plain && !plain->is_null() && plain->boolean();
     const auto* constrained = root.find("constrained");

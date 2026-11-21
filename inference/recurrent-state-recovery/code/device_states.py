@@ -44,6 +44,7 @@ captured round replays it; a step's row tables reach the device by asynchronous 
 """
 
 import heapq
+import itertools
 import math
 import time
 
@@ -209,6 +210,8 @@ class StatePool:
         self.prompt_real = torch.zeros(1, dtype=torch.bool, device=self.device)
         self.prompt_sequence = None
         self._uploads, self._upload = [None] * UPLOADS, 0   # pinned host tables and the copy event of each
+        # The chunk-aligned exact form (chunk_states.ChunkState, the plugin's decode option chunk), or None: the scan.
+        self.chunk = None
 
     # -- sequences ------------------------------------------------------------------------------------------------------
     def open(self, sequence):
@@ -231,9 +234,20 @@ class StatePool:
         self.index[sequence] = i
         self.states[:, i].zero_()
         self.control[:, i].zero_()
+        if self.chunk is not None:
+            self.chunk.open(i)
         if self.channels:
             self.windows[:, i].zero_()
             self.conv_pending[:, i].zero_()
+
+    def discard(self):
+        """The pool is over (its engine closes): an elastic pool's range goes back to the device now. The device's
+        registry of ranges (crit_plugins.memory.DeviceMemory.ranges) holds a range until it is closed, so without this
+        the pool's backed states would outlive the engine and an engine opened next in the process would start with
+        less free device memory. Nothing reads the pool afterwards."""
+        elastic, self.elastic = self.elastic, None
+        if elastic is not None:
+            elastic.close()
 
     def close(self, sequence):
         i = self.index.pop(sequence, None)
@@ -254,12 +268,17 @@ class StatePool:
         self.open(new)
         target = self.index[new]
         self.states[:, target].copy_(self.states[:, source])
+        if self.chunk is not None:
+            self.chunk.fork(source, target)
         if self.channels:
             self.windows[:, target].copy_(self.windows[:, source])
 
     def state(self, layer, sequence):
-        """The sequence's committed state of a layer: [heads][keys][values] (a flush first)."""
+        """The sequence's committed state of a layer: [heads][keys][values] (a flush first). In the chunk form a new
+        tensor: the chunk's prefill over the held tokens from the boundary."""
         self.flush(sequence)
+        if self.chunk is not None:
+            return self.chunk.live_state(self.layers[layer], self._index(sequence), 1.0)
         return self.states[self.layers[layer], self._index(sequence)]
 
     def window(self, layer, sequence):
@@ -275,11 +294,15 @@ class StatePool:
         finals, windows = self.finals.pop(sequence, {}), self.final_windows.pop(sequence, {})
         self.final_units.pop(sequence, None)
         if count == 0:
+            if self.chunk is not None:
+                self.chunk.drop_prompt(sequence)
             return
         i = self._index(sequence)
         if prompt:
             if count != tokens:
                 raise ValueError(f"a prompt row of {tokens} tokens keeps its final state only, not {count}")
+            if self.chunk is not None:
+                self.chunk.accept_prompt(sequence, i)
             for li, final in finals.items():
                 self.states[li, i].copy_(final)
             for li, window in windows.items():
@@ -287,7 +310,11 @@ class StatePool:
             return
         if not 0 < count <= tokens:
             raise ValueError(f"the sequence's last row held {tokens} tokens, not {count}")
-        self.control[:, i, :self.blocks].fill_(count)
+        if self.chunk is not None:
+            torch = self.torch
+            self.chunk.commit(torch.tensor([i], device=self.device), torch.tensor([count], device=self.device))
+        else:
+            self.control[:, i, :self.blocks].fill_(count)
         if self.channels:
             self.conv_pending[:, i].fill_(count)
 
@@ -299,8 +326,10 @@ class StatePool:
             return
         meta = self._meta([[0, 0, i, FLUSH, -1] for i in indices])
         if self.kernels is not None:
-            self.kernels.pool_delta_replay(self.states, self.stash, self.control, None, None, meta=meta, rows=len(indices),
-                                           capacity=self.capacity, key_heads=self.key_heads, mode=FLUSH_PENDING)
+            if self.chunk is None:   # (the chunk form keeps nothing pending in its states)
+                self.kernels.pool_delta_replay(self.states, self.stash, self.control, None, None, meta=meta,
+                                               rows=len(indices), capacity=self.capacity, key_heads=self.key_heads,
+                                               mode=FLUSH_PENDING)
             if self.channels:
                 out, x, weight = self._conv_none
                 self.kernels.pool_conv(out, self.windows, self.conv_stash, self.conv_pending, None, x, weight, None,
@@ -338,6 +367,8 @@ class StatePool:
         place (no accept follows a captured chunk). After the replay."""
         if batch.sequence != self.prompt_sequence:
             raise ValueError(f"the pool staged {self.prompt_sequence!r}'s prompt chunk, not {batch.sequence!r}'s")
+        if self.chunk is not None and batch.sequence is not None:
+            self.chunk.commit_captured(self._index(batch.sequence), batch.count)
         self.prompt_sequence = None
 
     # -- captured rounds ------------------------------------------------------------------------------------------------
@@ -371,7 +402,9 @@ class StatePool:
         rows_at = torch.where(sequences < 0, self.spare, sequences)   # unbound rows write the spare sequence
         slots = self.slot_ids[:rows]
         counts = count.to(torch.int32)[None, :, None]
-        if self.commit == "deferred":
+        if self.chunk is not None:
+            self.chunk.commit(rows_at, count.to(torch.int64))
+        elif self.commit == "deferred":
             self.control[:, rows_at, :self.blocks] = counts
         elif self.commit == "checkpoints":
             chosen = self.checkpoints[:, slots, count]
@@ -572,12 +605,12 @@ def asked_prompt(prompt_rows, prompt, pinned=False):
 
 def prompt_exactness(prompts):
     """The level a recurrence plugin's rows keep, from its pools' prompt records (a plugin's exactness() returns it;
-    crit_kernels.exactness): decode and verify rows row-exact; prompt rows exact where every pool's run the scan
+    crit_plugins.exactness): decode and verify rows row-exact; prompt rows exact where every pool's run the scan
     (the bits of decoding their tokens one by one) and repeatable where a pool's long rows reach a chunked kernel,
     whose sums follow the prompt's length and chunking. Nothing before a pool is made."""
     if not prompts:
         return {}
-    chunked = any(pool["chunked"] is not None for pool in prompts)
+    chunked = any(pool["chunked"] is not None and pool.get("decode") != "chunk" for pool in prompts)
     return {"decode": "row-exact", "prompt": "repeatable" if chunked else "exact"}
 
 
@@ -592,6 +625,9 @@ CHUNKED_ARITHMETIC = {
     "two_pass": "recurrent-scans' two-pass prefill (delta-prefill-rb): FP32 on CUDA cores",
     "tensor_cores": "recurrent-scans' chunked WY prefill on tensor cores (delta-prefill-tc): FP16 operands rounded once a "
                     "chunk, FP32 accumulation and state; values and states within FP16's range",
+    "chunk_rows": "recurrent-scans' chunk-aligned exact form (delta-chunk-rows) for every row, decode and verify too: "
+                  "delta-prefill-tc's arithmetic over each sequence's tokens since its last 64-aligned position, so "
+                  "a prompt row has the bits of decoding its tokens",
 }
 CAPTURED = ("a captured prompt chunk (prompts:recurrence, a padded bucket): in a bucket of up to scan_rows_captured "
             "tokens the "
@@ -710,6 +746,8 @@ def forward(layer, query, key, value, log_decay, beta, pool, batch, geometry, ex
     tokens = v.shape[0]
     if out is None:
         out = torch.empty(tokens, pool.heads, pool.values, dtype=torch.float32, device=v.device)
+    if pool.chunk is not None:
+        return _chunk_forward(pool, li, q, k, v, g, b, batch, geometry, out)
     args = (geometry["epsilon"], geometry["query_scale"], geometry["normalize_keys"], geometry["normalize_queries"])
     if batch.prompt:
         return _prompt_state(pool, li, q, k, v, g, b, batch, geometry, chunk_fp32, prompt, out)
@@ -766,6 +804,49 @@ def forward(layer, query, key, value, log_decay, beta, pool, batch, geometry, ex
             final = _two_pass(pool, q[span], k[span], v[span], g[span], b[span], state, geometry, out[span],
                               chunked == "tensor_cores")
         pool.finals.setdefault(sequence, {})[li] = final
+    return out
+
+
+def _chunk_forward(pool, li, q, k, v, g, b, batch, geometry, out):
+    """forward() in the chunk form (chunk_states): every row through gated_delta_chunk_rows from its sequence's
+    boundary, nothing kept until its commit."""
+    torch, chunk = pool.torch, pool.chunk
+    eps, scale = geometry["epsilon"], geometry["query_scale"]
+    q = _normal(torch, q.float(), eps, geometry["normalize_queries"]).contiguous()
+    k = _normal(torch, k.float(), eps, geometry["normalize_keys"]).contiguous()
+    v, g, b = v.float().contiguous(), g.float().contiguous(), b.float().contiguous()
+    if batch.prompt:   # a captured chunk: the staged sequence (padding alone: no real token, nothing changes)
+        if v.shape[0] != batch.bucket:
+            raise ValueError(f"a prompt chunk of {batch.bucket} tokens (its bucket), not {v.shape[0]}")
+        valid = batch.valid_t
+        count = valid.sum().view(1).to(torch.int64)
+        return chunk.captured_prompt(li, q, k, v, g, b, pool.prompt_index, count, valid, scale, out)
+    if batch.round:
+        cols = batch.width + 1
+        pool._round_rows(batch.rows)
+        if cols > pool.capacity:
+            raise ValueError(f"a round of {cols} columns in a pool of verify rows up to {pool.capacity} (widest)")
+        sequences = pool.table[:batch.rows].long()
+        seq = torch.where(sequences < 0, chunk.spare, sequences)
+        start = batch.starts_t.to(torch.int64)
+        chunk.rows(li, q, k, v, g, b, seq, start, start[1:] - start[:-1], scale, out)
+        _unbound_zero(torch, out, sequences, batch.rows, cols)
+        return out
+    plan = pool._plan(batch)
+    rows = plan["rows"]
+    window = [(r, i, first, count) for r, (_, i, first, count) in enumerate(rows) if count <= pool.capacity]
+    if window:
+        idx = torch.cat([torch.arange(first, first + count, device=q.device) for _, _, first, count in window])
+        counts = [count for _, _, _, count in window]
+        seq = torch.tensor([i for _, i, _, _ in window], dtype=torch.int64, device=q.device)
+        start = torch.tensor([0] + list(itertools.accumulate(counts)), dtype=torch.int64, device=q.device)
+        found = torch.empty(idx.numel(), pool.heads, pool.values, dtype=torch.float32, device=q.device)
+        chunk.rows(li, q[idx], k[idx], v[idx], g[idx], b[idx], seq, start, start[1:] - start[:-1], scale, found)
+        out.index_copy_(0, idx, found)
+    for r in plan["prompts"]:
+        sequence, i, first, count = rows[r]
+        span = slice(first, first + count)
+        chunk.prompt(li, q[span], k[span], v[span], g[span], b[span], i, sequence, scale, out[span])
     return out
 
 
@@ -905,6 +986,18 @@ def convolve(layer, x, weight, bias, pool, batch, activation="silu", out=None):
     if pool.kernels is not None:
         pool.kernels.pool_conv(out, pool.windows, pool.conv_stash, pool.conv_pending, None, x, weight, bias, meta=meta,
                                rows=batch.rows, kind=STASH, layer=li, layers=1, capacity=pool.capacity, silu=silu)
+        if len(prompts) > 1 and hasattr(pool.kernels, "conv_segments_rows"):   # one launch, each row's bits
+            found = [rows[r] for r in prompts]
+            index = torch.tensor([i for _, i, _, _ in found], dtype=torch.int64, device=pool.device)
+            windows = pool.windows[li].index_select(0, index).contiguous()
+            finals = torch.empty_like(windows)
+            starts = torch.tensor([[first, count] for _, _, first, count in found], dtype=torch.int32,
+                                  device=pool.device)
+            pool.kernels.conv_segments_rows(out, windows, finals, x, starts, weight, bias, silu=silu,
+                                            widest=max(count for _, _, _, count in found))
+            for r, (sequence, _, _, _) in enumerate(found):
+                pool.final_windows.setdefault(sequence, {})[li] = finals[r]
+            return out
         for r in prompts:
             sequence, i, first, count = rows[r]
             span = slice(first, first + count)

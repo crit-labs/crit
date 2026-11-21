@@ -65,63 +65,12 @@ class LayoutTests(PluginTestCase):
 
 
 class SpanTests(PluginTestCase):
-    def test_spans_are_the_longest_within_the_budget_at_each_position(self):
-        rows = template("rows")
-        costs = rows.fit({(128, 0): 0.02, (512, 0): 0.06, (512, 200_000): 0.9}, {128: 1e8, 512: 4e8})
-        spans = rows.Spans(512, costs, 0.5)
-        for position in (0, 50_000, 120_000, 200_000):
-            found = spans.rows(position)
-            self.assertEqual(found % rows.QUANTUM, 0)
-            self.assertLessEqual(spans.predicted(found, position), 0.5)
-            if found < 512:
-                self.assertGreater(spans.predicted(found + rows.QUANTUM, position), 0.5)
-        self.assertEqual(spans.rows(0), 512)
-        self.assertLess(spans.rows(200_000), 512)
-        self.assertEqual(spans.stop(1000), 1000 + spans.rows(1000))
-
-    def test_a_span_leaves_the_rooms_bytes_and_one_without_a_calibration_is_the_chunk(self):
+    def test_the_calibration_fits_a_steps_seconds_and_a_rows_bytes(self):
+        # The fit is Core's prompt-step budget's first guess (crit_plugins.steps, tests/test_steps.py).
         rows = template("rows")
         costs = rows.fit({(16, 0): 0.001, (64, 0): 0.002, (64, 1000): 0.003}, {16: 16 << 20, 64: 64 << 20})
         self.assertEqual(costs["m"], float(f"{1 << 20:.4g}"))
-        self.assertEqual(rows.Spans(64, costs, 10.0, room=int(costs["m"] * 40)).rows(0), 32)
-        self.assertEqual(rows.Spans(64).rows(10 ** 6), 64)
-
-    def test_where_no_span_meets_the_budget_spans_are_the_ones_that_prefill_fastest(self):
-        # A step whose fixed part alone passes the budget (an experts plugin copying a chunk's experts every step):
-        # shorter spans pay it again for fewer tokens, so the span is the whole chunk, or the longest that still ends
-        # inside the cancel grace, and the facts name the fixed part.
-        rows = template("rows")
-        fixed = {"c": 0.6, "a": 2e-4, "b": 0.0, "m": 0.0}
-        spans = rows.Spans(1024, fixed, 0.5, deepest=200_000)
-        self.assertEqual([spans.rows(p) for p in (0, 100_000, 200_000)], [1024, 1024, 1024])
-        self.assertIn("0.60 s of it whatever its span", spans.facts()["over_budget"])
-        self.assertEqual(spans.facts()["steps"][-1], {"position": 200_000, "rows": 1024, "seconds": 0.8048,
-                                                      "tokens_per_second": 1272.0})
-        # The default budget leaves the grace a quarter: a step that copies its experts (0.45 s) and takes 0.48 ms a
-        # token runs 624 tokens, 830 a second, where half a second ran 96 and 190.
-        staged = {"c": 0.45, "a": 4.8e-4, "b": 0.0, "m": 0.0}
-        self.assertEqual(rows.SECONDS, 0.75 * rows.GRACE)
-        self.assertEqual((rows.Spans(1024, staged, rows.SECONDS).rows(0), rows.Spans(1024, staged, 0.5).rows(0)),
-                         (624, 96))
-        self.assertEqual(template("compose").DEFAULTS["span_seconds"], rows.SECONDS)
-        slow = rows.Spans(1024, {**fixed, "a": 5e-4}, 0.5)     # the chunk would take 1.11 s: past the grace
-        self.assertEqual(slow.rows(0), 784)                     # the longest that ends inside it (0.992 s)
-        self.assertLess(slow.predicted(784, 0), rows.GRACE)
-        hopeless = rows.Spans(1024, {**fixed, "c": 1.5}, 0.5)   # nothing ends inside the grace: the fastest
-        self.assertEqual(hopeless.rows(0), 1024)
-        # A step whose time grows with its rows keeps the rule: the longest span within the budget.
-        grows = rows.Spans(1024, {"c": 0.05, "a": 1e-3, "b": 0.0, "m": 0.0}, 0.5)
-        self.assertEqual(grows.rows(0), 448)
-        self.assertNotIn("over_budget", grows.facts())
-        self.assertEqual(rows.Spans(64, {**fixed, "m": 1.0}, 0.0, room=0).rows(0), rows.QUANTUM)   # no room at all
-
-    def test_the_fit_reads_back_its_own_rounding(self):
-        rows = template("rows")
-        costs = rows.fit({(16, 0): 0.0011111, (64, 0): 0.0023456, (64, 999): 0.0034567}, {64: 12345678})
-        self.assertEqual(rows.fit({(16, 0): 0.0011111, (64, 0): 0.0023456, (64, 999): 0.0034567}, {64: 12345678}),
-                         costs)
-        self.assertEqual(json.loads(json.dumps(costs)), costs)
-
+        self.assertEqual(set(costs), {"c", "a", "b", "m"})
 
 class CheckpointTests(PluginTestCase):
     def test_the_index_names_the_shards_wherever_the_checkpoint_keeps_them(self):
@@ -233,12 +182,26 @@ class CheckpointTests(PluginTestCase):
                              ("mxfp8", (4, 64), (4, 2)))
             kind, stacked = matrices.stacked(["mx", "mx"])
             self.assertEqual((kind, tuple(stacked["scale"].shape)), ("mxfp8", (8, 2)))
-            # FP8 in 128 x 128 blocks: read with its multipliers, refused by name where the projections slot would
-            # load it as stored, re-encoded where only a drafter reads it
+            # FP8 in 128 x 128 blocks: read with its multipliers and handed to the projections slot as stored (it
+            # loads fp8:block on fp8-block-rows), refused by name by a slot whose formats leave it out, re-encoded
+            # where only a drafter reads it
             kind, stored = matrices.stored("wide")
             self.assertEqual((kind, stored["block"], tuple(stored["scale"].shape)), ("fp8:block", (128, 128), (2, 2)))
+
+            class Slot:
+                formats = ("bf16", "fp8:channel", "fp8:block")
+
+                def load(self, tensors, fmt, role=None, encode=None):
+                    return fmt, tensors
+            matrices.proj = Slot()
+            fmt, tensors = matrices.load(["wide"], "draft")
+            self.assertEqual((fmt, tensors["block"]), ("fp8:block", (128, 128)))
+            class Narrow(Slot):
+                formats = ("bf16", "fp8:channel")
+            matrices.proj = Narrow()
             with self.assertRaisesRegex(ValueError, "FP8 in blocks of"):
                 matrices.load(["wide"], "draft")
+            matrices.proj = None
             kind, encoded = matrices.reformat("wide", "nvfp4")
             self.assertEqual((kind, tuple(encoded["weight"].shape), tuple(encoded["scale"].shape)),
                              ("nvfp4", (256, 128), (256, 16)))
@@ -252,7 +215,76 @@ class CheckpointTests(PluginTestCase):
             self.assertEqual(float(stored["global_scale"]), 2.0)   # ModelOpt's multiplier, as crit's divisor
             ck.close()
             # Tensors read in place keep the file mapped, and Windows deletes no mapped file.
-            del matrices, stored, stacked, encoded, scales
+            del matrices, stored, stacked, encoded, scales, tensors
+            import gc
+            gc.collect()
+
+    def test_expert_stacks_under_a_layouts_names_read_as_stored(self):
+        # A checkpoint that names its tensors its own way (the layout's `names`) and stores its experts as two stacks:
+        # NVFP4 whose factor is an amax over a denominator, one amax an expert, with each gate row beside its up row;
+        # and MXFP8. Each expert reaches the slot as stored, gate rows then up rows, and decodes to the values the
+        # checkpoint's reference decodes it to (E2M1 codes x E4M3 scale x amax / denominator, rows de-interleaved).
+        try:
+            import torch
+            from safetensors.torch import save_file
+        except ImportError:
+            self.skipTest("torch and safetensors")
+        import tempfile
+        checkpoint = template("checkpoint")
+        g = torch.Generator().manual_seed(7)
+        experts, inter, hidden = 3, 16, 64
+        codes = torch.randint(0, 256, (experts, 2 * inter, hidden // 2), dtype=torch.uint8, generator=g)
+        scale = (torch.rand(experts, 2 * inter, hidden // 16, generator=g) * 2 + 0.25).to(torch.float8_e4m3fn)
+        amax = torch.rand(experts, generator=g) + 0.5
+        denominator = torch.tensor([3.0])
+        down_codes = torch.randint(0, 256, (experts, hidden, inter // 2), dtype=torch.uint8, generator=g)
+        down_scale = torch.ones(experts, hidden, 1).to(torch.float8_e4m3fn)
+        mx = (torch.randn(experts, 2 * inter, hidden, generator=g)).to(torch.float8_e4m3fn)
+        mx_scale = torch.randint(120, 130, (experts, 2 * inter, hidden // 32), dtype=torch.uint8, generator=g)
+        names = [[r"experts\.w13_", "experts.gate_up_proj."], [r"experts\.w2_", "experts.down_proj."]]
+        e2m1 = torch.tensor((0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0))
+
+        def reference(weight, block_scale, factor):   # the reference's decode, then its Interleave(dim=1)
+            pairs = torch.stack((e2m1[weight.long() & 0xF], e2m1[weight.long() >> 4]), dim=-1)
+            values = pairs.view(*block_scale.shape, 16) * block_scale.float()[..., None] * factor
+            values = values.reshape(weight.shape[0], -1)
+            return values.reshape(values.shape[0] // 2, 2, -1).transpose(0, 1).reshape(values.shape)
+
+        with tempfile.TemporaryDirectory() as folder:
+            save_file({"l0.experts.w13_weight": codes, "l0.experts.w13_weight_scale": scale,
+                       "l0.experts.w13_weight_amax": amax, "l0.experts.w13_weight_outer_scale_denominator": denominator,
+                       "l0.experts.w2_weight": down_codes, "l0.experts.w2_weight_scale": down_scale,
+                       "l0.experts.w2_weight_amax": amax.clone(),
+                       "l0.experts.w2_weight_outer_scale_denominator": denominator.clone(),
+                       "l1.experts.w13_weight": mx, "l1.experts.w13_weight_scale": mx_scale,
+                       "l1.experts.w2_weight": torch.zeros(experts, hidden, inter * 8).to(torch.float8_e4m3fn),
+                       "l1.experts.w2_weight_scale": torch.full((experts, hidden, inter * 8 // 32), 127,
+                                                                dtype=torch.uint8)},
+                      str(Path(folder) / "model.safetensors"))
+            ck = checkpoint.Checkpoint(Path(folder), names)
+            self.assertIn("l0.experts.gate_up_proj.weight_amax", ck)
+            self.assertEqual(ck.stored_names["l0.experts.gate_up_proj.weight"], "l0.experts.w13_weight")
+            matrices = checkpoint.Matrices(ck, None, {}, "cpu")
+            self.assertEqual([matrices.format(f"l{i}.experts.gate_up_proj") for i in (0, 1)], ["nvfp4", "mxfp8"])
+            for e in range(experts):
+                fmt, gate_up, down = matrices.stacked_expert("l0.experts.gate_up_proj", "l0.experts.down_proj", e,
+                                                             interleaved=True)
+                self.assertEqual((fmt, tuple(gate_up["weight"].shape)), ("nvfp4", (2 * inter, hidden // 2)))
+                self.assertAlmostEqual(float(gate_up["global_scale"]), float(denominator / amax[e]), places=6)
+                # crit's convention: code x scale / global_scale (a divisor), the rows as they reach the slot
+                w, sc = gate_up["weight"].long(), gate_up["scale"].float()
+                pairs = torch.stack((e2m1[w & 0xF], e2m1[w >> 4]), dim=-1).view(*sc.shape, 16)
+                decoded = (pairs * sc[..., None] / gate_up["global_scale"]).reshape(2 * inter, hidden)
+                want = reference(codes[e], scale[e], float(amax[e] / denominator))
+                self.assertTrue(torch.allclose(decoded, want, rtol=1e-6, atol=1e-6), e)
+                fmt, gate_up, down = matrices.stacked_expert("l1.experts.gate_up_proj", "l1.experts.down_proj", e,
+                                                          interleaved=True)
+                self.assertEqual(fmt, "mxfp8")
+                self.assertTrue(torch.equal(gate_up["weight"].view(torch.uint8),
+                                            torch.cat([mx[e, 0::2], mx[e, 1::2]]).view(torch.uint8)))
+                self.assertTrue(torch.equal(gate_up["scale"], torch.cat([mx_scale[e, 0::2], mx_scale[e, 1::2]])))
+            ck.close()
+            del matrices, gate_up, down
             import gc
             gc.collect()
 

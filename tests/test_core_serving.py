@@ -1,4 +1,5 @@
 """crit_core.serving.ResidentChat and the package check that keeps resident adapters complete (offline)."""
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -837,6 +838,51 @@ class PackageCapabilityTests(unittest.TestCase):
                 self.assertIn("chat-sampling-temperature-v1", found)
             self.assertIn("chat-tools-v1", taught)
             self.assertNotIn("chat-tools-v1", untaught)
+
+    def test_a_model_plugin_names_its_own_tool_call_and_reasoning_syntax(self):
+        """A model whose template writes a syntax crit does not register gets calls parsed in the ToolFormat and its
+        reasoning split by the ReasoningFormat its model plugin names (manifest tool_format, reasoning_format): crit
+        serve declares tools and the thinking budget from the manifest without running the plugin's code, and the
+        resident engine imports the formats. A grammar cannot write a call syntax crit does not register, so forced
+        calls stay undeclared."""
+        from crit_core.engine import capabilities as package_capabilities, reasoning_format, tool_format
+        from crit_core.text.reasoning import ReasoningFormat
+        from crit_core.text.tools import ToolFormat
+        from crit_plugins import PluginError
+        from support.engines import write_package
+        with tempfile.TemporaryDirectory() as temp:
+            plain = write_files(Path(temp) / "plain", llama_files())
+            package = write_package(Path(temp) / "package")
+            self.assertIsNone(tool_format(package))
+            self.assertIsNone(reasoning_format(package))
+            self.assertNotIn("chat-thinking-budget-v1", package_capabilities(package, plain))
+            model = package / "plugins" / "toy-model"
+            (model / "calls.py").write_text(
+                "from crit_core.text.reasoning import ReasoningFormat\n"
+                "from crit_core.text.tools import ToolFormat\n"
+                "FORMAT = ToolFormat(lambda body, functions: None, '[[call ', ']]', markers=('=',))\n"
+                "THINKING = ReasoningFormat('<<', '>>')\n"
+                "NOT_A_FORMAT = 3\n", encoding="utf-8")
+            manifest = model / "plugin.json"
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            manifest.write_text(json.dumps({**data, "tool_format": "calls.py:FORMAT",
+                                            "reasoning_format": "calls.py:THINKING"}), encoding="utf-8")
+            found = package_capabilities(package, plain)
+            self.assertIn("chat-tools-v1", found)
+            self.assertIn("chat-tool-stream-v1", found)
+            self.assertNotIn("chat-tool-choice-v1", found)
+            self.assertIn("chat-thinking-budget-v1", found)
+            format = tool_format(package)
+            self.assertIsInstance(format, ToolFormat)
+            self.assertEqual((format.opening, format.closing, format.markers), ("[[call ", "]]", ("=",)))
+            self.assertEqual(reasoning_format(package), ReasoningFormat("<<", ">>"))
+            manifest.write_text(json.dumps({**data, "tool_format": "calls.py:NOT_A_FORMAT"}), encoding="utf-8")
+            with self.assertRaisesRegex(PluginError, "tool_format calls.py:NOT_A_FORMAT is no crit_core.text.ToolFormat"):
+                tool_format(package)
+            manifest.write_text(json.dumps({**data, "reasoning_format": "calls.py:FORMAT"}), encoding="utf-8")
+            with self.assertRaisesRegex(PluginError,
+                                        "reasoning_format calls.py:FORMAT is no crit_core.text.ReasoningFormat"):
+                reasoning_format(package)
 
 
 if __name__ == "__main__":

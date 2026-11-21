@@ -3,6 +3,7 @@ and value dims from its config), random inputs of the plugins' layout seeded per
 token-by-token reference of the recurrence (recurrent-state-recovery's gated-delta operation)."""
 import torch
 
+from crit_kernels import contracts
 from crit_kernels.gates import shared_memory_optin
 
 BLOCK = 256   # prefill tokens generated per seed, so a prompt's first tokens do not depend on its length
@@ -22,24 +23,8 @@ def _key(shape):
 
 
 def recurrence(q, k, v, g, b, state, scale, eps=None):
-    """FP64 gated delta token by token over [T, heads, ...] inputs with a leading batch of sequences or none: per token
-    delta = b (v - e^g S^T k); S' = e^g S + k delta^T; out = scale S'^T q (keys and queries L2-normalized first with
-    eps). Returns (outputs, final state)."""
-    q, k, v, g, b, S = (t.double() for t in (q, k, v, g, b, state))
-    if eps is not None:
-        k = k / (k.square().sum(-1, keepdim=True) + eps).sqrt()
-        q = q / (q.square().sum(-1, keepdim=True) + eps).sqrt()
-    ratio = v.shape[-2] // q.shape[-2]
-    q, k = q.repeat_interleave(ratio, dim=-2), k.repeat_interleave(ratio, dim=-2)
-    out = torch.empty(v.shape, dtype=torch.float64, device=v.device)
-    for t in range(v.shape[-3]):
-        e = g[..., t, :].exp()[..., None, None]
-        kt, qt = k[..., t, :, :], q[..., t, :, :]
-        delta = b[..., t, :, None] * (v[..., t, :, :] - e[..., 0] * torch.einsum("...hkv,...hk->...hv", S, kt))
-        S = e * S + kt[..., :, None] * delta[..., None, :]
-        out[..., t, :, :] = scale * torch.einsum("...hkv,...hk->...hv", S, qt)
-    return out, S
-
+    """The gated-delta operation's FP64 token-by-token reference (crit_kernels.contracts.gated_delta)."""
+    return contracts.gated_delta(q, k, v, g, b, state, scale, eps)
 
 class DeltaPrefillRb:
     """gated_delta_prefill at 128 key dims (the register-blocked passes), FP32 inputs as the plugin passes them
@@ -98,9 +83,9 @@ class DeltaPrefillRb:
         # A chunked prefill sums in another order than the recurrence: FP32 rounding of the chunks' products, which grows
         # with the prompt's length but stays far below a wrong tile's error.
         for name, x, y in (("outputs", got[0], want[0]), ("final state", got[1], want[1])):
-            bad = int(((x.double() - y).abs() > 1e-3 + 1e-3 * y.abs()).sum())
-            if bad:
-                return f"{bad} {name} beyond 1e-3 + 1e-3|x| of the FP64 recurrence"
+            problem = contracts.check("gated-delta", x, y)
+            if problem:
+                return f"{name}: {problem}"
         return None
 
     def first_row(self, out):
@@ -218,8 +203,7 @@ class PoolDelta:
         return self._references[s["key"]]
 
     def check(self, got, want, s):
-        bad = int(((got.double() - want).abs() > 1e-5 + 1e-4 * want.abs()).sum())
-        return None if bad == 0 else f"{bad} outputs beyond 1e-5 + 1e-4|x| of the FP64 recurrence"
+        return contracts.check("gated-delta", got, want, arithmetic="token-by-token")
 
     def first_row(self, out):
         return out[0]
@@ -316,15 +300,8 @@ def _seeded(rows, make, device, seed):
 
 
 def ssd_recurrence(x, dt, B, C, A, D, state):
-    """FP64 Mamba-2 token by token: H' = e^(dt A) H + dt x B^T; y = H' C + D x (groups shared by heads / groups)."""
-    x, dt, B, C, A, D, H = (t.double() for t in (x, dt, B, C, A, D, state))
-    ratio = x.shape[1] // B.shape[1]
-    B, C = B.repeat_interleave(ratio, dim=1), C.repeat_interleave(ratio, dim=1)
-    out = torch.empty_like(x)
-    for t in range(x.shape[0]):
-        H = torch.exp(dt[t] * A)[:, None, None] * H + dt[t][:, None, None] * x[t][:, :, None] * B[t][:, None, :]
-        out[t] = torch.einsum("hpn,hn->hp", H, C[t]) + D[:, None] * x[t]
-    return out, H
+    """The ssd-scan operation's FP64 token-by-token reference (crit_kernels.contracts.ssd)."""
+    return contracts.ssd(x, dt, B, C, A, D, state)
 
 
 class _Untuned:
@@ -340,9 +317,9 @@ class _Untuned:
 
     def check(self, got, want, s):
         for name, x, y in (("outputs", got[0], want[0]), ("final state", got[1], want[1])):
-            bad = int(((x.double() - y).abs() > 1e-3 + 1e-3 * y.abs()).sum())
-            if bad:
-                return f"{bad} {name} beyond 1e-3 + 1e-3|x| of the FP64 recurrence"
+            problem = contracts.check(self.operation, x, y)
+            if problem:
+                return f"{name}: {problem}"
         return None
 
     def first_row(self, out):
@@ -357,6 +334,7 @@ class _Untuned:
 class SsdPrefill(_Untuned):
     """ssd_prefill on a prompt of `rows` tokens from a random state, the plugin's FP32 inputs (dt after softplus)."""
     structure = "ssd-prefill"
+    operation = "ssd-scan"
     nan_block = 64   # 64-token chunks, as gated delta's prefill
     call = "ssd_prefill"
 
@@ -398,6 +376,7 @@ class SsdColumns(SsdPrefill):
 class DeltaColumns(_Untuned):
     """gated_delta_scan: one sequence's decode and verify columns, from the plugin's FP32 inputs."""
     structure = "delta-columns"
+    operation = "gated-delta"
 
     def __init__(self):
         super().__init__()
@@ -434,6 +413,7 @@ class DeltaPrefill64(DeltaColumns):
 class CausalConv(_Untuned):
     """causal_conv1d: one sequence's convolution with its carried window, SiLU, the model's channels and width."""
     structure = "causal-conv"
+    operation = "causal-conv"
 
     def shapes(self, model):
         return conv_shapes(model)
@@ -459,9 +439,8 @@ class CausalConv(_Untuned):
 
     def recurrence(self, s):
         w = s["weight"].shape[1]
+        out = contracts.causal_conv(s["x"], s["weight"], s["window0"].T, s["bias"])
         padded = torch.cat([s["window0"].T.double(), s["x"].double()])
-        out = torch.stack([(padded[t:t + w].T * s["weight"].double()).sum(1) + s["bias"].double()
-                           for t in range(s["x"].shape[0])])
         return torch.nn.functional.silu(out), padded[-(w - 1):].T
 
 

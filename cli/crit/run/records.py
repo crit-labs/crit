@@ -29,12 +29,12 @@ WORKLOAD_MODES = ("resident", "cold")
 TARGETS = ("decode_tps", "prefill_tps", "request_ms")  # a run's speed objectives, each a positive number
 VERIFICATION_LEVELS = ("reported", "artifact_verified")
 EXACTNESS_MODES = {"reported", "required"}  # must speculative output equal plain greedy?
-# The quality modes (crit-eval's): how much output drift from the checkpoint the user selected the engine may trade
-# for speed, never how that checkpoint is quantized or stored. Both are judged against the same reference, that
-# checkpoint's stored weights with exact activations. speed: a budget that only keeps out a broken engine, near-tie
-# output differences allowed; preserve: a budget that keeps the output close to the checkpoint's, every precision
-# change measured against it. Every run record states its mode.
-QUALITY_MODES = ("preserve", "speed")
+# The quality modes (Core's, crit_plugins.exactness; crit Eval judges each by its budget): how much output drift from
+# the checkpoint the user selected the engine may trade for speed, never how that checkpoint is quantized or stored.
+# Both are judged against the same reference, that checkpoint's stored weights with exact activations. speed: a budget
+# that only keeps out a broken engine, near-tie output differences allowed; preserve: a budget that keeps the output
+# close to the checkpoint's, every precision change measured against it. Every run record states its mode.
+from crit_plugins.exactness import QUALITY_MODES  # noqa: E402
 # The quality mode of a run whose request (and settings.toml) names none.
 DEFAULT_QUALITY_MODE = "speed"
 # Every run follows the current rules: a plan for every candidate, the plan rules of crit.run.plans, lever fates in
@@ -151,9 +151,9 @@ def validate_origin(value, stored=None):
 
 def row_exactness(value, what):
     """The exactness an engine asks of its rows, as a crit-hub card's result or an origin's evidence states it: one
-    level, or a level per phase, returned as {"decode": level, "prompt": level} (crit_kernels.exactness.setting; `what`
+    level, or a level per phase, returned as {"decode": level, "prompt": level} (crit_plugins.exactness.setting; `what`
     names the value in the error)."""
-    from crit_kernels.exactness import PHASES, setting
+    from crit_plugins.exactness import PHASES, setting
     if not isinstance(value, (str, dict)) or (isinstance(value, dict) and set(value) != set(PHASES)):
         raise ValueError(f"{what} is a level (declared, exact, row-exact, repeatable) or one each for decode and prompt")
     try:
@@ -302,7 +302,8 @@ def cases_need(data, workload):
 def kv_capacity(data, model, vram_headroom_bytes, reserve_bytes=None, need=0):
     """The run's KV capacity in tokens of prompt plus output, and what it rests on. An explicit kv_tokens
     is taken as given. Otherwise the request names its device (a `crit eval probe` result) and the run is
-    built for Eval's max context: the context the user wants (context_tokens, from settings.toml; default 262,144),
+    built for Eval's max context: the context the user wants (context_tokens, from settings.toml; default crit Eval's
+    DEFAULT_CONTEXT_TOKENS, 200,000),
     capped by the model's positions and the KV cache that fits on the device next to the companion drafters the
     request names (drafters: folders a candidate may load beside the model). need: the KV the workload's concurrent
     requests hold at once (kv_need); a wanted context below it is raised to it, never past the model or device."""
@@ -358,10 +359,10 @@ def request_spec(data):
     keys(workload, set(), {name for name, *_ in WORKLOAD} | {"mode"})
     workload = validate_workload({**{name: default for name, default, *_ in WORKLOAD}, "mode": WORKLOAD_MODES[0],
                                   **workload})
-    from crit_eval import VRAM_HEADROOM_GIB
+    from crit.settings import RAM_HEADROOM_GIB, vram_headroom_gib
     headroom = {kind + "_headroom_bytes": round(number(data.get(kind + "_headroom_gib", default), kind + " headroom",
                                                        high=65536) * GIB)
-                for kind, default in (("vram", VRAM_HEADROOM_GIB), ("ram", 2))}
+                for kind, default in (("vram", vram_headroom_gib({})), ("ram", RAM_HEADROOM_GIB))}
     reserve = (round(number(data["context_reserve_gib"], "context reserve", 0, 65536) * GIB)
                if "context_reserve_gib" in data else None)
     capacity, context = kv_capacity(data, path, headroom["vram_headroom_bytes"], reserve, cases_need(data, workload))

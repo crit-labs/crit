@@ -3,14 +3,19 @@
 Each test compares two ways the engine computes the same thing (a prefix against the whole prompt, decode against
 prefill, a reply against its score, a request against itself after another one), or checks a property any working
 model has (finite, ranked log-probabilities; a low loss on plain prose; copying a repeated text). None needs a
-reference model, so they run on any engine crit serves, and each failure names the component that broke.
+reference model, so they run on any engine crit serves, and each failure names the component that broke. Given the
+checkpoint's own reference (crit_smoke.reference, recorded by recon from crit Eval's), `fluent` is judged relative
+to it instead of by an absolute perplexity.
 """
 import math
 import threading
 import time
 
+from crit_plugins.exactness import LEVELS, PHASES
+
 from .client import CONCURRENT, LOGPROBS, PLAIN, SCORE, TOKENIZE, Unsupported
 from .compare import DECODE, TOLERANCES, compare, is_choice, nll, same_tokens
+from .reference import ABSOLUTE_PERPLEXITY, LIMITS, judge, validate
 from .texts import PROMPTS, PROSE, recall_words
 
 TESTS = []
@@ -24,9 +29,9 @@ LONG_PREFIXES = (1025, 2049, 3001, 4097, 6001, 8193)
 WINDOW = 64
 
 
-# The levels (crit_kernels.exactness) at which a prompt row's bits follow nothing but the row, and at which they are
-# the bits of the same token decoded.
-KEEPS_ROWS, KEEPS_DECODE = ("row-exact", "exact", "declared"), ("exact", "declared")
+# The levels (Core's, crit_plugins.exactness) at which a prompt row's bits follow nothing but the row, and at which
+# they are the bits of the same token decoded: row-exact and every level above it, exact and every level above it.
+KEEPS_ROWS, KEEPS_DECODE = LEVELS[LEVELS.index("row-exact"):], LEVELS[LEVELS.index("exact"):]
 
 
 def asked_note(ctx, decode=False):
@@ -51,8 +56,8 @@ def test(*needs):
 
 
 class Context:
-    def __init__(self, client, profile="loose", long=4096):
-        self.client, self.profile = client, profile
+    def __init__(self, client, profile="loose", long=4096, reference=None):
+        self.client, self.profile, self.reference = client, profile, reference
         self.tolerance, self.decode_tolerance = TOLERANCES[profile], DECODE[profile]
         # An engine that states the exactness it asks of its rows (its facts' exactness.asked, from its
         # configuration) is judged by it where the level promises bits: prompt rows that are row-exact or higher never
@@ -61,7 +66,7 @@ class Context:
         # is judged by the profile: the drift a path may round by.
         asked = (client.facts().get("exactness") or {}).get("asked")
         asked = asked if isinstance(asked, dict) else {}
-        self.asked = {phase: asked.get(phase) for phase in ("decode", "prompt")}
+        self.asked = {phase: asked.get(phase) for phase in PHASES}
         self.prompt_tolerance = TOLERANCES["strict"] if self.asked["prompt"] in KEEPS_ROWS else self.tolerance
         if self.asked["prompt"] in KEEPS_DECODE and self.asked["decode"] in KEEPS_ROWS:
             self.decode_tolerance = DECODE["strict"]
@@ -140,11 +145,35 @@ def rows_valid(ctx):
 
 @test(SCORE, TOKENIZE)
 def fluent(ctx):
-    """Plain prose reads at a low perplexity: broken weights, dequantisation or norms read it at hundreds."""
-    loss = nll(ctx.prose_rows())
-    limit = 40.0
-    state = "passed" if math.exp(loss) <= limit else "failed"
-    return state, f"perplexity {math.exp(loss):.2f} on {len(ctx.prose())} tokens of prose (limit {limit:g})"
+    """The engine reads text as its checkpoint does: given the checkpoint's reference (ctx.reference), its scores of
+    the reference's texts (one prefill each) against the reference's, by the perplexity ratio and the drift per target
+    (median and p90); without one, plain prose at a low perplexity. Broken weights, dequantisation or norms read it
+    at hundreds."""
+    prose = math.exp(nll(ctx.prose_rows()))
+    if ctx.reference is None:
+        state = "passed" if prose <= ABSOLUTE_PERPLEXITY else "failed"
+        return state, (f"perplexity {prose:.2f} on {len(ctx.prose())} tokens of prose (absolute limit "
+                       f"{ABSOLUTE_PERPLEXITY:g}: no reference of the checkpoint; crit run ... recon --data DATA "
+                       "records one)")
+    validate(ctx.reference)   # a malformed record fails the test, naming what is wrong
+    engine, reference, scored = [], [], []
+    context = ctx.client.context()
+    for text in ctx.reference["texts"]:
+        ids, prompt = text["ids"], text["prompt_tokens"]
+        if context and len(ids) > context:
+            continue
+        rows = ctx.client.score(ids)[0]
+        if len(rows) != len(ids) - 1:
+            return "failed", f"reference text {text['id']}: {len(rows)} rows for a prompt of {len(ids)} tokens"
+        engine += [row[1] for row in rows[prompt - 1:]]
+        reference += text["target"]
+        scored.append(text["id"])
+    if not scored:
+        return "skipped", "every reference text is longer than the engine's context"
+    ok, summary = judge(engine, reference, LIMITS[ctx.profile])
+    texts = f"{len(scored)} reference text" + ("s" if len(scored) > 1 else "")
+    return ("passed" if ok else "failed"), (f"{len(engine)} answer tokens of {texts}: {summary}; smoke's prose at "
+                                            f"perplexity {prose:.2f}")
 
 
 def row_paths(facts):
@@ -183,6 +212,26 @@ def causal(ctx):
     return "passed", f"{len(lengths)} prefixes ({lengths[0]} to {lengths[-1]} tokens) match the whole prompt"
 
 
+def rounding_or_fault(ctx, prompt, continuation, expected):
+    """Why a decode comparison failed, for its item: on an engine whose facts say decode_via_prompt, the same tokens
+    decoded again with the decode rows through the model's prompt arithmetic (each a one-token prompt chunk, the same
+    KV and positions). Rows that then match prefill within the drift a prompt's chunking may round by say the gap was
+    rounding between the decode and prompt arithmetic; rows that still move say a fault the paths share: KV writes or
+    reads, positions, masking."""
+    if not ctx.client.facts().get("decode_via_prompt"):
+        return "; the engine offers no decode_via_prompt to tell rounding from a fault"
+    try:
+        _, rows = ctx.client.score(prompt, continuation, prompt_rows=False, decode_via_prompt=True)
+    except Exception as error:   # the failed comparison stands; the item says why it has no verdict
+        return f"; decoding through the prompt path failed ({type(error).__name__}: {error})"[:600]
+    ok, summary = compare(rows, expected, ctx.prompt_tolerance)
+    if ok:
+        return (f"; rounding: decoded through the prompt path the rows match prefill ({summary}), so the gap is the "
+                "decode arithmetic's (GEMV against GEMM, another reader), not the KV cache, positions or masking")
+    return (f"; fault: decoded through the prompt path the rows still move ({summary}): KV cache writes or reads, "
+            "positions or masking, which decode shares with it")
+
+
 @test(SCORE, TOKENIZE)
 def decode_matches_prefill(ctx):
     """Decoding a text after a prefill scores it as prefilling all of it does: KV cache writes and reads, positions
@@ -196,9 +245,11 @@ def decode_matches_prefill(ctx):
         problem = check_rows(rows, "continuation")
         if problem:
             return "failed", problem
-        ok, summary = compare(rows, full[split - 1:split - 1 + steps], ctx.decode_tolerance)
+        expected = full[split - 1:split - 1 + steps]
+        ok, summary = compare(rows, expected, ctx.decode_tolerance)
         if not ok:
-            return "failed", f"{steps} tokens decoded after {split}: {summary}" + asked_note(ctx, decode=True)
+            return "failed", f"{steps} tokens decoded after {split}: {summary}" + asked_note(ctx, decode=True) \
+                + rounding_or_fault(ctx, ids[:split], ids[split:split + steps], expected)
         details.append(f"after {split}: {summary}")
     return "passed", "; ".join(details)
 
@@ -240,9 +291,11 @@ def decode_long(ctx):
         problem = check_rows(rows, "continuation")
         if problem:
             return "failed", f"after {split}: {problem}"
-        ok, summary = compare(rows, full[split - 1:split - 1 + steps], ctx.decode_tolerance)
+        expected = full[split - 1:split - 1 + steps]
+        ok, summary = compare(rows, expected, ctx.decode_tolerance)
         if not ok:
-            return "failed", f"{steps} tokens decoded after {split}: {summary}" + asked_note(ctx, decode=True)
+            return "failed", f"{steps} tokens decoded after {split}: {summary}" + asked_note(ctx, decode=True) \
+                + rounding_or_fault(ctx, ids[:split], ids[split:split + steps], expected)
         details.append(f"after {split}: mean delta {summary.split('mean delta ')[1].split(',')[0]}")
     return "passed", "; ".join(details)
 
@@ -365,12 +418,14 @@ def recall(ctx):
     return "passed", "; ".join(details)
 
 
-def run(client, only=None, profile="loose", long=4096, log=print, budget=300):
+def run(client, only=None, profile="loose", long=4096, log=print, budget=300, reference=None):
     """Run the smoke tests against `client`'s engine. Returns items {name, state, detail, seconds}, the shape of
     crit run serve --check's report: state passed, failed or skipped. A suite still running after `budget` seconds
     stops with a failed `budget` item: a working engine answers these requests in a minute or two, so one that
-    cannot is too slow, or slows down as it serves, and the rest would only hold the machine."""
-    ctx = Context(client, profile, long)
+    cannot is too slow, or slows down as it serves, and the rest would only hold the machine. `reference`: the
+    checkpoint's smoke reference (crit_smoke.reference.load), which fluent is judged against; None judges it by an
+    absolute perplexity."""
+    ctx = Context(client, profile, long, reference)
     items, begun = [], time.perf_counter()
     for name, needs, function in TESTS:
         if only and name not in only:

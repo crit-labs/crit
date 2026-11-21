@@ -73,7 +73,8 @@ from . import _crit_cuda, _crit_tuning, _flash, _kernels
 
 __all__ = ["KINDS", "PIECE", "MAX_COLUMNS", "Derive", "attend", "derive", "cuda_block", "cuda_chunk", "cuda_parts", "cuda_ramp",
            "cuda_splits", "flash_block", "flash_chunk", "flash_parts", "flash_tile",
-           "owner", "partitions", "piece_size", "prefill", "release", "tile_for", "workspace_floats", "write"]
+           "owner", "partitions", "piece_size", "prefill", "prefill_rows", "release", "tile_for", "workspace_floats",
+           "write"]
 
 KINDS = {"bf16": 0, "fp16": 0, "fp8": 1, "fp8:row": 2, "int8": 3}
 PIECE = 32          # positions per piece of FP8 or INT8 pages at a 256-wide head (piece_size)
@@ -397,7 +398,7 @@ def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, column
            offsets=None, tokens=None, key_scales=None, value_scales=None, multipliers=(1.0, 1.0), scale=None,
            partitions=None, parents=None, blocks=None, block_size=None, out=None, lse=None, workspace=None, piece=None,
            fused=False, fresh=None, vsplit=None, tile=None, num_warps=None, num_stages=None, maxnreg=None,
-           flash=False, chunk=None, ramp=None, sinks=None, sliding=0, derive=None):
+           flash=False, chunk=None, ramp=None, sinks=None, sliding=0, derive=None, bias=None):
     """Decode and verify windows over paged KV (see the module's description).
 
     q [tokens][heads][dim] BF16 or FP16 (FP16 for "fp16" pages); key_pages/value_pages one layer's pages, key_scales/
@@ -442,7 +443,11 @@ def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, column
 
     derive: a Derive (or the tuple (weight, eps, freqs, rotary_dim)): the keys derived from the value pages on read (the
     module's "Derived keys"); key_pages and key_scales None (or the value ones), fresh (None, values, shift, first) or
-    with keys that are ignored, keys and values of one width; on the split and fused launches without block lists."""
+    with keys that are ignored, keys and values of one width; on the split and fused launches without block lists.
+
+    bias: FP32 [tokens][heads][extent], each token's score added (after the scale) for the positions 0 .. extent - 1
+    behind its own (d = its position - the key's; nothing further back): a relative-position bias the token computes
+    for itself; on the split and fused launches without block lists (not the flash structures)."""
     if derive is not None:
         _refuse_flash_derive(derive, flash)
         if blocks is not None:
@@ -455,6 +460,12 @@ def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, column
     k_kind = _check_kind(kind, key_scales)
     T, hq, d = q.shape
     _check_sinks(sinks, q)
+    if bias is not None:
+        if bias.dtype != torch.float32 or bias.dim() != 3 or tuple(bias.shape[:2]) != (T, hq) or \
+                not bias.is_contiguous() or bias.device != q.device or not bias.shape[2]:
+            raise ValueError(f"bias is contiguous FP32 [{T}][{hq}][extent] on q's device")
+        if blocks is not None or flash:
+            raise ValueError("a bias reads the split and fused launches, without block lists or flash structures")
     sliding = _check_sliding(sliding, blocks)
     hkv, dv = key_pages.shape[-2], value_pages.shape[-1]
     R = int(starts.shape[0])
@@ -512,6 +523,8 @@ def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, column
     warps, stages = num_warps or warps, num_stages or stages
     if derived is not None and not num_stages:
         stages = 1   # a derived piece holds its rows, their partners and two key parts: one stage (speed only)
+    if bias is not None and not num_stages:
+        stages = 1   # a piece's bias rows beside its keys and values: one stage keeps every tile within shared memory
     common = dict(HQ=hq, HKV=hkv, G=g, D=d, DV=dv, PIECE=piece, PAGE=page, KIND=k_kind,
                   HW_FP8=_hardware_fp8(device), TREE=tree, COUNTS=counts is not None, OFFSETS=offsets is not None,
                   DC=min(64, d, dv))
@@ -540,9 +553,10 @@ def attend(q, key_pages, value_pages, kind, tables, rows, starts, firsts, column
                      out, lse if lse is not None else ks, fk, fv, fshift, ffirst, sinks if sinks is not None else ks,
                      q.stride(0), q.stride(1), out.stride(0), out.stride(1), fk.stride(0), fv.stride(0), fstride,
                      tables.stride(0), tables.shape[1], parts, scale, k_mult, float(multipliers[1]),
-                     columns, sliding, COLS=columns, CPT=cpt, BLOCK_M=bm, num_warps=warps, num_stages=stages,
+                     columns, sliding, bias if bias is not None else ks, int(bias.shape[2]) if bias is not None else 1,
+                     COLS=columns, CPT=cpt, BLOCK_M=bm, num_warps=warps, num_stages=stages,
                      FUSED=bool(fused), LSE=bool(fused) and lse is not None, FRESH=fresh is not None, DVP=dv // split,
-                     SINKS=bool(fused) and sinks is not None, **common, **launch,
+                     SINKS=bool(fused) and sinks is not None, BIAS=bias is not None, **common, **launch,
                      **({} if derived is None else dict(DERIVE=True, DW=has_weight, ROT=derived.rotary_dim)))
         if fused:
             return out
@@ -773,7 +787,7 @@ def _prefill_flash(q, kp, vp, kind, k_kind, table, position, page, ks, vs, multi
 
 # -- the CUDA flash tile (cuda_window.cu, kernel.json "cuda": compiled by the build, _crit_cuda) ----------------------
 CUDA_CHUNK = 512          # positions a split of a cuda launch over a cache where no GPU is visible (cuda_chunk)
-CUDA_REACH = 90112        # cuda_chunk's rule: a decode row of this many positions spreads over two programs an SM
+CUDA_REACH = 90112        # cuda_chunk's rule: a decode row of this many positions spreads over six programs an SM
 CUDA_BLOCK = 32           # positions a step of its online softmax over 8-bit pages (cuda_block's rule; 16-bit: 16)
 CUDA_RAMP_SPLITS = 16     # splits a band of a ramp (cuda_ramp)
 CUDA_WIDTHS = (64, 128, 256)
@@ -784,7 +798,9 @@ FUSED_WORKSPACE = 64 << 20        # bytes a fused launch's ring of states may ta
 FUSED_PARTIALS = 128 << 20        # workspace bytes (workspace_floats) a fused launch may take as a window launch
 FUSED_DEPTH = 2                   # groups of slots a fused tile's ring holds (deeper rings measured slower: their
                                   # programs run ahead of the folds, which then trail the last split)
-_CUDA_WINDOW, _CUDA_FUSED, _CUDA_PREFILL = 0, 1, 2
+FUSED_SERIAL = 50                 # a fused launch whose tiles reach this percent of the programs the GPU holds at once
+                                  # runs one program a tile (cuda-fused's knob SERIAL, 0: this; never a bit)
+_CUDA_WINDOW, _CUDA_FUSED, _CUDA_PREFILL, _CUDA_SERIAL = 0, 1, 2, 3
 
 
 class _Params(ctypes.Structure):
@@ -822,29 +838,50 @@ def _cuda_lib(device, **variant):
         lib.crit_cw_merge.restype = ctypes.c_int
         lib.crit_cw_error.restype = ctypes.c_char_p
         lib.crit_cw_error.argtypes = [ctypes.c_int]
+        lib.crit_cw_resident.argtypes = [ctypes.c_int, ctypes.c_int]
+        lib.crit_cw_resident.restype = ctypes.c_int
         if lib.crit_cw_params_size() != ctypes.sizeof(_Params):
             raise RuntimeError("cuda_window.cu's Params and the package's _Params differ")
         _cuda_libs[key] = lib
     return lib
 
 
+_PLAN_FIELDS = 9   # crit_cw_plan's out
+
+
 def _cuda_plan(lib, structure, hq, hkv, page, rows, fresh=False, length=-1):
     """(entry, warps, stages, block, value split) of a call: the build's tuning for its shape, rows and length (the
     positions its page tables hold: a tuning's length ranges, kernel.json "lengths"), the rules resolved for its
-    variant, whether it reads fresh rows and the GPU's shared memory."""
-    out = (ctypes.c_int * 8)()
+    variant, whether it reads fresh rows and the GPU's shared memory. structure _CUDA_SERIAL (a fused launch's serial
+    form): with the FP32 floats of running outputs a tile keeps in the launch's workspace as a sixth value (0: in
+    registers)."""
+    out = (ctypes.c_int * _PLAN_FIELDS)()
     err = lib.crit_cw_plan(structure, hq, hkv, int(page), int(rows), int(bool(fresh)), int(length), out)
     if err == 1:
         raise RuntimeError("this build of paged-kv-attention holds no such cuda configuration (a sweep build of "
                            "another structure)")
     if err == 2:
         raise ValueError(f"a cuda tile of blocks of {out[3]} does not fit the GPU's shared memory")
-    return tuple(out[:5])
+    return tuple(out[:5]) + ((out[8],) if structure == _CUDA_SERIAL else ())
+
+
+_held_programs = {}
+
+
+def _cuda_resident(lib, structure, entry, device):
+    """The programs of a configuration's tile `device` holds at once (crit_cw_resident: its multiprocessors times the
+    tiles one holds, by its shared memory, registers and threads), read once a library, entry and device."""
+    key = (id(lib), structure, entry, str(device))
+    found = _held_programs.get(key)
+    if found is None:
+        with torch.cuda.device(device):
+            found = _held_programs[key] = int(lib.crit_cw_resident(structure, entry))
+    return found
 
 
 def _cuda_converts(lib, structure, hq, hkv, page, rows, fresh=False):
     """(warps, block, codes converted in registers) of a call's plan (where its configuration fits the GPU)."""
-    out = (ctypes.c_int * 8)()
+    out = (ctypes.c_int * _PLAN_FIELDS)()
     err = lib.crit_cw_plan(structure, hq, hkv, int(page), int(rows), int(bool(fresh)), -1, out)
     return None if err else (out[1], out[3], bool(out[7]))
 
@@ -957,15 +994,18 @@ def cuda_chunk(head_dim, value_dim, heads, kv_heads, page, kind="bf16"):
 
 @functools.lru_cache(maxsize=64)
 def _cuda_chunk_rule(kv_heads):
-    """The untuned split, from the GPU: a decode row of CUDA_REACH positions over two programs an SM, its KV heads
+    """The untuned split, from the GPU: a decode row of CUDA_REACH positions over six programs an SM, its KV heads
     counted by their square root (a row's KV heads share its splits' pages and queries' tiles: four times the heads
-    want about twice the split, measured), to the nearest 128 positions, 128 to 2,048. Short rows then take a few
-    splits a KV head and long rows few enough that their merge stays short; fixed per cache (the GPU and the cache's
-    KV heads), never by the batch."""
+    want about twice the split, measured), to the nearest 128 positions, 128 to 2,048, with the untuned RAMP 1 (a
+    row's first 16 splits half as long). Short rows then take a few splits a KV head and long rows few enough that
+    their merge stays short; fixed per cache (the GPU and the cache's KV heads), never by the batch. On an RTX 5090
+    (170 SMs: 128 positions at 2 KV heads, 256 at 8) over 1 to 32 rows of 1K to 64K positions it decodes at 0.885x
+    the split-KV reader's time (geometric mean of 92 cases over four cache geometries, the worst 1.18x), where two
+    programs an SM without the ramp took 1.05-1.10x (the worst 3.3x, short rows)."""
     if not torch.cuda.is_available():
         return CUDA_CHUNK
     sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
-    found = CUDA_REACH * math.sqrt(int(kv_heads)) / (2 * sms)
+    found = CUDA_REACH * math.sqrt(int(kv_heads)) / (6 * sms)
     return int(min(2048, max(128, round(found / 128) * 128)))
 
 
@@ -1024,18 +1064,41 @@ def _fused_workspace(device, chains, rows, dvp, parts):
     while group > 1 and 4 * sum(floats(group, depth)) > FUSED_WORKSPACE:
         group //= 2
     ring, run = floats(group, depth)
-    words = 2 + (1 + depth) * chains
+    buffer, sync = _fused_buffers(device, ring + run, 2 + (1 + depth) * chains)
+    return group, depth, buffer[:ring], buffer[ring:ring + run], sync
+
+
+def _fused_buffers(device, floats, words):
+    """A fused launch's module workspace of `floats` FP32 and `words` sync words or more (the ring's states and running
+    states, a serial launch's running outputs): one a device and owner, grown outside a capture only, the one it
+    replaces kept (graphs captured over it replay into it). The sync words are zero between launches."""
     found = _fused_workspaces.get(_held(device))
-    if found is None or found[0].numel() < ring + run or found[1].numel() < words:
+    if found is None or found[0].numel() < floats or found[1].numel() < words:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("paged_kv_attention.attend: run a fused launch of this size once before capturing it "
                                "(its workspace is allocated outside the capture)")
-        size = max(ring + run, 4096, found[0].numel() if found else 0)
+        size = max(floats, 4096, found[0].numel() if found else 0)
         _retire(found)
         found = (torch.empty(size, dtype=torch.float32, device=device),
                  torch.zeros(max(words, 1024, found[1].numel() if found else 0), dtype=torch.int32, device=device))
         _fused_workspaces[_held(device)] = found
-    return group, depth, found[0][:ring], found[0][ring:ring + run], found[1]
+    return found
+
+
+def _cuda_serial(lib, device, d, dv, hq, hkv, page, k_kind, columns, rows, fresh, length):
+    """A fused cuda launch's serial form where it runs that way, as _cuda_plan gives it, else None: the launch's tiles
+    (its rows' columns times the query heads a KV head, in the plan's tiles, times the value split and the KV heads)
+    reach cuda-fused's SERIAL percent (0: FUSED_SERIAL; 1: every launch) of the programs the device holds at once
+    (_cuda_resident). Each tile is then one program that walks its row's splits in turn; below that the launch's
+    programs take a split each, so that short launches over long rows still fill the GPU. The same bits either way."""
+    out = (ctypes.c_int * _PLAN_FIELDS)()
+    if lib.crit_cw_plan(_CUDA_SERIAL, hq, hkv, int(page), int(columns), int(bool(fresh)), int(length), out):
+        return None   # a sweep build of another structure, or a tile the GPU does not hold
+    plan = tuple(out[:5]) + (out[8],)
+    held = _cuda_resident(lib, _CUDA_SERIAL, plan[0], device)
+    tiles = -(-columns * (hq // hkv) // (16 * plan[1])) * plan[4] * rows * hkv
+    share = int(_knobs("cuda-fused", _flash_key(d, dv, hq, hkv, page, k_kind), columns)["SERIAL"]) or FUSED_SERIAL
+    return plan if held > 0 and (share <= 1 or tiles * 100 >= held * share) else None
 
 
 def _fused_as_window(partial_rows, heads, parts, dv):
@@ -1074,7 +1137,13 @@ def _attend_cuda(q, key_pages, value_pages, kind, k_kind, tables, rows, starts, 
         raise ValueError(f"a cuda split ({chunk} positions) is a multiple of the block ({block})")
     lib = _cuda_lib(device, T=t_kind, KIND=k_kind, D=d, DV=dv, W=int(num_warps or 0), S=int(num_stages or 0),
                     VS=int(vsplit or 0) if fused else 0)
-    if fused and offsets is None and workspace is None and _fused_as_window(
+    serial = None
+    if fused and parents is None:
+        # One program a tile, walking its splits in turn, where the launch's tiles fill the GPU that way (the same
+        # bits: a speed choice, by the programs the device holds at once).
+        serial = _cuda_serial(lib, device, d, dv, hq, hkv, page, k_kind, columns, R, fresh is not None,
+                              tables.shape[1] * page)
+    if serial is None and fused and offsets is None and workspace is None and _fused_as_window(
             R * columns, hq, cuda_splits(tables.shape[1] * page, chunk,
                                          tuple(ramp) if ramp is not None else cuda_ramp(d, dv, hq, hkv, page, kind)),
             dv):
@@ -1083,9 +1152,9 @@ def _attend_cuda(q, key_pages, value_pages, kind, k_kind, tables, rows, starts, 
         fused = False
         lib = _cuda_lib(device, T=t_kind, KIND=k_kind, D=d, DV=dv, W=int(num_warps or 0), S=int(num_stages or 0),
                         VS=0)
-    structure = _CUDA_FUSED if fused else _CUDA_WINDOW
-    entry, warps, _, built_block, split = _cuda_plan(lib, structure, hq, hkv, page, columns, fresh is not None,
-                                                     tables.shape[1] * page)
+    structure = _CUDA_SERIAL if serial else _CUDA_FUSED if fused else _CUDA_WINDOW
+    entry, warps, _, built_block, split = serial[:5] if serial else _cuda_plan(
+        lib, structure, hq, hkv, page, columns, fresh is not None, tables.shape[1] * page)
     if built_block != block:
         raise RuntimeError(f"the build's cuda block ({built_block}) differs from cuda_block() ({block})")
     ramp = tuple(ramp) if ramp is not None else cuda_ramp(d, dv, hq, hkv, page, kind)
@@ -1096,7 +1165,14 @@ def _attend_cuda(q, key_pages, value_pages, kind, k_kind, tables, rows, starts, 
     out = torch.empty(T, hq, dv, dtype=q.dtype, device=device) if out is None else out
     _cuda_rows_ok(q, out)
     P = _cuda_params(q, key_pages, value_pages, key_scales, value_scales, out, lse, scale, multipliers, hq, hkv, page)
-    if fused:
+    if serial:
+        # The tiles' running outputs where a thread's registers do not hold them (FP32, a tile's rows x value columns)
+        floats = tiles * split * R * hkv * serial[5]
+        if floats:
+            fits = workspace is not None and workspace.dtype == torch.float32 and workspace.numel() >= floats
+            P.run = (workspace if fits else _fused_buffers(device, floats, 0)[0]).data_ptr()
+        P.tiles = tiles
+    elif fused:
         dvp = dv // split
         group, depth, slots, run, sync = _fused_workspace(device, tiles * split * R * hkv, 16 * warps, dvp, parts)
         states = slots.numel() // (dvp // 2 + 2)   # one a row of a slot
@@ -1141,7 +1217,7 @@ def _attend_cuda(q, key_pages, value_pages, kind, k_kind, tables, rows, starts, 
         P.stride_fk, P.stride_fv, P.stride_fr = fk.stride(0), fv.stride(0), fstride
     P.n_parts, P.chunk, P.cols, P.flags, P.block = parts, chunk, columns, flags, block
     P.ramp, P.ramp_k = ramp
-    _cuda_launch(lib, structure, entry, P, device, (tiles, parts, R * hkv))
+    _cuda_launch(lib, structure, entry, P, device, (tiles, 1 if serial else parts, R * hkv))
     if not fused:
         # The staged merge: deep batches where its programs fit the GPU at once, shallow ones where they do not.
         P.merge = 1 if columns * hq * R <= _capability(device)[1] else 2
@@ -1329,4 +1405,79 @@ def prefill(q, key_pages, value_pages, kind, table, position, page, *, key_scale
              num_warps=tuned["WARPS"],
              # A derived chunk holds a block of rows, their partners and keys in FP32: one stage (speed only, the same bits)
              num_stages=1 if derived is not None else tuned["STAGES"] or (3 if int8_qk else 2))))
+    return out
+
+
+_ragged_plans = {}   # (device, BLOCK_M, rows' tokens, positions and first tokens) -> (block map, metadata)
+
+
+def _ragged_plan(device, block_m, starts, counts, positions, firsts):
+    """The block map ([blocks][2] int32: the row, its block) and metadata ([rows][4] int64: first token, tokens, first
+    position, first fresh position) of a ragged prompt launch, made once a set of rows (every layer of a step takes
+    the same) and kept for the last 64 sets."""
+    key = (str(device), int(block_m), tuple(starts), tuple(counts), tuple(positions), tuple(firsts))
+    found = _ragged_plans.get(key)
+    if found is None:
+        blocks = [(r, b) for r, n in enumerate(counts) for b in range(-(-int(n) // block_m))]
+        if not blocks:
+            raise ValueError("a ragged prompt launch holds at least one token")
+        meta = torch.tensor([[s, n, p, f] for s, n, p, f in zip(starts, counts, positions, firsts)], dtype=torch.int64)
+        found = (torch.tensor(blocks, dtype=torch.int32).to(device, non_blocking=True), meta.to(device, non_blocking=True))
+        if len(_ragged_plans) >= 64:
+            _ragged_plans.pop(next(iter(_ragged_plans)))
+        _ragged_plans[key] = found
+    return found
+
+
+def prefill_rows(q, key_pages, value_pages, kind, tables, starts, counts, positions, page, *, key_scales=None,
+                 value_scales=None, multipliers=(1.0, 1.0), scale=None, out=None, lse=None, int8_qk=False, fresh=None,
+                 sinks=None, sliding=0):
+    """Several sequences' prompt chunks in one launch of the prompt reader (structure "prefill"): row i's queries
+    q[starts[i] : starts[i] + counts[i]] at positions positions[i].. (host ints, their keys and values written), its
+    page table tables[i] (int32 [rows][width]), causal; out and lse as prefill() writes them. fresh: (keys, values)
+    [tokens][kv_heads][dim] in q's dtype of the whole call, each row's own positions from them (the earlier ones from
+    the pages). Each row's tokens are the programs prefill() runs for the row alone (blocks of the row's own tokens,
+    the same blocks of positions), so a token has the bits prefill() gives it; the knobs are those of the call's
+    tokens together. Not with derived keys; not under a capture (the rows are host values)."""
+    k_kind = _check_kind(kind, key_scales)
+    _check_sinks(sinks, q)
+    sliding = _check_sliding(sliding, None)
+    if int8_qk and k_kind != 3:
+        raise ValueError("int8_qk multiplies INT8 queries with INT8 keys: int8 pages only")
+    T, hq, d = q.shape
+    hkv = key_pages.shape[-2]
+    if value_pages.shape[-1] != d:
+        raise ValueError("prompt chunks read keys and values of one width")
+    starts, counts, positions = [int(s) for s in starts], [int(c) for c in counts], [int(p) for p in positions]
+    if not (len(starts) == len(counts) == len(positions) == tables.shape[0]) or tables.dim() != 2 or             tables.dtype != torch.int32 or tables.stride(1) != 1:
+        raise ValueError("tables are int32 [rows][width], one row a chunk, as many as starts, counts and positions")
+    if any(s < 0 or n < 1 or s + n > T for s, n in zip(starts, counts)):
+        raise ValueError("each row's tokens lie in q")
+    device = q.device
+    out = torch.empty_like(q) if out is None else out
+    kp, vp = _codes(key_pages, kind, device), _codes(value_pages, kind, device)
+    ks = key_scales if key_scales is not None else _dummy(device)
+    vs = value_scales if value_scales is not None else ks
+    if fresh is not None:
+        fk, fv = fresh[:2]
+        if fk.shape != (T, hkv, d) or fv.shape != (T, hkv, d) or fk.stride(-1) != 1 or fv.stride(-1) != 1 or                 fk.stride(1) != d or fv.stride(1) != d:
+            raise ValueError(f"fresh keys and values are [{T}][{hkv}][{d}], each head row contiguous")
+    else:
+        fk = fv = q
+    fixed = dict(HQ=hq, HKV=hkv, G=hq // hkv, D=d, PAGE=page, KIND=k_kind, HW_FP8=_hardware_fp8(device),
+                 INT8_QK=int8_qk, LSE=lse is not None, POS_T=False, FRESH=fresh is not None, FIRST_T=False,
+                 SINKS=sinks is not None, RAGGED=True)
+    key = {"D": d, "HQ": hq, "HKV": hkv, "PAGE": int(page), "KIND": k_kind, "INT8": int(bool(int8_qk))}
+
+    def call(tuned):
+        blocks, meta = _ragged_plan(device, tuned["BLOCK_M"], starts, counts, positions, positions)
+        args = (q, kp, vp, ks, vs, tables, out, lse if lse is not None else ks, tables, fk, fv, tables,
+                sinks if sinks is not None else ks, sliding, T, 0, 0, float(scale if scale is not None else d ** -0.5),
+                float(multipliers[0]), float(multipliers[1]), q.stride(0), q.stride(1), out.stride(0), out.stride(1),
+                fk.stride(0), fv.stride(0))
+        return ((blocks.shape[0], hq), args,
+                dict(fixed, map_ptr=blocks, meta_ptr=meta, tab_stride=tables.stride(0), BLOCK_M=tuned["BLOCK_M"],
+                     BLOCK_N=tuned["BLOCK_N"] or (64 if d <= 128 else 32), num_warps=tuned["WARPS"],
+                     num_stages=tuned["STAGES"] or (3 if int8_qk else 2)))
+    _launch(_kernels._prefill_kernel, "prefill", key, T, call)
     return out

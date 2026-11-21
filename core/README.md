@@ -21,7 +21,9 @@ pages, row layout, acceptance); the arithmetic stays in the engine, an
 
 A test holds the line: [test_core_layering.py](../tests/test_core_layering.py) reads Core's source and fails when
 it imports a module above it, includes a header outside it, or names a library plugin or a model family beyond the
-names counted in its allowlist, which may only shrink.
+names counted in its allowlist, which may only shrink. The other side of that line is
+[what Core decides](#what-core-decides).
+
 Core also carries the protocol crit's own tools speak with an engine, so an engine
 needs nothing beyond Core to be measured and served: the stock eval-v1 and
 chat-resident-v1 adapters in `crit_core.native`, the package capabilities in
@@ -64,6 +66,38 @@ package in `python/` and the [contracts](contracts/README.md) in `contracts/`;
 | [Python package](python/README.md) | `crit_core`: model files, strict JSON, [config and safetensors](python/crit_core/model/README.md), [text layer](python/crit_core/text/README.md), constraints; `crit_plugins`: the [plugin](../docs/PLUGINS.md) contract an engine loads with | [crit_core](python/crit_core), [crit_plugins](python/crit_plugins) |
 | [Contracts](contracts/README.md) | Native ownership and request responsibilities | [CONTRACTS.json](contracts/CONTRACTS.json) |
 
+## What Core decides
+
+Core owns what decides how an engine computes and schedules on the device. The test
+for a decision is whether crit serve and Eval would get a different engine, or a different schedule, if it were
+made outside Core. If they would, Core makes it, once, and everything above Core (the CLI, crit serve, Eval, the
+library's plugins) reads Core's answer instead of keeping a copy. Core decides:
+
+- **The policy levels:** the exactness levels of an engine's rows and their phases, and the quality modes with the
+  level each asks (`crit_plugins.exactness`). crit_kernels reads a kernel.json against these levels; it does not
+  define them.
+- **The engine's policy:** what one load gives its plugins (its kernel tuning, its decisions record, the exactness,
+  quality mode and prompt activations it asks), held by that engine and never in the process's module state, so
+  two engines in one process never see each other's.
+- **Scheduling:** which requests run, in what order (their priority) and how many at once (the concurrency cap),
+  and how a prompt is cut into steps (the prompt-step budgets, `crit_plugins.steps`).
+- **The step's memory:** the step arena, the allocations a step may make and when the cached memory goes back
+  (the release threshold).
+- **The cancel grace** a step ends inside (`crit_plugins.steps.GRACE`), which crit serve's cancellation uses.
+- **What fits the device:** the KV that fits its free memory and the memory left free at every moment
+  (`crit_plugins.memory.HEADROOM`, the default VRAM headroom).
+
+A model plugin states what is true of the model (its vocabulary, the most rows a step takes, its page size, whether
+it chunks a prompt), and Core chooses within those limits. Some things touch the engine and still stay out of Core:
+reading settings files, crit serve's HTTP queue and its 429s, the GPU lock between processes, the Windows
+throttling opt-out, the placement scenario crit run advises an agent on, and model-family rules (GGUF config rules,
+chat templates), which belong to the library.
+
+[test_core_ownership.py](../tests/test_core_ownership.py) reads crit's source and fails where a value Core owns is
+assigned or spelled out outside its Core module, where Core imports the exactness levels from crit_kernels, or
+where Core's Python keeps an engine's policy in module state (`global`). Its allowlist counts the places that do
+not follow the rule yet, and it may only shrink.
+
 ## Build and use
 
 For the smallest engine Core's loader runs, start with the
@@ -75,7 +109,8 @@ Core needs no CUDA toolkit: it loads the device's driver at run time ([CUDA back
 [request release](src/runtime/README.md#request-release) for a known `thread`
 false positive).
 
-`crit core build` builds just the runtime engines load, `crit_core_steps`, into `build/core-steps` (from a crit
+`crit core build` builds just the runtime engines load, `crit_core_steps`, into `build/core-steps/<sys.platform>`
+(one folder an OS, so a checkout Windows and WSL share keeps a build of each; from a crit
 installed without a checkout: into Core's cache, `CRIT_CORE_CACHE`, default `core/VERSION` under `CRIT_CACHE_HOME` (`~/.cache/crit`), from the
 release's tag), where `crit_core.native.step_library()` finds it when `CRIT_CORE_STEP_LIBRARY` names none. The full
 build with its tests:
@@ -99,10 +134,10 @@ cmake --build build/consumer
 ctest --test-dir build/consumer --output-on-failure
 ```
 
-The SDK is version 0.21.0. Include `<crit/core.h>` and link the installed target:
+The SDK is version 0.22.0. Include `<crit/core.h>` and link the installed target:
 
 ```cmake
-find_package(critCore 0.21.0 EXACT CONFIG REQUIRED)
+find_package(critCore 0.22.0 EXACT CONFIG REQUIRED)
 target_link_libraries(your_engine PRIVATE crit::core)
 ```
 

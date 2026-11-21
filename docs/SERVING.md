@@ -42,7 +42,7 @@ reply = client.chat.completions.create(model="default", messages=[{"role": "user
 | `--lenient` | Ignore, list and log the request parameters crit does not apply instead of answering 400 ([lenient requests](#lenient-requests)); never used by Eval |
 | `--timeout SECONDS` | Limit per request, from when the engine takes it; default 600. A request's `crit.timeout` can only lower it |
 | `--max-queue N` | Requests that may [wait](#a-busy-engine) while the engine is busy; default 64. One more is refused at once |
-| `--max-concurrency N` | Run at most N requests at once, below the engine's declared capacity ([concurrent requests](#concurrent-requests)); default the engine's |
+| `--max-concurrency N` | Hold at most N requests in the engine at once, below what it takes on its own ([concurrent requests](#concurrent-requests)); Core's runtime applies it; default the engine's |
 | `--queue-timeout SECONDS` | Limit on a request's wait for the engine, after which it is refused; default none |
 | `--sse-ping-interval SECONDS` | [Keep-alive ping](#keep-alive-pings) on an OpenAI or Anthropic stream after this many seconds without output; default 15, 0 sends none |
 | `--load-timeout SECONDS` | Limit on loading the starting candidate; default 600 plus the model's bytes at 200 MB/s (50 MB/s with `--verify-model`). A load whose plugins report their work (`context.working(what, done, total)`: a store of tens of gigabytes being built) goes on past it while that work advances, at most 5 minutes between two reports, and crit serve prints where it stands every 30 seconds; a load that runs out says what it last reported |
@@ -289,7 +289,7 @@ refuses them ([a busy engine](#a-busy-engine): `--max-queue`, `--queue-timeout`)
 | `logprobs`, `top_logprobs` | [Token log-probabilities](#token-log-probabilities) for packages declaring `chat-logprobs-v1`: every token's own and up to 20 alternatives. Not with `stop` |
 | `chat_template_kwargs`, `reasoning_effort` | [Thinking controls](#thinking-controls) for packages declaring `chat-template-kwargs-v1`: the chat-template variables the package declares (`enable_thinking`, `thinking`, `reasoning_effort`), and `reasoning_effort` `none`, `minimal`, `low`, `medium`, `high` or `xhigh` mapped onto them; otherwise 400 `unsupported_parameter` (ignored with `--lenient`) |
 | `crit` | crit's own extension: `{"decode": "plain"}` decodes the reply one token per target pass, without drafting, for packages declaring `chat-plain-v1` ([plain decoding](#engine-facts-and-plain-decoding)); `{"timeout": SECONDS}`, a positive number, limits this request's turn as `--timeout` does, at most `--timeout` (a larger value keeps it): a turn that runs out is a 504 and a cooperative engine stays loaded; `{"prompt_cache": false}` has the engine prefill every prompt token, whatever its [prompt cache](PLUGINS.md#the-prompt-cache) holds, for packages declaring `chat-prompt-cache-v1` (a measured request: without it a prompt that begins as an earlier request did is served from the cache, and `usage.prompt_tokens_details.cached_tokens` counts the tokens it did not compute) |
-| `priority` | An extension to the OpenAI API: an integer, default 0 (also when null). Requests waiting for the engine go lower values first, then in arrival order, and are reordered only among requests for the same model: a request never moves ahead of a queued model switch, nor a switch ahead of requests queued before it, so priority adds no model loads. A running request is never preempted, and a higher value waits while lower ones keep arriving. Anthropic and `/api/chat` requests, whose APIs have no such field, and fixed-text scores wait at 0 |
+| `priority` | An extension to the OpenAI API: an integer, default 0 (also when null). Requests waiting for the engine go lower values first, then in arrival order (Core's rule, [request priority](../core/src/runtime/README.md#request-priority): the request carries it to Core's scheduler, which orders the requests the engine holds, and crit serve's queue hands over the ones waiting for room in the same order), and are reordered only among requests for the same model: a request never moves ahead of a queued model switch, nor a switch ahead of requests queued before it, so priority adds no model loads. A running request is never preempted, and a higher value waits while lower ones keep arriving. Anthropic and `/api/chat` requests, whose APIs have no such field, and fixed-text scores wait at 0 |
 
 Responses carry `usage` when measured and `crit_telemetry`: prompt and output tokens, the
 prompt tokens the engine did not compute (`usage.prompt_tokens_details.cached_tokens`: its
@@ -725,7 +725,8 @@ before the engine reports its tokens. The `/api/chat` API returns the same entri
 ### Fixed-text scores
 
 `POST /v1/crit/score` with `{"model", "prompt_ids", "continuation_ids", "top_logprobs"}` and
-optionally `"prompt_rows": false` (token ids as the model's tokenizer numbers them;
+optionally `"prompt_rows": false`, `"format": "packed"` and `"decode_via_prompt": true` (token
+ids as the model's tokenizer numbers them;
 `top_logprobs` 0 to 20) scores fixed text
 through the engine's own serving paths, for packages declaring `chat-score-v1`: `prompt`
 holds one row per prompt position after the first, from one prefill of the prompt as the
@@ -742,6 +743,14 @@ tokens and alternative tokens int32, the log-probabilities float32, the alternat
 row (`count` × `alternatives`), and the response names `"format": "packed"`. Eval's quality
 gate uses it ([crit Eval](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md)). A score runs alone on the engine, as Core runs
 scores, and is not streamed.
+
+`"decode_via_prompt": true` is a debug option for an engine whose `engine_facts` say `decode_via_prompt` (its model
+plugin honours `StepRequest.decode_via_prompt`, [the model plugin](PLUGINS.md#the-model-plugin)); another engine
+refuses it. The continuation is decoded after the same prefill, its KV cache and positions, but each decode row is
+computed as a one-token prompt chunk with the prompt rows' arithmetic, never in a captured round. Where decoding and
+prefilling disagree, rows that then match prefill say the gap is rounding between the two arithmetics and rows that
+still move say a fault the paths share (KV, positions, masking): crit smoke reads it so
+([rounding or fault](../smoke/README.md#rounding-or-fault)).
 
 ### Raw-prompt completions
 
@@ -1099,7 +1108,9 @@ loader passes to every plugin with the model files and device leases of the host
 Calls are serialized by default. The client owns the conversation (each
 request carries all of it); the engine owns tokenizer, private KV/recurrent state,
 scratch and graphs until switch or failure; the model pool owns the mapped model files and
-device weights until that model unloads, one entry per representation. A → B → A
+device weights until that model unloads, one entry per representation, and the host-side stores plugins build from
+the checkpoint and keep through `context.keep` (`crit_core.kept`: one store a name, replaced when asked under
+another key, refused to an unload while an engine holds one). A → B → A
 closes each engine before the next; different model identities also free the old
 pool before loading.
 
@@ -1115,12 +1126,13 @@ A package opts in with `chat-concurrent-v1` (or
 `max_concurrent_requests`, an integer from 1 to 1024, and
 `create_request(request)`. Capacity is the adapter's safe bound for the sealed
 configuration and memory limits; the host does not infer it from GPU or model names.
-`crit serve --max-concurrency N` runs at most N of them at once (the smaller of N and the
-declared capacity); the others wait in the [queue](#a-busy-engine).
+`crit serve --max-concurrency N` caps that capacity at N: the host loads the engine with the cap
+(`limits.max_concurrent_requests`) and Core's runtime holds no more requests than it, its lanes first;
+the others wait in the [queue](#a-busy-engine).
 
 Clients read the capacity as `max_concurrent_requests`, a crit-specific field of each
 `/v1/models` card and of `/health` (the default model's): 1 for a package without
-`chat-concurrent-v1`, the loaded engine's declared capacity capped by `--max-concurrency` while it is
+`chat-concurrent-v1`, the loaded engine's capacity (with `--max-concurrency`, as Core capped it) while it is
 the one loaded, and `null` until a concurrent package's engine loads, since it declares its capacity
 as it loads. [crit Eval](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md#concurrency)
 measures concurrent requests only when this is above 1, and `crit run measure` sends a case of
@@ -1488,7 +1500,9 @@ prompt position after the first (none when `prompt_rows` is false: the prompt is
 prefilled) and per continuation token (None for the rows when
 cancelled) and `timing` with `prefill_ms` and `decode_ms`; the host refuses to load the
 package otherwise. ResidentChat's `score(request, cancellation)` builds the response from
-it. Rows may also come as a `crit_core.serving.ScoreRows`, flat arrays of the log-probabilities
+it, passing `decode_via_prompt=True` as well when the request sets it on an engine whose
+`decode_via_prompt` attribute is True (it refuses the option on any other). Rows may also come
+as a `crit_core.serving.ScoreRows`, flat arrays of the log-probabilities
 and the alternatives row by row, which reads as the list it stands for. crit serve's score
 request offers `"format": "packed"`, and ResidentChat then answers with each part packed
 (`packed_scores`: base64 of int32 tokens and float64 log-probabilities, the same values as the

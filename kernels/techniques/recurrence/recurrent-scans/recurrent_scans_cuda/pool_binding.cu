@@ -322,6 +322,25 @@ void pool_conv_prompt(torch::Tensor& out, torch::Tensor& window, const torch::Te
              "pool_conv_prompt");
 }
 
+void conv_segments_rows(torch::Tensor& out, const torch::Tensor& windows_in, torch::Tensor& windows_out,
+                        const torch::Tensor& x, const torch::Tensor& meta, const torch::Tensor& weight,
+                        const std::optional<torch::Tensor>& bias, int64_t widest, bool silu) {
+    const c10::cuda::CUDAGuard guard(x.device());
+    rk::ConvInputs c = conv_inputs(out, x, weight, bias, silu);
+    check_contiguous(windows_in, "windows_in", torch::kFloat32, 3);
+    check_contiguous(windows_out, "windows_out", torch::kFloat32, 3);
+    TORCH_CHECK(windows_in.size(1) == c.channels && windows_out.sizes() == windows_in.sizes(),
+                "windows must be [rows][channels][(width - 1) * dilation]");
+    TORCH_CHECK(meta.is_cuda() && meta.scalar_type() == torch::kInt32 && meta.is_contiguous() && meta.dim() == 2 &&
+                    meta.size(1) == 2 && meta.size(0) == windows_in.size(0),
+                "meta must be contiguous int32 [rows][2] (first, count), a row a window");
+    set_dilation(c, windows_in.size(2));
+    check_ok(rk::enqueue_conv_segments_rows(c, windows_in.data_ptr<float>(), windows_out.data_ptr<float>(),
+                                            meta.data_ptr<std::int32_t>(), static_cast<int>(meta.size(0)),
+                                            static_cast<int>(widest), at::cuda::getCurrentCUDAStream()),
+             "conv_segments_rows");
+}
+
 void conv_segments(torch::Tensor& out, const torch::Tensor& window_in, torch::Tensor& window_out, const torch::Tensor& x,
                    const torch::Tensor& weight, const std::optional<torch::Tensor>& bias, bool silu) {
     const c10::cuda::CUDAGuard guard(x.device());

@@ -1,5 +1,5 @@
 """Prompt GEMMs whose rows do not depend on the row count: one cuBLASLt algorithm per GEMM shape and format, chosen
-once (pin) and run for every row count (Pinned.mm), from crit's recorded-selection technique (pinned GEMMs).
+once (pin) and run for every row count (Pinned.mm), from the pinned GEMMs of crit's former recorded-selection technique.
 
 cuBLAS's heuristics pick a GEMM's algorithm by its row count, and algorithms split a row's sum differently (split-K,
 stream-K, other K tiles), so a prompt row computes other bits when the prompt is longer, is cut into other chunks or

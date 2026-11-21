@@ -66,8 +66,8 @@ struct PlainDecoding final : RequestContext {
 // A generation the host side of Core's runtime keeps state for, named by `attachment` (crit_core.native: the matcher
 // of a request's constraint, a prompt's prepared inputs), which the step model's request carries. `constrained`: Core's
 // host side masks every token of it (structured output, forced calls), so it decodes one token per target pass, as
-// PlainDecoding does, and never in native rounds. `plain` as PlainDecoding. Passed through RequestOptions::context
-// when the options carry "attachment".
+// PlainDecoding does, in native rounds only where they mask (StepRounds::masks). `plain` as PlainDecoding. Passed
+// through RequestOptions::context when the options carry "attachment".
 struct HostAttachment final : RequestContext {
     std::uint64_t attachment = 0;
     bool constrained = false, plain = false;
@@ -75,7 +75,7 @@ struct HostAttachment final : RequestContext {
 };
 
 namespace native_api {
-inline constexpr int abi_version = 8;
+inline constexpr int abi_version = 10;
 // Called with the tokens published since its last call (a step's or a round's, in order); nonzero cancels the request.
 // request_wait takes a null callback for a request nobody listens to: its waiter then wakes only when it ends.
 using TokenCallback = int (*)(void* user, const std::int32_t* tokens, int count);
@@ -119,7 +119,7 @@ const char* last_error() noexcept;
 // The C ABI crit_core_steps exports (src/runtime/step_library.cpp), which crit_core.native.StepEngine loads. An engine
 // is never a library of its own: Core's loader (crit_core.engine) assembles a package's plugins and opens their model
 // on Core's step engine with crit_engine_open_steps (crit/step_engine.h). Functions:
-//   int   crit_engine_abi()                     ABI version (8)
+//   int   crit_engine_abi()                     ABI version (10)
 //   void* crit_engine_open_steps(config_json, callbacks)
 //   void* crit_engine_open_steps_rounds(config_json, callbacks, rounds)
 //                                               engine handle, or null (crit_engine_last_error)
@@ -131,8 +131,10 @@ const char* last_error() noexcept;
 //                                               [] disables), "temperature", "top_p", "top_k", "min_p", "seed",
 //                                               "repetition_penalty", "frequency_penalty", "presence_penalty",
 //                                               "logit_bias" ({"id": bias}), "min_tokens", "replay" (token array),
-//                                               "plain" (true: no drafting), "logprobs" (alternatives per token;
-//                                               requires token_logprobs, at most max_top_logprobs), "attachment"
+//                                               "plain" (true: no drafting), "decode_via_prompt" (true: decode
+//                                               rows through the model's prompt arithmetic), "logprobs"
+//                                               (alternatives per token; requires token_logprobs, at most
+//                                               max_top_logprobs), "attachment"
 //                                               (a positive id of host-side state, HostAttachment) with
 //                                               "constrained" (true: every token masked; no replay)
 //   int   crit_engine_request_wait(request, callback, user, out, result, cap)

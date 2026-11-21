@@ -40,11 +40,18 @@ class Engine:
     def generate_stream(self, request, cancellation, emit):
         prompt = ''.join('<%s>%s' % (m['role'], m['content']) for m in request['messages']) + '<a>'
         reply = REPLY[:request['limits']['max_output_tokens']]
+        # Tokens arrive over time, so the stream has a decode time: 10 ms a token on one schedule from the request's
+        # start. A sleep on a loaded host overshoots by tens of milliseconds; slept token by token, the overshoots added
+        # up, the repetitions of a speed case varied by more than Eval's limit (27% against 25%) and Eval aborted the
+        # round as disturbed.
+        due = time.perf_counter()
         for c in reply:
             cancellation.check()
             if emit:
                 emit(c)
-                time.sleep(.01)  # tokens arrive over time, so the stream has a decode time
+                due += .01
+                while time.perf_counter() < due:
+                    time.sleep(min(.002, max(0.0, due - time.perf_counter())))
         response = dict(schema_version=1, record_kind='chat_response',
                         **{k: request[k] for k in ('request_id', 'candidate_id', 'package_sha256')}, assistant=reply,
                         telemetry=dict(prompt_tokens=len(prompt), output_tokens=len(reply), prefill_tokens=len(prompt),
@@ -331,9 +338,11 @@ class RunEvalTests(RunFixture, unittest.TestCase):
         self.assertGreater(result["journal"]["replayed_calls"], 0)
         self.assertIsNone(result["journal"]["diverged"])
         # The speed cases are the interrupted attempt's own measurements, read back from its journal.
-        def measured(case):   # host load is unmeasured over requests the journal answered
-            return {key: value for key, value in case.items() if key != "host_other_cpu_cores"}
+        def measured(case):   # host load and the GPUs' energy are unmeasured over requests the journal answered
+            return {key: value for key, value in case.items() if key not in ("host_other_cpu_cores", "energy")}
         self.assertEqual(measured(result["speed"]["cases"]["chat"]), measured(partial["speed"]["cases"]["chat"]))
+        self.assertEqual((result["speed"]["cases"]["chat"].get("energy") or {"status": "unmeasured"})["status"],
+                         "unmeasured")
         self.assertTrue(result["context"]["points"])
         self.assertEqual({g["name"]: g["state"] for g in resumed["status"]["gates"]}["quality"], "pass")
         events = [read_json(p) for p in sorted((self.directory / "events").glob("event-*.json"))]

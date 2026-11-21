@@ -122,7 +122,11 @@ class Client:
     """The server as an MCP client sees it: one JSON-RPC message per line."""
 
     def __init__(self, *arguments, cwd):
-        environment = {**os.environ, "PYTHONPATH": os.pathsep.join(str(ROOT / f) for f in FOLDERS)}
+        # crit Eval where this process imports it from: beside this checkout as FOLDERS has it, or wherever the
+        # environment puts it (a worktree's crit-eval is not beside it), as tests/stress.py finds it.
+        import crit_eval
+        folders = [ROOT / f for f in FOLDERS] + [Path(crit_eval.__file__).resolve().parents[1]]
+        environment = {**os.environ, "PYTHONPATH": os.pathsep.join(map(str, folders))}
         self.process = subprocess.Popen([sys.executable, "-B", "-m", "crit_mcp", *arguments], cwd=cwd, env=environment,
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         self.number = 0

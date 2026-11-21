@@ -126,6 +126,11 @@ struct ConvInputs {
     bool silu = true;
 };
 int pool_conv_blocks(int channels);
+// Many long rows of conv_segments in one launch: row r's inputs are x rows meta[r] = (first, count) (int32 [count][2],
+// on the device), its window before them windows_in[r] and after them windows_out[r] ([count][channels][S]); widest is
+// the longest row's count. Each row's outputs and window have the bits of enqueue_conv_segments over that row alone.
+cudaError_t enqueue_conv_segments_rows(const ConvInputs& c, const float* windows_in, float* windows_out,
+                                       const std::int32_t* meta, int count, int widest, cudaStream_t stream);
 // The convolutions the kernels run: 2 .. 8 taps undilated, 2 .. 4 taps at dilation 2 .. 4.
 bool pool_conv_supported(int width, int dilation);
 // Rows of kStash (deferred window: apply the pending count, convolve from the window without writing it, stash the

@@ -175,7 +175,7 @@ rows' bits and the native bound.
 - **Its scale decoder** when the checkpoint's scales are not plain E4M3 bytes, and `post` as the device
   computes it.
 - **Threads and the CPU share.** Split rows or experts over a worker pool, for example behind the
-  [host-work mailbox](../host-work-mailbox/README.md). Leave the share to measured dispatch with the host
+  [host's handoffs](../../core/python/crit_plugins/host/README.md). Leave the share to measured dispatch with the host
   lane timed on the target machine. Host time per expert grows with its weight bytes until the workers
   saturate host DRAM, and the device pays each miss's transfer at the measured host-to-device rate. Link copies
   read the same host DRAM, so with both paths busy each runs below its rate alone: time the lanes concurrently

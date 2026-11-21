@@ -131,8 +131,8 @@ def plugin_package(folder, model_path, configuration, what, device_file=None):
 
 
 def _exactness_rank(level):
-    """A row exactness level's place on the kernels' scale (a higher rank keeps more)."""
-    from crit_kernels.exactness import rank
+    """A row exactness level's place on Core's scale (a higher rank keeps more)."""
+    from crit_plugins.exactness import rank
     return rank(level)
 
 
@@ -145,7 +145,7 @@ def _asked_rows(evidence):
 
 def with_exactness(configuration, mode):
     """A plugin package's configuration with the exactness of its rows stated in full, {"decode": level, "prompt":
-    level} (crit_kernels.exactness): the levels the configuration asks, and for a phase it leaves out the level of
+    level} (crit_plugins.exactness): the levels the configuration asks, and for a phase it leaves out the level of
     the run's quality mode (exact in both: a prompt row has the bits of the same token decoded). So every candidate
     says the level it was built and measured at, and Core holds the engine to it wherever it is served
     (docs/PLUGINS.md#exactness). It also states the run's quality mode, whatever it named itself (a run's mode is
@@ -155,7 +155,7 @@ def with_exactness(configuration, mode):
     from .external import spec_of
     if not isinstance(configuration, dict) or spec_of(configuration) is not None:
         return configuration
-    from crit_kernels.exactness import setting
+    from crit_plugins.exactness import setting
     asked = configuration.get("exactness")
     if asked is not None and not isinstance(asked, (str, dict)):
         raise ValueError('configuration.exactness is a level (declared, exact, row-exact, repeatable) or '
@@ -166,9 +166,43 @@ def with_exactness(configuration, mode):
         raise ValueError(f"configuration.exactness: {exc}") from None
 
 
-# What crit completes in a candidate's configuration: the recon's frozen block, the exactness of its rows in full and
-# the run's quality mode.
-COMPLETED = ("recon", "exactness", "quality_mode")
+def with_activations(configuration, plan):
+    """A plugin package's configuration asking the prompt activations its build plan declared (the plan's
+    prompt_activations, written as the configuration's): Core tells the engine's plugins (an activation option left to
+    choose takes them) and refuses an engine that serves others wherever it loads, so a candidate and its plan cannot
+    state two. A configuration that states other activations than its plan is refused; a plan that declares none
+    leaves the configuration as it is, as does an external engine's."""
+    from .external import spec_of
+    declared = (plan or {}).get("prompt_activations")
+    if declared is None or not isinstance(configuration, dict) or spec_of(configuration) is not None:
+        return configuration
+    stated = configuration.get("prompt_activations")
+    if stated is not None and stated != declared:
+        raise ValueError(f"configuration.prompt_activations {json.dumps(stated, sort_keys=True)} differs from what "
+                         f"{plan.get('plan_id', 'the plan')} declared ({json.dumps(declared, sort_keys=True)}): leave "
+                         "it out (crit writes the plan's) or record a plan that declares what the candidate serves")
+    return {**configuration, "prompt_activations": declared}
+
+
+def with_headroom(configuration, run):
+    """A plugin package's configuration naming the run's VRAM headroom (vram_headroom_bytes): the device memory the
+    engine's givers leave free at every moment, which Core's loader gives the device (crit_plugins.memory's headroom)
+    and the run's device-memory checks read at every step's peak. No plugin option sizes it. A configuration that
+    names another headroom is refused; an external engine's is left as it is."""
+    from .external import spec_of
+    headroom = run["spec"]["hardware_constraints"]["vram_headroom_bytes"]
+    if not isinstance(configuration, dict) or spec_of(configuration) is not None:
+        return configuration
+    stated = configuration.get("vram_headroom_bytes")
+    if stated is not None and stated != headroom:
+        raise ValueError(f"configuration.vram_headroom_bytes {stated} differs from the run's VRAM headroom "
+                         f"({headroom}): leave it out, crit writes the run's")
+    return {**configuration, "vram_headroom_bytes": headroom}
+
+
+# What crit completes in a candidate's configuration: the recon's frozen block, the exactness of its rows in full, the
+# run's quality mode and VRAM headroom, and the prompt activations its plan declared.
+COMPLETED = ("recon", "exactness", "quality_mode", "prompt_activations", "vram_headroom_bytes")
 
 
 def before_completion(supplied, configuration):
@@ -279,8 +313,11 @@ class RunStore:
         if not remaining and state["phase"] in {"awaiting_agent", "running", "discovering", "building"}:
             state["phase"] = "expired"
         prompt_path = safe_path(root, f"segments/{bounds['segment_id']}/agent_request.md")
+        # The run's rung-unreachable state, and what it means for certification (crit.run.ladder).
+        unreachable = ladder.unreachable(root)
         return {"run": run, "state": state, "segment": bounds, "candidates": candidates, "errors": errors,
-                "folder": str(root), "prompt": prompt_path.read_text(encoding="utf-8")}
+                "folder": str(root), "prompt": prompt_path.read_text(encoding="utf-8"),
+                "ladder": {"rung_unreachable": unreachable, "certified": ladder.uncertified(root)}}
 
     @store_operation
     def list(self):
@@ -584,9 +621,17 @@ class RunStore:
             # The exactness of the engine's rows, stated in full: what the configuration asks, and the run's quality
             # mode's level for a phase it leaves out.
             configuration = with_exactness(configuration, quality_mode(run["spec"]["correctness"]))
+            # The prompt activations the plan declared, which Core holds the engine to wherever it loads.
+            configuration = with_activations(configuration, plan)
+            # The run's VRAM headroom, which the device keeps free at every moment of the engine's steps.
+            configuration = with_headroom(configuration, run)
             engine_package(source, run["spec"]["model_path"], configuration, "The candidate's source",
                            run_device_file(run), launchable=False)
             plans.check_engine(plan, configuration)
+            # The KV the plan budgets the device by, against the engine's own answer before any load (its plugins'
+            # resolve()), at the context its serve checks load it at: refused here, not after a build and a load.
+            plans.check_kv(plan, source, run["spec"]["model_path"], configuration,
+                           run["spec"]["hardware_constraints"]["kv_tokens"], run_device_file(run))
             candidate_id = next_id(root / "candidates", "candidate")
             folder = root / "candidates" / candidate_id
             # Validate complete staged records and source before publishing the candidate ID.
@@ -622,6 +667,9 @@ class RunStore:
         takes; there the parent's Eval status is the one the replay rendered again)."""
         root = self.directory(run_id)
         if check:
+            if isinstance(data, dict) and data.get("retroactive") is True and (root / replay.MARKER).is_file():
+                raise ValueError("A replay decides the next plan before any code: its plan is never retroactive, so "
+                                 "leave retroactive out")
             with lease(root):
                 run = load_run(root)
                 bounds = segment(root, run, read_json(safe_path(root, "state.json"))["current_segment_id"])
@@ -638,7 +686,8 @@ class RunStore:
             self._state(root)
             self._event(root, "plan_recorded", reference={"path": f"plans/{plan_id}/plan.json", "sha256": file_sha(path)},
                         detail={"plan_id": plan_id, "decision": value["decision"], "parent_candidate_id": value["parent_candidate_id"],
-                                "supersedes": value["supersedes"], "priorities": value["priorities"]})
+                                "supersedes": value["supersedes"], "priorities": value["priorities"],
+                                **({"retroactive": True} if value.get("retroactive") else {})})
         return value
 
     @store_operation
@@ -663,6 +712,26 @@ class RunStore:
         return next_step(self, run_id)
 
     @store_operation
+    def rung_unreachable(self, run_id, candidate_id, scope, reason):
+        """Record that Eval refused to measure the run's model when crit run ... eval asked it to measure the
+        candidate (`scope`: its rung's Eval): the run's rung-unreachable state (crit.run.ladder.UNREACHABLE). The
+        first refusal stands; a later one returns it."""
+        root = self._recording(run_id)
+        with lease(root):
+            path = safe_path(root, ladder.UNREACHABLE)
+            if path.is_file():
+                return read_json(path)
+            ident(candidate_id, "candidate")
+            state = read_json(safe_path(root, "state.json"))
+            value = record("rung_unreachable", run_id, candidate_id=candidate_id, scope=scope,
+                           segment_id=state["current_segment_id"], reason=text(str(reason)[:4000], "Eval's refusal", 4000),
+                           recorded_at=now())
+            write_json(path, value, immutable=True)
+            self._event(root, "rung_unreachable", candidate_id, detail={"reason": value["reason"], "scope": scope},
+                        reference={"path": ladder.UNREACHABLE, "sha256": file_sha(path)})
+        return value
+
+    @store_operation
     def plan_outcome(self, run_id, candidate_id, attempt_id):
         """After a retained Eval attempt of a candidate created from a plan: the plan's forecast next to what Eval
         measured, at plans/PLAN_ID/outcomes/ATTEMPT.json. None when the candidate has no plan."""
@@ -685,10 +754,10 @@ class RunStore:
         return value
 
     @store_operation
-    def recon(self, run_id, force=False, drafters=()):
+    def recon(self, run_id, force=False, drafters=(), data=None):
         root = self._recording(run_id)
         with lease(root):
-            value = recon.write(root, load_run(root), force, drafters)
+            value = recon.write(root, load_run(root), force, drafters, data)
             self._event(root, "model_recon", reference={"path": recon.RECON_JSON, "sha256": file_sha(root / recon.RECON_JSON)})
         return value
 
@@ -898,7 +967,8 @@ class RunStore:
             raise ValueError(f"Measure {', '.join(missing)} before sealing {candidate_id} as completed (crit run ... "
                              f"check --candidate {candidate_id} --from-eval, then crit run ... measure --candidate "
                              f"{candidate_id}): select needs every case's benchmark, and a sealed candidate takes no "
-                             "new measurement")
+                             "new measurement. Where measure refuses it (its checks keep its benchmarks exploratory), "
+                             f"seal it built (--lifecycle built): crit run ... next names the seal it takes")
 
     @store_operation
     def seal(self, run_id, candidate_id, lifecycle, failure=None):
@@ -1028,7 +1098,7 @@ class RunStore:
         amended = amendments(root, bounds["segment_id"])
         quality_budget, exactness = quality_terms(correctness, amended)
         mode = quality_mode(correctness)
-        from crit_kernels.exactness import setting
+        from crit_plugins.exactness import PHASES, setting
         levels = setting(None, mode)
         policy = correctness.get("weights_policy")
         capacity = run["spec"]["hardware_constraints"]["kv_tokens"]
@@ -1096,7 +1166,7 @@ class RunStore:
             evidence = ", ".join(f"{e['path']} ({e['measured_with']}, {e['gpu']}, {e['model']}, quality mode "
                                  f"{e['quality_mode']}{_asked_rows(e)})" for e in origin["evidence"]) or "none published"
             lower = sorted({f"{phase} rows {e['exactness'][phase]}" for e in origin["evidence"] if e.get("exactness")
-                            for phase in ("decode", "prompt")
+                            for phase in PHASES
                             if _exactness_rank(e["exactness"][phase]) < _exactness_rank(levels[phase])})
             origin_line = (
                 f"\nOrigin engine: this run starts from the crit-hub engine {origin['engine']} ({origin['title']}), source "

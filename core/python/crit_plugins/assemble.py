@@ -8,7 +8,8 @@ from pathlib import Path
 import sys
 import types
 
-from .manifest import HOST, ID, MANIFEST, REQUIRED_SLOTS, SLOT, SLOTS, PluginError, load_manifest, options_for
+from .manifest import (HOST, ID, MANIFEST, REQUIRED_SLOTS, SLOT, SLOTS, PluginError, load_manifest, options_for,
+                       source_plugin)
 from .device import DEVICE_EXTENSIONS, POOL_EXTENSIONS, device_missing, extension_missing
 from .memory import device_bytes, device_memory, release_cached   # noqa: F401 - the loader reads them from here too
 from .observe import PLUGIN_MODULES, Observed, unobserve
@@ -114,7 +115,8 @@ class Registry:
 def normalize(selection, registry=None):
     """configuration.plugins in its full form: use (slot -> plugin id or None), base (each used slot's plain choice,
     the one an ablation falls back to: None for an optional slot, and by default the plugin in use for a slot every
-    engine fills, which an engine never runs without) and options (plugin id -> option values)."""
+    engine fills, which an engine never runs without, and with a registry for a slot a plugin in use requires) and
+    options (plugin id -> option values)."""
     if not isinstance(selection, dict):
         raise PluginError("configuration.plugins is an object with use, base and options")
     unknown = set(selection) - SELECTION_KEYS
@@ -138,7 +140,16 @@ def normalize(selection, registry=None):
     if extra:
         raise PluginError(f"plugins.base names {', '.join(extra)}, which plugins.use does not: base gives each used "
                           "slot its plain choice")
-    out["base"] = {slot: out["base"].get(slot, out["use"][slot] if slot in REQUIRED_SLOTS else None)
+    # A slot a plugin in use requires (its manifest's requires and requires_when) is no more optional than a slot
+    # every engine fills: a base that left it empty would be an engine its own plugins refuse.
+    filled = set(REQUIRED_SLOTS)
+    if registry is not None:
+        for plugin_id in {p for p in out["use"].values() if p is not None}:
+            manifest = registry[plugin_id]
+            filled.update(manifest.get("requires", ()))
+            for slots in (manifest.get("requires_when") or {}).values():
+                filled.update(slots)
+    out["base"] = {slot: out["base"].get(slot, out["use"][slot] if slot in filled else None)
                    for slot in out["use"]}
     options = selection.get("options", {})
     if not isinstance(options, dict) or not all(isinstance(v, dict) for v in options.values()):
@@ -218,6 +229,94 @@ def check(selection, registry, facts=(), strict_options=True, device=None):
         options[plugin_id] = options_for(registry[plugin_id], selection["options"].get(plugin_id),
                                          f"plugins.options.{plugin_id}")
     return use, order, options
+
+
+def approximations(registry, options):
+    """The approximations a selection's resolved options set: [{plugin, option, value, exact, what}] for each option
+    whose manifest declares `approximates` and whose value is none of its exact ones."""
+    found = []
+    for plugin_id, given in options.items():
+        for name, spec in (registry[plugin_id].get("options") or {}).items():
+            said = spec.get("approximates")
+            if said and name in given and given[name] not in said["exact"]:
+                found.append({"plugin": plugin_id, "option": name, "value": given[name], "exact": said["exact"],
+                              "what": said["what"]})
+    return found
+
+
+class Dry:
+    """The selection as a plugin's resolve() sees it, before any plugin exists: which plugin fills each slot
+    (plugin), the facts it provides (facts) and its module (module: the functions a slot's plugin offers for a dry
+    answer, such as the kv_cache plugin's price of a pool position)."""
+
+    def __init__(self, use, registry):
+        self._use, self._registry = dict(use), registry
+
+    def slots(self):
+        return list(self._use)
+
+    def plugin(self, slot):
+        return self._use.get(slot)
+
+    def facts(self, slot):
+        plugin_id = self._use.get(slot)
+        return tuple(self._registry[plugin_id]["provides"]) if plugin_id in self._registry else ()
+
+    def module(self, slot):
+        """The module of the plugin filling `slot`, or None for an empty slot."""
+        plugin_id = self._use.get(slot)
+        return load_module(self._registry[plugin_id]) if plugin_id in self._registry else None
+
+
+# Engine facts that add up over the plugins that hold their part (each plugin's pools a token of context): a plugin's
+# resolve() states its own share, and the resolution is their sum.
+ADDITIVE_FACTS = ("kv_bytes_per_token",)
+
+
+def resolve(registry, use, order, options, context):
+    """What the engine of a selection will state of itself, answered before any plugin is created: each plugin's
+    module's optional resolve(context, options, dry) returns engine facts it can tell from the checkpoint's headers,
+    its options and the selection alone (Dry), with no weights read and no device touched (a model plugin's
+    kv_bytes_per_token: its pools by its layers, priced by the kv_cache plugin). A fact of ADDITIVE_FACTS is each
+    plugin's share, summed; two plugins that state another fact otherwise are refused. Returns {"facts": {key:
+    value}, "by": {key: "plugin" or "plugin + plugin"}}. Core's loader runs it before it creates the plugins and
+    holds the loaded engine to it (resolution_problems); crit run checks a plan against it before any load
+    (crit_core.engine.resolve_package)."""
+    dry, facts, by = Dry(use, registry), {}, {}
+    for plugin_id in order:
+        function = getattr(load_module(registry[plugin_id]), "resolve", None)
+        if not callable(function):
+            continue
+        found = function(context, options[plugin_id], dry)
+        if found is None:
+            continue
+        if not isinstance(found, dict) or not all(isinstance(key, str) for key in found):
+            raise PluginError(f"{plugin_id}: resolve() returns a dict of engine facts")
+        for key, value in found.items():
+            if key in ADDITIVE_FACTS:
+                if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                    raise PluginError(f"{plugin_id}: resolve() states {key} as bytes (an int of 0 or more)")
+                facts[key] = facts.get(key, 0) + value
+                by[key] = f"{by[key]} + {plugin_id}" if key in by else plugin_id
+                continue
+            if key in facts and facts[key] != value:
+                raise PluginError(f"{plugin_id}: resolve() states {key} {value!r}, which {by[key]} states as "
+                                  f"{facts[key]!r}")
+            facts.setdefault(key, value)
+            by.setdefault(key, plugin_id)
+    return {"facts": facts, "by": by}
+
+
+def resolution_problems(resolved, stated):
+    """Why a loaded engine is not what its plugins resolved it to be ([] when it is): each resolved fact against the
+    engine's own (its info() and its plugins' facts, `stated`). Numbers agree to the byte, everything else as equal."""
+    problems = []
+    for key, value in sorted((resolved or {}).get("facts", {}).items()):
+        found = stated.get(key)
+        if found != value:
+            problems.append(f"{resolved['by'][key]}'s resolve() states {key} {value!r}, and the loaded engine "
+                            f"{found!r}")
+    return problems
 
 
 def fit(manifest, facts, device, registry=None):
@@ -328,10 +427,27 @@ def _find_plugins():
         sys.meta_path.insert(0, _PluginFinder)
 
 
-def load_module(manifest):
-    """The plugin's entry module, imported as a submodule of a package for its folder, so its relative imports
-    resolve inside the plugin. A module already imported (the same folder, an engine opened again) is reused. No
-    module of a plugin package writes bytecode (_SourceLoader)."""
+def _subpackages(module, sources, through):
+    """Each source as the subpackage module.name over its folder. A source that is another plugin's folder (it holds
+    plugin.json: a plugin the plugin extends or composes) carries that plugin's manifest (__crit_manifest__) and its
+    own sources nested under it, so its modules import as in their own plugin (from .name.plugin import Class)."""
+    for name, source in sources.items():   # code the plugin imports as .name
+        sub = types.ModuleType(f"{module.__name__}.{name}")
+        sub.__path__ = [str(source["folder"])]
+        sub.__package__ = sub.__name__
+        sys.modules[sub.__name__] = sub
+        setattr(module, name, sub)
+        folder = Path(source["folder"]).resolve()
+        if source_plugin(source) and folder not in through:
+            nested = load_manifest(folder)
+            sub.__crit_manifest__ = nested
+            _subpackages(sub, nested["sources"], (*through, folder))
+
+
+def load_module(manifest, file=None):
+    """The plugin's entry module (or its module `file`, FILE.py in its folder), imported as a submodule of a package
+    for its folder, so its relative imports resolve inside the plugin. A module already imported (the same folder, an
+    engine opened again) is reused. No module of a plugin package writes bytecode (_SourceLoader)."""
     _find_plugins()
     folder = Path(manifest["folder"]).resolve()
     tag = hashlib.sha256(str(folder).encode()).hexdigest()[:12]
@@ -339,14 +455,10 @@ def load_module(manifest):
     if package not in sys.modules:
         module = types.ModuleType(package)
         module.__path__ = [str(folder)]
+        module.__crit_manifest__ = manifest
         sys.modules[package] = module
-        for name, source in manifest.get("sources", {}).items():   # code the plugin imports as .name
-            sub = types.ModuleType(f"{package}.{name}")
-            sub.__path__ = [str(source["folder"])]
-            sub.__package__ = sub.__name__
-            sys.modules[sub.__name__] = sub
-            setattr(module, name, sub)
-    file = manifest["entry"][0]
+        _subpackages(module, manifest.get("sources", {}), (folder,))
+    file = file or manifest["entry"][0]
     name = package + "." + file[:-3].replace("/", ".")
     if name not in sys.modules:
         spec = importlib.util.spec_from_file_location(name, folder / file, loader=_SourceLoader(name, str(folder / file)))
@@ -360,6 +472,20 @@ def load_module(manifest):
     return sys.modules[name]
 
 
+def _engine_policy(method):
+    """An Assembly method run with its engine's policy active (crit_plugins.policy), where it has one: the plugins'
+    facts and telemetry answer for their own engine whichever thread asks."""
+    import functools
+
+    @functools.wraps(method)
+    def run(self, *args, **kwargs):
+        if self.policy is None:
+            return method(self, *args, **kwargs)
+        with self.policy.active():
+            return method(self, *args, **kwargs)
+    return run
+
+
 class Assembly:
     """The engine's plugins, created: assembly[slot] is the plugin filling it (None for an empty slot). memory: each
     plugin's declared memory (memory_of); measured: the device bytes each plugin's factory was measured to take beyond
@@ -367,9 +493,11 @@ class Assembly:
 
     def __init__(self, use, order, options, instances, memory):
         self.use, self.order, self.options = dict(use), list(order), options
+        self.approximations = []   # [{plugin, option, value, exact, what}] the options set (assemble: approximations)
         self.instances, self.memory = instances, memory
         self.measured = {}
         self.parts = None   # what the factories were handed (assemble's _Parts)
+        self.policy = None  # the engine's policy (crit_plugins.policy), its context's: what its facts report
 
     def declared_device(self):
         """The device bytes the plugins' own memory counts as planned: each plugin's declaration, at most what its
@@ -394,10 +522,13 @@ class Assembly:
     def get(self, slot, default=None):
         return self[slot] if slot in self.use and self.use[slot] is not None else default
 
+    @_engine_policy
     def facts(self):
         """What the engine reports of its plugins in its facts: the plugins it runs, so crit serve shows which ones,
         and the engine facts a plugin knows of its own work (a plugin object's optional facts(), such as the
-        projections plugin's prompt_activations), the first plugin in creation order winning a key."""
+        projections plugin's prompt_activations), the first plugin in creation order winning a key; and the
+        approximations its options set (approximations(): an option whose manifest says it approximates the model,
+        set to a value that does), which Eval's drift and an ablation judge by quality, not speed alone."""
         from .kernels import loaded
         found = {}
         for plugin_id in self.order:
@@ -406,6 +537,8 @@ class Assembly:
                 for key, value in dict(report() or {}).items():
                     found.setdefault(key, value)
         found["plugins"] = dict(self.use)
+        if self.approximations:
+            found["approximations"] = [dict(row) for row in self.approximations]
         # crit's kernels this engine's plugins asked for, and how each was built (crit_plugins.kernels).
         kernels = {name: record for name, record in loaded().items() if set(record.get("plugins") or ()) & set(self.order)}
         if kernels:
@@ -416,8 +549,9 @@ class Assembly:
             found["exactness"] = kept
         return found
 
+    @_engine_policy
     def exactness(self):
-        """The exactness of the engine's rows (crit_kernels.exactness's levels): {"asked": the levels the
+        """The exactness of the engine's rows (crit_plugins.exactness's levels): {"asked": the levels the
         configuration asks per phase (crit_plugins.kernels.exactness()) or None, "decode" and "prompt": the lowest
         level any plugin keeps there, "plugins": {plugin id: {phase: level}}}, from each plugin object's optional
         exactness() (the level its rows keep as it is loaded, a phase it computes nothing in left out). None where
@@ -434,7 +568,7 @@ class Assembly:
             return None
         found = {"asked": asked}
         if plugins:
-            from crit_kernels.exactness import LEVELS, PHASES
+            from .exactness import LEVELS, PHASES
             for plugin_id, stated in plugins.items():
                 wrong = [f"{phase}: {level}" for phase, level in stated.items()
                          if phase not in PHASES or level not in LEVELS]
@@ -448,6 +582,7 @@ class Assembly:
             found["plugins"] = plugins
         return found
 
+    @_engine_policy
     def telemetry(self):
         """What the engine's plugins report of their work so far, for crit serve's /health and Eval: each plugin
         object's optional telemetry() (a dict of sections, such as a device expert cache's {"expert_cache": {slots,
@@ -500,12 +635,10 @@ def exactness_shortfalls(report):
     asked = (report or {}).get("asked")
     if not asked:
         return []
-    from crit_kernels.exactness import LEVELS
-    def rank(phase, level):
-        return LEVELS.index("row-exact" if phase == "decode" and level == "exact" else level)
+    from .exactness import keeps
     return [f"{plugin_id} keeps its {phase} rows {stated[phase]} where the configuration's exactness asks {asked[phase]}"
             for plugin_id, stated in (report.get("plugins") or {}).items() for phase in asked
-            if phase in stated and rank(phase, stated[phase]) < rank(phase, asked[phase])]
+            if phase in stated and not keeps(phase, stated[phase], asked[phase])]
 
 
 def _measure(assembly, plugin_id, held, now, plans):
@@ -617,6 +750,8 @@ def assemble(selection, registry, context=None, facts=(), budget=None, device=No
                               f"{limit / 2**30:.2f} GiB ({shares})")
     instances = {}
     assembly = Assembly(use, order, options, instances, memory)
+    assembly.policy = getattr(context, "policy", None)
+    assembly.approximations = approximations(registry, options)
     parts = assembly.parts = _Parts(use, instances, observe, registry, context)
     measure = measure or device_bytes
     try:

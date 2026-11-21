@@ -7,7 +7,10 @@ and scaffolds work/recon.md, whose model-card, reference-code, drafting-plan and
 agent writes (crit refuses a candidate while either plan is unfinished: recon.unfinished). With
 `--drafter PATH` (repeatable) it also reads each companion drafter's config.json through crit_core.model.drafters
 (EAGLE-3, DFlash, DSpark and crit's own `crit models drafter` heads) and records what the engine wires: kind, taps
-into the target, draft vocabulary, block size and mask token, checked against the target's depth.
+into the target, draft vocabulary, block size and mask token, checked against the target's depth. With `--data DATA`
+(crit Eval's prepared data for the run's model, holding the reference's scores) it records smoke's reference
+(smoke_reference): a few quality texts and the reference's log-probability of each written-answer token, which crit
+smoke's quality limits are relative to; on an existing recon.json it records only that.
 
 The sampling is not the agent's to choose. recon.json records the sampling crit Eval's sampled suite measures (the
 model's generation_config.json, else the protocol default, else the user's eval_sampling override from run create),
@@ -86,6 +89,9 @@ STANDARD_VARIABLES = {"messages", "tools", "documents", "add_generation_prompt",
                       "raise_exception", "strftime_now", "bos_token", "eos_token", "unk_token", "sep_token",
                       "pad_token", "cls_token", "mask_token", "namespace", "range", "dict", "loop_messages"}
 MODEL_CARD = "README.md"
+# smoke's reference (crit_smoke.reference): the first quality texts of the conversations set, each at most
+# SMOKE_TEXT_TOKENS long, SMOKE_TEXTS of them; each a prefill in smoke's fluent test.
+SMOKE_SET, SMOKE_TEXTS, SMOKE_TEXT_TOKENS = "conversations", 4, 1024
 
 
 # Per-module lists in quantization_config (ModelOpt lists every quantized and ignored module) are summarized by
@@ -456,6 +462,14 @@ def load(root, run):
     return frozen, reference
 
 
+def smoke_reference_of(root):
+    """The smoke reference the run's recon.json records (crit_smoke.reference), or None."""
+    path = safe_path(root, RECON_JSON)
+    if not path.is_file():
+        return None
+    return (read_json(path).get("gathered") or {}).get("smoke_reference")
+
+
 def compare_with_run(root, run, other):
     """Compare the run's model (its recon.json fingerprint) with another checkpoint, without writing anything."""
     path = safe_path(root, RECON_JSON)
@@ -470,14 +484,74 @@ def compare_with_run(root, run, other):
             "other": {"model": str(other), "fingerprint_sha256": theirs["sha256"]}, "comparison": compare(mine, theirs)}
 
 
-def write(root, run, force=False, drafters=()):
+def smoke_reference(model, data):
+    """smoke's reference from crit Eval's prepared data for `model` (crit_smoke.reference): up to SMOKE_TEXTS texts of
+    SMOKE_SET with their token ids, and the reference's log-probability of each written-answer token, read from the
+    scores `crit eval reference` stored under the data; with the reference's perplexity of those tokens and where they
+    came from. ValueError when the data is another model's or holds no reference scores."""
+    import math
+    try:
+        from crit_eval import EVAL_DIR, load_json
+        from crit_eval.quality import fixed
+        from crit_eval.quality.prepare import PREPARED, model_identity, prepared_template
+        from crit_eval.quality.reference import REFERENCE_VERSION
+    except ImportError:
+        raise ValueError("recon --data reads crit Eval's reference scores: crit Eval is not installed beside crit") from None
+    data = Path(data).absolute()
+    if not (data / PREPARED).is_file():
+        raise ValueError(f"{data} holds no {PREPARED}: prepare it from the run's model first "
+                         f"(crit eval prepare --model {model} --data {data})")
+    prepared = load_json(data / PREPARED)
+    if prepared["model"]["sha256"] != model_identity(model, prepared_template(prepared))["sha256"]:
+        raise ValueError(f"{data} was prepared from another model than the run's")
+    protocol = load_json(EVAL_DIR / "protocol.json")
+    identity = {"model_sha256": prepared["model"]["sha256"], "reference": REFERENCE_VERSION,
+                **fixed.identity(fixed.texts(prepared), protocol["quality"]["top_k"], prepared["valid_vocab"])}
+    scores = fixed.load(data, identity)
+    if scores is None:
+        raise ValueError(f"{data} holds no reference scores of its quality texts: crit eval reference --model {model} "
+                         f"--data {data} scores them (a run's first Eval does too)")
+    texts = []
+    for row in prepared["quality"]:
+        ids = list(row["prompt_ids"]) + list(row["continuation_ids"])
+        if row.get("set") != SMOKE_SET or not row["continuation_ids"] or len(ids) > SMOKE_TEXT_TOKENS:
+            continue
+        prompt = len(row["prompt_ids"])
+        texts.append({"id": row["id"], "set": row["set"], "prompt_tokens": prompt, "ids": ids,
+                      "target": [round(p["logprob"], 6) for p in scores[row["id"]][prompt - 1:]]})
+        if len(texts) == SMOKE_TEXTS:
+            break
+    if not texts:
+        raise ValueError(f"{data} holds no {SMOKE_SET} text of at most {SMOKE_TEXT_TOKENS} tokens for smoke")
+    target = [v for t in texts for v in t["target"]]
+    return {"source": {"data": str(data), "model_sha256": prepared["model"]["sha256"],
+                       "reference_version": REFERENCE_VERSION,
+                       "index_sha256": file_sha(data / fixed.STORE / "index.json")},
+            "perplexity": round(math.exp(-sum(target) / len(target)), 4), "tokens": len(target), "texts": texts}
+
+
+def write(root, run, force=False, drafters=(), data=None):
     """Gather the run's model (and companion drafters), write work/recon.json and scaffold work/recon.md (kept when
-    it exists)."""
+    it exists). `data`: crit Eval's prepared data, whose reference scores give smoke's reference (smoke_reference); on
+    an existing recon.json without `force` only that is recorded. Gathering again keeps a smoke reference recorded
+    for the same checkpoint (an equal fingerprint)."""
     path = safe_path(root, RECON_JSON)
-    if path.exists() and not force:
-        raise ValueError(f"{RECON_JSON} exists; edit its frozen block, or pass --force to gather again")
     model = run["spec"]["model_path"]
+    earlier = read_json(path) if path.is_file() else None
+    if earlier is not None and not force:
+        if data is None:
+            raise ValueError(f"{RECON_JSON} exists; edit its frozen block, or pass --force to gather again")
+        if earlier.get("model_path") != model:
+            raise ValueError(f"{RECON_JSON} describes another model; run recon again with --force")
+        earlier["gathered"]["smoke_reference"] = smoke_reference(model, data)
+        write_json(path, earlier)
+        return earlier
     rows, gathered, frozen = gather(model, run, drafters)
+    if data is not None:
+        gathered["smoke_reference"] = smoke_reference(model, data)
+    elif (earlier is not None and (earlier.get("gathered") or {}).get("smoke_reference")
+          and (earlier["gathered"].get("fingerprint") or {}).get("sha256") == gathered["fingerprint"]["sha256"]):
+        gathered["smoke_reference"] = earlier["gathered"]["smoke_reference"]
     value = record("model_recon", run["run_id"], created_at=now(), model_path=model, sources=rows,
                    gathered=gathered, frozen=frozen)
     write_json(path, value)
@@ -517,8 +591,14 @@ def _context(found):
     if found.get("note"):
         lines += f"Note: {found['note']}.\n"
     if found.get("kv_bytes"):
-        lines += (f"Its KV cache takes {found['kv_bytes'] / (1 << 30):.2f} GiB at {found.get('kv_precision') or 'the protocol'} "
-                  "precision.\n")
+        lines += (f"Eval's capacity prices its KV cache at {found['kv_bytes'] / (1 << 30):.2f} GiB, at "
+                  f"{found.get('kv_precision') or 'the protocol'} precision: that is the protocol's price for the "
+                  "context, not an engine's. What an engine's KV takes is its plugins' resolution of its KV options "
+                  "(an auto precision follows the checkpoint: FP8 only where it stores static k_scale and v_scale; "
+                  "indexer keys and a draft layer's pool come on top), which they give before any load: crit plugins "
+                  f"resolve PACKAGE --model M --context {found['tokens']} (kv_bytes_per_token). Budget the device from "
+                  "that, and state it in the plan (kv_bytes_per_token): creating the candidate refuses a plan its "
+                  "engine does not match, and serve --check holds the loaded engine to it (plan_kv).\n")
     return lines + ("You cannot change it: only the user does (context_tokens in settings.toml, or kv_tokens at run "
                     "create). Eval's capacity gate fails a candidate that cannot serve it.\n\nTODO. Plan the KV cache "
                     "for it: precision, layout and paging, where it lives next to the weights, drafter state and "

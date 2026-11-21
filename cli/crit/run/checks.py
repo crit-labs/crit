@@ -234,7 +234,8 @@ def full_context_checks(port, engine, kv_tokens, headroom, grace, timeout, log, 
     passes when the slowest prompt step finishes within `grace` (a cancel settles only between steps, and the host is
     retired with its weights when a cancel does not settle within crit serve's grace), full_context_device_memory
     when the least free device memory at any probed step's peak, prompt or decode, is at least `headroom` (the run's
-    vram_headroom_bytes). An engine that reports no probe (its steps not on Core's StepEngine, or no CUDA for
+    vram_headroom_bytes), each step's reading taken as if the memory outside the engine had stayed at the least it
+    held during the request (_device_memory). An engine that reports no probe (its steps not on Core's StepEngine, or no CUDA for
     memory) leaves the item unverified."""
     client = Client(port, timeout)
     names = ("full_context_prompt_step", "full_context_device_memory")
@@ -379,8 +380,9 @@ def _probe(engine):
 
 
 def _since(before, after):
-    """Core's probe of the steps between two telemetry reads, per kind: their count, the slowest's seconds and the
-    least free device memory, from the samples Core keeps (its recent ones). None when the engine reports no probe."""
+    """Core's probe of the steps between two telemetry reads, per kind: their count, the slowest's seconds, the
+    least free device memory and each step's (free, outside) memory, from the samples Core keeps (its recent ones;
+    outside None from a Core that does not sample it). None when the engine reports no probe."""
     if after is None:
         return None
     found = {}
@@ -389,10 +391,11 @@ def _since(before, after):
         samples = value.get("recent", [])[-steps:] if steps > 0 else []
         if not samples:
             continue
-        found[kind] = {"steps": steps, "slowest_seconds": max(s for s, _ in samples)}
-        free = [f for _, f in samples if f is not None]
-        if free:
-            found[kind]["min_free_device_bytes"] = min(free)
+        found[kind] = {"steps": steps, "slowest_seconds": max(sample[0] for sample in samples)}
+        memory = [(sample[1], sample[2] if len(sample) > 2 else None) for sample in samples if sample[1] is not None]
+        if memory:
+            found[kind]["min_free_device_bytes"] = min(free for free, _ in memory)
+            found[kind]["memory"] = memory
     return found
 
 
@@ -411,17 +414,45 @@ def _prompt_step(probe, grace, prompted):
                          "that runs its prompt spans layer by layer over several steps: model-template's passes)")}
 
 
+def engine_free(pairs, baseline=()):
+    """The engine's own free device memory at each of `pairs` [(free bytes the device read, memory outside the engine
+    then or None)]: each reading as if the memory outside the engine (the CUDA driver, other programs on the card:
+    crit_plugins.memory's other()) had stayed at the least it held over the readings and `baseline` (more readings of
+    it), so another program's allocations do not count against the engine. Returns ([(judged, free, outside)], the
+    least outside or None, the most or None); a reading without its outside memory is judged as the device read it."""
+    outside = [other for _, other in pairs if other is not None] + [other for other in baseline if other is not None]
+    floor = min(outside) if outside else None
+    judged = [(free if other is None or floor is None else free + other - floor, free, other) for free, other in pairs]
+    return judged, floor, (max(outside) if outside else None)
+
+
 def _device_memory(probe, headroom):
-    found = {kind: value["min_free_device_bytes"] for kind, value in (probe or {}).items()
-             if "min_free_device_bytes" in value}
-    if not found:
+    """The least free device memory at a probed step's peak against `headroom`, judged by the engine alone: each
+    step's free memory as if the memory outside the engine (the CUDA driver, other programs on the card: Core's
+    outside reading) had stayed at the least it held during the request, so another program's allocations during a
+    step do not count against the engine and the headroom stays the room the engine leaves on top of what others
+    hold. A Core that does not sample the outside memory is judged by the device's reading."""
+    readings = {kind: value.get("memory") or [(value["min_free_device_bytes"], None)]
+                for kind, value in (probe or {}).items() if "min_free_device_bytes" in value}
+    if not readings:
         return {"name": "full_context_device_memory", "state": "unverified",
                 "detail": "the engine reports no probed device memory (Core's StepEngine on CUDA probes it)"}
-    least = min(found.values())
-    shown = ", ".join(f"{kind} {value / 2**30:.2f} GiB" for kind, value in sorted(found.items()))
+    every = [(kind, pair) for kind, pairs in readings.items() for pair in pairs]
+    judged, floor, most = engine_free([pair for _, pair in every])
+    found = {}
+    for (kind, _), reading in zip(every, judged):
+        if kind not in found or reading[0] < found[kind][0]:
+            found[kind] = reading
+    least, free, other = min(found.values(), key=lambda found: found[0])
+    shown = ", ".join(f"{kind} {value[0] / 2**30:.2f} GiB" for kind, value in sorted(found.items()))
+    netted = ("" if floor is None else
+              f"; memory outside the engine (the CUDA driver, other programs) held {floor / 2**20:,.0f} to "
+              f"{most / 2**20:,.0f} MiB during the request, and the least-free step's "
+              f"{((other or floor) - floor) / 2**20:,.0f} MiB above its least was subtracted from what the step used "
+              f"(the device read {free / 2**30:.2f} GiB free there)")
     return {"name": "full_context_device_memory", "state": "passed" if least >= headroom else "failed",
             "detail": f"least free device memory at a step's peak up to the full context: {shown}; the run's VRAM "
-                      f"headroom is {headroom / 2**30:.2f} GiB"
+                      f"headroom is {headroom / 2**30:.2f} GiB" + netted
                       + ("" if least >= headroom else
                          ": a step took device memory that no plugin of crit_plugins.memory's ledger made room "
                          "for (an elastic cache grows into whatever a smaller KV cache or shorter chunks free, so "
@@ -429,12 +460,148 @@ def _device_memory(probe, headroom):
                          "the device)")}
 
 
-def serve_checks(port, capabilities, variables, timeout, log, planned_activations=None):
+# The decode rounds a drafting engine's check must have served before its drafts are judged: a working drafter keeps
+# some drafts within a few greedy replies to real prompts, and fewer rounds may hold none by chance.
+DRAFT_ROUNDS = 32
+
+
+def core_counts(engine):
+    """What Core counted of an engine load's requests, from its telemetry: the kernels compiled once its load was
+    over (core.compiles_after_load), its drafting (core.drafts) and its steps' memory (memory.steps: segments
+    refused, past the arena, past the headroom, since it served); {} where the engine reports none or its report
+    fails."""
+    try:
+        telemetry = engine.telemetry() or {}
+    except Exception:   # an engine that cannot report counts nothing
+        return {}
+    core = telemetry.get("core") or {}
+    found = {key: core[key] for key in ("compiles_after_load", "drafts") if isinstance(core.get(key), dict)}
+    steps = (telemetry.get("memory") or {}).get("steps")
+    if isinstance(steps, dict):
+        found["steps"] = steps
+    return found
+
+
+def core_items(counts, log):
+    """The check's items from Core's counters over every load it served (core_counts, one a load):
+    compiles_after_load fails where a request compiled a kernel or built an extension (every plugin compiles at
+    load: Core's warm requests serve each kind of request first, and a request that compiles waits for it), and
+    drafts_accepted fails a drafting engine that kept none of its drafts over at least DRAFT_ROUNDS decode rounds
+    (its drafter proposes nothing the model keeps: one that never asks the draft head the model loaded, a head that
+    reads the wrong layer). An engine that reports neither leaves them unverified."""
+    items = []
+    seen = [c["compiles_after_load"] for c in counts if c.get("compiles_after_load")]
+    if not seen:
+        state, detail = "unverified", "the engine reports no compile watch (Core's loader keeps one)"
+    else:
+        total = sum(int(c.get("count") or 0) for c in seen)
+        named = [what for c in seen for what in c.get("first") or ()]
+        state = "passed" if not total else "failed"
+        detail = ("no kernel compiled and no extension was built after load, over every request of the check"
+                  if not total else
+                  f"{total} kernel compiles or extension builds after load, during the check's requests: "
+                  + "; ".join(named[:4]) + ". A plugin compiles every kernel its requests launch at load (its "
+                  "warm-up, or Core's warm requests: crit_core.engine.warm_requests), never on a request")
+    items.append({"name": "compiles_after_load", "state": state, "detail": detail})
+    drafts = [c["drafts"] for c in counts if c.get("drafts")]
+    rounds = sum(int(d.get("rounds") or 0) for d in drafts)
+    accepted = sum(int(d.get("accepted") or 0) for d in drafts)
+    known = drafts and all(d.get("drafted") is not None for d in drafts)
+    proposed = sum(int(d.get("drafted") or 0) for d in drafts) if known else None
+    if not drafts:
+        state, detail = "passed", "no request of the check drafted"
+    elif rounds < DRAFT_ROUNDS:
+        state, detail = "unverified", f"{rounds} drafting decode rounds, fewer than the {DRAFT_ROUNDS} judged"
+    elif not accepted:
+        state = "failed"
+        detail = (f"none of the drafts of {rounds} decode rounds was accepted"
+                  + (f" ({proposed} proposed)" if proposed is not None else "") +
+                  ": the drafter proposes nothing the model keeps (one that never asks the draft head the model "
+                  "loaded, such as mtp-decode's copy drafts alone, or a draft head reading the wrong layer); drafting "
+                  "then costs every round and gains none")
+    else:
+        state = "passed"
+        detail = (f"{accepted} drafts accepted over {rounds} decode rounds"
+                  + (f" ({accepted / proposed:.0%} of {proposed} proposed)" if proposed else ""))
+    items.append({"name": "drafts_accepted", "state": state, "detail": detail})
+    items.append(step_memory_item(counts))
+    for item in items:
+        log(f"serve check {item['name']}: {item['state']} ({item['detail']})")
+    return items
+
+
+def step_memory_item(counts):
+    """step_memory, from Core's allocator over every load the check served (core_counts' steps, counted since each
+    load began serving): failed where a step's segment was refused (the device had not the bytes: a request failed
+    or waited on torch's retry), passed the step arena (Core's load measured no step that large: a step kind its warm
+    requests do not reach, or a plugin's temporary that grows with the request) or left less free than the run's
+    VRAM headroom, judged by the engine's own use: each segment's free memory as if the memory outside the engine had
+    stayed at the least it held over the load (engine_free, from Core's segment_memory), so other programs on the
+    card do not move the verdict. A load whose Core reports no such readings (or more segments than it keeps) is
+    judged by the device's reading. An engine without Core's allocator (no CUDA, no compiler) leaves it
+    unverified."""
+    seen = [c["steps"] for c in counts if c.get("steps")]
+    if not seen or any(s.get("unaccounted") for s in seen):
+        why = next((s["unaccounted"] for s in seen if s.get("unaccounted")), "the engine reports no step memory")
+        return {"name": "step_memory", "state": "unverified", "detail": why}
+    total = {key: sum(int(s.get(key) or 0) for s in seen) for key in ("steps", "refused", "overflows", "breaches")}
+    least, outside = [], []
+    raw = total["breaches"]
+    for s in seen:
+        pairs = [tuple(pair) for pair in s.get("segment_memory") or ()]
+        if not pairs or s.get("segment_memory_cut") or "headroom" not in s:
+            if s.get("least_free") is not None:
+                least.append(s["least_free"])
+            continue
+        judged, floor, most = engine_free(pairs, [s.get("outside_at_serve")])
+        total["breaches"] += sum(1 for value, _, _ in judged if value < int(s["headroom"])) - int(s.get("breaches") or 0)
+        least.append(min(value for value, _, _ in judged))
+        if floor is not None:
+            outside.append((floor, most))
+    arena = max(int(s.get("arena") or 0) for s in seen)
+    said = (f"{total['steps']} steps, arena {arena / 2**20:.0f} MiB"
+            + (f", least free {min(least) / 2**20:.0f} MiB" if least else "")
+            + (f"; memory outside the engine held {min(f for f, _ in outside) / 2**20:,.0f} to "
+               f"{max(m for _, m in outside) / 2**20:,.0f} MiB, its growth set aside"
+               + (f" ({raw} segments left less than the headroom by the device's reading)"
+                  if raw != total["breaches"] else "") if outside else ""))
+    wrong = [f"{total[key]} {what}" for key, what in (
+        ("refused", "segments refused (the device lacked the bytes)"),
+        ("overflows", "segments past the step arena (a step larger than any the load measured)"),
+        ("breaches", "segments that left less free than the VRAM headroom")) if total[key]]
+    if wrong:
+        return {"name": "step_memory", "state": "failed",
+                "detail": "; ".join(wrong) + f" over the check's requests ({said}). Core's arena is what the load's "
+                          "largest steps took (crit_plugins.memory size_arena): a step past it is a kind no warm "
+                          "request reaches, or a temporary that grows with the request"}
+    return {"name": "step_memory", "state": "passed",
+            "detail": f"every step's segments within the arena and the headroom ({said})"}
+
+
+def plan_kv(planned, facts):
+    """(state, detail) of plan_kv: whether the engine's KV pools take the bytes a token its plan budgeted (the
+    plan's kv_bytes_per_token against the engine facts' own, within 1%)."""
+    served = facts.get("kv_bytes_per_token")
+    if not served:
+        return "failed", (f"the candidate's plan budgets {planned:,} KV bytes a token and the engine's facts declare "
+                          "no kv_bytes_per_token: its kv_cache plugin states what its pools take")
+    if abs(int(served) - int(planned)) > 0.01 * int(planned):
+        return "failed", (f"the engine's KV pools take {int(served):,} bytes a token, the candidate's plan budgeted "
+                          f"{planned:,} ({int(served) / int(planned):.2f}x): the plan's device budget (its expert "
+                          "cache, its context) rests on the other figure. Plan from the engine's facts (the kv_cache "
+                          "plugin's resolution of its KV options: an auto precision, indexer keys, a draft layer's "
+                          "pool), or set the KV options that serve what the plan budgets")
+    return "passed", f"the engine's KV pools take the {int(served):,} bytes a token its plan budgeted"
+
+
+def serve_checks(port, capabilities, variables, timeout, log, planned_activations=None, planned_kv=None):
     """Run the standard serving checks against crit serve at `port`; returns their items (name, state, detail)
     without the final stop_engine item, which the caller adds once the engine has stopped. planned_activations: the
     prompt activations the candidate's plan declared (its prompt_activations), which the engine's facts must match
     (plan_activations): a candidate that serves other activations than it planned is caught at its first check, not
-    at the next plan after a whole Eval."""
+    at the next plan after a whole Eval. planned_kv: the plan's kv_bytes_per_token, which the engine's facts must
+    give (plan_kv): a plan that budgeted the device for another KV (the protocol's FP8 price where the kv_cache
+    plugin resolved BF16 and added indexer keys) is caught there too."""
     client, items = Client(port, timeout), []
 
     def check(name, run):
@@ -547,6 +714,9 @@ def serve_checks(port, capabilities, variables, timeout, log, planned_activation
                                   "gave), or plan what is served")
             return "passed", f"the engine serves the prompt activations its plan declared ({json.dumps(served)})"
         check("plan_activations", plan_activations)
+
+    if planned_kv is not None:
+        check("plan_kv", lambda: plan_kv(planned_kv, seen.get("facts") or {}))
 
     switches = {k: not v for k, v in variables.items() if isinstance(v, bool)}
     if switches and TEMPLATE_KWARGS_CAPABILITY in capabilities:

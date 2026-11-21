@@ -75,3 +75,46 @@ class BundleStoreTests(PluginTestCase):
         layout = self.assemble()["expert_source"].open_store({"bundle_bytes": 2048}, 1, 4, device, path, identity)
         self.assertFalse(layout.complete)   # another layout too
         layout.close()
+
+    def test_a_kept_store_comes_back_sealed_to_the_next_engine(self):
+        # The host's keeper (crit serve's model pool, crit eval's process: crit_core.kept) holds the store between
+        # two engines of one model: the second one's source gets it sealed, as the first one left it.
+        from crit_core.kept import Kept
+        torch = __import__("torch")
+        device = self.device()
+        keeper = Kept()
+
+        class Context:
+            def keep(self, name, key, build, close=None, nbytes=None):
+                return keeper.keep(name, key, build, close, nbytes)
+
+            def keeping(self, name):
+                return keeper.nbytes(name)
+
+            def drop_kept(self, name):
+                keeper.drop(name)
+        bundles = self.bundles(1, 4, 1024, seed=3)
+        first = self.assemble(context=Context())["expert_source"]
+        store = first.open_store({"bundle_bytes": 1024}, 1, 4, device, kept=["checkpoint", "packing code"])
+        for (l, e), b in bundles.items():
+            store.put(l, e, b)
+        store.region()
+        first.close()   # the engine's close leaves a kept store to its keeper
+        self.assertTrue(store.kept)
+        keeper.release("expert-tensors:store")
+        second = self.assemble(context=Context())["expert_source"]
+        self.assertEqual(second.kept_bytes(), 4096)   # the memory the next engine's store has
+        again = second.open_store({"bundle_bytes": 1024}, 1, 4, device, kept=["checkpoint", "packing code"])
+        self.assertIs(again, store)
+        self.assertTrue(again.sealed)
+        self.assertTrue(torch.equal(again.bundle(0, 2), bundles[(0, 2)]))
+        self.assertEqual(keeper.report()["expert-tensors:store"], {"nbytes": 4096, "users": 1, "reused": 1})
+        keeper.release("expert-tensors:store")
+        other = second.open_store({"bundle_bytes": 1024}, 1, 4, device, kept=["another checkpoint", "packing code"])
+        self.assertIsNot(other, store)   # other contents: the kept store is closed and another one built
+        self.assertFalse(other.sealed)
+        self.assertIsNone(store._mapping)   # its memory went before the other store's was made
+        keeper.release("expert-tensors:store")
+        second.drop_kept()   # an engine whose experts go elsewhere frees it
+        self.assertEqual((other.kept, second.kept_bytes(), other._mapping), (True, 0, None))
+        keeper.close()

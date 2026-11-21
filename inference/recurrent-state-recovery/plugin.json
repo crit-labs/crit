@@ -53,6 +53,12 @@
       "choices": ["pool-delta-pipe", "pool-delta"],
       "description": "recurrent-scans' structure for the decode, verify and scanned prompt rows: pool-delta-pipe (each slot's state tile and first tokens staged in shared memory by cp.async, whole 128-byte rows, ahead of the slot a block runs; as fast or faster than pool-delta on decode and verify rows from 1 to 32 sequences, tuned or not, numbers in recurrent-scans' README) or pool-delta (the state tile loaded into registers, the structure before). The same bits either way for every row, commit and pending count, so a pool may switch between them (facts: recurrence_prompts' scan)"
     },
+    "decode": {
+      "type": "choice",
+      "default": "scan",
+      "choices": ["scan", "chunk"],
+      "description": "how every row of the recurrence runs: scan (the default), decode and verify rows through the column scan, prompt rows by prompt_rows and exact_rows; chunk, every row (decode, verify, prompt, captured rounds and prompt chunks) through recurrent-scans' chunk-aligned exact form (delta-chunk-rows: each sequence's tokens since its last 64-aligned position from the state there, on tensor cores), so prompt rows have the bits of decoding their tokens at tensor-core speed (exact prompt rows), and each decode step recomputes its chunk so far (a dearer step; the README says when it pays: short answers to long prompts that must be exact). Needs the kernel, keys 64 or 128, values a multiple of 16, and a pool that is not elastic; prompt_rows, exact_rows, prefill, scan and commit do not apply to its state"
+    },
     "commit": {
       "type": "choice",
       "default": "deferred",

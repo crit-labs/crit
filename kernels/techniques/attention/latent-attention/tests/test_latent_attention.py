@@ -260,6 +260,28 @@ def test_a_prompt_tokens_bits_do_not_follow_its_chunks_length_and_a_graph_replay
         assert torch.equal(out, la.prefill(q, cache.cache, cache.tables[0], at, 64, rank=512)), at
 
 
+def test_prompt_rows_of_several_sequences_have_each_rows_own_bits():
+    """prefill_rows: several sequences' chunks in one launch (lengths that leave tiles part-filled, one token, a
+    sequence's chunk at another position), each token with the bits prefill() gives its row alone, lse and sinks too."""
+    cache = Cache(512, 64, 64, [900, 300, 1200, 70], seed=21)
+    sinks = torch.randn(16, generator=torch.Generator().manual_seed(22)).to(dev)
+    rows = [(0, 133, 400), (1, 1, 299), (2, 64, 0), (3, 37, 33)]   # (sequence, tokens, first position)
+    counts = [n for _, n, _ in rows]
+    starts = [sum(counts[:i]) for i in range(len(rows))]
+    q = _q(sum(counts), 16, 576, 23)
+    tables = cache.tables[[s for s, _, _ in rows]].contiguous()
+    for s in (None, sinks):
+        lse = torch.empty(sum(counts), 16, device=dev)
+        out = la.prefill_rows(q, cache.cache, tables, starts, counts, [p for _, _, p in rows], 64, rank=512,
+                              lse=lse, sinks=s)
+        for (seq, n, position), first in zip(rows, starts):
+            alone_lse = torch.empty(n, 16, device=dev)
+            alone = la.prefill(q[first:first + n], cache.cache, cache.tables[seq], position, 64, rank=512,
+                               lse=alone_lse, sinks=s)
+            assert torch.equal(out[first:first + n], alone), (seq, n)
+            assert torch.equal(lse[first:first + n], alone_lse), (seq, n)
+
+
 def test_a_prompt_chunk_over_an_e4m3_cache_matches_float64_over_its_stored_values():
     cache = Fp8Cache(512, 64, 64, [600], seed=15)
     q = _q(90, 16, 576, 16)

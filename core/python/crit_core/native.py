@@ -25,7 +25,7 @@ from crit_core.serving import SAMPLING, ScoreRows
 from crit_plugins.device import Allowed
 from crit_plugins.memory import of as memory_of
 
-ABI = 8
+ABI = 10
 NONFINITE = "nonfinite"   # a round counter of that name fails the request it is not zero for
 RESULT_BYTES = 1 << 20  # a generation's result JSON: finish, timing and the engine's request facts
 TOKEN_CALLBACK = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32), ctypes.c_int)
@@ -143,7 +143,8 @@ class _Runtime(_Requests):
                 self._check_device_memory()
 
     def _generate(self, prompt, output_tokens, *, stop_tokens=None, sampling=None, replay=None, plain=False,
-                  logprobs=None, on_tokens=None, cancelled=None, constraint=None, inputs=None, prompt_cache=False):
+                  logprobs=None, on_tokens=None, cancelled=None, constraint=None, inputs=None, prompt_cache=False,
+                  decode_via_prompt=False, priority=0):
         """Returns (tokens, result) with result's "finish", "timing" (ms, decode_steps) and the engine's request
         facts, or (None, {"cancelled": True}) when cancelled() turned true. stop_tokens None keeps the model's;
         [] disables them. sampling: temperature, top_p, top_k, min_p, seed, penalties and logit_bias.
@@ -153,20 +154,25 @@ class _Runtime(_Requests):
         constraint that cannot continue, or a token outside it, fails the request with NativeError. inputs: what the
         model's prepare() made of the prompt's images, which its open() gets as StepRequest.inputs. prompt_cache: the
         request may be served from the model's prompt cache (StepRequest.prompt_cache, crit_plugins.prompt_cache): off
-        unless asked for, so a request measured or scored prefills every prompt token; a replay never is."""
+        unless asked for, so a request measured or scored prefills every prompt token; a replay never is.
+        decode_via_prompt: a debug request whose decode rows the model computes as one-token prompt chunks, never in a
+        native round (StepRequest.decode_via_prompt, on a model whose info says decode_via_prompt). priority: the order
+        Core's runtime admits the request in while it waits for a lane, a lower value first, the oldest first among
+        equals (next_request)."""
         if cancelled and cancelled():
             return None, {"cancelled": True}
         prompt_cache = bool(prompt_cache) and replay is None
         if constraint is None and inputs is None and not prompt_cache:
             return self._run(prompt, output_tokens, stop_tokens, sampling, replay, plain, logprobs, on_tokens,
-                             cancelled, None)
+                             cancelled, None, decode_via_prompt, priority)
         if replay is not None:
             raise NativeError("a replay is its own continuation: it takes no constraint or inputs")
         holder = _Attached(None if constraint is None else self._matcher(constraint), inputs, prompt_cache)
         stopped = cancelled
         try:
             tokens, result = self._run(prompt, output_tokens, stop_tokens, sampling, replay, plain, logprobs, on_tokens,
-                                       lambda: holder.failure is not None or bool(stopped and stopped()), holder)
+                                       lambda: holder.failure is not None or bool(stopped and stopped()), holder,
+                                       decode_via_prompt, priority)
         finally:
             holder.close()
         if holder.failure is not None:
@@ -174,14 +180,20 @@ class _Runtime(_Requests):
         return tokens, result
 
     def _run(self, prompt, output_tokens, stop_tokens, sampling, replay, plain, logprobs, on_tokens, cancelled,
-             holder):
+             holder, decode_via_prompt=False, priority=0):
         options = dict(sampling or {})
+        if priority:
+            if type(priority) is not int or not -(1 << 31) <= priority < (1 << 31):
+                raise NativeError("priority is a 32-bit signed integer")
+            options["priority"] = priority
         if stop_tokens is not None:
             options["stop_tokens"] = [int(t) for t in stop_tokens]
         if replay is not None:
             options["replay"] = [int(t) for t in replay]
         if plain:
             options["plain"] = True
+        if decode_via_prompt:
+            options["decode_via_prompt"] = True
         if logprobs is not None:
             options["logprobs"] = int(logprobs)
         if holder is not None:
@@ -263,6 +275,9 @@ class _Runtime(_Requests):
             self._counted["nonfinite_requests"] = self._counted.get("nonfinite_requests", 0) + 1
             raise NativeError(f"generation failed: the model's logits were not finite in {facts[NONFINITE]} verified "
                               "columns of this request (a NaN or an infinity), so its tokens are not the model's")
+        counted = getattr(self, "_counted", None)
+        if counted is not None:
+            count_drafts(counted, facts)
         return [out[i] for i in range(count)], facts
 
     def score(self, ids, first_target, path="", queries=None, top_k=0, packed=False):
@@ -474,11 +489,14 @@ PROBE_RECENT = 8192
 # for an engine whose every step replays captured graphs over buffers made at load, so that nothing allocates on
 # the token path, and a test or a check that holds it to that.
 STEP_ALLOCATIONS = "CRIT_CORE_STEP_ALLOCATIONS"
-# The library's file on each OS, and the folders of a crit checkout it is looked for in when STEP_LIBRARY names none:
-# where `crit core build` builds it (build/core-steps), and Core's build folder of core/README.md (build/core), each
-# with a multi-configuration generator's Release folder.
-STEP_LIBRARY_FILES = ("libcrit_core_steps.so", "crit_core_steps.dll", "libcrit_core_steps.dylib")
-STEP_LIBRARY_FOLDERS = ("build/core-steps", "build/core-steps/Release", "build/core", "build/core/Release")
+# The library's file on this OS (the only one its loader can open), and the folders of a crit checkout it is looked
+# for in when STEP_LIBRARY names none: where `crit core build` builds it (STEP_BUILD, build/core-steps/<sys.platform>:
+# a checkout that two OSes share, Windows and WSL, keeps a build of each), and Core's build folder of core/README.md
+# (build/core), each with a multi-configuration generator's Release folder.
+STEP_LIBRARY_FILE = {"win32": "crit_core_steps.dll", "darwin": "libcrit_core_steps.dylib"}.get(
+    sys.platform, "libcrit_core_steps.so")
+STEP_BUILD = f"build/core-steps/{sys.platform}"
+STEP_LIBRARY_FOLDERS = (STEP_BUILD, f"{STEP_BUILD}/Release", "build/core", "build/core/Release")
 
 
 def step_cache():
@@ -499,13 +517,41 @@ def step_library():
     folders = [root / f for f in STEP_LIBRARY_FOLDERS] if (root / "core" / "include" / "crit" / "core.h").is_file() else []
     cache = step_cache() / "build"
     for folder in folders + [cache, cache / "Release"]:
-        for name in STEP_LIBRARY_FILES:
-            if (folder / name).is_file():
-                return str(folder / name)
+        if (folder / STEP_LIBRARY_FILE).is_file():
+            return str(folder / STEP_LIBRARY_FILE)
     return None
 # The settings of a step model's info that configure Core (crit/step_engine.h's "engine" object), from the table Core's
 # step engine reads too (step_settings.json); the rest are facts.
 STEP_SETTINGS = tuple(jsonfile.read(Path(__file__).with_name("step_settings.json"))["settings"])
+# The settings Core's runtime takes from the engine's caller, never from the model: how long a request may wait for a
+# lane (StepEngine's pending_timeout; the most milliseconds Core's profile holds where nothing bounds the wait).
+CORE_SETTINGS = ("pending_timeout_ms",)
+NO_DEADLINE_MS = (1 << 32) - 1
+
+
+def next_request(priorities):
+    """Core's admission rule, which its runtime applies to the requests it holds (core/src/runtime/admission.cpp,
+    next_waiting; core/src/runtime/README.md#request-priority): of waiting requests with these priorities, in
+    arrival order, the index of the one admitted next: the lowest value, the oldest among equals. A server that holds
+    requests before the engine takes them (crit serve's queue) orders them by it too."""
+    priorities = list(priorities)
+    return min(range(len(priorities)), key=lambda i: (priorities[i], i)) if priorities else None
+
+
+def cap_concurrency(settings, max_concurrent_requests):
+    """A step model's settings with Core's cap on the requests its runtime holds at once (running and waiting for a
+    lane, max_concurrent_requests): lanes first (max_concurrency, at most the cap), then waiting places (max_pending,
+    at most the cap less the lanes). None: the model's own (max_concurrency, default 8; max_pending, default
+    max_concurrency, as Core's step engine reads them)."""
+    if max_concurrent_requests is None:
+        return settings
+    cap = int(max_concurrent_requests)
+    if cap < 1:
+        raise NativeError("the most requests Core's runtime holds at once is 1 or more")
+    lanes = int(settings.get("max_concurrency", 8))
+    pending = int(settings.get("max_pending", lanes))
+    lanes = min(lanes, cap)
+    return {**settings, "max_concurrency": lanes, "max_pending": min(pending, cap - lanes)}
 FINISHES = ("length", "stop", "cancelled", "failed")
 
 
@@ -569,7 +615,7 @@ class _StepRounds(ctypes.Structure):
                 ("widths", ctypes.POINTER(ctypes.c_int32)), ("slot_session", ctypes.POINTER(ctypes.c_uint64)),
                 ("last", ctypes.POINTER(ctypes.c_uint32)), ("runs", ctypes.POINTER(ctypes.c_uint64)),
                 ("logprobs", ctypes.c_void_p), ("top_ids", ctypes.c_void_p), ("top_logprobs", ctypes.c_void_p),
-                ("top", ctypes.c_uint32), ("boundary", ctypes.POINTER(ctypes.c_uint32))]
+                ("top", ctypes.c_uint32), ("boundary", ctypes.POINTER(ctypes.c_uint32)), ("masks", ctypes.c_uint32)]
 
 
 class NativeRounds:
@@ -599,10 +645,18 @@ class NativeRounds:
 
     ask_step() makes the next decode step go to the model's step() once although a round could run it: any thread
     may call it, and the step engine clears it as that step begins. It is how Core's own code gets to run between
-    two rounds (crit_plugins.memory's watch: device memory another program took goes back there)."""
+    two rounds (crit_plugins.memory's watch: device memory another program took goes back there).
+
+    stage(slot, allowed): the rounds mask a constrained request's row (StepRounds::masks). Each round masks every
+    logits row of a slot staged so by its allowed set (crit_plugins.Allowed) and cuts its drafts, so the slot emits one
+    token a round from that set; stage keeps the set in the round's device buffers, outside a capture, on the rounds'
+    stream. Core then runs constrained requests in native rounds and calls the model's commit() after every round
+    that ran one: the step engine checks the slot's token against the set staged, appends it to the request's
+    matcher once Core keeps it, and stages the matcher's next set, before Core launches the next round. Without
+    stage, a constrained request decodes through step()."""
 
     def __init__(self, launch, wait, user, block, row_stride, entry_bytes, max_rows, widths, widest, keep=(),
-                 telemetry=0, counters=0, logprobs=0, top_ids=0, top_logprobs=0, top=0):
+                 telemetry=0, counters=0, logprobs=0, top_ids=0, top_logprobs=0, top=0, stage=None):
         if entry_bytes not in (4, 8) or max_rows < 1 or not widths or widest < 0:
             raise ValueError("native rounds: entries of 4 or 8 bytes, the widths' array and the widest round")
         if top and not (logprobs and top_ids and top_logprobs):
@@ -618,8 +672,12 @@ class NativeRounds:
         self.struct = _StepRounds(user, launch, wait, block, row_stride, entry_bytes, max_rows, int(telemetry),
                                   int(counters), int(widest), self._widths, self._slots, self._last, self._runs,
                                   int(logprobs or 0), int(top_ids or 0), int(top_logprobs or 0), int(top),
-                                  self._boundary)
+                                  self._boundary, 1 if stage is not None else 0)
         self.max_rows, self._handles, self._close = max_rows, {}, None
+        self.stage = stage
+        # The result block as Core reads it, for a constrained slot's token (emitted).
+        self._block = ctypes.cast(int(block), ctypes.POINTER(ctypes.c_int64 if entry_bytes == 8 else ctypes.c_int32))
+        self._stride = int(row_stride)
         # The slots the captures of these rounds called (the round driver's): Core's loader counts a request's native
         # rounds as calls of them, as it counts a Python replay.
         self.captured_slots = ()
@@ -642,7 +700,7 @@ class NativeRounds:
 
     @classmethod
     def cuda(cls, library, stream, graphs, block, row_stride, entry_bytes, max_rows, max_width, widths, widest,
-             telemetry=0, counters=0, logprobs=0, top_ids=0, top_logprobs=0, top=0, logprob_graphs=None):
+             telemetry=0, counters=0, logprobs=0, top_ids=0, top_logprobs=0, top=0, logprob_graphs=None, stage=None):
         lib = ctypes.CDLL(str(Path(library).resolve()))
         lib.crit_rounds_cuda_open.restype = ctypes.c_void_p
         lib.crit_rounds_cuda_open.argtypes = [ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64),
@@ -667,7 +725,7 @@ class NativeRounds:
         wait = _WAIT(ctypes.cast(lib.crit_rounds_cuda_wait, ctypes.c_void_p).value)
         rounds = cls(launch, wait, user, block, row_stride, entry_bytes, max_rows, widths, widest, keep=(lib, tables),
                      telemetry=telemetry, counters=counters, logprobs=logprobs, top_ids=top_ids,
-                     top_logprobs=top_logprobs, top=top)
+                     top_logprobs=top_logprobs, top=top, stage=stage)
         rounds._close = lambda: lib.crit_rounds_cuda_close(user)
         return rounds
 
@@ -677,6 +735,18 @@ class NativeRounds:
 
     def unbind(self, slot):
         self._slots[slot] = 0
+
+    def slot_of(self, session):
+        """The slot holding Core's session handle `session`, or None."""
+        for slot in range(self.max_rows):
+            if self._slots[slot] == session:
+                return slot
+        return None
+
+    def emitted(self, slot):
+        """The tokens the last round emitted in `slot`, from its result block."""
+        at = slot * self._stride
+        return [int(self._block[at + 3 + t]) for t in range(int(self._block[at]))]
 
     @property
     def last(self):
@@ -694,10 +764,12 @@ class NativeRounds:
 # forced continuation (replay) or plain decoding (crit/native_engine.h's ReplayContinuation and PlainDecoding, which
 # every constrained request has); the inputs the model's prepare() made of the prompt's images (None: none); and
 # whether the request may be served from the model's prompt cache (crit_plugins.prompt_cache: False for a request that
-# prefills every prompt token, as Eval's timed and scored ones do).
+# prefills every prompt token, as Eval's timed and scored ones do); and decode_via_prompt, a debug request whose decode
+# rows the model computes as one-token prompt chunks (its prompt arithmetic) and Core never runs in a native round, on a
+# model whose info says decode_via_prompt (crit smoke tells a decode gap's rounding from a fault by it).
 StepRequest = namedtuple("StepRequest",
-                         "key prompt output_tokens sampling stop_tokens logprobs replay plain inputs prompt_cache",
-                         defaults=(None, False))
+                         "key prompt output_tokens sampling stop_tokens logprobs replay plain inputs prompt_cache "
+                         "decode_via_prompt", defaults=(None, False, False))
 # One scheduled row of a step: the session open() returned, its WorkBudget (crit/core.h) and, for a constrained
 # request, the tokens its next token is taken from (crit_plugins.Allowed; None: any), which the model hands its sampler
 # as the row's params["allowed"].
@@ -720,6 +792,25 @@ StepResult = namedtuple("StepResult",
 
 # Facts Core keeps per round: the model's own list of them covers its step() rounds.
 ROUND_LISTS = ("accepted", "drafted")
+
+
+def count_drafts(counted, facts):
+    """A finished request's drafting into an engine's counters (`counted`, telemetry's core.drafts): its decode
+    rounds that drafted, the drafts they proposed where every round's count is known, and the drafts accepted. A
+    request whose facts list no accepted drafts drafted nothing (a plain one, an engine without a drafter)."""
+    accepted = facts.get("accepted")
+    if not isinstance(accepted, list) or not accepted:
+        return
+    drafted = facts.get("drafted") if isinstance(facts.get("drafted"), list) else None
+    found = counted.setdefault("drafts", {"requests": 0, "rounds": 0, "accepted": 0, "drafted": 0,
+                                          "drafted_known": True})
+    found["requests"] += 1
+    found["rounds"] += len(accepted)
+    found["accepted"] += sum(a for a in accepted if type(a) is int and a > 0)
+    if drafted is None or len(drafted) != len(accepted):
+        found["drafted_known"] = False
+    else:
+        found["drafted"] += sum(d for d in drafted if type(d) is int and d > 0)
 
 
 def merge_facts(model, core, counters=()):
@@ -809,12 +900,19 @@ class StepEngine(_Runtime):
     on Core's one engine worker, never two at once. A constrained request (generate's constraint: structured output,
     forced calls) decodes plainly (StepRequest.plain), and each of its rows carries the tokens its constraint allows
     next (StepRow.allowed), which the model passes to its sampler; Core checks each token such a row produces against
-    them, and a row that produces another token or more than one fails the request. CONSTRAINTS are the kinds;
+    them, and a row that produces another token or more than one fails the request. Native rounds that mask
+    (NativeRounds' stage) run constrained requests too: Core stages each one's allowed set for its slot between
+    rounds and checks the round's token the same way. CONSTRAINTS are the kinds;
     constrain(vocabulary) gives Core the model's byte vocabulary that json and grammar constraints are matched over. It generates and scores max_concurrent_requests
     (max_concurrency + max_pending) requests at once. `library` is crit_core_steps, else step_library()'s.
     facts: what the engine reports beside the model's info (the loader's plugins); close: what closes the model's
     parts, the assembly (else the model's own close()); telemetry: what reports the engine's work so far (the
-    assembly's telemetry(), else the model's own). A model with native_rounds(library) returning NativeRounds decodes
+    assembly's telemetry(), else the model's own). max_concurrent_requests: Core's cap on the requests it holds at
+    once, running and waiting for a lane (cap_concurrency; None: the model's); pending_timeout: the seconds a request
+    may wait for a lane before it fails (None: no deadline). Requests wait in priority order (generate's priority,
+    next_request). scope: a context every call into the model and its parts runs in
+    (each callback on Core's worker, prepare(), telemetry(), close()): Core's loader passes the engine's policy
+    (crit_plugins.policy), which Core's worker, a thread Python did not start, would not otherwise have. A model with native_rounds(library) returning NativeRounds decodes
     without calling step() (NativeRounds).
 
     Each generation's result carries its request's facts (crit_core.serving.REQUEST_FACTS, rounds): Core's of its
@@ -827,18 +925,31 @@ class StepEngine(_Runtime):
     CONSTRAINTS = ("json_object", "grammar", "tokens")
 
     def __init__(self, model, library=None, facts=None, close=None, telemetry=None, frames=(), relieve=None,
-                 health=None):
+                 health=None, memory=None, timed=None, scope=None, max_concurrent_requests=None, pending_timeout=None):
         self.model, self._close_parts = model, close
+        self._scope = scope or nullcontext
         # health() -> None, or why the engine cannot serve on (a host handoff that failed: crit_plugins.host's
         # failures): read as each step begins, and the step then fails the engine with it.
         self._health = health
         # The device's memory, told between steps (crit_plugins.memory's relieve): where another program took
         # memory, the givers hand theirs back before this step's allocations. Native rounds run no Python.
         self._relieve = relieve
+        # timed(seconds): a step that ran prompt rows took `seconds` in the model's step() (crit_plugins.steps: the
+        # engine's prompt-step budgets learn what such steps take as they run).
+        self._timed = timed
         # Step frames: parts told of every step() and score() Core is about to run and of its end (crit_plugins.device
         # STEP_FRAMES): begin_step(prompt_tokens) before, end_step(prompts_open) after. Native rounds run no Python.
         self._begin = [_frame(f.begin_step) for f in frames if callable(getattr(f, "begin_step", None))]
         self._end = [_frame(f.end_step) for f in frames if callable(getattr(f, "end_step", None))]
+        # The device's memory (crit_plugins.memory's DeviceMemory) frames every step as well, before every plugin's
+        # begin frame and after every end frame: it gives a prompt step its room before any part runs and learns
+        # what the step took once every part has handed back what it held for it.
+        if memory is not None:
+            self._begin.insert(0, _frame(memory.begin_step))
+            self._end.append(_frame(memory.end_step))
+        # and hands out every byte a step's tensors take: the model's step() and score() run in its step pool, whose
+        # segments Core's allocator admits through the device's ledger (crit_plugins.memory's step_pool).
+        self._memory = memory
         own = getattr(model, "telemetry", None)
         self._telemetry = telemetry if telemetry is not None else (own if callable(own) else None)
         self._request_facts = getattr(model, "request_facts", None)
@@ -862,7 +973,12 @@ class StepEngine(_Runtime):
         self.library, self.path = self.path, None   # Eval takes it from the facts' native_libraries
         self.lib.crit_engine_open_steps.restype = ctypes.c_void_p
         self.lib.crit_engine_open_steps.argtypes = [ctypes.c_char_p, ctypes.POINTER(_StepCallbacks)]
-        settings = {key: info[key] for key in STEP_SETTINGS if key in info}
+        # The model's settings, under Core's cap (cap_concurrency) and with Core's own (CORE_SETTINGS): how long a request
+        # waits for a lane is the caller's (pending_timeout seconds; None: as long as it takes).
+        settings = cap_concurrency({key: info[key] for key in STEP_SETTINGS if key in info and key not in CORE_SETTINGS},
+                                   max_concurrent_requests)
+        settings["pending_timeout_ms"] = (NO_DEADLINE_MS if pending_timeout is None else
+                                          max(1, min(NO_DEADLINE_MS, round(float(pending_timeout) * 1000))))
         self._counter_names = tuple(settings.get("round_counters") or ())
         self._pending_facts = {}   # a session's encoded facts while Core sizes its buffer for them
         facts = {**{key: value for key, value in info.items() if key not in STEP_SETTINGS}, **(facts or {})}
@@ -904,7 +1020,8 @@ class StepEngine(_Runtime):
         if ident not in self._threads:
             _keep_thread_state(ident, self._threads)
         try:
-            result = run()
+            with self._scope():
+                result = run()
             return 0 if result is None else result
         except BaseException as error:
             self._failure = f"{type(error).__name__}: {error}"
@@ -931,7 +1048,7 @@ class StepEngine(_Runtime):
                            {key: options[key] for key in SAMPLING if key in options},
                            options.get("stop_tokens", []), options.get("logprobs"), options.get("replay"),
                            bool(options.get("plain")), None if holder is None else holder.inputs,
-                           bool(holder is not None and holder.prompt_cache))
+                           bool(holder is not None and holder.prompt_cache), bool(options.get("decode_via_prompt")))
 
     def _held(self, attachment):
         with self._attaching:
@@ -942,7 +1059,8 @@ class StepEngine(_Runtime):
 
     def prepare(self, ids, images, cancelled=None):
         """The model's prepare() of a prompt's images (crit_plugins.IMAGES), on the caller's thread: (ids, inputs)."""
-        prepared = self.model.prepare(list(ids), list(images), cancelled or (lambda: False))
+        with self._scope():
+            prepared = self.model.prepare(list(ids), list(images), cancelled or (lambda: False))
         found, inputs = prepared
         return [int(t) for t in found], inputs
 
@@ -1036,17 +1154,20 @@ class StepEngine(_Runtime):
         return torch
 
     def _probe_free(self, torch):
-        """The free device memory at a probed step's peak: the free memory when the model's step returned, less what
-        torch reserved during the step beyond what it holds then. Read before the step's end frames: a plugin whose
-        memory follows the requests takes back there what the step no longer needs."""
+        """(the free device memory at a probed step's peak, the memory outside the engine then): the free memory when
+        the model's step returned, less what torch reserved during the step beyond what it holds then, and what
+        crit_plugins.memory's other() counts at that reading (the driver, other programs). Read before the step's end
+        frames: a plugin whose memory follows the requests takes back there what the step no longer needs."""
         if torch is None:
             return None
         memory = memory_of("cuda")
-        return int(memory.free() - max(0, memory.peak() - memory.torch()["reserved"]))
+        free, state = memory.free(), memory.torch()
+        return int(free - max(0, memory.peak() - state["reserved"])), memory.other(free, state)
 
     def _probe_end(self, torch, kind, started, free, made=None, parts=None):
-        """At a probed step's end: its seconds with its device work finished, the free device memory at its peak
-        (_probe_free) and the device allocations it made, kept per kind. parts: the seconds the step's begin frames
+        """At a probed step's end: its seconds with its device work finished, the free device memory at its peak and
+        the memory outside the engine (`free`: _probe_free's pair, or None) and the device allocations it made, kept
+        per kind. parts: the seconds the step's begin frames
         and the model's step took on the host; the slowest step's are kept with what was left of it (its end frames
         and the device work still queued then), so a step past the cancel grace says which part took it there."""
         if torch is not None:
@@ -1062,9 +1183,10 @@ class StepEngine(_Runtime):
         if made is not None:
             found["allocations"] = found.get("allocations", 0) + made
             found["most_allocations"] = max(found.get("most_allocations", 0), made)
+        free, outside = free if free is not None else (None, None)
         if free is not None:
             found["min_free_device_bytes"] = min(found.get("min_free_device_bytes", free), free)
-        found["recent"].append((seconds, free))
+        found["recent"].append((seconds, free, outside))
 
     def _step(self, _user, rows, count, progress, tokens, logprobs, top_ids, top_logprobs):
         def run():
@@ -1094,7 +1216,8 @@ class StepEngine(_Runtime):
             results = free = None
             entered = stepped = time.perf_counter()
             try:
-                results = self.model.step(scheduled)
+                with self._step_pool():
+                    results = self.model.step(scheduled)
                 if not isinstance(results, (list, tuple)):
                     results = list(results)
             finally:
@@ -1108,6 +1231,8 @@ class StepEngine(_Runtime):
                         end(prompts_open)
                 if audited is not None:
                     audited()
+            if self._timed is not None and prompt_tokens:
+                self._timed(stepped - entered)
             if len(results) != count:
                 raise ValueError(f"step returned {len(results)} results for {count} rows")
             kind = "prompt" if any(row.prefill_tokens for row in scheduled) else "decode"
@@ -1161,9 +1286,18 @@ class StepEngine(_Runtime):
     def _commit(self, _user, decisions, count):
         def run():
             found = list(_DECISION.iter_unpack(ctypes.string_at(decisions, count * _DECISION.size)))
+            rounds = self.rounds
+            # After a native round Core reads no step(): a constrained row's token is the round's, under the mask
+            # staged for its slot (NativeRounds.stage), and is checked as a step's is.
+            native = self._constrained and rounds is not None and rounds.stage is not None and rounds.last[2]
             for session, accepted, terminal, cancelled in found if self._constrained else ():
                 holder = self._constrained.get(session)
-                if holder is None or holder.pending is None:
+                if holder is None:
+                    continue
+                if native:
+                    slot = rounds.slot_of(session)
+                    self._check(session, rounds.emitted(slot) if slot is not None else [])
+                if holder.pending is None:
                     continue
                 token, holder.pending = holder.pending, None
                 if accepted and not (terminal or cancelled) and holder.failure is None:
@@ -1176,7 +1310,26 @@ class StepEngine(_Runtime):
                 self.model.commit([tuple.__new__(StepDecision, (sessions[session], accepted, terminal != 0,
                                                                 cancelled != 0))
                                    for session, accepted, terminal, cancelled in found])
+            if self._constrained and rounds is not None and rounds.stage is not None:
+                self._stage([session for session, _, terminal, cancelled in found if not (terminal or cancelled)])
         return self._guard(run)
+
+    def _stage(self, sessions):
+        """Stages the next allowed set of each constrained session of `sessions` that sits in a round slot (after the
+        model's commit or retire, which bind and move slots), so the next native round masks it: the mask of round
+        n + 1 follows round n's token, which Core's commit callback has just appended, and nothing runs on the host
+        inside a round. A session whose constraint failed or cannot continue is staged nothing (its request ends with
+        its failure, its tokens unpublished)."""
+        rounds = self.rounds
+        for session in sessions:
+            if session not in self._constrained:
+                continue
+            slot = rounds.slot_of(session)
+            if slot is None:
+                continue
+            allowed = self._mask(session)
+            if allowed is not None:
+                rounds.stage(slot, allowed)
 
     def _facts(self, _user, session, core, out, capacity):
         """The retiring session's facts for its result: Core's (`core`) with the model's request_facts(session)
@@ -1200,6 +1353,11 @@ class StepEngine(_Runtime):
         ctypes.memmove(out, data + b"\0", len(data) + 1)
         return len(data)
 
+    def _step_pool(self):
+        """The device's step pool for a step's tensors (crit_plugins.memory's step_pool), or nothing to enter."""
+        import contextlib
+        return self._memory.step_pool() if self._memory is not None else contextlib.nullcontext()
+
     def ask_step(self):
         """The next decode step runs the model's step() although a native round could run it (any thread): Core's
         code that only runs in a step gets its turn between two rounds. Nothing without native rounds, where every
@@ -1221,12 +1379,14 @@ class StepEngine(_Runtime):
         what was left, its end frames with the device work still queued), the least free device memory at a step's peak (torch's reservations; CUDA only), the device
         allocations the steps made and the most one made ("allocations", "most_allocations": 0 for steps that only
         replay captured graphs; CUDA only), and "recent": the
-        last PROBE_RECENT steps' [seconds, free bytes or None], so a caller can judge the steps of one request (those
-        past the count it read before). Probing waits
+        last PROBE_RECENT steps' [seconds, free bytes at the peak or None, the bytes outside the engine then or None
+        (crit_plugins.memory's other(): the driver, other programs)], so a caller can judge the steps of one request
+        (those past the count it read before) by the engine's memory alone. Probing waits
         on the device at every step's start and end, so only checks turn it on; Core's native rounds are not probed.
         It may run on another thread while the engine steps (docs/PLUGINS.md, Facts and telemetry: a plugin's
         telemetry() reads its counters and does not wait on the device)."""
-        found = dict(self._telemetry() or {}) if self._telemetry is not None else {}
+        with self._scope():
+            found = dict(self._telemetry() or {}) if self._telemetry is not None else {}
         counted = self._counted
         native = self.rounds.runs if getattr(self, "rounds", None) is not None else (0, 0, 0)
         found["core"] = {**(found.get("core") or {}), "steps": counted["steps"] + native[0],
@@ -1236,6 +1396,11 @@ class StepEngine(_Runtime):
                          "step_seconds": round(counted["step_s"], 6)}
         if counted.get("nonfinite_requests"):   # requests failed for logits that were not finite
             found["core"]["nonfinite_requests"] = counted["nonfinite_requests"]
+        if counted.get("drafts"):   # the drafting of the requests served so far (count_drafts)
+            drafts = dict(counted["drafts"])
+            if not drafts.pop("drafted_known"):
+                drafts["drafted"] = None
+            found["core"]["drafts"] = drafts
         if self._probed is not None:
             found["core"]["probe"] = {kind: {**value, "recent": [list(sample) for sample in value["recent"]]}
                                       for kind, value in list(self._probed.items())}
@@ -1247,6 +1412,10 @@ class StepEngine(_Runtime):
                 self.audit.retire()
             if callable(getattr(self.model, "retire", None)):
                 self.model.retire(self._sessions[session], FINISHES[finish])
+            rounds = self.rounds
+            if self._constrained and rounds is not None and rounds.stage is not None:
+                # The model's retire may move a constrained session to the retired one's slot: its mask follows.
+                self._stage([s for s in self._constrained if s != session])
         return self._guard(run)
 
     def _release(self, _user, session):
@@ -1264,8 +1433,9 @@ class StepEngine(_Runtime):
             for begin in self._begin:   # a score runs its text through the prompt path
                 begin(count, score=True)
             try:
-                scored = self.model.score(ids[:count], first_target, (path or b"").decode("utf-8"), queries=rows,
-                                          top_k=top_k)
+                with self._step_pool():
+                    scored = self.model.score(ids[:count], first_target, (path or b"").decode("utf-8"), queries=rows,
+                                              top_k=top_k)
             finally:
                 for end in self._end:
                     end(False)
@@ -1293,10 +1463,11 @@ class StepEngine(_Runtime):
             self._matchers.close()
             self._matchers = None
         if self.model is not None:
-            if self._close_parts is not None:
-                self._close_parts()
-            elif callable(getattr(self.model, "close", None)):
-                self.model.close()
+            with self._scope():
+                if self._close_parts is not None:
+                    self._close_parts()
+                elif callable(getattr(self.model, "close", None)):
+                    self.model.close()
             self.model = self._telemetry = self._request_facts = self.audit = None
             self.plugins = {}
             self._sessions.clear()

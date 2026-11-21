@@ -75,7 +75,7 @@ LADDER = (24, 96, 192, 400, 1600, 6400)   # prompt_ladder's prompt lengths in to
 LADDER_SLACK = 0.9         # a rung's prefill rate against the rung's before it: under this share of it fails
 PRECHECKS = 3              # with --spread: crit-eval's gate pre-check, run this often in one load
 CANCEL_AFTER_S = 1.5       # a cancel this far into a long prompt's prefill
-GRACE_S = 1.0              # crit serve's cancel grace (crit_api.residency.CANCEL_GRACE_SECONDS)
+from crit_plugins.steps import GRACE as GRACE_S   # noqa: E402 - Core's cancel grace, crit serve's (crit_api.residency)
 # Gates a cut model cannot pass: they judge its text against a full model's.
 CUT_MODEL_GATES = {
     "smoke_fluent": "judges perplexity against a working model's text; a cut model's text is nonsense",
@@ -213,7 +213,7 @@ def selection(model):
     (model-template refuses another), the lookup tables are placed off the device (the n-gram table is larger than
     the device), and the drafter is the draft layer's chain."""
     use = {"model": "model-template", "placement": "device-placement", "projections": "quantized-projections",
-           "attention": "partitioned-attention", "kv_cache": "attention-state", "sampler": "token-sampling",
+           "attention": "partitioned-attention", "kv_cache": "attention-state", "sampler": "token-constraints",
            "norms": "fused-norms", "embeddings": "lookup-table-rows", "recurrence": "sequential-recurrence",
            "router": "topk-router", "experts": "expert-offload", "expert_source": "expert-tensors",
            "drafter": "greedy-head-drafter"}
@@ -227,7 +227,7 @@ def selection(model):
 
 
 PLUGINS = ["model-template", "device-placement", "quantized-projections", "partitioned-attention", "attention-state",
-           "token-sampling", "fused-norms", "lookup-table-rows", "sequential-recurrence", "topk-router",
+           "token-constraints", "fused-norms", "lookup-table-rows", "sequential-recurrence", "topk-router",
            "expert-offload", "expert-tensors", "greedy-head-drafter", "mtp-decode"]
 
 
@@ -468,12 +468,32 @@ def in_load(report, prefix, served, port, extras, cut=True):
         chat.port = port
     if "lower" in extras:
         with report.scenario(prefix + f"reopen_at_{LOWER_CONTEXT // 1024}k") as found:
+            before = reserved_ranges(served)
             _, _, port2 = served.open(LOWER_CONTEXT)
             data, seconds = Chat(port2).chat(words(CONTEXT_32K - 512), 8)
             _, _, port = served.open()
             chat.port = port
-            found["detail"] = f"reopened at {LOWER_CONTEXT:,} tokens, a 32k prompt in {seconds:.1f} s"
+            after = reserved_ranges(served)
+            found["detail"] = (f"reopened at {LOWER_CONTEXT:,} tokens, a 32k prompt in {seconds:.1f} s; the device's "
+                               f"elastic ranges {sum(before.values()) >> 20:,} MiB before, "
+                               f"{sum(after.values()) >> 20:,} MiB after reopening at the first context")
+            # The engine reopened as it was holds the ranges it held: more means a closed engine's ranges outlived it
+            # (the Flash-Next build's pool leak: its plugins never closed their pools, the device's registry kept them).
+            if not before:   # the engine reports no elastic range: nothing to compare, not a pass
+                found["state"] = "failed"
+                found["detail"] += "; the engine's telemetry names no elastic range (memory.elastic)"
+            elif sum(after.values()) > sum(before.values()):
+                found["state"] = "failed"
+                found["detail"] += "; left by the closed engines: " + ", ".join(sorted(set(after) - set(before)))
     return chat.port
+
+
+def reserved_ranges(served):
+    """The served engine's elastic ranges: owner/name -> its reserved bytes, from its telemetry (memory.elastic, its
+    resident host's crit_plugins.memory report). Not this process's: the engine runs in crit serve's host."""
+    engine = served.current[0] if served.current else None
+    elastic = (((engine.telemetry() if engine is not None else {}) or {}).get("memory") or {}).get("elastic") or {}
+    return {key: int(value.get("reserved") or 0) for key, value in elastic.items()}
 
 
 def served_configuration(served):
@@ -490,7 +510,7 @@ def precheck_spread(report, prefix, served, store, run_id, data, port, count):
     runs = []
     for number in range(count):
         began = time.perf_counter()
-        items = _precheck(served, run, data, port, log=lambda line: None)
+        items = _precheck(served, run, store.directory(run_id), data, port, log=lambda line: None)
         runs.append(items)
         for item in items:
             report.add(f"{prefix}precheck#{number + 1}/{item['name']}", item["state"], time.perf_counter() - began,
@@ -619,7 +639,8 @@ def plan_loads(checkpoints, only, tier="full", spread=False, arithmetic=False):
 
     full (before an engine build or a release): every cut checkpoint in both modes at every pressure, and the whole
     checkpoint once (speed, no ballast: its experts exceed the device as they are), with the ladder. The first
-    checkpoint's speed load also drafts through the drafter seam and its preserve load runs the pre-check; the
+    checkpoint's speed load also drafts through the drafter seam and reopens at a lower context and back (in both
+    tiers), and its preserve load runs the pre-check; the
     pressure loads and the deep cut run smoke once, at the run's context ("smoke": in the load, no reopen); the deep
     cut also measures each prompt arithmetic with the CPU tier computing decode misses where `arithmetic` asks (its
     expert store, built in host memory at every load, takes ten minutes).
@@ -639,7 +660,9 @@ def plan_loads(checkpoints, only, tier="full", spread=False, arithmetic=False):
                 if arithmetic:   # its 23 GB expert store is built in host memory: ten minutes a load
                     loads.append((name, "speed", "tight", {"short", "cancel", "smoke", "arithmetic"}, False))
             continue
-        first = ({"drafting"} | ({"spread"} if spread else set())) if n == 0 else set()
+        # The first checkpoint's speed load also reopens at a lower context and back (reopen_at_64k: a closed
+        # engine's elastic ranges must not outlive it), in both tiers: one reopen and a 32k prompt.
+        first = ({"drafting", "lower"} | ({"spread"} if spread else set())) if n == 0 else set()
         loads.append((name, "speed", "natural", {"short", "32k", "cancel"} | ({"precheck"} if n == 0 or tier == "full"
                                                                            else set()) | first, n == 0))
         if tier == "quick":

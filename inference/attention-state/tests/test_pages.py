@@ -164,6 +164,22 @@ class ElasticKVPoolTests(KVPoolTests):
         _, c_keys, _ = self.step(pool, device, [("c", 0, 9000)], seed=7)   # the pages backed again come usable
         self.assertTrue(self.torch.equal(pool.gather(3, "c", 9000)[0].cpu(), c_keys.cpu()))
 
+    def test_closing_the_plugin_gives_every_pools_range_back_to_the_device(self):
+        # The Flash-Next build's leak: the device's registry of ranges kept a closed engine's pools, so an engine
+        # reopened in the same process (crit serve's reload, Eval's lower-context engine) started with less memory.
+        from crit_plugins import memory
+        if self.device() != "cuda" or not memory.of("cuda").elastic_ranges:
+            self.skipTest("an elastic range is the CUDA driver's")
+        kv = self.assemble(options={"page": 16, "elastic": True})["kv_cache"]
+        pools = [kv.pool([0, 3], 2, 4, 256, "cuda", "fp32") for _ in range(2)]
+        ranges = [pool.elastic.range for pool in pools]
+        device = memory.of(pools[0].device)
+        self.assertEqual(sum(made in ranges for made in device.ranges.values()), 2)
+        kv.close()
+        self.assertFalse([key for key, made in device.ranges.items() if made in ranges])
+        self.assertTrue(all(pool.elastic is None for pool in pools) and all(not made.base for made in ranges))
+        kv.close()   # a second close finds nothing left
+
     def test_host_memory_holds_the_pages_the_device_cannot_and_every_row_reads_the_same(self):
         from unittest import mock
         from crit_plugins import memory

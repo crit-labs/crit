@@ -422,6 +422,19 @@ class RateWidth:
 WIDTH_POLICIES = {"fixed": FixedWidth, "step": StepWidth, "rate": RateWidth}
 
 
+UNCAPTURED = 1e30   # a recorded round time where no round of that row count and width is captured (JSON has no inf)
+
+
+def _recorded(table):
+    """A round-time table as a decision records it: inf as UNCAPTURED."""
+    return [[UNCAPTURED if v == float("inf") else float(v) for v in row] for row in table]
+
+
+def _timed(table):
+    """A recorded round-time table back as times: UNCAPTURED as inf."""
+    return [[float("inf") if float(v) >= UNCAPTURED else float(v) for v in row] for row in table]
+
+
 def fitted_costs(table, widths):
     """A calibration table [rows][widths] (ms, inf where not captured) fitted per row count by least squares as
     a + b x (width + 1), floored at the smallest time measured for that row count: a round's cost grows with its
@@ -1044,7 +1057,8 @@ class SpeculativeRounds:
         model's commit() only for rows it trims, ends or cancels; adopt(rows, width) before truncate()
         then. Core launches each round in its log-probability form when a row's request asks for log-probabilities
         or replays a continuation, else in its plain form (the module's docstring, Forms), each form's graph
-        captured."""
+        captured. Rounds whose sampler masks (Rounds.masks) take constrained requests: Core stages each one's next
+        allowed set between rounds (stage_allowed), and commit() then follows every round that ran one."""
         from crit_core.native import NativeRounds
         graphs = {logprobs: {(rows, width): graph.raw_cuda_graph_exec()
                              for (rows, width, graph_mode, form), graph in self.graphs.items()
@@ -1059,7 +1073,8 @@ class SpeculativeRounds:
         self.width_table.copy_(self.torch.tensor(table, dtype=self.torch.int32))
         self.host_widths.copy_(self.width_table.cpu())
         self._native_mode = mode
-        stream = self.torch.cuda.current_stream(self.device).cuda_stream
+        self._native_stream = self.torch.cuda.current_stream(self.device)
+        stream = self._native_stream.cuda_stream
         # The rounds' log-probabilities of their emitted tokens (logprobs=), which Core gives the requests that ask.
         ranked = dict(logprobs=self.host_logprobs.data_ptr(), top=self.top,
                       top_ids=self.host_top_ids.data_ptr() if self.top else 0,
@@ -1068,7 +1083,11 @@ class SpeculativeRounds:
         return NativeRounds.cuda(library, stream, graphs[False], self.host.data_ptr(), self.host.shape[1],
                                  self.host.element_size(), self.rows, self.widest, self.host_widths.data_ptr(),
                                  max([w for _, w in needed] or [0]), telemetry=self.words_at,
-                                 counters=len(self.counter_names), logprob_graphs=graphs.get(True), **ranked)
+                                 counters=len(self.counter_names), logprob_graphs=graphs.get(True),
+                                 stage=self.stage_allowed if self.masks else None, **ranked)
+
+    # Whether the rounds mask a constrained request's slot (Rounds.masks); an engine's own hooks do not.
+    masks = False
 
     def _native_graphs(self, widths):
         """The (rows, width) rounds native rounds over `widths` may run: each row count given a width at it and at
@@ -1099,6 +1118,24 @@ class SpeculativeRounds:
         torch = self.torch
         if self.device.type != "cuda":
             raise ValueError("calibrating times captured rounds: a CUDA device")
+        # A measured decision (crit_plugins.decisions): the round times a width policy chooses from are recorded with
+        # the package and replayed, so a reopen at another context decodes at the widths the package was measured at.
+        from crit_plugins import decisions
+        key = {"device": torch.cuda.get_device_name(self.device), "rows": self.rows, "widths": list(self.round_widths),
+               "mode": mode, "graphs": sorted([r, w] for (r, w, m, lp) in self.graphs if m == mode and not lp)}
+        table = decisions.settle("rounds", f"width-costs:{mode}", key=key,
+                                 measure=lambda: {"table": _recorded(self._time_rounds(mode, repeats, trials))},
+                                 decide=lambda found: _recorded(fitted_costs(_timed(found["table"]),
+                                                                             self.round_widths)))
+        table = _timed(table)
+        costs = _method(self.width_policy, "set_costs")
+        if costs is not None:
+            costs(table)
+        return table
+
+    def _time_rounds(self, mode, repeats, trials):
+        """The raw times of calibrate(): [rows][widths] in ms, inf where no round is captured."""
+        torch = self.torch
         saved = {name: tensor.clone() for name, tensor in self._state().items()}
         table = [[float("inf")] * len(self.round_widths) for _ in range(self.rows)]
         start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
@@ -1120,10 +1157,6 @@ class SpeculativeRounds:
             tensor.copy_(saved[name])
         self._reset()
         torch.cuda.synchronize(self.device)
-        table = fitted_costs(table, self.round_widths)
-        costs = _method(self.width_policy, "set_costs")
-        if costs is not None:
-            costs(table)
         return table
 
     def adopt(self, rows, width):
@@ -1349,6 +1382,26 @@ class Rounds(SpeculativeRounds):
             self.native.unbind(source)
             if session is not None:
                 self.native.bind(target, session)
+
+    @property
+    def masks(self):
+        """Whether the rounds mask a constrained request's slot by its allowed set (the sampler's stage_mask), so a
+        model plugin may bind constrained requests (plain, width 0) and Core runs them natively."""
+        return _method(self.sampler, "stage_mask") is not None
+
+    def stage_allowed(self, slot, allowed):
+        """The allowed set (crit_plugins.Allowed) of the next token of the constrained request in slot `slot`, in the
+        sampler's round buffers on the rounds' stream: Core's step engine calls it between rounds (NativeRounds'
+        stage), after the request's matcher took the last round's token. The slot's params keep it, so a move()
+        stages it in the target slot."""
+        sequence, capacity, session, params = self.bound[slot]
+        self.bound[slot] = (sequence, capacity, session, {**(params or {}), "allowed": allowed})
+        stream = getattr(self, "_native_stream", None)
+        if stream is not None and self.device.type == "cuda":
+            with self.torch.cuda.stream(stream):
+                self.sampler.stage_mask(slot, allowed)
+        else:
+            self.sampler.stage_mask(slot, allowed)
 
     # The round ------------------------------------------------------------------------------------------------------
 

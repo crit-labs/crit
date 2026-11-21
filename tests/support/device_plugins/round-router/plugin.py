@@ -1,18 +1,7 @@
 """A test stand-in for the router slot's round form (rounds:router), which topk-router also provides: the
 package's topk-router in every respect, its device selection the same rule over the router logits with nothing read
 back to the host (topk-router first checks the logits finite on the host, which a captured round cannot do)."""
-from pathlib import Path
-
-from crit_plugins import Registry
-from crit_plugins.assemble import load_module
-from crit_plugins.manifest import options_for
-
-
-def library_plugin(context, plugin_id, parts, options=None):
-    """The package's plugin `plugin_id` (copied in beside this stand-in), created as Core's loader creates a plugin."""
-    manifest = Registry.discover(Path(context.package) / "plugins")[plugin_id]
-    factory = getattr(load_module(manifest), manifest["entry"][1])
-    return factory(context, options_for(manifest, options or {}, f"plugins.options.{plugin_id}"), parts)
+from crit_plugins.compose import package_plugin
 
 
 class RoundRouter:
@@ -50,4 +39,4 @@ class RoundRouter:
 
 def create(context, options, parts):
     inner = {k: options[k] for k in ("score_before_selection", "renormalize")}
-    return RoundRouter(library_plugin(context, options["inner"], parts, inner))
+    return RoundRouter(package_plugin(context, options["inner"], parts, inner))

@@ -35,8 +35,8 @@ from crit_core.native import NativeError, StepEngine
 from crit_core.serving import (ENGINE_FACTS, EXPERT_FACTS, REQUEST_FACTS, SAMPLING, TOP_LOGPROBS, PreparedPrompt,
                                RequestRejected, ResidentChat, ScoreRows, image_parts)
 from crit_core.serving import capabilities as serving_capabilities
-from crit_plugins import IMAGES, Image, PluginError, Registry, assemble, check, decisions, model_problems
-from crit_plugins.assemble import exactness_shortfalls, normalize
+from crit_plugins import IMAGES, Image, PluginError, Registry, assemble, check, model_problems
+from crit_plugins.assemble import exactness_shortfalls, normalize, resolution_problems, resolve as resolve_selection
 from crit_plugins.host import current as host_of
 from crit_plugins.memory import device_bytes, device_memory, of as memory_of, release_cached
 from crit_plugins.manifest import HOST, POLICY_SLOTS
@@ -56,11 +56,11 @@ SPECULATIVE_SLOTS = ("drafter", "verifier")
 # The penalties at the values that change nothing, for requests that must not take an engine's defaults (Eval's).
 NEUTRAL_PENALTIES = {"presence_penalty": 0.0, "frequency_penalty": 0.0, "repetition_penalty": 1.0}
 # Engine info facts the eval-v1 adapter passes on (crit-eval's docs/ADAPTER.md): crit serve's engine facts
-# (crit_core.serving.ENGINE_FACTS) but speculative and plain, which the adapter states itself, and what only an
-# in-process adapter reports: kernel classes and the configuration overrides of --attribute-drift and of a
-# wider-draft probe.
-FACTS = tuple(key for key in ENGINE_FACTS if key not in ("speculative", "plain")) + ("kernel_work", "exact_variants",
-                                                                                   "wider_draft")
+# (crit_core.serving.ENGINE_FACTS) but speculative and plain, which the adapter states itself, and decode_via_prompt,
+# a served score's debug option, and what only an in-process adapter reports: kernel classes and the configuration
+# overrides of --attribute-drift and of a wider-draft probe.
+FACTS = tuple(key for key in ENGINE_FACTS if key not in ("speculative", "plain", "decode_via_prompt")) + (
+    "kernel_work", "exact_variants", "wider_draft")
 
 
 def read_configuration(package):
@@ -76,76 +76,160 @@ def read_configuration(package):
     return value
 
 
-def package_tuning(package, configuration):
+def tuning_of(package, configuration):
     """The kernel tuning a package carries: configuration "kernel_tuning", a folder of crit kernels sweep's tables
-    inside the package (relative to it), which the kernels the plugins build use (crit_plugins.kernels.use_tuning)
-    before any plugin is made, so the package served is the package Eval measured; without it CRIT_KERNEL_TUNING, else
-    the kernels' default knobs. Returns the folder or None."""
-    from crit_plugins.kernels import use_tuning
+    inside the package (relative to it), which the kernels the engine's plugins build use (its policy's tuning,
+    crit_plugins.policy), so the package served is the package Eval measured; without it CRIT_KERNEL_TUNING, else
+    the kernels' default knobs. Returns the folder or None; PluginError for a folder that is not one inside it."""
     name = configuration.get("kernel_tuning")
     if name is None:
-        use_tuning(None)
         return None
     folder = (Path(package) / str(name)).resolve()
     if not isinstance(name, str) or not folder.is_dir() or not folder.is_relative_to(Path(package).resolve()):
         raise PluginError(f"kernel_tuning {name!r} is a folder of tuning tables inside the package (crit kernels sweep "
                           "--out), relative to it")
-    use_tuning(folder)
     return folder
 
 
-def package_decisions(package, configuration):
+def decisions_of(package, configuration):
     """The decisions record a package carries: configuration "decisions", a file inside the package (relative to
-    it) that `crit plugins decisions` wrote, from which the plugins settle the choices they would otherwise time at
-    load (crit_plugins.decisions.use_record), so every process of the package decides alike; without it
-    CRIT_DECISIONS, else every load measures. Returns the file or None."""
-    from crit_plugins.decisions import use_record
+    it) that `crit plugins decisions` wrote, from which the engine's plugins settle the choices they would otherwise
+    time at load (its policy's record, crit_plugins.decisions), so every process of the package decides alike;
+    without it CRIT_DECISIONS, else every load measures. Returns the file or None; PluginError for a file that is not
+    one inside it."""
     name = configuration.get("decisions")
     if name is None:
-        use_record(None)
         return None
     path = (Path(package) / str(name)).resolve()
     if not isinstance(name, str) or not path.is_file() or not path.is_relative_to(Path(package).resolve()):
         raise PluginError(f"decisions {name!r} is a decisions record inside the package (crit plugins decisions "
                           "writes it), relative to it")
+    return path
+
+
+def policy_of(package, configuration, cache=None):
+    """The engine's policy (crit_plugins.policy.Policy): what its configuration asks of its plugins (the kernel
+    tuning, the decisions record, the exactness, the quality mode, the prompt activations) and the folder for files
+    its plugins can build again (`cache`, else the PLUGIN_CACHE environment variable's). Core's loader makes one for
+    every engine and activates it around every call into the engine's plugins, so two engines in one process never
+    see each other's. PluginError for a configuration that asks what does not exist."""
+    from crit_plugins.policy import Policy
+    if cache is None and os.environ.get(PLUGIN_CACHE):
+        cache = os.environ[PLUGIN_CACHE]
+    return Policy(tuning=tuning_of(package, configuration), exactness=exactness_levels(configuration),
+                  quality_mode=quality_mode_of(configuration), activations=activations_of(configuration),
+                  decisions=decisions_of(package, configuration), cache=cache)
+
+
+def package_tuning(package, configuration):
+    """tuning_of(), told to the active engine's (else the process's) policy (crit_plugins.kernels.use_tuning).
+    Returns the folder or None."""
+    from crit_plugins.kernels import use_tuning
+    folder = tuning_of(package, configuration)
+    use_tuning(folder)
+    return folder
+
+
+def package_decisions(package, configuration):
+    """decisions_of(), told to the active engine's (else the process's) policy (crit_plugins.decisions.use_record).
+    Returns the file or None."""
+    from crit_plugins.decisions import use_record
+    path = decisions_of(package, configuration)
     use_record(path)
     return path
 
 
 def exactness_levels(configuration):
     """The exactness a configuration asks of its engine's rows, {"decode": level, "prompt": level}, or None where it
-    asks nothing: configuration "exactness", one of crit_kernels.exactness's levels (declared, exact, row-exact,
-    repeatable) for both phases, or a level for each. PluginError for anything else."""
-    value = configuration.get("exactness")
-    if value is None:
+    asks nothing: configuration "exactness", one of Core's levels (crit_plugins.exactness: declared, exact,
+    row-exact, repeatable) for both phases, or a level for each, and for a phase it leaves out the level of the
+    quality mode it states (crit_plugins.exactness.for_quality_mode: exact in both modes). This is the one resolution
+    of the levels:
+    crit run completes a candidate's configuration with it, and Core's loader asks what it gives, so an engine loaded
+    anywhere (crit serve, Eval, a package made outside a run) asks the levels its mode asks. PluginError for anything
+    else."""
+    value, mode = configuration.get("exactness"), quality_mode_of(configuration)
+    if value is None and mode is None:
         return None
-    if not isinstance(value, (str, dict)):
+    if value is not None and not isinstance(value, (str, dict)):
         raise PluginError('configuration "exactness" is a level (declared, exact, row-exact, repeatable) or '
                           '{"decode": level, "prompt": level}')
+    from crit_plugins.exactness import setting
     try:
-        from crit_kernels.exactness import setting
-        return setting(value)
+        return setting(value, mode)
     except ValueError as error:
         raise PluginError(f'configuration "exactness": {error}') from None
-    except ImportError:
-        raise PluginError('configuration "exactness" needs crit\'s kernels package (crit_kernels), which is not '
-                          "installed") from None
 
 
 def package_exactness(configuration):
-    """The exactness a package asks of its rows (exactness_levels), told to the plugins before any is made
-    (crit_plugins.kernels.use_exactness): a plugin that can compute a phase's rows in more than one way takes its
-    fastest that keeps the level asked (asks), and the loader refuses the engine where one keeps less. Without it
-    the engine asks nothing and every plugin's options decide alone. Returns the levels asked or None."""
+    """The exactness a package asks of its rows (exactness_levels: its own, else its quality mode's), told to the
+    active engine's (else the process's) policy (crit_plugins.kernels.use_exactness): a plugin that can compute a phase's rows in more
+    than one way takes its fastest that keeps the level asked (asks), and the loader refuses the engine where one
+    keeps less. A configuration that states neither asks nothing, and every plugin's options decide alone. Returns
+    the levels asked or None."""
     from crit_plugins.kernels import use_exactness
     return use_exactness(exactness_levels(configuration))
+
+
+def activations_of(configuration):
+    """The prompt activations a configuration asks its engine to serve (configuration "prompt_activations": what
+    the build plan declared, crit_core.serving.prompt_activations' form), or None where it asks none. PluginError for
+    another value."""
+    value = configuration.get("prompt_activations")
+    if value is None:
+        return None
+    from .serving import PROMPT_ACTIVATIONS, prompt_activations
+    if not prompt_activations(value):
+        raise PluginError(f'configuration "prompt_activations" is one of {", ".join(PROMPT_ACTIVATIONS)} for every '
+                          'quantized format, or one per stored format ({"nvfp4": "stored", "fp8": "fp8"}), not '
+                          f"{value!r}")
+    return value
+
+
+def headroom_of(configuration):
+    """The device memory an engine's givers leave free at every moment (crit_plugins.memory's headroom): the
+    configuration's vram_headroom_bytes, the run's VRAM headroom, which crit run writes into every candidate; Core's
+    default (crit_plugins.memory.HEADROOM, which crit run and crit Eval take too) where it names none. PluginError for another
+    value."""
+    from crit_plugins.memory import HEADROOM
+    value = configuration.get("vram_headroom_bytes")
+    if value is None:
+        return HEADROOM
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise PluginError(f'configuration "vram_headroom_bytes" is the device memory left free at every moment, in '
+                          f"bytes (an integer, 0 or more), not {value!r}")
+    return value
+
+
+def package_activations(configuration):
+    """The prompt activations a package asks (activations_of), told to the active engine's (else the process's)
+    policy (crit_plugins.kernels.use_activations): a projections plugin whose activation option for a format is left to
+    choose takes the one asked, and the loader refuses the engine where its facts serve others
+    (activation_problems). Returns the value or None."""
+    from crit_plugins.kernels import use_activations
+    return use_activations(activations_of(configuration))
+
+
+def activation_problems(asked, facts):
+    """Why an engine does not serve the prompt activations its configuration asks, or []: `facts` are the engine's
+    (its model's info over its plugins' facts), whose prompt_activations say per stored format what its prompt rows
+    multiply (an engine that states none multiplies no quantized format's rows)."""
+    from .serving import activations_served
+    served = facts.get("prompt_activations")
+    if asked is None or activations_served(asked, served):
+        return []
+    chosen = facts.get("chosen") or {}
+    why = f" ({'; '.join(f'{k}: {v}' for k, v in chosen.items())})" if chosen else ""
+    return [f"its prompt rows multiply {json.dumps(served, sort_keys=True)}{why} where the configuration asks "
+            f"{json.dumps(asked, sort_keys=True)} (prompt_activations: what the build plan declared): set the "
+            "projections plugin's activation options to what is asked, or plan the activations it serves"]
 
 
 def quality_mode_of(configuration):
     """The quality mode a configuration states, "speed" or "preserve" (configuration "quality_mode": the mode of the
     run that built the engine, which crit run writes into every candidate), or None where it states none.
     PluginError for anything else."""
-    from crit_plugins.kernels import QUALITY_MODES
+    from crit_plugins.exactness import QUALITY_MODES
     mode = configuration.get("quality_mode")
     if mode is not None and mode not in QUALITY_MODES:
         raise PluginError(f'configuration "quality_mode" is one of {", ".join(QUALITY_MODES)}, not {mode!r}')
@@ -153,7 +237,7 @@ def quality_mode_of(configuration):
 
 
 def package_quality_mode(configuration):
-    """The quality mode a package states (quality_mode_of), told to the plugins before any is made
+    """The quality mode a package states (quality_mode_of), told to the active engine's (else the process's) policy
     (crit_plugins.kernels.use_quality_mode): a plugin whose precision option is left to choose takes the lower
     precision the speed mode starts from (an output head in FP8), and the stored precision in preserve. Without it
     every such option keeps the stored precision. Returns the mode or None."""
@@ -330,9 +414,49 @@ def check_package(package, model, configuration=None, device=None, probe=None):
     configuration = read_configuration(package) if configuration is None else configuration
     exactness_levels(configuration)
     quality_mode_of(configuration)
+    activations_of(configuration)
+    headroom_of(configuration)
     chosen, registry = selection(configuration), registry_of(package)
     device = device or engine_device(registry, chosen["use"], configuration)
     return check(chosen, registry, architecture_facts(model) + machine_facts(device, probe), device=device)
+
+
+class DryContext:
+    """What a plugin's resolve() gets as `context` outside a load (resolve_package): LoadContext's description of
+    the engine (package, model, config, configuration, context_tokens, device, speculative, model_file) without its
+    services: no device memory, scratch, graphs or host, since nothing is made."""
+
+    serving = cache = None
+
+    def __init__(self, package, model, configuration, context_tokens=None, device=DEVICE, speculative=True):
+        self.package, self.model = Path(package), Path(model)
+        self.config = model_config(self.model)
+        self.configuration = dict(configuration)
+        self.policy = policy_of(self.package, self.configuration)   # what the engine's plugins would be given
+        self.context_tokens = int(context_tokens) if context_tokens else None
+        self.device, self.speculative = device, bool(speculative)
+
+    def model_file(self, name):
+        return self.model / name
+
+    def working(self, what, done=None, total=None):
+        pass
+
+
+def resolve_package(package, model, configuration=None, *, context_tokens=None, speculative=True, device=None,
+                    probe=None):
+    """What a package's engine for `model` will state of itself, before any load: check_package's checks, then each
+    selected plugin's resolve() (crit_plugins.assemble.resolve) over a DryContext, the checkpoint's headers read and
+    no weight, no device touched. Returns {"facts": {key: value}, "by": {key: plugin}}: the loader holds the loaded
+    engine to it, and crit run checks a candidate's plan against it before any load (kv_bytes_per_token)."""
+    configuration = read_configuration(package) if configuration is None else configuration
+    chosen, registry = selection(configuration, speculative), registry_of(package)
+    device = device or engine_device(registry, chosen["use"], configuration)
+    use, order, options = check(chosen, registry, architecture_facts(model) + machine_facts(device, probe),
+                                device=device)
+    context = DryContext(package, model, configuration, context_tokens, device, speculative)
+    with context.policy.active():
+        return resolve_selection(registry, use, order, options, context)
 
 
 def sampling_fields(registry, use):
@@ -357,9 +481,43 @@ def capabilities(package, model, configuration=None):
     kept = constrains(text, text.generation.stop_token_ids)
     registry = registry_of(package)
     images = IMAGES in registry[chosen["use"]["model"]]["provides"]
+    # a model plugin's own tool-call and reasoning syntax, declared in its manifest: read, never imported, here
+    declared = registry[chosen["use"]["model"]].get("tool_format")
+    reasoning = registry[chosen["use"]["model"]].get("reasoning_format")
     return serving_capabilities(text, sampling_fields(registry, chosen["use"]), concurrent=True, logprobs=True,
                                 score=True, plain=speculative, grammars=kept, constraints=kept, images=images,
-                                completion=True, prompt_cache=True)
+                                completion=True, prompt_cache=True,
+                                tool_format=":".join(declared) if declared else None,
+                                reasoning_format=":".join(reasoning) if reasoning else None)
+
+
+def _text_format(package, configuration, key, kind):
+    from crit_plugins.assemble import load_module
+    configuration = read_configuration(package) if configuration is None else configuration
+    manifest = registry_of(package)[selection(configuration)["use"]["model"]]
+    if not manifest.get(key):
+        return None
+    file, name = manifest[key]
+    found = getattr(load_module(manifest, file), name, None)
+    if not isinstance(found, kind):
+        raise PluginError(f"{manifest['id']}: {key} {file}:{name} is no crit_core.text.{kind.__name__}")
+    return found
+
+
+def tool_format(package, configuration=None):
+    """The crit_core.text.ToolFormat the package's model plugin names as its `tool_format` (FILE.py:NAME in its
+    manifest), imported from the plugin, or None when it names none: the calls crit serve parses for a model whose
+    chat template writes a syntax crit_core.text.tools does not register."""
+    from crit_core.text.tools import ToolFormat
+    return _text_format(package, configuration, "tool_format", ToolFormat)
+
+
+def reasoning_format(package, configuration=None):
+    """The crit_core.text.ReasoningFormat the package's model plugin names as its `reasoning_format` (FILE.py:NAME),
+    imported from the plugin, or None when it names none: the markers crit serve splits reasoning from the reply by,
+    for a model whose chat template uses markers crit_core.text.reasoning does not register."""
+    from crit_core.text.reasoning import ReasoningFormat
+    return _text_format(package, configuration, "reasoning_format", ReasoningFormat)
 
 
 def constrains(text, stop_tokens):
@@ -433,25 +591,35 @@ class LoadContext:
     Scratch, the bytes every plugin's calls compute in, one after another), its graph pool (`graphs`: the one
     memory pool Core's round driver and prompt graphs capture the engine's graphs into), the host (`host`:
     crit_plugins.host's object, the process's cores, worker pool and in-stream handoffs), a folder for files a
-    plugin can build again from the checkpoint and reopen at the next load (`cache`: the PLUGIN_CACHE environment
-    variable's, which crit run sets to a folder of the run; None where none is given, and a plugin then keeps
-    nothing between loads), whether it drafts (`speculative`) and, under crit serve, crit
+    plugin can build again from the checkpoint and reopen at the next load (`cache`: the policy's, the PLUGIN_CACHE
+    environment variable's unless the load names one, which crit run sets to a folder of the run; None where none is
+    given, and a plugin then keeps nothing between loads), the engine's policy (`policy`, crit_plugins.policy: what
+    its configuration asks of its plugins, which the module functions they call answer from), whether it drafts (`speculative`) and, under crit serve, crit
     serve's model context (`serving`: verified model files, device leases that stay loaded when the engine is built
     again; None in process). A plugin says what a long step of its load is doing with `working(what, done=None,
-    total=None)`."""
+    total=None)`, and keeps a host-side store it builds from the checkpoint for the next engine built for the model
+    with `keep(name, key, build, close=None, nbytes=None)` (crit_core.kept). kept: the in-process keeper the stores
+    go to where crit serve's model pool does not take them (crit eval's engines, eval_v1); without either, a kept
+    store is closed with the engine."""
 
     def __init__(self, package, model, configuration, context_tokens=None, device=DEVICE, speculative=True,
-                 serving=None):
+                 serving=None, kept=None, policy=None, max_concurrent_requests=None):
         self.package, self.model = Path(package), Path(model)
         self.config = model_config(self.model)
         self.configuration = dict(configuration)
+        self.policy = policy if policy is not None else policy_of(self.package, self.configuration)
         self.context_tokens = int(context_tokens) if context_tokens else None
         self.device, self.speculative, self.serving = device, bool(speculative), serving
+        self.kept, self._own_kept, self._held = kept, kept is None, []
         self.memory = memory_of(device)
         self.scratch = self.memory.scratch()
         self.host = host_of()
-        self.cache = Path(os.environ[PLUGIN_CACHE]) if os.environ.get(PLUGIN_CACHE) else None
+        self.cache = self.policy.cache
         self._graphs = None
+        from crit_plugins.steps import Steps
+        # The engine's step plan: what Core decides of its steps (lanes, waiting places, spans, the release threshold)
+        # and its prompt-step budgets, which Core's step engine tells each step's time.
+        self.steps = Steps(max_concurrent_requests, release_override(self.configuration), self.memory)
 
     @property
     def graphs(self):
@@ -466,6 +634,49 @@ class LoadContext:
         """A file of the checkpoint: crit serve's verified copy when served, else the model folder's."""
         return Path(self.serving.model_file(name)) if self.serving is not None else self.model / name
 
+    def keep(self, name, key, build, close=None, nbytes=None):
+        """A host-side store the plugin builds from the checkpoint, kept for the next engine built for the same model
+        in this host (crit_core.kept.Kept.keep): `key` names everything its bytes depend on (any JSON value; the
+        model's identity is the keeper's), build() makes it, close(value) frees it once the keeper lets it go. The
+        store kept under the name with that key comes back as it was left, so the plugin must not change or close
+        it; under crit serve it is crit serve's model pool's (crit_api.models.ModelPool), in crit eval's engines
+        (eval_v1) the process's until eval_release(), else the engine's, closed with it."""
+        keep = getattr(self.serving, "keep", None)
+        if callable(keep):
+            return keep(name, key, build, close, nbytes)
+        if self.kept is None:
+            from .kept import Kept
+            self.kept = Kept()
+        value = self.kept.keep(name, key, build, close, nbytes)
+        self._held.append(str(name))
+        return value
+
+    def keeping(self, name):
+        """The host bytes of the store kept as `name` that no engine holds: host memory a plugin choosing where its
+        store goes counts as free, since its keep() gets that store back or frees it first."""
+        keeping = getattr(self.serving, "keeping", None)
+        if callable(keeping):
+            return keeping(name)
+        return self.kept.nbytes(name) if self.kept is not None else 0
+
+    def drop_kept(self, name):
+        """Close the store kept as `name` where no engine holds it: a plugin that will not ask for it (its store
+        goes elsewhere this time) frees that memory before it plans its own."""
+        drop = getattr(self.serving, "drop_kept", None)
+        if callable(drop):
+            drop(name)
+        elif self.kept is not None:
+            self.kept.drop(name)
+
+    def release_kept(self):
+        """The engine is closed: its kept stores go back to their keeper, and the ones only it kept are closed."""
+        held, self._held = self._held, []
+        if self.kept is not None:
+            for name in held:
+                self.kept.release(name)
+            if self._own_kept:
+                self.kept.close()
+
     def working(self, what, done=None, total=None):
         """A plugin's word on a long step of the load (a store of tens of gigabytes built from the checkpoint,
         kernels compiled): what it is doing and, where it counts, how far it is. Under crit serve the host passes it
@@ -477,7 +688,7 @@ class LoadContext:
 
 
 def load(package, model, configuration=None, *, context_tokens=None, speculative=True, device=None, serving=None,
-         library=None):
+         library=None, kept=None, cache=None, max_concurrent_requests=None, pending_timeout=None):
     """The package's engine for `model`: its selection assembled as a whole engine on `device` (crit_plugins.assemble;
     engine_device when not given; every plugin on a device speaks its slot's device form, crit_plugins.device) and its
     model plugin run on Core's concurrent runtime (StepEngine; `library` is crit_core_steps, else
@@ -492,23 +703,51 @@ def load(package, model, configuration=None, *, context_tokens=None, speculative
     is told when the load starts and when it is over: once the warm requests ran, its givers take what the load
     left (serve()), and a census says which plugin holds what of torch's bytes; the engine's telemetry carries the
     device as it stands ("memory") and the host ("host": crit_plugins.host's cores, pool and handoffs). The
-    engine's facts carry the plugins it runs."""
+    engine's facts carry the plugins it runs. kept: the in-process keeper of the plugins' host-side stores
+    (LoadContext.keep), which outlives the engine.
+
+    The engine's policy (policy_of: what its configuration asks of its plugins; cache: the folder for files they can
+    build again, else PLUGIN_CACHE's) is its own: it is active while the engine loads and around every call Core
+    makes into its plugins after (StepEngine's scope), and the engine carries it (`engine.policy`), so two engines in
+    one process never see each other's.
+
+    Core schedules the engine's requests (crit_core.native.StepEngine): max_concurrent_requests caps the requests its
+    runtime holds at once, running and waiting for a lane (crit serve's --max-concurrency; None: as many as the model
+    plugin takes), pending_timeout bounds how long one waits for a lane (None: no deadline), and waiting requests are
+    admitted by their priority (generate's priority)."""
     package = Path(package)
     configuration = read_configuration(package) if configuration is None else dict(configuration)
-    package_tuning(package, configuration)
-    package_decisions(package, configuration)
-    package_exactness(configuration)
-    package_quality_mode(configuration)
+    policy = policy_of(package, configuration, cache)
+    with policy.active():
+        return _load(package, model, configuration, policy, context_tokens=context_tokens, speculative=speculative,
+                     device=device, serving=serving, library=library, kept=kept,
+                     max_concurrent_requests=max_concurrent_requests, pending_timeout=pending_timeout)
+
+
+def _load(package, model, configuration, policy, *, context_tokens, speculative, device, serving, library, kept,
+          max_concurrent_requests=None, pending_timeout=None):
+    """load()'s body, with the engine's policy active."""
+    asked_activations = policy.activations
     chosen = selection(configuration, speculative)
     registry = registry_of(package)
     device = device or engine_device(registry, chosen["use"], configuration)
-    context = LoadContext(package, model, configuration, context_tokens, device, speculative, serving)
+    from crit_plugins import compiles
+    compiles.record()   # every compile from here on: one after load says what changed since the load's (Watch)
+    context = LoadContext(package, model, configuration, context_tokens, device, speculative, serving, kept, policy,
+                          max_concurrent_requests)
     memory = context.memory
+    # The device memory the givers leave free at every moment is the run's headroom, the device's to keep: no plugin
+    # sizes or tunes it (crit_plugins.memory's step frames).
+    memory.headroom = headroom_of(configuration)
     memory.load()
     before = device_bytes(device)
     calls = Calls()
-    assembly = assemble(chosen, registry, context, architecture_facts(model) + machine_facts(device), device=device,
-                        observe=calls, measure=lambda: device_bytes(device))
+    known = architecture_facts(model) + machine_facts(device)
+    # What the plugins say the engine will be before any of them is made (their resolve()): the loaded engine is held
+    # to it below, so the answer crit run checks a plan against before any load is the one every load gives.
+    resolved = resolve_selection(registry, *check(chosen, registry, known, device=device), context)
+    assembly = assemble(chosen, registry, context, known, device=device, observe=calls,
+                        measure=lambda: device_bytes(device))
     engine = None
     try:
         step_model = assembly["model"]
@@ -532,42 +771,65 @@ def load(package, model, configuration=None, *, context_tokens=None, speculative
             raise PluginError("the engine keeps less than it asks: " + "; ".join(short) + ". Set the plugin's option "
                               "to a way that keeps the level, or ask for the level the engine keeps "
                               "(kernels/README.md#exactness)")
+        wrong = activation_problems(asked_activations, {**facts, **stated})
+        if wrong:
+            raise PluginError("the engine is not what it is asked: " + "; ".join(wrong))
+        unresolved = resolution_problems(resolved, {**assembly.facts(), **stated})
+        if unresolved:
+            raise PluginError("the engine is not what its plugins resolved it to be before the load: "
+                              + "; ".join(unresolved) + ". A plugin's resolve() and its load disagree: fix the one "
+                              "that is wrong")
         def held():
             """torch's bytes now and `other`: what neither torch nor an elastic range holds and is not free (the
             process's CUDA context, modules and graphs, other processes), so the load says which stage took it."""
             found, now = device_memory(device), memory.report()
             return found if found is None or now is None else {**found, "other": now["other"]}
-        load = {"made": held(), "released_cached": release_cached(device)}
+        load = {"made": held(), "released_cached": release_cached(device), "resolved": dict(resolved["facts"])}
         load["opened"] = held()
         # The plugin objects themselves, past the loader's counting proxies: a frame is Core's call, not the
         # model's use of a slot. One object in two slots is told once.
         frames = list({id(part): part for part in (
             unwrap(assembly.get(slot)) for slot, chosen in assembly.use.items()
             if chosen is not None and slot != "model") if part is not None}.values())
+        watched = {}   # the compile watch Core keeps once the engine serves (crit_plugins.compiles)
+
         def telemetry():
             found = {**assembly.telemetry(), "load": dict(load)}
+            if watched.get("compiles") is not None:   # what the engine compiled since its load was over
+                found["core"] = {**(found.get("core") or {}),
+                                 "compiles_after_load": watched["compiles"].report()}
             device_now = memory.report()
             if device_now is not None:
                 found["memory"] = device_now
             found["host"] = context.host.report()
-            found["decisions"] = decisions.report()
+            found["decisions"] = policy.decisions.report()
             return found
-        def close():   # the watch of the device's memory, the engine's plugins, then the scratch their calls computed in
+        def close():   # the watches of the device's memory and of compiles, the engine's plugins, then the scratch
             memory.unwatch()
+            if watched.get("compiles") is not None:
+                watched.pop("compiles").stop()
             try:
                 assembly.close()
             finally:
                 context.scratch.close()
+                context.release_kept()
         def health():   # a host handoff that failed (its job threw, or ran past the job budget) ends the engine
             failed = context.host.failures()
             return "; ".join(f"the host handoff {label} failed: {why}" for label, why in failed.items()) or None
         engine = StepEngine(step_model, library, facts=facts, close=close, telemetry=telemetry, frames=frames,
-                            relieve=memory.relieve, health=health)
+                            relieve=memory.relieve, health=health, memory=memory, timed=context.steps.observe,
+                            scope=policy.active, max_concurrent_requests=max_concurrent_requests,
+                            pending_timeout=pending_timeout)
+        engine.policy, engine.steps = policy, context.steps
         problems = slot_problems(engine, assembly.use, calls)
         if problems:
             raise PluginError(f"{assembly.use['model']}: the engine is not its plugins: " + "; ".join(problems))
-        load["warmed"] = warm_requests(engine)
+        load["warmed"] = warm_requests(engine, largest=context.steps.largest())
         load["warm"] = held()
+        # The step arena: what the warm requests' steps took from Core's allocator (the largest prompt and score
+        # steps among them), or the model's word for its deepest step (info's step_bytes, a step at a position no
+        # warm request reaches), whichever is more. The givers keep it free whenever no step holds it.
+        load["arena"] = memory.size_arena(step_model.info().get("step_bytes"))
         # What the warm requests left in torch's cache (their intermediates, a long prompt chunk's workspaces) goes back
         # to the device too: Core reads the device's free memory, and the engine keeps only what it plans.
         load["released_after_warm"] = release_cached(device)
@@ -587,13 +849,21 @@ def load(package, model, configuration=None, *, context_tokens=None, speculative
             raise PluginError(f"{assembly.use['model']}: the engine is not where its plan put it: " + "; ".join(problems))
         # The checks passed: the counting proxies leave the hot path, each plugin calling the others' objects directly.
         assembly.unobserve()
+        # The load is over: from here on a kernel compile or extension build is a request's (its first token waits
+        # for it), which every plugin should have done at load. Core watches for them while the engine lives and its
+        # telemetry says what compiled (core.compiles_after_load), which crit run serve --check fails.
+        from crit_plugins.compiles import Watch
+        watched["compiles"] = Watch()
         return engine
     except BaseException:
         if engine is not None:
             engine.close()
         else:
-            assembly.close()
-            context.scratch.close()
+            try:
+                assembly.close()
+            finally:
+                context.scratch.close()
+                context.release_kept()
         raise
 
 
@@ -661,15 +931,22 @@ def slot_problems(engine, use, calls, prompt_tokens=8, output_tokens=2):
 WARM_PROMPTS = (37, 601)
 
 
-def warm_requests(engine, prompt_tokens=8, output_tokens=4):
+def warm_requests(engine, prompt_tokens=8, output_tokens=4, largest=0):
     """Serve at load every kind of request the first one (slot_problems) is not, so the kernels their paths launch
     compile here and none on a request (crit_plugins.testing.compiles): a sampled request, one with
     log-probabilities, a plain one (an engine that drafts), a replay of the greedy reply with log-probabilities and
     the prompt scored with alternatives (Eval's scored continuation, chat-score-v1), longer prompts (WARM_PROMPTS,
     within the engine's context: rows past an attention window and the prompt buckets run the eager prompt paths),
-    and two greedy requests of other prompts together (a step of two rows). Each path's first request through a
-    model's step(), its eager rounds and its prompt rows then runs at load. Returns the kinds run, which the
-    engine's load telemetry records."""
+    and two greedy requests of other prompts together (a step of two rows), and a prompt of each length the model's
+    info states in warm_prompts (the lengths past which its paths change: a sparse attention's budget). Each path's
+    first request through a model's step(), its eager rounds and its prompt rows then runs at load.
+
+    The largest step of each kind runs here too, since Core's step arena is what these steps took (DeviceMemory
+    size_arena): a prompt of the longest chunk a prompt-step budget gives (`largest`, LoadContext.steps) and a
+    fixed text of as many tokens scored with the most alternatives a request asks for (TOP_LOGPROBS), so a score's
+    logits, their log-softmax and their ranking at a full slice of rows are measured (an 8-token score at load left
+    a 32,768-token score's 1.1 GiB of them to the model's estimate, and the arena at 0.7 GiB). Returns the kinds
+    run, which the engine's load telemetry records."""
     from concurrent.futures import ThreadPoolExecutor
     info = engine.info()
     vocabulary = int(info.get("vocabulary") or 2)
@@ -692,11 +969,24 @@ def warm_requests(engine, prompt_tokens=8, output_tokens=4):
         engine.generate(prompt, len(first), stop_tokens=[], sampling=greedy, replay=list(first), logprobs=TOP_LOGPROBS)
         ran.append("replay")
     paths = info.get("score_paths") or []
-    engine.score(prompt, 1, "prefill" if "prefill" in paths else "", top_k=TOP_LOGPROBS)
+    path = "prefill" if "prefill" in paths else ""
+    engine.score(prompt, 1, path, top_k=TOP_LOGPROBS)
     ran.append("score")
-    for seed, length in enumerate(WARM_PROMPTS, 1):
+    widest = max(int(largest or 0), WARM_PROMPTS[-1])   # the largest score step: a full chunk, every row scored
+    widest = min(widest, context - 1) if context else widest
+    if widest > prompt_tokens:
+        engine.score(prompt_of(widest, 99), 1, path, top_k=TOP_LOGPROBS)
+        ran.append(f"score:{widest}")
+    # Past an attention window and the default buckets, and past every length the model says its paths switch at
+    # (info's warm_prompts: a sparse attention's budget, past which a prompt's rows select their blocks), so the
+    # kernels of a long prompt's paths compile here and not on the first long request.
+    stated = [int(n) for n in info.get("warm_prompts") or () if isinstance(n, int) and not isinstance(n, bool) and n > 0]
+    served = set()
+    chunk = [int(largest)] if largest else []   # the largest prompt step: the longest chunk a budget gives
+    for seed, length in enumerate(list(WARM_PROMPTS) + sorted(set(stated) | set(chunk)), 1):
         length = min(length, context - output_tokens - 1) if context else length
-        if length > prompt_tokens:
+        if length > prompt_tokens and length not in served:
+            served.add(length)
             engine.generate(prompt_of(length, seed), output_tokens, stop_tokens=[], sampling=greedy)
             ran.append(f"prompt:{length}")
     with ThreadPoolExecutor(2) as pool:
@@ -736,7 +1026,9 @@ class EvalEngine:
     replay, plain decoding when it drafts, fixed-text scores (`score`, for `crit eval run --only quality` in process,
     development evidence), the engine's own prefill and first-token times with every generation, and its headroom
     facts. context: crit-eval's, its config the configuration over the package's, with `package` naming the
-    package."""
+    package. The plugins' host-side stores (LoadContext.keep) stay in the process for the next engine crit-eval opens
+    for the model (eval_kept), as crit serve's model pool keeps them: `crit eval ab --package` builds its two engines
+    again every round without building those again."""
 
     def __init__(self, context):
         given = dict(context.get("config") or {})
@@ -749,7 +1041,7 @@ class EvalEngine:
         speculative = bool(context.get("speculative", True))
         self.configuration = configuration
         self.native = load(package, context["model"], configuration, context_tokens=context.get("context_tokens"),
-                           speculative=speculative)
+                           speculative=speculative, kept=eval_kept(context["model"]))
         self.facts = self.native.info()
         self.speculative = bool(self.facts.get("speculative"))
         # Eval decodes greedily: temperature zero and neutral penalties where the engine applies them.
@@ -893,22 +1185,24 @@ class EvalEngine:
         self.native.close()
 
 
-def release_threshold(configuration, limits):
-    """Bytes of free device memory below which a request's end hands back what torch's allocator caches and nothing
-    uses (a long prompt's or score's temporaries otherwise stay reserved, and the next long request finds no room):
-    configuration "release_below_mib" where the engine sets it (0 never releases), else the device memory headroom the
-    run or crit serve keeps (limits' vram_headroom_bytes, from the machine settings); None releases nothing."""
-    if "release_below_mib" in configuration:
-        below = int(configuration["release_below_mib"]) << 20
-    else:
-        below = int((limits or {}).get("vram_headroom_bytes") or 0)
-    return below or None
+def release_override(configuration):
+    """The configuration's release_below_mib in bytes (0: never release), or None where it names none and Core's
+    threshold holds (crit_plugins.steps.Steps.threshold: the device's headroom and the step arena, what the next step
+    needs free). PluginError for another value."""
+    value = configuration.get("release_below_mib")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise PluginError(f'configuration "release_below_mib" is the free device memory in MiB below which an ended '
+                          f"request hands back what torch's allocator caches (an integer, 0: never), not {value!r}")
+    return value << 20
 
 
-def _release_after_request(below):
-    if below:
-        from crit_plugins.device import release_cached_under
-        release_cached_under(below)
+def _release_after_request(engine):
+    """Core's release at a request's end (the engine's step plan: Steps.release)."""
+    steps = getattr(engine, "steps", None)
+    if steps is not None:
+        steps.release()
 
 
 class ResidentEngine(ResidentChat):
@@ -925,6 +1219,8 @@ class ResidentEngine(ResidentChat):
     engine's `facts` (crit_core.serving.engine_facts). Configuration "chat_template_kwargs" passes variables to the
     chat template."""
 
+    priorities = True   # a request's priority orders it in Core's runtime (generate_tokens' priority)
+
     def __init__(self, context, package):
         configuration = {**read_configuration(package), **(context.configuration or {})}
         # the served checkpoint's folder (a lone GGUF has no config.json file: Core derives it)
@@ -932,21 +1228,28 @@ class ResidentEngine(ResidentChat):
         model = Path(folder()) if folder is not None else Path(context.model_file("config.json")).parent
         super().__init__(context, model, configuration=configuration)
         limits = getattr(context, "limits", {}) or {}
+        # crit serve's cap on the requests run at once (--max-concurrency) is Core's runtime's to apply.
         self.native = load(package, model, self.configuration, context_tokens=limits.get("kv_tokens"),
-                           serving=context)
+                           serving=context, max_concurrent_requests=limits.get("max_concurrent_requests"))
         self.facts = self.native.info()
         self.max_concurrent_requests = int(self.facts["max_concurrent_requests"])
         self._owns_native = True
         self.capacity = min(int(self.facts["context"]), int(limits.get("kv_tokens") or self.facts["context"]))
-        self.release_below = release_threshold(self.configuration, limits)
         self.stop_ids = set(self.facts.get("stop_tokens") or [])
         support = self.facts.get("sampling") or {}
         self.sampling = tuple(key for key in SAMPLING if support.get(PENALTY if key in PENALTIES else key))
         self.logprobs = self.scores = True
         self.plain = bool(self.facts.get("speculative"))
         self.prompt_cache = True   # a request may turn the model plugin's prompt cache off (chat-prompt-cache-v1)
+        # A score may decode its continuation through the model's prompt arithmetic where the model plugin says it
+        # does (its info's decode_via_prompt): crit smoke tells a decode gap's rounding from a fault by it.
+        self.decode_via_prompt = self.facts.get("decode_via_prompt") is True
         self.grammars = self.constraints = constrains(self.text, self.stop_ids)
         self.images = bool(self.facts.get("images"))
+        self.tool_format = tool_format(package, self.configuration)   # None: the template's registered syntax
+        found = reasoning_format(package, self.configuration)
+        if found is not None:
+            self.reasoning_format = found   # else ResidentChat's: the templates' registered markers
         self._vocabulary = {"lock": threading.Lock(), "ready": False}   # the requests' copies share it
 
     def create_request(self, request):
@@ -988,17 +1291,19 @@ class ResidentEngine(ResidentChat):
                                     **options)
 
     def generate_tokens(self, ids, max_new_tokens, sampling, on_tokens, cancelled, logprobs=None, plain=False,
-                        constraint=None, inputs=None, prompt_cache=True):
+                        constraint=None, inputs=None, prompt_cache=True, priority=0):
         # A served request may be answered from the model plugin's prompt cache (crit_plugins.prompt_cache) unless
-        # it says otherwise (crit.prompt_cache false: Eval's timed requests).
+        # it says otherwise (crit.prompt_cache false: Eval's timed requests). Its priority orders it among the
+        # requests waiting for a lane in Core's runtime.
         if constraint is not None:
             self._constrain()
         try:
             tokens, result = self.native.generate(ids, max_new_tokens, on_tokens=on_tokens, sampling=sampling,
                                                   logprobs=logprobs, plain=plain, cancelled=cancelled,
-                                                  constraint=constraint, inputs=inputs, prompt_cache=prompt_cache)
+                                                  constraint=constraint, inputs=inputs, prompt_cache=prompt_cache,
+                                                  priority=priority)
         finally:
-            _release_after_request(self.release_below)
+            _release_after_request(self.native)
         if tokens is None:
             return None, {}
         timing = result["timing"]
@@ -1009,13 +1314,13 @@ class ResidentEngine(ResidentChat):
                **request_facts(result, plain)}
         return tokens, out
 
-    def score_tokens(self, ids, continuation, top_k, cancelled, prompt_rows):
+    def score_tokens(self, ids, continuation, top_k, cancelled, prompt_rows, decode_via_prompt=False):
         started = time.monotonic()
         paths = self.facts.get("score_paths") or []
         # The engine's own arrays as ScoreRows (top_k > 0), which ResidentChat.score packs without a row loop.
         scored = (self.native.score(ids, 1, "prefill" if "prefill" in paths else "", top_k=top_k, packed=True)
                   if prompt_rows and len(ids) > 1 else None)
-        _release_after_request(self.release_below)
+        _release_after_request(self.native)
         prefill_ms = (time.monotonic() - started) * 1000
         rows = []
         if continuation:
@@ -1026,7 +1331,7 @@ class ResidentEngine(ResidentChat):
             tokens, result = self.native.generate(list(ids), len(continuation), stop_tokens=[], replay=list(continuation),
                                                   sampling=greedy, logprobs=top_k,
                                                   on_tokens=lambda _tokens, found: rows.extend(found),
-                                                  cancelled=cancelled)
+                                                  cancelled=cancelled, decode_via_prompt=decode_via_prompt)
             if tokens is None:
                 return None, None, {}
             if list(tokens) != list(continuation):
@@ -1064,6 +1369,27 @@ def eval_v1(context):
     return EvalEngine(context)
 
 
+# The host-side stores crit-eval's engines keep in this process (EvalEngine), for one model at a time.
+_EVAL_KEPT = {}
+
+
+def eval_kept(model):
+    """The keeper of the plugins' host-side stores for crit-eval's engines of `model` (crit_core.kept.Kept): one
+    model's at a time, another model's closed first (its engines are closed: crit-eval opens one engine at a time)."""
+    from .kept import Kept
+    model = str(Path(model).resolve())
+    for other in [name for name in _EVAL_KEPT if name != model]:
+        _EVAL_KEPT.pop(other).close()
+    return _EVAL_KEPT.setdefault(model, Kept())
+
+
+def eval_release():
+    """Close the host-side stores crit-eval's engines kept in this process (eval-v1's optional release(), which
+    crit-eval calls once its last engine closed). Refused while an engine holds one."""
+    while _EVAL_KEPT:
+        _EVAL_KEPT.popitem()[1].close()
+
+
 __all__ = ["CONFIGURATION", "FOLDER", "EvalEngine", "LoadContext", "ResidentEngine", "capabilities", "check_package",
-           "constrains", "eval_v1", "load", "machine_facts", "read_configuration", "reply_end", "request_images",
-           "resident", "selection", "serving_problems", "stored_facts"]
+           "constrains", "eval_kept", "eval_release", "eval_v1", "load", "machine_facts", "read_configuration",
+           "reply_end", "request_images", "resident", "selection", "serving_problems", "stored_facts"]

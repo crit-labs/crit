@@ -17,6 +17,13 @@ void gated_delta_prefill(torch::Tensor& out, torch::Tensor& state, const torch::
 // The prefill on tensor cores (FP16 operands, FP32 accumulation and state): dk 64 or 128, dv a multiple of 16.
 void gated_delta_prefill_tc(torch::Tensor& out, torch::Tensor& state, const torch::Tensor& q, const torch::Tensor& k,
                             const torch::Tensor& v, const torch::Tensor& log_decay, const torch::Tensor& beta, double scale);
+// The chunk-aligned exact form (recurrent_kernels.h's enqueue_delta_chunk_rows_tc): packed rows q, k [T, k_heads, dk],
+// v [T, v_heads, dv], log_decay, beta [T, v_heads]; meta int32 [rows, 4] (first, tokens, slot_in, slot_out); states
+// [slots, v_heads, dk, dv]; widest the longest row's tokens.
+void gated_delta_chunk_rows_tc(torch::Tensor& out, torch::Tensor& states_out, const torch::Tensor& states_in,
+                               const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
+                               const torch::Tensor& log_decay, const torch::Tensor& beta, const torch::Tensor& meta,
+                               int64_t widest, double scale);
 void gated_delta_scan(torch::Tensor& out, torch::Tensor& state, const torch::Tensor& q, const torch::Tensor& k,
                       const torch::Tensor& v, const torch::Tensor& log_decay, const torch::Tensor& beta, double scale,
                       const std::optional<torch::Tensor>& checkpoints);
@@ -52,6 +59,9 @@ void pool_conv(torch::Tensor& out, torch::Tensor& window, torch::Tensor& stash, 
                const std::optional<torch::Tensor>& starts, const std::optional<torch::Tensor>& slots,
                const std::optional<torch::Tensor>& table, int64_t rows, int64_t kind, int64_t layer, int64_t layers,
                int64_t capacity, bool silu);
+void conv_segments_rows(torch::Tensor& out, const torch::Tensor& windows_in, torch::Tensor& windows_out,
+                        const torch::Tensor& x, const torch::Tensor& meta, const torch::Tensor& weight,
+                        const std::optional<torch::Tensor>& bias, int64_t widest, bool silu);
 void conv_segments(torch::Tensor& out, const torch::Tensor& window_in, torch::Tensor& window_out, const torch::Tensor& x,
                    const torch::Tensor& weight, const std::optional<torch::Tensor>& bias, bool silu);
 // A captured prompt chunk's convolution: its count and sequence from meta [5] on the device (recurrent_rows.h).

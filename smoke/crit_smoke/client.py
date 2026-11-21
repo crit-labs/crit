@@ -80,12 +80,15 @@ class Client:
         """The ids a chat request with these messages prefills, as the engine renders them."""
         return list(self.call("/tokenize", {"model": self._model(), "messages": messages})["tokens"])
 
-    def score(self, prompt, continuation=(), top=5, prompt_rows=True):
+    def score(self, prompt, continuation=(), top=5, prompt_rows=True, decode_via_prompt=False):
         """(prompt rows, continuation rows): one row per prompt position after the first, from one prefill, and one
-        per continuation token, decoded after it with every step forced to the continuation."""
-        data = self.call("/v1/crit/score", {"model": self._model(), "prompt_ids": list(prompt),
-                                            "continuation_ids": list(continuation), "top_logprobs": top,
-                                            "prompt_rows": prompt_rows})
+        per continuation token, decoded after it with every step forced to the continuation. decode_via_prompt: the
+        decode steps through the model's prompt arithmetic (an engine whose facts say decode_via_prompt)."""
+        body = {"model": self._model(), "prompt_ids": list(prompt), "continuation_ids": list(continuation),
+                "top_logprobs": top, "prompt_rows": prompt_rows}
+        if decode_via_prompt:
+            body["decode_via_prompt"] = True
+        data = self.call("/v1/crit/score", body)
         return [_row(r) for r in data.get("prompt") or []], [_row(r) for r in data.get("continuation") or []]
 
     def chat(self, messages, max_tokens=32, top=5, plain=False):

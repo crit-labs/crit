@@ -1,8 +1,8 @@
 // Decode GEMVs on CUDA cores (decode_gemv.h): one kernel template for every weight format (kernel.json's structure
 // gemv-cuda, the format a run option: NVFP4, FP8 with row scales, MXFP8, BF16, INT4 with a zero point a group), the
-// format's decoder a trait (Fmt below) over the kernel core's decoders. Its earlier per-format structures gemv-nvfp4,
-// gemv-fp8 and gemv-bf16 stay as aliases of it for one format (a tuning that names them still applies): the same
-// kernel, the same lane order, and so the same bits as the per-format kernels this file held before.
+// format's decoder a trait (Fmt below) over the kernel core's decoders: the same lane order, and so the same bits, as
+// the per-format kernels this file held before. Their structures (gemv-nvfp4, gemv-fp8, gemv-bf16) are retired: a
+// tuning that names them is migrated into gemv-cuda's table when the kernel is built (kernel.json "retired").
 // The decoders, the 16-bit conversions, the block-scale layout, the weight loads and the warp sums are the kernel
 // core's (kernels/core: crit_kcore/formats.cuh, load.cuh, reduce.cuh).
 #include "decode_gemv.h"
@@ -285,9 +285,9 @@ void launch_rows(const void* x, int ldx, const Matrix& m, void* out, int ldo, in
 }
 
 // ROWS 0: each format's rows a warp from before the knobs (speed only). NVFP4 and INT4: 2, 4 at 3-4 activation rows, 8
-// at 5-8, 4 at 9-16 (gemv-nvfp4's default_rows); BF16: 2, 4 at 3-8 (gemv-bf16's); FP8 and MXFP8: fewer at more
-// activation rows (each weight is decoded once for them all) and where the matrix would not give the device two
-// blocks a multiprocessor (gemv-fp8's ROWS 0).
+// at 5-8, 4 at 9-16; BF16: 2, 4 at 3-8; FP8 and MXFP8: fewer at more activation rows (each weight is decoded once
+// for them all) and where the matrix would not give the device two blocks a multiprocessor (the per-format kernels'
+// rules).
 template <int WF, int M>
 constexpr int rule_rows() {
   if constexpr (WF == kBf16) return M >= 3 && M <= 8 ? 4 : 2;
@@ -337,8 +337,7 @@ bool dispatch_rows(int M, const void* x, int ldx, const Matrix& m, void* out, in
 // gemv-cuda's configuration for this format, matrix and row count (crit_tuning.h; 0, the defaults, where it names
 // none).
 template <int WF, typename X, typename O>
-bool dispatch_generic(int M, const void* x, int ldx, const Matrix& m, void* out, int ldo, int N, int K,
-                      cudaStream_t stream) {
+bool dispatch(int M, const void* x, int ldx, const Matrix& m, void* out, int ldo, int N, int K, cudaStream_t stream) {
   switch (crit_lookup_gemv_cuda(WF, N, K, M)) {
 #define CRIT_GEMV_CONFIG(index, warps, rows, wpr, pref, stream_) \
   case index: return dispatch_rows<WF, warps, rows, wpr, pref, stream_, X, O>(M, x, ldx, m, out, ldo, N, K, stream);
@@ -348,56 +347,6 @@ bool dispatch_generic(int M, const void* x, int ldx, const Matrix& m, void* out,
   }
 }
 
-// The aliases (gemv-nvfp4, gemv-fp8, gemv-bf16: gemv-cuda for one format, with the knobs they had). A build holds an
-// alias's dispatch only where its tuning gives the alias more than its defaults or a table (a tuning made before
-// gemv-cuda); a call takes the alias's configuration where a sweep selected one, where the alias's table names a
-// configuration other than its defaults for the call, or where the tuning tunes the alias and not gemv-cuda.
-#define CRIT_ALIAS_BUILT(S) (CRIT_CONFIG_COUNT_##S > 1 || crit_table_size_##S > 0)
-#define CRIT_ALIAS_TAKES(S, index) \
-  (crit_selected_##S >= 0 || (index) != 0 || (crit_table_size_##S > 0 && crit_table_size_gemv_cuda == 0))
-
-template <int WF, typename X, typename O>
-bool dispatch(int M, const void* x, int ldx, const Matrix& m, void* out, int ldo, int N, int K, cudaStream_t stream) {
-  if constexpr (WF == kNvfp4 && CRIT_ALIAS_BUILT(gemv_nvfp4)) {
-    const int index = crit_lookup_gemv_nvfp4(N, K, M);
-    if (CRIT_ALIAS_TAKES(gemv_nvfp4, index)) {
-      switch (index) {
-#define CRIT_NVFP4_CONFIG(i, warps, rows, wpr, pref, stream_) \
-  case i: return dispatch_rows<WF, warps, rows, wpr, pref, stream_, X, O>(M, x, ldx, m, out, ldo, N, K, stream);
-        CRIT_CONFIGS_gemv_nvfp4(CRIT_NVFP4_CONFIG)
-#undef CRIT_NVFP4_CONFIG
-        default: return false;
-      }
-    }
-  }
-  if constexpr ((WF == kFp8 || WF == kMxfp8) && CRIT_ALIAS_BUILT(gemv_fp8)) {
-    const int index = crit_lookup_gemv_fp8(N, K, M);
-    if (CRIT_ALIAS_TAKES(gemv_fp8, index)) {
-      switch (index) {
-#define CRIT_FP8_CONFIG(i, warps, rows, pref, stream_) \
-  case i: return dispatch_rows<WF, warps, rows, 1, pref, stream_, X, O>(M, x, ldx, m, out, ldo, N, K, stream);
-        CRIT_CONFIGS_gemv_fp8(CRIT_FP8_CONFIG)
-#undef CRIT_FP8_CONFIG
-        default: return false;
-      }
-    }
-  }
-  if constexpr (WF == kBf16 && CRIT_ALIAS_BUILT(gemv_bf16)) {
-    const int index = crit_lookup_gemv_bf16(N, K, M);
-    if (CRIT_ALIAS_TAKES(gemv_bf16, index)) {
-      switch (index) {
-#define CRIT_BF16_CONFIG(i, warps, rows, pref, stream_) \
-  case i: return dispatch_rows<WF, warps, rows, 1, pref, stream_, X, O>(M, x, ldx, m, out, ldo, N, K, stream);
-        CRIT_CONFIGS_gemv_bf16(CRIT_BF16_CONFIG)
-#undef CRIT_BF16_CONFIG
-        default: return false;
-      }
-    }
-  }
-  return dispatch_generic<WF, X, O>(M, x, ldx, m, out, ldo, N, K, stream);
-}
-#undef CRIT_ALIAS_TAKES
-#undef CRIT_ALIAS_BUILT
 
 template <int WF>
 bool by_types(bool x_bf16, bool out_fp32, int M, const void* x, int ldx, const Matrix& m, void* out, int ldo, int N,

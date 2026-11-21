@@ -101,6 +101,10 @@ class WheelInstallTests(unittest.TestCase):
         if installed.returncode != 0:
             raise AssertionError(f"pip install failed:\n{installed.stdout[-3000:]}{installed.stderr[-3000:]}")
         borrowed = site.getsitepackages() + ([site.getusersitepackages()] if site.ENABLE_USER_SITE else [])
+        # crit Eval too where this Python imports it from a checkout on its path rather than its site folders (an
+        # editable install's or a PYTHONPATH's): the folder holds crit_eval alone, none of this checkout's sources.
+        import crit_eval
+        borrowed.append(str(Path(crit_eval.__file__).resolve().parents[1]))
         (cls.purelib / "crit-test-borrowed.pth").write_text(
             f"import site; list(map(site.addsitedir, {borrowed!r}))\n", encoding="utf-8")
         cls.crit = shutil.which("crit", path=str(scripts))

@@ -62,7 +62,7 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(set(unknown["workers"]) - {-1}, set())
         report = host.report()
         self.assertEqual(report["cores"], 4)
-        self.assertEqual(set(memory_bytes()), {"total", "available"})
+        self.assertEqual(set(memory_bytes()), {"total", "available", "binding"})
         self.assertNotIn("pool", report)   # nobody asked for the pool: no thread was started
 
 

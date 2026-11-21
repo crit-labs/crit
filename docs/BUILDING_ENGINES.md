@@ -54,7 +54,9 @@ into every candidate's configuration as `recon`; edit it, with the reason in `re
 should change. `--force` gathers again and keeps `recon.md`. `recon.json` also fingerprints the checkpoint
 (architecture, weight layout, tokenizer, template); `recon --compare OTHER_MODEL` says what another checkpoint
 changes for the engine (an equal fingerprint: weight values only). `recon --drafter PATH` records a companion
-drafter's pass bytes.
+drafter's pass bytes. `recon --data EVAL_DATA`, once the data holds the reference's scores (`crit eval reference`, or
+after the first Eval), records smoke's reference, which `serve --check`'s crit smoke judges `fluent` against
+instead of an absolute perplexity ([crit smoke](../smoke/README.md#against-the-checkpoints-reference)).
 
 Each case's request is a JSON file under `captured/CASE/`, `{"messages": [...], "tools": [...],
 "chat_template_kwargs": {...}}` (the last two optional), whose messages render to the workload's `prompt_tokens` as
@@ -95,8 +97,8 @@ GPU, tuned by `crit kernels sweep`) or its torch fallback. A mixture of experts 
 code for its experts: [expert-offload](../inference/expert-offload/README.md) in the experts slot takes the same calls as
 experts that fit (begin(), load(), open() after the model's pools, forward()) and decides by itself where the experts
 live (device, host memory, a file), keeps those routed last in a device expert cache that takes every byte the device
-has free past the run's VRAM headroom while the engine serves (it gives a prompt step its measured room and grows
-back), computes misses on the
+has free past the run's VRAM headroom while the engine serves (the device keeps the headroom and a prompt step's
+measured room, the cache gives and grows back: nothing for a build to size or tune), computes misses on the
 CPU tier while the link copies them in beside the round, stages prompt chunks, and says what it decided and why.
 With their `elastic` option the pools hold only what their open sequences use (attention-state's KV pages, the
 recurrence plugin's states), and the expert cache the rest. `crit plugins offload --model M --device-file DEVICE --context TOKENS` gives the options from config.json

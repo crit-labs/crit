@@ -93,7 +93,10 @@ DEVICE_INTERFACES = {
                    "attention:sliding (sliding: an int, a sliding window: a token sees its last `sliding` positions, "
                    "its own included; 0 for all; never with blocks), attention:latent (latent=R: latent attention, "
                    "queries [tokens][heads][R + P] over a pool of keys only with one KV head whose rows are each "
-                   "position's latent then its rotary key, the latent its value too; out [tokens][heads][R])",
+                   "position's latent then its rotary key, the latent its value too; out [tokens][heads][R]), "
+                   "attention:distance-bias (bias [tokens][heads][extent] FP32: each token's score added, in the "
+                   "scaled scores' units, to head h's score of the position d before its own for d below extent; "
+                   "nothing further back; never with blocks or latent)",
     },
     "recurrence": {
         "pool": "pool(layers, heads, keys, values, device, sequences=None, widest=0, conv=None, key_heads=None, "
@@ -247,6 +250,7 @@ DEVICE_EXTENSIONS = {
     "attention:sinks": {},
     "attention:sliding": {},
     "attention:latent": {},
+    "attention:distance-bias": {},
     # A KV pool's static FP8 scales per layer (a checkpoint's k_scale and v_scale), on the pool.
     "kv:scales": {
         "set_scales": "set_scales(layer, key_scale, value_scale): the layer's stored = value / scale for its keys "
@@ -395,12 +399,16 @@ DEVICE_EXTENSIONS = {
         "routes": "routes() -> [(layer, [experts])]: the recorded decode routes (record_routes option), the trace crit "
                   "plugins offload --trace replays",
     },
+    # MXFP8 experts (E4M3 codes, an E8M0 exponent a 32) taken as stored: load(..., "mxfp8") with {weight, scale}.
+    "experts:mxfp8": {},
     # Routed blocks gated otherwise than by SiLU, in the experts slot.
     "experts:activations": {
-        "activate": "activate(name): the gate of the blocks' product, act(gate) * up, for every layer the plugin "
-                    "computes: silu (SwiGLU, the default) or gelu_tanh (GELU in its tanh form); before the first "
-                    "forward (an offload plugin: before open()). A model plugin calls it where the checkpoint's "
-                    "activation is not SiLU",
+        "activate": "activate(name, caps=None): the gate of the blocks' product, act(gate) * up, for every layer "
+                    "the plugin computes: silu (SwiGLU, the default), gelu_tanh (GELU in its tanh form) or "
+                    "softcapped_silu with caps (gate, up): cap_g * tanh(gate / cap_g) * sigmoid(gate) times "
+                    "cap_u * tanh(up / cap_u); before the first forward (an offload plugin: before open()); a plugin "
+                    "refuses a name it does not compute. A model plugin calls it where the checkpoint's activation "
+                    "is not SiLU",
     },
     # A device expert cache in the expert_residency slot.
     "experts:cache": {
@@ -411,17 +419,29 @@ DEVICE_EXTENSIONS = {
                  "step, start_round(view) and count_round(view) for captured rounds (crit_plugins.rounds), "
                  "telemetry() -> {slots, resident, lent, reads, hits, fills, fill_bytes} without waiting for the device",
     },
+    # The device expert cache over opaque byte rows of the caller's own layout, in the expert_residency slot.
+    "experts:rows": {
+        "row_store": "row_store(groups, keys, row_bytes, device, rows, path=None, identity=None) -> a store of groups "
+                     "x keys rows of row_bytes bytes (any count) in the caller's own layout, from rows ([groups * "
+                     "keys][row_bytes] uint8, in key order: key = group * keys + key)",
+        "row_cache": "row_cache(groups, keys, row_bytes, slots, device, source, lend=None) -> the experts:cache "
+                     "ExpertCache over those rows (plan(group, ids), prompt(group, ids), the round hooks, telemetry "
+                     "as cache()'s), with rows() -> [S][row_bytes] uint8, the slots' rows without their padding",
+    },
     # Bundles in host memory or files, which a device expert cache fills its slots from.
     "experts:store": {
-        "open_store": "open_store(layout, layers, experts, device, path=None, identity=None) -> a store of the "
-                      "experts plugin's slot layout with layout, keys, bundle_bytes, mapped and compressed: "
+        "open_store": "open_store(layout, layers, experts, device, path=None, identity=None, kept=None) -> a store of "
+                      "the experts plugin's slot layout with layout, keys, bundle_bytes, mapped and compressed: "
                       "put(layer, expert, bundle, compressed=None) of a slot-layout bundle, read(keys, into); a mapped "
                       "store also region() -> (host tensor, device tensor over its device address) and "
                       "address(layer, expert); a store file at path is bound to the checkpoint's identity. The "
                       "plugin's csf_scales option keeps scale components CSF-compressed: store.layout is then the "
                       "store's own (a fill program the expert cache runs to rebuild the slot layout), store.compressed "
                       "names them, and put() encodes them from the bundle or takes the checkpoint's as compressed "
-                      "{component: (fixed, exceptions), or a list of such parts stacked by rows}",
+                      "{component: (fixed, exceptions), or a list of such parts stacked by rows}. kept: the key of "
+                      "what the bundles hold beyond the arguments; the store is then kept for the next engine built "
+                      "for the model (LoadContext.keep), comes back sealed (store.sealed) and is closed by its keeper "
+                      "(store.kept), never by the engine",
     },
     # A drafter that drafts inside a captured round, from the model's device draft head (draft:head-device).
     "draft:device": {

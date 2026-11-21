@@ -7,10 +7,10 @@ arithmetic, the CPU tier's workers, device-placement's off-device prefixes for l
 (layer, experts) group per routed layer of each decoded token: the cache's own record, record_routes) it also replays
 the cache's residency offline at several sizes and copy budgets (device-expert-cache's trace_replay: the rule the
 device runs), so what a size or a budget is worth is read in seconds from real routing, not from an engine rebuild.
-The cache's size stays expert-offload's own: every byte the device has free past the run's VRAM headroom (its
-margin_mib option, written here) while the engine serves."""
+The cache's size stays expert-offload's own: every byte the device has free past what the device keeps (the run's
+VRAM headroom, which Core's loader gives the device from the candidate's configuration: no option of the plan) while
+the engine serves."""
 import json
-import math
 from pathlib import Path
 
 GIB = 1 << 30
@@ -148,9 +148,10 @@ def plan(model, device, tokens, quality_mode="speed", vram_headroom_bytes=None, 
     layers, experts, top, hidden, inter = shape
     format = expert_format(config)
     size = bundle_bytes(format, hidden, inter)
-    if vram_headroom_bytes is None:   # the machine's setting, else crit Eval's default
-        from crit_eval import VRAM_HEADROOM_GIB, machine_settings
-        vram_headroom_bytes = round(machine_settings().get("vram_headroom_gib", VRAM_HEADROOM_GIB) * GIB)
+    if vram_headroom_bytes is None:   # the machine's setting, else Core's default (crit_plugins.memory.HEADROOM)
+        from crit.settings import vram_headroom_bytes as headroom_of
+        from crit_eval import machine_settings
+        vram_headroom_bytes = headroom_of(machine_settings())
     if settings is None:
         from crit_eval import EVAL_DIR
         settings = json.loads((Path(EVAL_DIR) / "protocol.json").read_text(encoding="utf-8"))["context"]
@@ -179,12 +180,12 @@ def plan(model, device, tokens, quality_mode="speed", vram_headroom_bytes=None, 
                             "copied over the link")
     out["miss_path"] = "cpu" if cpu else "link"
     workers = -1 if cores is None else max(1, int(cores) - 1)
-    # The cache leaves the run's VRAM headroom free at every moment (its margin): what the run's checks measure.
-    # A prompt chunk's arithmetic is the plugin's own choice (prompt_arithmetic auto): the faster one that keeps the
+    # The device keeps the run's VRAM headroom free at every moment (Core's, from the candidate's configuration): what
+    # the run's checks measure, which the plan sets nowhere. A prompt chunk's arithmetic is the plugin's own choice (prompt_arithmetic auto): the faster one that keeps the
     # level the engine asks of its prompt rows. So is the miss path where the placement prices the CPU first (misses
     # auto): the floors are lower bounds from a probe of an idle device, and the plugin times a missed expert both
     # ways in the loaded engine, where a turn to the host costs what it costs there, and takes the faster.
-    plugin = {"misses": "auto" if cpu else "link", "margin_mib": math.ceil(vram_headroom_bytes / (1 << 20))}
+    plugin = {"misses": "auto" if cpu else "link"}
     if cores is not None:
         plugin["workers"] = workers
     # The KV pools hold only the pages sequences use (attention-state's elastic pools): the expert cache the rest.
@@ -283,7 +284,8 @@ def add_parser(subs):
     sub.add_argument("--model", type=Path, required=True, help="The checkpoint folder (its config.json)")
     sub.add_argument("--device-file", type=Path, required=True, help="A crit eval probe result for this machine")
     sub.add_argument("--context", type=int, required=True, help="The context tokens the engine must serve")
-    sub.add_argument("--quality-mode", choices=("speed", "preserve"), default="speed")
+    from crit_plugins.exactness import QUALITY_MODES
+    sub.add_argument("--quality-mode", choices=QUALITY_MODES, default="speed")
     sub.add_argument("--trace", type=Path, help="A routing trace: [layer, [experts]] groups per routed layer of each "
                                                  "decoded token (JSON or JSON Lines; expert-offload's trace_path)")
     sub.add_argument("--profile", type=Path, help="With --trace: a routing or residency profile (its keys, hottest "

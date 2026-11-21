@@ -18,6 +18,15 @@ format, pass, shape and token count; no knob changes a route's bits.
     out = forward(x, ids, weights, store, slots, layout, ws)          # [tokens][hidden] FP32
     y = route_outputs(x, ids, store, slots, layout, ws)               # unweighted rows, [tokens * top][hidden]
     out = combine(y, ids, weights, slots, experts)                    # fmaf(weight, row, sum) in route order
+
+arithmetic="fp4" (nvfp4 bundles with input scales, hidden and inter multiples of 128, where fp4_available()): W4A4 on
+the block-scaled FP4 tensor cores, every route's inputs and intermediate quantized by crit's declared NVFP4 quantizer
+to E2M1 codes and UE4M3 scales, one MMA chain an output over K in order: decode and prompt items again give a route
+the same bits (structures fp4-decode and fp4-prompt), another arithmetic than the BF16 path's a4. arithmetic="fp8"
+(fp8:channel and fp8:block bundles, hidden and inter multiples of 128, where fp8_available()): W8A8 on the E4M3 tensor
+cores, every route's inputs and intermediate quantized per 128 values of a row in E4M3 at amax / 448 (crit's declared
+group quantizer), each 128-k block's sum folded by the activation's and the weight's scales in block order (structures
+fp8-decode and fp8-prompt: again a route's bits whatever its item).
 """
 import math
 
@@ -25,13 +34,21 @@ import torch
 
 from ._ops import ops
 
-__all__ = ["ACTIVATIONS", "ARITHMETICS", "FORMATS", "MAX_EXPERTS", "MAX_ITEMS", "SMALL_PLAN", "Workspace", "combine",
-           "forward", "quantize_e2m1x2", "route_outputs", "width_for"]
+__all__ = ["ACTIVATIONS", "ARITHMETICS", "caps_layout", "FORMATS", "MAX_EXPERTS", "MAX_ITEMS", "SMALL_PLAN", "Workspace",
+           "combine", "forward", "fp4_available", "fp8_available", "quantize_e2m1x2", "route_outputs", "width_for"]
 
-FORMATS = {"bf16": 0, "fp8:channel": 1, "fp8:block": 2, "nvfp4": 3, "int4": 4, "mxfp4": 5, "int4_zp": 6}
+FORMATS = {"bf16": 0, "fp8:channel": 1, "fp8:block": 2, "nvfp4": 3, "int4": 4, "mxfp4": 5, "int4_zp": 6, "mxfp8": 7}
 # A block's gated product, a layout's 13th integer (after the int4_zp group, 0 for none): silu(gate) * up, crit's
-# declared SwiGLU and the default, or gelu(gate) * up with GELU's tanh form (the tensor arithmetic only).
-ACTIVATIONS = {"silu": 0, "gelu_tanh": 1}
+# declared SwiGLU and the default, gelu(gate) * up with GELU's tanh form, or SwiGLU with its linear gate factor and
+# its up capped by a tanh each, the two caps a layout's 14th and 15th integers (caps_layout) (the tensor arithmetic
+# only).
+ACTIVATIONS = {"silu": 0, "gelu_tanh": 1, "softcapped_silu": 2}
+
+
+def caps_layout(caps):
+    """The layout integers of softcapped_silu's (gate cap, up cap): each an FP32's bits."""
+    import struct
+    return [struct.unpack("<i", struct.pack("<f", float(cap)))[0] for cap in caps]
 SMALL_PLAN = 1024   # routes the one-block plan takes; larger calls group their routes from a stable sort
 MAX_ITEMS = 65535   # a call's items (the launches' second grid dimension)
 MAX_EXPERTS = 65535   # the experts a call may name, in either plan
@@ -70,6 +87,7 @@ class Workspace:
         self.y = self._rows("y", routes, hidden, torch.float32)
         self.ones = torch.ones(routes, **ints) if routes > SMALL_PLAN else None
         self.hidden, self.inter, self.device, self._declared, self.xa = hidden, inter, device, None, None
+        self._fp4 = self._fp8 = None
 
     def declared(self, layout):
         """The declared arithmetic's buffers (made at its first call): quantized inputs and intermediate, gate/up rows."""
@@ -82,6 +100,26 @@ class Workspace:
                               "h": self._rows("declared.h", n, I, torch.int8),
                               "hs": self._rows("declared.hs", n, I // block, torch.float32)}
         return self._declared
+
+    def fp4(self):
+        """The FP4 arithmetic's buffers (made at its first call): the routes' input codes and scales, the
+        intermediate's."""
+        if self._fp4 is None:
+            n, H, I = self.routes, self.hidden, self.inter
+            self._fp4 = {"x": self._rows("fp4.x", n, H // 2, torch.uint8),
+                         "xs": self._rows("fp4.xs", n, H // 16, torch.uint8),
+                         "h": self._rows("fp4.h", n, I // 2, torch.uint8),
+                         "hs": self._rows("fp4.hs", n, I // 16, torch.uint8)}
+        return self._fp4
+
+    def fp8(self):
+        """The FP8 arithmetic's buffers (made at its first call): the routes' input codes and group scales, the
+        intermediate's (h itself is the workspace's)."""
+        if self._fp8 is None:
+            n, H, I = self.routes, self.hidden, self.inter
+            self._fp8 = {"x": self._rows("fp8.x", n, H, torch.uint8), "xs": self._rows("fp8.xs", n, H // 128, torch.float32),
+                         "h": self._rows("fp8.h", n, I, torch.uint8), "hs": self._rows("fp8.hs", n, I // 128, torch.float32)}
+        return self._fp8
 
 
 def _plan(ids, slots, ws):
@@ -103,23 +141,68 @@ def _plan(ids, slots, ws):
     ops.items(order, counts, starts, item_end, slots, experts, ws.item_slot, ws.item_routes, ws.item_count)
 
 
-ARITHMETICS = ("tensor", "declared")
+ARITHMETICS = ("tensor", "declared", "fp4", "fp8")
+_probed = {}
+
+
+def _probe(kind, device):
+    device = torch.device(device) if device is not None else torch.device("cuda", torch.cuda.current_device())
+    key = (kind, str(device))
+    if key not in _probed:
+        with torch.cuda.device(device):
+            _probed[key] = bool(ops.fp4_available() if kind == "fp4" else ops.fp8_available())
+    return _probed[key]
+
+
+def fp4_available(device=None):
+    """Whether this build multiplies on the device's block-scaled FP4 tensor cores (arithmetic "fp4": its code for
+    the device has mma.sync kind::mxf4nvf4, the sm_120 family's specific targets)."""
+    return _probe("fp4", device)
+
+
+def fp8_available(device=None):
+    """Whether this build multiplies on the device's E4M3 tensor cores (arithmetic "fp8": 8.9 on)."""
+    return _probe("fp8", device)
 
 
 def route_outputs(x, ids, store, slots, layout, ws, a4=False, arithmetic="tensor"):
     """Each planned route's unweighted output row, y [tokens * top][hidden] FP32 (ws.y; rows of skipped routes keep
     what they held). x [tokens][hidden] BF16 contiguous; ids [tokens][top]; store uint8 [slots][bytes]; slots int32
     [experts] or None (expert e in slot e); a4: nvfp4 W4A4 at the bundles' input scales. arithmetic: "tensor" (BF16
-    tensor cores, every format) or "declared" (crit's integer block order, the CPU tier's bits: nvfp4 W4A4, int4
-    W4A8)."""
+    tensor cores, every format), "declared" (crit's integer block order, the CPU tier's bits: nvfp4 W4A4, int4 W4A8)
+    "fp4" (nvfp4 W4A4 on the FP4 tensor cores, a4 implied) or "fp8" (fp8 W8A8 on the E4M3 tensor cores): see the
+    module's docstring."""
     if ids.shape != (ws.tokens, ws.top):
         raise ValueError(f"the workspace takes ids [{ws.tokens}][{ws.top}], not {list(ids.shape)}")
     if arithmetic not in ARITHMETICS:
         raise ValueError(f"arithmetic is {' or '.join(ARITHMETICS)}, not {arithmetic!r}")
+    if arithmetic == "fp4" and (layout[0] != FORMATS["nvfp4"] or ws.hidden % 128 or ws.inter % 128):
+        raise ValueError("the fp4 arithmetic takes nvfp4 bundles with input scales, hidden and inter multiples of 128")
+    if arithmetic == "fp4" and not fp4_available(x.device):
+        raise ValueError("the fp4 arithmetic runs on the block-scaled FP4 tensor cores (the sm_120 family): this "
+                         "device's code has none")
+    if arithmetic == "fp8" and (layout[0] not in (FORMATS["fp8:channel"], FORMATS["fp8:block"]) or ws.hidden % 128 or
+                                ws.inter % 128):
+        raise ValueError("the fp8 arithmetic takes fp8:channel and fp8:block bundles, hidden and inter multiples of 128")
+    if arithmetic == "fp8" and not fp8_available(x.device):
+        raise ValueError("the fp8 arithmetic runs on the E4M3 tensor cores (8.9 on): this device's code has none")
     _plan(ids, slots, ws)
     items = (ws.item_slot, ws.item_routes, ws.item_count)
+    if arithmetic == "fp4":
+        f = ws.fp4()
+        ops.fp4_inputs(x, ws.top, store, list(layout), *items, f["x"], f["xs"])
+        ops.fp4_gate_up(f["x"], f["xs"], store, list(layout), *items, f["h"], f["hs"], ws.tokens)
+        ops.fp4_down(f["h"], f["hs"], store, list(layout), *items, ws.y, ws.tokens)
+        return ws.y
+    if arithmetic == "fp8":
+        f = ws.fp8()
+        ops.fp8_inputs(x, ws.top, *items, f["x"], f["xs"])
+        ops.fp8_gate_up(f["x"], f["xs"], store, list(layout), *items, ws.h, ws.tokens)
+        ops.fp8_inputs(ws.h, 1, *items, f["h"], f["hs"])
+        ops.fp8_down(f["h"], f["hs"], store, list(layout), *items, ws.y, ws.tokens)
+        return ws.y
     if arithmetic == "declared":
-        if len(layout) == 13 and layout[12]:
+        if len(layout) >= 13 and layout[12]:
             raise ValueError("the declared arithmetic is SwiGLU's (its host twin computes no other gate): a block "
                              "gated by GELU runs the tensor arithmetic")
         d = ws.declared(layout)

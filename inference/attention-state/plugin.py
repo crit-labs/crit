@@ -21,6 +21,17 @@ class KVStateCache:
         self.host_bytes = int(host_pages_mib) << 20   # of an elastic pool's pages, the most kept in host memory
         self.pools = []   # the device pools made, whose bytes per token and prompt reads facts() reports
 
+    def position_bytes(self, layers, kv_heads, head_dim, dtype="bf16", value_dim=None):
+        """A pool position's device bytes (pages.position_bytes), which a model's plan prices its pools by."""
+        return pages.position_bytes(layers, kv_heads, head_dim, dtype, value_dim)
+
+    def close(self):
+        """The engine closes: every pool made gives its device memory back (pages.KVPool.discard)."""
+        for made in self.pools:
+            made.discard()
+        self.pools = []
+        self.states = {}
+
     def _state(self, sequence):
         try:
             return self.states[sequence]
@@ -118,7 +129,7 @@ class KVStateCache:
 
 
     def exactness(self):
-        """The level the pools' pages leave a prompt row (crit_kernels.exactness; Core compares it with the level the
+        """The level the pools' pages leave a prompt row (crit_plugins.exactness; Core compares it with the level the
         configuration asks): over FP8 or INT8 pools with the fresh buffer (fresh_mib) a prompt row reads its own
         chunk's keys and values as the projections gave them and the earlier positions from the pages, so its bits
         follow the chunk it is read in: repeatable prompt rows, whatever reader the attention plugin takes. Without
@@ -127,6 +138,13 @@ class KVStateCache:
         if quantized and min(p.fresh_tokens for p in quantized):
             return {"prompt": "repeatable"}
         return {}
+
+
+def position_bytes(layers, kv_heads, head_dim, dtype="bf16", value_dim=None):
+    """The device bytes one position of a pool takes (pages.position_bytes): the price a model plugin's resolve()
+    asks of the kv_cache slot for each pool it will make, before any is made; facts() counts the same of the pools
+    made."""
+    return pages.position_bytes(layers, kv_heads, head_dim, dtype, value_dim)
 
 
 def memory(context, options):

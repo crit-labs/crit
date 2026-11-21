@@ -29,7 +29,6 @@ leaves to the engine.
 | Need | Entry | Supplies |
 | --- | --- | --- |
 | Load exact encoded regions | [artifact-loading](artifact-loading/README.md) | Extent/content checks, retained materialization, native chunked reads |
-| Check host memory before large allocations | [host-memory-admission](host-memory-admission/README.md) | Physical, commit and cgroup admission; incremental working sets |
 | Audit imported model metadata | [model-import-audit](model-import-audit/README.md) | Safetensors header/index checks, tensor roles, shard geometry |
 | Reuse serialized state | [checkpoint-storage](checkpoint-storage/README.md) | Complete manifests, prefix coordination, paced transfers, leased tiers |
 | Recover speculative recurrence | [recurrent-state-recovery](recurrent-state-recovery/README.md) | Gated-delta verification, accepted-prefix repair, chunked prefill reference; on the device a state pool whose verify windows keep their accepted prefix in captured rounds (deferred, checkpoints or recompute) |
@@ -47,12 +46,9 @@ leaves to the engine.
 | Compute NVFP4 experts on the CPU with the device's bits | [host-expert-arithmetic](host-expert-arithmetic/README.md) | Declared FP32 orders and exact integer block rows, scalar oracles, AVX2/AVX-512 (VNNI) paths, matching CUDA functions, scale hook; serves the projections slot on the CPU |
 | Compute a layer's CPU share of experts on a pinned pool | [host-expert-tier](host-expert-tier/README.md) | Ready `HostExpertTier` on the host's worker pool (Core's): integer rows with the device's bits, declared SwiGLU and quantizer, handoff payload, telemetry; serves the experts slot on the CPU and joins a CUDA engine's -2 routes inside the stream (heterogeneous-expert-dispatch) |
 | Join asynchronous contributions | [async-expert-contributions](async-expert-contributions/README.md) | Receipt-based join, source retention, ordered reduction |
-| Run device-decided host work inside a captured graph | [host-work-mailbox](host-work-mailbox/README.md) | Device-reset doorbells, measured stream-wait or poll join, release and failure answering; Core runs it for every plugin (`crit_plugins.host`'s handoffs) |
 | Serve a dense model larger than device memory | [dense-layer-offload](dense-layer-offload/README.md) | Measured planner, host AVX2/AVX-512 layers, double-buffered weight streaming, measured plan selection |
 | Fetch file-backed experts | [ssd-expert-materialization](ssd-expert-materialization/README.md) | Checked reads, a host tier fed by device evictions, bounded gather, read-ahead, upload handoff |
 | Read embedding or n-gram table rows from disk | [lookup-table-rows](lookup-table-rows/README.md) | Random-access advice, exact parallel row reads, hot-row cache; on CUDA tables in registered host memory or files, gathered inside captured graphs |
-| Bound prefill, physical batches and scratch | [session-scheduling](session-scheduling/README.md) | Transactional cursor, latency chunk policy, physical caps and workspace sizing |
-| Batch independent requests | [concurrent-request-execution](concurrent-request-execution/README.md) | Ready-row compaction, metadata patches, retirement barrier |
 | Execute speculative rounds | [mtp-decode](mtp-decode/README.md) | Token-history proposals, greedy/sampled verification, repair, adaptive budgets; copy drafts from device token histories (`draft:device`) |
 | Sample tokens on the device, and verify sampled drafts | [token-sampling](token-sampling/README.md) | Core's whole law over the full vocabulary (penalties, top-k/p, min-p), rejection-sampling verify predictions; `rounds:sampler` for captured rounds (draft draws with sparse laws, rejection-sampling predictions, emitted-token log-probabilities) |
 | Keep structured output exact under speculation | [token-constraints](token-constraints/README.md) | [Core](../core/src/constraints/README.md) matchers in sampled speculation, private forks and rewinds; serves on CUDA: masks before token-sampling's device law, staged for captured steps and rounds |
@@ -60,7 +56,6 @@ leaves to the engine.
 | Verify a tree of drafts in one pass | [draft-trees](draft-trees/README.md) | EAGLE-2 trees, ancestor masks, device tree walk (greedy or sampled), row compaction; device tree drafting and walk in captured rounds (`draft:device`, `verify:device`; its rounds need `attention:tree`) |
 | Draft with a published EAGLE-3, DFlash or DSpark drafter | [hidden-state-drafters](hidden-state-drafters/README.md) | Core's reader of every drafter format (one tap convention), catch-up, block input, d2t mapping, confidence cuts |
 | Cheapen the draft head | [draft-vocabulary-subset](draft-vocabulary-subset/README.md) | Head row subset, index mapping, CUDA gather-argmax |
-| Select compatible execution and retain choices | [recorded-selection](recorded-selection/README.md) | Phase/shape replay policy, recorded choices, repeatability checks |
 | Fuse the elementwise work around the matmuls | [fused-norms](fused-norms/README.md) | RMSNorm with a residual, head norms with rotary positions, gated norms, activation products, L2 norms, residual-stream mixes as the `norms` slot: one launch per call of crit's kernel fused-norms, each row's bits independent of its batch; the FP64 host form, the torch form (base torch-norms, and the fallback) and conformance checks for any norms plugin |
 
 Each entry has a Python host reference; the entries that fill a slot also serve on a device as plugins, and some add
@@ -117,7 +112,7 @@ checkpoint, keep the fastest that passes, and drop one that fails. A technique w
 through the manifest's `sources` (`"code"`), with tests against the slot's base plugin
 or the technique's exact reference. Its variants are options, and parts that only work
 together are one fused plugin. The base plugins, the plain plugin of each slot, are in
-[base/](base/) (chain-verifier, device-placement, eager-graphs, expert-tensors,
+[base/](base/) (chain-verifier, device-placement, expert-tensors,
 experts-reference, greedy-head-drafter, memory-table-rows, projections-dense,
 sequential-recurrence, softmax-attention, topk-router, torch-norms). Together they are
 crit's library: `crit plugins list` shows them, `crit inference show ID` lists a
@@ -125,11 +120,18 @@ technique's plugin and the plugins built on its code, and `crit plugins add
 ENGINE/plugins ID...` copies plugins and the code they import into an engine, which then
 puts its own device code behind the same interface and keeps the tests. Two entries
 only lend their code to plugins (async-expert-contributions and expert-streamed-prefill),
-and eight are no plugin, because a model plugin calls them rather than plugs them into a slot:
-artifact-loading, model-import-audit, checkpoint-storage, host-memory-admission and
-device-speculative-round; or because Core does it for every engine: session-scheduling and
-concurrent-request-execution (its concurrent runtime) and host-work-mailbox (the host's
-handoffs, `crit_plugins.host`). dense-layer-offload is the placement slot's layer planner.
+and four are no plugin, because a model plugin calls them rather than plugs them into a slot:
+artifact-loading, model-import-audit, checkpoint-storage and device-speculative-round.
+dense-layer-offload is the placement slot's layer planner.
+
+What Core does for every engine has no entry here, since no engine chooses it: the scheduling of requests and of
+prompt steps (Core's [runtime](../core/src/runtime/README.md), with request priority, mixed batches and step
+publication, and the prompt-step budgets of `crit_plugins.steps`), the host's handoffs that run device-decided host
+work inside a captured graph ([crit_plugins.host](../core/python/crit_plugins/host/README.md)), what host memory the
+OS can back (`crit_plugins.host.memory`), measured choices recorded once and replayed (`crit_plugins.decisions`) and
+the captured prompt chunks, which run the smallest captured bucket that holds a chunk (`crit_plugins.prompt_graphs`).
+These were entries of their own (session-scheduling, concurrent-request-execution, host-work-mailbox,
+host-memory-admission, recorded-selection) before Core took them over.
 
 Read the mechanism (units, identities, arithmetic, state transitions) before
 porting; the Python object model is a reference, not a required interface. To

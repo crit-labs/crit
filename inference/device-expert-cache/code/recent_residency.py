@@ -1,5 +1,5 @@
 """Recent residency, the rule on the host (numpy). The device runs the same rule in expert_cache._Recent and the
-directory's plan (directory_ops.cu, device_directory.py); trace_replay.recent replays it over a routing trace.
+directory's plan (crit's kernel expert-directory, device_directory.py); trace_replay.recent replays it over a routing trace.
 
 What is resident is what was routed last. Every expert a plan misses is computed by the CPU tier and copied into the
 cache beside the round, so it serves from the next round. It takes a slot from the round's victim list: the `swaps`

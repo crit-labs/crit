@@ -242,6 +242,17 @@ __host__ __device__ constexpr int smem_bytes(int dvp, int bn, int warps, int sta
 // Tile memory of the fused launch's sync words: ticket, done, then three a tile.
 constexpr int SYNC_HEAD = 2;
 
+// What a program does with its splits (a tile's FORM): one split, its state a partial for the merge (FORM_SPLIT: window
+// launches, and prompt chunks in one range or in splits of their own); one split, its state into its tile's ring, folded
+// by the next group's programs (FORM_RING); every split of its tile in turn, each folded into the tile's running state
+// as it ends (FORM_SERIAL). The three fold the same states in the same order with the merge's steps: the same bits.
+enum : int { FORM_SPLIT = 0, FORM_RING = 1, FORM_SERIAL = 2 };
+
+// A serial tile's running outputs (FP32, one a row and value column): in registers beside the split's accumulators
+// where both fit a thread (up to 128 value columns a program), else in the launch's workspace, read and written once a
+// split (a thread's NVW x 4 floats as float4, one after another across the CTA's threads: coalesced).
+__host__ __device__ constexpr bool run_in_registers(int dvp) { return dvp <= 128; }
+
 // WARPS row groups of 16 query rows, VW warps a row group: the group's warps share its rows' scores (each computing
 // some of a block's positions, n8 tiles of the scores, which they exchange through shared memory) and split its value
 // columns (each the outputs of NV / VW n8 tiles). Every warp of a group runs the group's online softmax on the same
@@ -252,7 +263,7 @@ constexpr int SYNC_HEAD = 2;
 // converts the ones its fragments take in registers (the keys' pairs read from their rows, the values' by ldmatrix
 // .trans of 16-bit pairs and a quad shuffle), with codes_to_16 as the shared block's conversion: the same operands, the
 // same bits, no 16-bit block and no pass converting it.
-template <int DVP, int BN, int WARPS, int VW, int STAGES, bool IREG, bool FUSED>
+template <int DVP, int BN, int WARPS, int VW, int STAGES, bool IREG, int FORM>
 struct Tile {
     static_assert(!IREG || BYTE_PAGES, "in-register conversion takes 8-bit pages");
     static_assert(DVP % 64 == 0, "value columns a program: a multiple of 64");
@@ -274,6 +285,8 @@ struct Tile {
     // evenly over the group's warps, else single tiles.
     static constexpr bool PAIRS = (NT / 2) % VW == 0;
     __host__ __device__ static constexpr int owner(int t) { return PAIRS ? (t / 2) % VW : t % VW; }
+    // FORM_SERIAL: FP32 floats of a tile's running outputs kept in the launch's workspace (0: in registers)
+    static constexpr int RUN_FLOATS = FORM == FORM_SERIAL && !run_in_registers(DVP) ? ROWS * DVP : 0;
 };
 
 // What a fused program owes: its ticket's work, then (when its group is complete) the group's fold.
@@ -281,9 +294,10 @@ struct Work {
     int mt, b, rk, split;
 };
 
-template <int DVP, int BN, int WARPS, int VW, int STAGES, bool IREG, bool FUSED>
+template <int DVP, int BN, int WARPS, int VW, int STAGES, bool IREG, int FORM>
 __device__ __forceinline__ void cw_tile(const Params& p, const Work w, unsigned char* smem) {
-    using C = Tile<DVP, BN, WARPS, VW, STAGES, IREG, FUSED>;
+    using C = Tile<DVP, BN, WARPS, VW, STAGES, IREG, FORM>;
+    constexpr bool FUSED = FORM == FORM_RING, SERIAL = FORM == FORM_SERIAL;
     constexpr int ROWS = C::ROWS, THREADS = C::THREADS, NT = C::NT, NV = C::NV, KSTEPS = C::KSTEPS;
     constexpr int NVW = C::NVW;
     constexpr int Q_BYTES = C::Q_BYTES, STAGE_K = C::STAGE_K, STAGE_V = C::STAGE_V, STAGE_BYTES = C::STAGE_BYTES;
@@ -324,8 +338,17 @@ __device__ __forceinline__ void cw_tile(const Params& p, const Work w, unsigned 
     int chunk = p.chunk;
     if(flags & F_DEV_CHUNK) chunk = int(cdivll(cdivll(first + count, p.n_parts), BN) * BN);
     int lo, hi;
-    const int vofs = FUSED ? b * DVP : 0;
-    if(one_split) {
+    const int vofs = FUSED || SERIAL ? b * DVP : 0;
+    int s_at = 0, s_end = 0;   // FORM_SERIAL: the split being walked and the position it ends at
+    if constexpr(SERIAL) {
+        // Every split of the tile in turn, from the first one a split program would run (the splits wholly below the
+        // tile's window hold nothing) to the one holding its last column: the same blocks as those programs', one
+        // after another.
+        const int wlo = first + c_lo - p.window + 1;
+        s_at = p.window > 0 && wlo > 0 ? int(splits_to(wlo, chunk, p.ramp, p.ramp_k)) - 1 : 0;
+        const Split sp = split_of(s_at, chunk, p.ramp, p.ramp_k);
+        lo = sp.lo, hi = n_keys, s_end = sp.lo + sp.size;
+    } else if(one_split) {
         lo = 0, hi = n_keys;
         if(flags & (F_STATE_OUT | F_STATE_IN)) {
             // A chunk in passes over one range, each continuing the state the one before it left (F_STATE_IN) and
@@ -356,6 +379,13 @@ __device__ __forceinline__ void cw_tile(const Params& p, const Work w, unsigned 
         // a split left without positions keeps an empty state, which its merge folds as nothing.
         const int wlo = first + c_lo - win + 1;
         if(wlo > lo) lo = min(hi, lo + (wlo - lo) / BN * BN);
+    }
+    if constexpr(SERIAL) {
+        // (a first split wholly below the window holds no block: an empty state, which folds as nothing)
+        while(lo >= s_end) {
+            const Split sp = split_of(++s_at, chunk, p.ramp, p.ramp_k);
+            s_end = sp.lo + sp.size;
+        }
     }
     const long long start = one_row ? 0 : p.starts[r];
     const long long trow = one_row ? 0 : p.rows[r];
@@ -564,6 +594,97 @@ __device__ __forceinline__ void cw_tile(const Params& p, const Work w, unsigned 
             l[h] = __ldcg(p.state + (4 * NVW + 2 + h) * state_n + state_at);
         }
     }
+
+    // -- FORM_SERIAL: the tile's running state (the merge's: FP32 outputs, maximum, sum), each split folded into it as
+    // it ends, in split order, with the merge's steps on the split's state as a split program writes it (its outputs
+    // rounded to BF16). A row folds the splits its merge folds: those holding its positions, from its window's on.
+    constexpr int RUN_REG = SERIAL && run_in_registers(DVP) ? NVW : 1;
+    float run[RUN_REG][4];
+#pragma unroll
+    for(int t = 0; t < RUN_REG; ++t) run[t][0] = run[t][1] = run[t][2] = run[t][3] = 0.0f;
+    float m_run[2] = {-INFINITY, -INFINITY}, l_run[2] = {0.0f, 0.0f};
+    int s_first[2] = {0, 0}, s_last[2] = {0, 0};   // the splits row h folds: s_first <= s < s_last
+    float4* run_mem = nullptr;                     // the thread's running outputs in the workspace (float4 t at t x THREADS)
+    bool folded = false;                           // a split was folded: the running outputs hold it
+    if constexpr(SERIAL) {
+#pragma unroll
+        for(int h = 0; h < 2; ++h) {
+            s_last[h] = int(splits_to(lim[h] + 1, chunk, p.ramp, p.ramp_k));
+            if(win > 0 && lim[h] - win + 1 > 0)
+                s_first[h] = min(s_last[h], int(splits_to(lim[h] - win + 1, chunk, p.ramp, p.ramp_k)) - 1);
+        }
+        if constexpr(C::RUN_FLOATS != 0) {
+            const long long chain = ((long long)rk * (DV / DVP) + b) * gridDim.x + mt;
+            run_mem = reinterpret_cast<float4*>(p.run) + chain * (NVW * THREADS) + tid;
+        }
+    }
+    // The split that ends: its state folded into the running one (`last`: the tile's last split, into the outputs).
+    auto fold_split = [&](int s, bool last) {
+        kc::SoftmaxFold2 f[2];
+        bool on[2];
+        const float lt[2] = {kc::softmax_row_total(l[0]), kc::softmax_row_total(l[1])};
+#pragma unroll
+        for(int h = 0; h < 2; ++h) {
+            on[h] = live[h] && s >= s_first[h] && s < s_last[h];
+            f[h] = kc::softmax_fold2(m_run[h], l_run[h], m[h], lt[h]);
+            if(on[h]) m_run[h] = f[h].m, l_run[h] = f[h].l;
+        }
+        float keep[2] = {1.0f, 1.0f};
+        T* row[2] = {nullptr, nullptr};
+        if(last) {
+            T* out = reinterpret_cast<T*>(p.out);
+#pragma unroll
+            for(int h = 0; h < 2; ++h) {
+                if(!live[h]) continue;
+                row[h] = out + (start + col[h]) * p.stride_ot + (long long)(kvh * G + hd[h]) * p.stride_oh + vofs;
+                if(flags & F_SINKS) {
+                    const kc::SoftmaxFold2 sf = kc::softmax_sink2(m_run[h], l_run[h], p.sinks[kvh * G + hd[h]]);
+                    m_run[h] = sf.m, l_run[h] = sf.l, keep[h] = sf.keep;
+                }
+                if((flags & F_LSE) && tig == 0 && vw == 0 && b == 0)
+                    p.lse[(start + col[h]) * p.hq + kvh * G + hd[h]] = kc::softmax_lse2(m_run[h], l_run[h]);
+            }
+        }
+#pragma unroll
+        for(int t = 0; t < NVW; ++t) {
+            float o[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            if constexpr(C::RUN_FLOATS == 0) {
+#pragma unroll
+                for(int i = 0; i < 4; ++i) o[i] = run[t][i];
+            } else {
+                if(folded) {
+                    const float4 x = run_mem[t * THREADS];
+                    o[0] = x.x, o[1] = x.y, o[2] = x.z, o[3] = x.w;
+                }
+            }
+#pragma unroll
+            for(int h = 0; h < 2; ++h) {
+                // the split's outputs as its partial holds them (BF16), folded as the merge folds them
+                const uint32_t pair = kc::pack_bf16x2(acc[t][2 * h], acc[t][2 * h + 1]);
+                const float x = kc::fold_output(o[2 * h], kc::bf16_lo(pair), f[h]);
+                const float y = kc::fold_output(o[2 * h + 1], kc::bf16_hi(pair), f[h]);
+                if(on[h]) o[2 * h] = x, o[2 * h + 1] = y;
+            }
+            if(last) {
+#pragma unroll
+                for(int h = 0; h < 2; ++h) {
+                    if(!live[h]) continue;
+                    const float x = (flags & F_SINKS) ? __fmul_rn(o[2 * h], keep[h]) : o[2 * h];
+                    const float y = (flags & F_SINKS) ? __fmul_rn(o[2 * h + 1], keep[h]) : o[2 * h + 1];
+                    *reinterpret_cast<uint32_t*>(row[h] + 8 * (tv0 + t) + 2 * tig) =
+                        pack_out(kc::softmax_finish(x, l_run[h]), kc::softmax_finish(y, l_run[h]));
+                }
+            } else if constexpr(C::RUN_FLOATS == 0) {
+#pragma unroll
+                for(int i = 0; i < 4; ++i) run[t][i] = o[i];
+            } else {
+                run_mem[t * THREADS] = make_float4(o[0], o[1], o[2], o[3]);
+            }
+            acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.0f;
+        }
+        kc::softmax_rows_init(m, l);
+        folded = true;
+    };
 
     const int nblk = (hi - lo + BN - 1) / BN;
     // The lane's ldmatrix offsets (elements), the same every block: k-step kk's chunk 2 kk + h of a swizzled row
@@ -818,8 +939,18 @@ __device__ __forceinline__ void cw_tile(const Params& p, const Work w, unsigned 
             if(it + 1 < nblk) issue(n0 + BN, 0, 2);
             kc::cp_async_commit();
         }
+        if constexpr(SERIAL) {
+            // The split's last block (the tile's: the last of all): its state into the running one, the next split
+            // from an empty state. (A warp past its rows folds states that hold nothing for them.)
+            if(n0 + BN >= min(s_end, hi)) {
+                if(warp_live) fold_split(s_at, it + 1 == nblk);
+                const Split sp = split_of(++s_at, chunk, p.ramp, p.ramp_k);
+                s_end = sp.lo + sp.size;
+            }
+        }
     }
     kc::cp_async_wait<0>();
+    if constexpr(SERIAL) return;
 
     if(flags & F_STATE_OUT) {   // a chunk's first pass: the state for its second
 #pragma unroll
@@ -1035,12 +1166,16 @@ __device__ __forceinline__ void cw_tile(const Params& p, const Work w, unsigned 
     }
 }
 
-template <int DVP, int BN, int WARPS, int VW, int STAGES, bool IREG, bool FUSED>
+template <int DVP, int BN, int WARPS, int VW, int STAGES, bool IREG, int FORM>
 __global__ void __launch_bounds__(32 * WARPS * VW) cw_window(const Params p) {
     extern __shared__ __align__(128) unsigned char smem[];
-    if constexpr(!FUSED) {
+    if constexpr(FORM == FORM_SPLIT) {
         const Work w{int(gridDim.x - 1 - blockIdx.x), 0, int(blockIdx.z), int(blockIdx.y)};   // the longest tiles first
-        cw_tile<DVP, BN, WARPS, VW, STAGES, IREG, false>(p, w, smem);
+        cw_tile<DVP, BN, WARPS, VW, STAGES, IREG, FORM_SPLIT>(p, w, smem);
+    } else if constexpr(FORM == FORM_SERIAL) {
+        // One program a tile and part of the value columns: every split of the tile in turn (the longest tiles first)
+        const Work w{int(gridDim.x - 1 - blockIdx.x), int(blockIdx.y), int(blockIdx.z), 0};
+        cw_tile<DVP, BN, WARPS, VW, STAGES, IREG, FORM_SERIAL>(p, w, smem);
     } else {
         // A ticket in split order (every tile's first split, the longest tiles first, then every tile's second...):
         // a program waits only for programs of its tile's earlier splits, which hold earlier tickets and run already,
@@ -1055,7 +1190,7 @@ __global__ void __launch_bounds__(32 * WARPS * VW) cw_window(const Params p) {
         const int split = t / chains, chain = t % chains;
         const int mt = p.tiles - 1 - chain % p.tiles, rest = chain / p.tiles;
         const Work w{mt, rest % (DV / DVP), rest / (DV / DVP), split};
-        cw_tile<DVP, BN, WARPS, VW, STAGES, IREG, true>(p, w, smem);
+        cw_tile<DVP, BN, WARPS, VW, STAGES, IREG, FORM_RING>(p, w, smem);
         __syncthreads();
         if(threadIdx.x == 0 && atomicAdd(p.sync + 1, 1) == total - 1) {
             p.sync[0] = 0;   // every program is done: the counters are ready for the next launch
@@ -1334,11 +1469,11 @@ constexpr Resolved resolve(int bn, int warps, int stages, int vsplit, bool fused
 }
 
 struct WindowKnobs { int chunk, bn, warps, stages, vwarps, convert, ramp; };
-struct FusedKnobs { int warps, stages, vsplit, vwarps, convert; };
+struct FusedKnobs { int warps, stages, vsplit, vwarps, convert, serial; };
 struct PrefillKnobs { int bn, warps, stages, splits; };
 #define CW_WINDOW(i, chunk, bn, warps, stages, vwarps, convert, ramp) \
     WindowKnobs{chunk, bn, warps, stages, vwarps, convert, ramp},
-#define CW_FUSED(i, warps, stages, vsplit, vwarps, convert) FusedKnobs{warps, stages, vsplit, vwarps, convert},
+#define CW_FUSED(i, warps, stages, vsplit, vwarps, convert, serial)     FusedKnobs{warps, stages, vsplit, vwarps, convert, serial},
 #define CW_PREFILL(i, bn, warps, stages, splits) PrefillKnobs{bn, warps, stages, splits},
 constexpr WindowKnobs kWindow[] = {CRIT_CONFIGS_cuda_window(CW_WINDOW)};
 constexpr FusedKnobs kFused[] = {CRIT_CONFIGS_cuda_fused(CW_FUSED)};
@@ -1371,38 +1506,50 @@ constexpr bool BUILD_WINDOW = true, BUILD_FUSED = true, BUILD_PREFILL = true, SW
 
 using Launch = int (*)(const Params*, cudaStream_t, int, int, int);
 
-template <int DVP, int BN, int WARPS, int VW, int STAGES, bool IREG, bool FUSED>
+template <int DVP, int BN, int WARPS, int VW, int STAGES, bool IREG, int FORM>
 int launch_tile(const Params* p, cudaStream_t stream, int gx, int gy, int gz) {
-    using C = Tile<DVP, BN, WARPS, VW, STAGES, IREG, FUSED>;
+    using C = Tile<DVP, BN, WARPS, VW, STAGES, IREG, FORM>;
     // The tile's shared memory, raised once a device (the limit is the function's on the device it is loaded on, and
     // one library serves every GPU of its kind in the process).
     static kc::PerDevice<cudaError_t> optin;
-    if(const cudaError_t e = kc::shared_memory_optin(optin, cw_window<DVP, BN, WARPS, VW, STAGES, IREG, FUSED>, C::SMEM);
-       e != cudaSuccess)
-        return int(e);
-    // fused: gy splits times the value split's programs
-    cw_window<DVP, BN, WARPS, VW, STAGES, IREG, FUSED><<<dim3(gx, FUSED ? gy * (DV / DVP) : gy, gz), C::THREADS,
-                                                         C::SMEM, stream>>>(*p);
+    const cudaError_t e = kc::shared_memory_optin(optin, cw_window<DVP, BN, WARPS, VW, STAGES, IREG, FORM>, C::SMEM);
+    if(!p) {
+        // No launch: the tile's programs the device holds at once (0 where it refuses the tile).
+        static kc::PerDevice<int> held;
+        return e != cudaSuccess ? 0 : kc::resident_ctas(held, cw_window<DVP, BN, WARPS, VW, STAGES, IREG, FORM>,
+                                                        C::THREADS, C::SMEM);
+    }
+    if(e != cudaSuccess) return int(e);
+    // ring: gy splits times the value split's programs; serial: the value split's programs
+    cw_window<DVP, BN, WARPS, VW, STAGES, IREG, FORM><<<dim3(gx, FORM == FORM_SPLIT ? gy : gy * (DV / DVP), gz),
+                                                         C::THREADS, C::SMEM, stream>>>(*p);
     return int(cudaGetLastError());
 }
 
 // Window entries: (configuration for the call's rows, configuration for one row: its block, an order knob, the rule's
-// tile shape, fresh rows or not), NW x NW x VARIANTS (a sweep build: the diagonal, select() picks one configuration for
-// both). A configuration whose warps are given takes the same tile at every shape (one instantiation), and 16-bit pages
-// the same with fresh rows or without.
+// tile shape, fresh rows or not), NW x NW x VARIANTS. A sweep build holds the diagonal only, NW x VARIANTS: select()
+// gives both lookups one configuration, so its other pairs never launch, and a table of every pair would make the
+// build's cost grow with the square of its configurations (crit_cw_plan answers an off-diagonal pair as before). A
+// configuration whose warps are given takes the same tile at every shape (one instantiation), and 16-bit pages the
+// same with fresh rows or without.
 constexpr int VARIANTS = RULE_SHAPES * 2;
+constexpr int WINDOW_PAIRS = SWEEP ? NW : NW * NW;
+template <int I>
+constexpr int window_c() { return SWEEP ? I / VARIANTS : I / VARIANTS / NW; }   // the call's rows' configuration
+template <int I>
+constexpr int window_o() { return SWEEP ? I / VARIANTS : I / VARIANTS % NW; }   // one row's
 template <int I>
 constexpr Resolved window_resolved() {
-    constexpr int c = I / VARIANTS / NW, o = I / VARIANTS % NW, shape = I % VARIANTS / 2;
+    constexpr int c = window_c<I>(), o = window_o<I>(), shape = I % VARIANTS / 2;
     return resolve(kWindow[o].bn, kWindow[c].warps, kWindow[c].stages, 0, false, false, kWindow[c].vwarps, shape,
                    kWindow[c].convert, I % 2);
 }
 template <int I>
 Launch window_entry() {
     constexpr Resolved r = window_resolved<I>();
-    constexpr int c = I / VARIANTS / NW, o = I / VARIANTS % NW;
+    constexpr int c = window_c<I>(), o = window_o<I>();
     if constexpr(BUILD_WINDOW && r.ok && (!SWEEP || c == o))
-        return &launch_tile<r.dvp, r.bn, r.warps, r.vw, r.stages, r.ireg, false>;
+        return &launch_tile<r.dvp, r.bn, r.warps, r.vw, r.stages, r.ireg, FORM_SPLIT>;
     else
         return nullptr;
 }
@@ -1417,7 +1564,15 @@ constexpr Resolved fused_resolved() {
 template <int I>
 Launch fused_entry() {
     constexpr Resolved r = fused_resolved<I>();
-    if constexpr(BUILD_FUSED && r.ok) return &launch_tile<r.dvp, r.bn, r.warps, r.vw, r.stages, r.ireg, true>;
+    if constexpr(BUILD_FUSED && r.ok) return &launch_tile<r.dvp, r.bn, r.warps, r.vw, r.stages, r.ireg, FORM_RING>;
+    else return nullptr;
+}
+// Serial entries: the fused launch's tiles, one program a tile walking its splits in turn (the fused configuration's
+// warps, stages and value split, the window configuration's block).
+template <int I>
+Launch serial_entry() {
+    constexpr Resolved r = fused_resolved<I>();
+    if constexpr(BUILD_FUSED && r.ok) return &launch_tile<r.dvp, r.bn, r.warps, r.vw, r.stages, r.ireg, FORM_SERIAL>;
     else return nullptr;
 }
 template <int I>
@@ -1430,7 +1585,7 @@ template <int I>
 Launch prefill_entry() {
     constexpr Resolved r = prefill_resolved<I>();
     if constexpr(BUILD_PREFILL && D == DV && r.ok)
-        return &launch_tile<r.dvp, r.bn, r.warps, 1, r.stages, r.ireg, false>;
+        return &launch_tile<r.dvp, r.bn, r.warps, 1, r.stages, r.ireg, FORM_SPLIT>;
     else return nullptr;
 }
 
@@ -1442,6 +1597,11 @@ const Launch* window_table(std::integer_sequence<int, I...>) {
 template <int... I>
 const Launch* fused_table(std::integer_sequence<int, I...>) {
     static const Launch t[] = {fused_entry<I>()...};
+    return t;
+}
+template <int... I>
+const Launch* serial_table(std::integer_sequence<int, I...>) {
+    static const Launch t[] = {serial_entry<I>()...};
     return t;
 }
 template <int... I>
@@ -1465,11 +1625,13 @@ const Resolved* prefill_info(std::integer_sequence<int, I...>) {
     return t;
 }
 
-enum : int { S_WINDOW = 0, S_FUSED = 1, S_PREFILL = 2 };
+// S_SERIAL: the fused launch's serial form (the fused structure's configurations and entries).
+enum : int { S_WINDOW = 0, S_FUSED = 1, S_PREFILL = 2, S_SERIAL = 3 };
 
 static const Launch* table_of(int structure) {
-    if(structure == S_WINDOW) return window_table(std::make_integer_sequence<int, NW * NW * VARIANTS>{});
+    if(structure == S_WINDOW) return window_table(std::make_integer_sequence<int, WINDOW_PAIRS * VARIANTS>{});
     if(structure == S_FUSED) return fused_table(std::make_integer_sequence<int, NF * NW * VARIANTS>{});
+    if(structure == S_SERIAL) return serial_table(std::make_integer_sequence<int, NF * NW * VARIANTS>{});
     return prefill_table(std::make_integer_sequence<int, NP * 2>{});
 }
 
@@ -1477,8 +1639,9 @@ static const Launch* table_of(int structure) {
 
 // The configuration of a call (fresh: the launch reads fresh rows; length: the positions its page tables hold, the
 // tuning's length ranges'; -1 any): out = {entry, warps (row groups), stages, block,
-// value split, shared memory, warps a row group, codes converted in registers}. Returns 0, or 1 where the build holds
-// no such configuration (a sweep build's other structures), 2 where it does not fit the GPU.
+// value split, shared memory, warps a row group, codes converted in registers, FP32 floats of running outputs a serial
+// tile keeps in the launch's workspace (0: in registers)}. Returns 0, or 1 where the build holds no such configuration
+// (a sweep build's other structures), 2 where it does not fit the GPU.
 extern "C" int crit_cw_plan(int structure, long long hq, long long hkv, long long page, int rows, int fresh,
                             long long length, int* out) {
     int entry;
@@ -1487,9 +1650,17 @@ extern "C" int crit_cw_plan(int structure, long long hq, long long hkv, long lon
     if(structure == S_WINDOW) {
         const int i = crit_lookup_cuda_window(D, DV, hq, hkv, page, KIND, rows, length);
         const int j = crit_lookup_cuda_window(D, DV, hq, hkv, page, KIND, 1, length);
-        entry = (i * NW + j) * VARIANTS + variant;
-        info = window_info(std::make_integer_sequence<int, NW * NW * VARIANTS>{});
-    } else if(structure == S_FUSED) {
+        if(SWEEP && i != j) {   // a pair a sweep build does not hold: its resolved tile, and 1 (or 2: does not fit)
+            const Resolved r = resolve(kWindow[j].bn, kWindow[i].warps, kWindow[i].stages, 0, false, false,
+                                       kWindow[i].vwarps, variant / 2, kWindow[i].convert, variant % 2);
+            out[0] = (i * NW + j) * VARIANTS + variant, out[1] = r.warps, out[2] = r.stages, out[3] = r.bn;
+            out[4] = r.vsplit, out[5] = smem_bytes(r.dvp, r.bn, r.warps, r.stages, r.vw, r.ireg), out[6] = r.vw;
+            out[7] = r.ireg, out[8] = 0;
+            return r.ok ? 1 : 2;
+        }
+        entry = (SWEEP ? i : i * NW + j) * VARIANTS + variant;
+        info = window_info(std::make_integer_sequence<int, WINDOW_PAIRS * VARIANTS>{});
+    } else if(structure == S_FUSED || structure == S_SERIAL) {
         const int i = crit_lookup_cuda_fused(D, DV, hq, hkv, page, KIND, rows, length);
         const int j = crit_lookup_cuda_window(D, DV, hq, hkv, page, KIND, 1, length);
         entry = (i * NW + j) * VARIANTS + variant;
@@ -1501,11 +1672,20 @@ extern "C" int crit_cw_plan(int structure, long long hq, long long hkv, long lon
     const Resolved r = info[entry];
     out[0] = entry, out[1] = r.warps, out[2] = r.stages, out[3] = r.bn, out[4] = r.vsplit;
     out[5] = smem_bytes(r.dvp, r.bn, r.warps, r.stages, r.vw, r.ireg), out[6] = r.vw, out[7] = r.ireg;
+    out[8] = structure == S_SERIAL && !run_in_registers(r.dvp) ? 16 * r.warps * r.dvp : 0;
     if(!r.ok) return 2;
     return table_of(structure)[entry] ? 0 : 1;
 }
 
 extern "C" int crit_cw_params_size() { return int(sizeof(Params)); }
+
+// The programs of a configuration's tile the current device holds at once (its multiprocessors times the tiles one
+// holds: the launches a form fills the GPU with); 0 where the build holds no such configuration or the device refuses
+// the tile.
+extern "C" int crit_cw_resident(int structure, int entry) {
+    const Launch fn = table_of(structure)[entry];
+    return fn ? fn(nullptr, nullptr, 0, 0, 0) : 0;
+}
 
 extern "C" int crit_cw_launch(int structure, int entry, const Params* p, void* stream, int gx, int gy, int gz) {
     const Launch fn = table_of(structure)[entry];

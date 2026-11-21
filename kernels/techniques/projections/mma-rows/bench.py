@@ -230,12 +230,18 @@ class DecodeTile:
                    "int4_zp": n * k // 2 + 3 * n * (k // group)}[fmt]
         return weights + rows * k * 2 + rows * n * 2
 
+    arithmetic = "bf16"   # the tiles' MMA: weights decoded to BF16 (W*A16)
+
+    def flops(self, shape, rows):   # crit_kernels.floors
+        return 2 * rows * int(shape["N"]) * int(shape["K"]), self.arithmetic
+
 
 class Fp4Tile(DecodeTile):
     """NVFP4 matrices (K a multiple of 128) with blocked scales on the FP4 MMA, the activations quantized by its
     pre-pass; the reference multiplies the quantized activations (the quantize_nvfp4 op's codes and scales) in FP64.
     Devices without the MMA (fp4_mma() false) drop every configuration."""
     structure = "fp4-tile"
+    arithmetic = "nvfp4"   # W4A4 on the FP4 tensor cores
     acts = "nvfp4_mma"
     blocked = True
 

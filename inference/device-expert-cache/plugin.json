@@ -2,13 +2,14 @@
   "schema": "crit-plugin-v1",
   "id": "device-expert-cache",
   "title": "A device expert cache: the directory on the device under a clock, a ranked or a recent policy",
-  "description": "Host form: device-expert-cache's ClockDirectory, the host twin of its device directory, under its clock or ranked policy, or RecentResidency under its recent one. clock: a plan pins its resident experts, then admits each miss in route order to the slot the clock hand finds unpinned and unreferenced; admit_quota bounds the misses a plan admits (-1 for all), second_touch admits an expert only on its second miss, and a bypassed miss runs from the store. ranked (RankedPolicy, off the step's critical path): plans admit no misses and count every route; every `period` windows the keys are ranked by decayed route counts and the top ones swapped in, begun at one boundary and committed at the next, and a plan for a layer at or below the previous plan's layer starts a new window. recent (RecentResidency; with a CPU tier): what is resident is what was routed last; every miss is the CPU tier's now and is copied in beside the round, serving from the next round, in the slot of the expert routed longest ago (at most max_swaps copies a round). The clock and ranked host forms plan at most 32 experts and never more than the slots. Device form (experts:cache): cache(layers, experts, layout, slots, device, source, lend=None) -> ExpertCache: one store tensor of bundle slots on the device, the directory in device tensors, plan(layer, ids) one capture-safe launch per routed layer over a step's routes (duplicates and -1 allowed; misses admitted by the policy, or with cpu_tier sent to the CPU tier as slot -2 by admit_quota, quota_table or second_touch) then one fill launch copying the admitted bundles by SM loads from the store's device address; prompt(layer, ids) never admits (end_prompt() ends a prompt step): long chunks stage every non-resident expert of a layer by the copy engine into a ring of slots, the next layer under the current one, short ones plan their routed misses into ring slots; with lend (a KV pool made with spare bytes) the pool's pages no sequence holds are slots too, reclaimed before KV lands there. The directory's plan and fill are CUDA built at load (directory_ops.cu), torch ops where it does not build (native false: always), the same rule as LayerDirectory bit for bit.",
+  "description": "Host form: device-expert-cache's ClockDirectory, the host twin of its device directory, under its clock or ranked policy, or RecentResidency under its recent one. clock: a plan pins its resident experts, then admits each miss in route order to the slot the clock hand finds unpinned and unreferenced; admit_quota bounds the misses a plan admits (-1 for all), second_touch admits an expert only on its second miss, and a bypassed miss runs from the store. ranked (RankedPolicy, off the step's critical path): plans admit no misses and count every route; every `period` windows the keys are ranked by decayed route counts and the top ones swapped in, begun at one boundary and committed at the next, and a plan for a layer at or below the previous plan's layer starts a new window. recent (RecentResidency; with a CPU tier): what is resident is what was routed last; every miss is the CPU tier's now and is copied in beside the round, serving from the next round, in the slot of the expert routed longest ago (at most max_swaps copies a round). The clock and ranked host forms plan at most 32 experts and never more than the slots. Device form (experts:cache): cache(layers, experts, layout, slots, device, source, lend=None) -> ExpertCache: one store tensor of bundle slots on the device, the directory in device tensors, plan(layer, ids) one capture-safe launch per routed layer over a step's routes (duplicates and -1 allowed; misses admitted by the policy, or with cpu_tier sent to the CPU tier as slot -2 by admit_quota, quota_table or second_touch) then one fill launch copying the admitted bundles by SM loads from the store's device address; prompt(layer, ids) never admits (end_prompt() ends a prompt step): long chunks stage every non-resident expert of a layer by the copy engine into a ring of slots, the next layer under the current one, short ones plan their routed misses into ring slots; with lend (a KV pool made with spare bytes) the pool's pages no sequence holds are slots too, reclaimed before KV lands there. The directory's plan and fill are crit's kernel expert-directory, torch ops where it does not build (native false: always), the same rule as LayerDirectory bit for bit. Opaque rows (experts:rows): row_store(groups, keys, row_bytes, device, rows) and row_cache(groups, keys, row_bytes, slots, device, source) give the same cache over rows of any byte count in the caller's own layout (each slot a row padded to 16 bytes), read back by cache.rows().",
   "fills": [
     "expert_residency"
   ],
   "provides": [
     "experts:residency",
-    "experts:cache"
+    "experts:cache",
+    "experts:rows"
   ],
   "options": {
     "policy": {
@@ -117,7 +118,7 @@
     "native": {
       "type": "bool",
       "default": true,
-      "description": "device form: run the directory's CUDA plan and fill (built at load); false: its torch ops"
+      "description": "device form: run the directory's plan and fill by crit's kernel expert-directory; false: its torch ops"
     },
     "round_rows": {
       "type": "int",
@@ -154,5 +155,11 @@
   "sources": {
     "cache": "code"
   },
+  "kernels": [
+    {
+      "name": "expert-directory",
+      "fallback": "the directory's torch ops (code/device_directory.py): the same rule, capture-safe, slower"
+    }
+  ],
   "entry": "plugin.py:create"
 }

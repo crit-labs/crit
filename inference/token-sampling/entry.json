@@ -45,13 +45,10 @@
   "path": "inference/token-sampling/README.md",
   "code_path": "inference/token-sampling/code",
   "code_files": [
-    {"path": "inference/token-sampling/code/sampling.h", "purpose": "Params, Request, Rows and Verify; selection, mask, sample, verify and commit launch interfaces"},
-    {"path": "inference/token-sampling/code/sampling.cu", "purpose": "Two-stage top-64 selection, the full-vocabulary law (processing, prefix searches, draw), rejection-sampling verification, commits and constraint masking"},
     {"path": "inference/token-sampling/code/sampling.py", "purpose": "FP64 Python mirror of processing, law, draw and verification with Core's Philox draw and a runnable example"},
     {"path": "inference/token-sampling/code/device_law.py", "purpose": "Core's sampling law over logits rows in torch on the device, a constrained row's mask applied first: the sampler slot's device form"},
     {"path": "inference/token-sampling/code/device_staged.py", "purpose": "Core's law with a step's rules staged in device buffers and Core's Philox draw on the device: sampling a model can capture in a CUDA graph"},
-    {"path": "inference/token-sampling/code/device_rounds.py", "purpose": "The rounds:sampler extension: a captured round's rules staged per slot, draft draws with their sparse laws and rejection-sampling verify predictions on the device (sampling.cu through sampling_torch.cpp, built at load), with a torch law as the fallback"},
-    {"path": "inference/token-sampling/code/sampling_torch.cpp", "purpose": "Host binding of sampling.cu's launches (enqueue_verify, enqueue_sample, enqueue_logprobs) and Request rows for torch tensors on torch's current stream"}
+    {"path": "inference/token-sampling/code/device_rounds.py", "purpose": "The rounds:sampler extension: a captured round's rules staged per slot, draft draws with their sparse laws and rejection-sampling verify predictions on the device (crit's kernel token-sampling, built for the device), with a torch law as the fallback"}
   ],
   "requires": {
     "hardware": "CUDA C++20 and Core's sampling header (crit::core) for the device path; Python 3.11+ standard library for the mirror",
@@ -98,8 +95,7 @@
     "device-speculative-round",
     "mtp-decode",
     "token-constraints",
-    "draft-trees",
-    "recorded-selection"
+    "draft-trees"
   ],
   "techniques": [
     "token-sampling"

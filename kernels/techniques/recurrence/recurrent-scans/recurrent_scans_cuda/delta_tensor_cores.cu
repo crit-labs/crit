@@ -48,7 +48,7 @@ struct TcScratch {
                   // take; zeroed before the launch
 };
 
-std::size_t tc_part_bytes(const DeltaShape& d, int chunks, int part) {
+__host__ __device__ std::size_t tc_part_bytes(const DeltaShape& d, int chunks, int part) {
     const std::size_t c = std::size_t(chunks);
     switch(part) {
     case 0: case 1: return std::size_t(d.k_heads) * c * kTcChunk * d.dk * sizeof(__half);
@@ -58,7 +58,7 @@ std::size_t tc_part_bytes(const DeltaShape& d, int chunks, int part) {
     }
 }
 
-TcScratch tc_split(void* scratch, const DeltaShape& d, int chunks) {
+__host__ __device__ TcScratch tc_split(void* scratch, const DeltaShape& d, int chunks) {
     auto* b = static_cast<unsigned char*>(scratch);
     TcScratch s;
     s.k = reinterpret_cast<__half*>(b); b += tc_part_bytes(d, chunks, 0);
@@ -244,11 +244,13 @@ constexpr std::size_t tc_stage_bytes() {
 }
 
 // Pass 2 of value head h and value columns 16 WARPS slice .. by the block's first 32 WARPS threads (the others must have
-// left). With s.ready, a chunk's tiles are read once pass 1 flagged them.
+// left). With s.ready, a chunk's tiles are read once pass 1 flagged them. The state is read from `state` and written to
+// `state_out` after the first `full` chunks (a prompt: all of them; chunk rows: the row's complete chunks, none when it
+// has none, the partial chunk after them giving outputs only).
 template <int DK, int WARPS, int STAGES>
 __device__ __forceinline__ void tc_scan_slice(const DeltaShape& d, const DeltaInputs& in, int rows, int chunks,
-                                              const TcScratch& s, float* state, float* out, std::size_t out_stride, int h,
-                                              int slice, unsigned char* smem) {
+                                              const TcScratch& s, const float* state, float* state_out, int full,
+                                              float* out, std::size_t out_stride, int h, int slice, unsigned char* smem) {
     static_assert(DK % 16 == 0 && DK <= 128 && (STAGES == 1 || STAGES == 2), "keys in 16-column steps");
     constexpr int KT = DK / 8, THREADS = 32 * WARPS;
     const int kh = h / (d.v_heads / d.k_heads);
@@ -286,8 +288,7 @@ __device__ __forceinline__ void tc_scan_slice(const DeltaShape& d, const DeltaIn
     };
     // S^T [16 value columns][DK keys] of this warp in MMA accumulators (crit_kcore/scan_chunk.cuh's TransposedState)
     kcore::scan::TransposedState<DK> tile;
-    float* sh = state + std::size_t(h) * DK * d.dv;
-    tile.load(sh, d.dv, v0, lane, live);
+    tile.load(state + std::size_t(h) * DK * d.dv, d.dv, v0, lane, live);
     if(STAGES == 2) load(0, 0);
     for(int c = 0; c < chunks; ++c) {
         const int st = STAGES == 2 ? (c & 1) : 0;
@@ -414,9 +415,9 @@ __device__ __forceinline__ void tc_scan_slice(const DeltaShape& d, const DeltaIn
                     mma16816(tile.s[2 * q + 1], wd[kt], bk[2], bk[3]);
                 }
         }
+        if(live && c + 1 == full) tile.store(state_out + std::size_t(h) * DK * d.dv, d.dv, v0, lane);
         if(STAGES == 1) bar_threads(THREADS);
     }
-    if(live) tile.store(sh, d.dv, v0, lane);
 }
 
 template <int DK, int WARPS, int STAGES>
@@ -424,7 +425,8 @@ __global__ void __launch_bounds__(32 * WARPS, 1) delta_tc_scan_kernel(DeltaShape
                                                                       TcScratch s, float* state, float* out,
                                                                       std::size_t out_stride) {
     extern __shared__ __align__(16) unsigned char smem[];
-    tc_scan_slice<DK, WARPS, STAGES>(d, in, rows, chunks, s, state, out, out_stride, blockIdx.x, blockIdx.y, smem);
+    tc_scan_slice<DK, WARPS, STAGES>(d, in, rows, chunks, s, state, state, chunks, out, out_stride, blockIdx.x,
+                                     blockIdx.y, smem);
 }
 
 // Both passes in one launch (the OVERLAP knob): blocks 0 .. scans - 1 run pass 2 (value head, slice), waiting on each
@@ -445,8 +447,8 @@ __global__ void __launch_bounds__(kPrepThreads, 1) delta_tc_fused_kernel(DeltaSh
     if(b < scans) {
         if(threadIdx.x >= 32 * WARPS) return;
         const int scan = b;
-        tc_scan_slice<DK, WARPS, STAGES>(d, in, rows, chunks, s, state, out, out_stride, scan / slices, scan % slices,
-                                         smem);
+        tc_scan_slice<DK, WARPS, STAGES>(d, in, rows, chunks, s, state, state, chunks, out, out_stride, scan / slices,
+                                         scan % slices, smem);
         return;
     }
     int* counter = s.ready + items;
@@ -496,6 +498,86 @@ cudaError_t delta_tc_launch(const DeltaShape& d, const DeltaInputs& in, int rows
     return cudaGetLastError();
 }
 
+// ---------------------------------------------------------------------------------------------- chunk rows
+// Many rows in one launch pair (blockIdx.z the row): row r's tokens first .. first + tokens - 1 of the packed inputs,
+// chunked from its first token (the caller aligns it to a 64-token boundary of the sequence), from state slot
+// meta[r].slot_in, the state after its complete chunks to slot_out (< 0: not written; nor when it has none), its
+// outputs at its tokens' rows of `out`. Each row runs the prompt's code on its own scratch (row_bytes each), so its
+// outputs and states have the bits of a prompt launch over those tokens from that state: the chunk-aligned exact form.
+__device__ __forceinline__ DeltaInputs row_inputs(const DeltaInputs& in, int first) {
+    DeltaInputs r = in;
+    r.q += std::size_t(first) * in.qk_stride;
+    r.k += std::size_t(first) * in.qk_stride;
+    r.v += std::size_t(first) * in.v_stride;
+    r.log_decay += std::size_t(first) * in.gate_stride;
+    r.beta += std::size_t(first) * in.gate_stride;
+    return r;
+}
+
+template <int DK>
+__global__ void __launch_bounds__(kPrepThreads) delta_tc_prepare_rows_kernel(DeltaShape d, DeltaInputs in,
+                                                                              const int4* meta, void* scratch,
+                                                                              std::size_t row_bytes) {
+    extern __shared__ __align__(16) unsigned char smem[];
+    __shared__ float Gs[2][kTcChunk], Bs[2][kTcChunk];
+    const int4 m = meta[blockIdx.z];
+    const int chunks = (m.y + kTcChunk - 1) / kTcChunk;
+    if(int(blockIdx.x) >= chunks) return;
+    TcScratch s = tc_split(static_cast<unsigned char*>(scratch) + blockIdx.z * row_bytes, d, chunks);
+    s.ready = nullptr;
+    tc_prepare_chunk<DK>(d, row_inputs(in, m.x), m.y, chunks, s, blockIdx.x, blockIdx.y, smem, Gs, Bs);
+}
+
+template <int DK, int WARPS, int STAGES>
+__global__ void __launch_bounds__(32 * WARPS, 1) delta_tc_scan_rows_kernel(DeltaShape d, DeltaInputs in, const int4* meta,
+                                                                           void* scratch, std::size_t row_bytes,
+                                                                           const float* states_in, float* states_out,
+                                                                           float* out, std::size_t out_stride) {
+    extern __shared__ __align__(16) unsigned char smem[];
+    const int4 m = meta[blockIdx.z];
+    const int chunks = (m.y + kTcChunk - 1) / kTcChunk, full = m.w < 0 ? 0 : m.y / kTcChunk;
+    if(!chunks) return;
+    TcScratch s = tc_split(static_cast<unsigned char*>(scratch) + blockIdx.z * row_bytes, d, chunks);
+    s.ready = nullptr;
+    const std::size_t slot = std::size_t(d.v_heads) * d.dk * d.dv;
+    tc_scan_slice<DK, WARPS, STAGES>(d, row_inputs(in, m.x), m.y, chunks, s, states_in + m.z * slot,
+                                     states_out + (m.w < 0 ? 0 : m.w) * slot, full, out + std::size_t(m.x) * out_stride,
+                                     out_stride, blockIdx.x, blockIdx.y, smem);
+}
+
+template <int DK, int WARPS, int STAGES>
+cudaError_t delta_tc_rows_launch(const DeltaShape& d, const DeltaInputs& in, const int4* meta, int count, int widest,
+                                 void* scratch, std::size_t row_bytes, const float* states_in, float* states_out,
+                                 float* out, std::size_t out_stride, cudaStream_t stream) {
+    constexpr std::size_t prep = tc_prep_bytes<DK>(), scan = STAGES * tc_stage_bytes<DK>();
+    const int slices = (d.dv / 16 + WARPS - 1) / WARPS, chunks = (widest + kTcChunk - 1) / kTcChunk;
+    cudaError_t e = cudaFuncSetAttribute(delta_tc_prepare_rows_kernel<DK>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         static_cast<int>(prep));
+    if(e == cudaSuccess)
+        e = cudaFuncSetAttribute(delta_tc_scan_rows_kernel<DK, WARPS, STAGES>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(scan));
+    if(e != cudaSuccess) return e;
+    delta_tc_prepare_rows_kernel<DK><<<dim3(chunks, d.k_heads, count), kPrepThreads, prep, stream>>>(d, in, meta, scratch,
+                                                                                                    row_bytes);
+    delta_tc_scan_rows_kernel<DK, WARPS, STAGES><<<dim3(d.v_heads, slices, count), 32 * WARPS, scan, stream>>>(
+        d, in, meta, scratch, row_bytes, states_in, states_out, out, out_stride);
+    return cudaGetLastError();
+}
+
+template <int DK>
+cudaError_t delta_tc_rows(const DeltaShape& d, const DeltaInputs& in, const int4* meta, int count, int widest,
+                          void* scratch, std::size_t row_bytes, const float* states_in, float* states_out, float* out,
+                          std::size_t out_stride, cudaStream_t stream) {
+    switch(crit_lookup_delta_prefill_tc(d.k_heads, d.v_heads, d.dk, d.dv, widest)) {   // the knobs: work layout only
+#define CRIT_CASE(index, warps, stages, overlap)                                                                     \
+    case index: return delta_tc_rows_launch<DK, warps, stages>(d, in, meta, count, widest, scratch, row_bytes,      \
+                                                               states_in, states_out, out, out_stride, stream);
+        CRIT_CONFIGS_delta_prefill_tc(CRIT_CASE)
+#undef CRIT_CASE
+    default: return cudaErrorInvalidConfiguration;
+    }
+}
+
 template <int DK>
 cudaError_t delta_tc(const DeltaShape& d, const DeltaInputs& in, int rows, int chunks, const TcScratch& s, float* state,
                      float* out, std::size_t out_stride, cudaStream_t stream) {
@@ -522,6 +604,31 @@ std::size_t delta_tc_scratch_bytes(const DeltaShape& d, int rows) {
     std::size_t total = 0;
     for(int part = 0; part < 6; ++part) total += tc_part_bytes(d, chunks, part);
     return total;
+}
+
+std::size_t delta_tc_rows_scratch_bytes(const DeltaShape& d, int count, int widest) {
+    return count < 1 ? 0 : std::size_t(count) * delta_tc_scratch_bytes(d, widest);
+}
+
+cudaError_t enqueue_delta_chunk_rows_tc(const DeltaShape& d, const DeltaInputs& in, const int* meta, int count, int widest,
+                                        const float* states_in, float* states_out, void* scratch, float* out,
+                                        std::size_t out_stride, cudaStream_t stream) {
+#if !defined(CRIT_DELTA_TC)
+    return cudaErrorNotSupported;
+#else
+    if(!count) return cudaSuccess;
+    if(!delta_tc_supported(d) || !in.q || !in.k || !in.v || !in.log_decay || !in.beta || !meta || !states_in ||
+       !states_out || !scratch || !out || count < 0 || count > 65535 || widest < 1 ||
+       out_stride < std::size_t(d.v_heads) * d.dv || (reinterpret_cast<std::uintptr_t>(scratch) & 15u) ||
+       (reinterpret_cast<std::uintptr_t>(meta) & 15u))
+        return cudaErrorInvalidValue;
+    const std::size_t row_bytes = delta_tc_scratch_bytes(d, widest);
+    const int4* m = reinterpret_cast<const int4*>(meta);
+    return d.dk == 64 ? delta_tc_rows<64>(d, in, m, count, widest, scratch, row_bytes, states_in, states_out, out,
+                                          out_stride, stream)
+                      : delta_tc_rows<128>(d, in, m, count, widest, scratch, row_bytes, states_in, states_out, out,
+                                           out_stride, stream);
+#endif
 }
 
 cudaError_t enqueue_delta_prefill_tc(const DeltaShape& d, const DeltaInputs& in, int rows, float* state, void* scratch,

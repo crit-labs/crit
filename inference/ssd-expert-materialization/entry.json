@@ -70,8 +70,7 @@
   "interactions": [
     "expert-residency",
     "quantized-projections",
-    "device-expert-cache",
-    "host-memory-admission"
+    "device-expert-cache"
   ],
   "techniques": [
     "ssd-expert-materialization",

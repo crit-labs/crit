@@ -194,6 +194,24 @@ class _Part:
         self._mapping = self.owner._need_memory().map_file(path)
         self._view(rows * self.row_bytes, read_only=True)
 
+    def from_resident(self, files):
+        """The files' rows read once into registered host memory (no reader, no file kept open): a table held in
+        memory, gathered over the link as a tensor's rows are."""
+        nbytes = sum(rows * self.row_bytes for _, _, rows in files)
+        self._mapping = self.owner._need_memory().map_anonymous(nbytes)
+        out = memoryview(self.owner.memory.host_tensor(self._mapping.address, nbytes).numpy())
+        at = 0
+        for path, offset, rows in files:
+            end = at + rows * self.row_bytes
+            with open(path, "rb", buffering=0) as handle:
+                handle.seek(offset)
+                while at < end:
+                    got = handle.readinto(out[at:end])
+                    if not got:
+                        raise ValueError(f"{path} ends before its {rows} rows of {self.row_bytes} bytes from {offset}")
+                    at += got
+        self._view(nbytes, read_only=False)
+
     def _view(self, nbytes, read_only):
         memory = self.owner.memory
         self.rows_count = nbytes // self.row_bytes
@@ -508,10 +526,12 @@ class HostRows:
             parts.append(part)
         return self._table(parts, width, dtype, rows.device, format, scale)
 
-    def open(self, source, width, dtype, device, mapped=False, format=None, scales=None, scale=1.0):
+    def open(self, source, width, dtype, device, mapped=False, format=None, scales=None, scale=1.0, resident=False):
         """The table in host memory or files: source a CPU tensor of rows, a file path, a list of paths (each holding
         the next rows in id order) or {"paths": [...], "offsets": [...], "rows": [...]}; width values of dtype a row.
         mapped: a file source mapped read-only and registered whole (it must fit in host memory) instead of read.
+        resident: a file source's rows read once into registered host memory (it must fit there) instead of served
+        by a reader from the files.
         format "nvfp4": source holds the code rows (width / 2 bytes each), scales the E4M3 scale rows (width / 16 bytes)
         in the same kinds of source, scale the global scale (a multiplier); format "fp8": source holds E4M3 code rows
         (width bytes each), scale the table's multiplier; format "gguf:<TYPE>": source holds the stored rows (whole
@@ -535,6 +555,8 @@ class HostRows:
                     if len(files) != 1 or files[0][1]:
                         raise ValueError("a mapped table is one file of rows from its first byte")
                     part.from_mapped(files[0][0], files[0][2])
+                elif resident:
+                    part.from_resident(files)
                 else:
                     part.from_files(files)
         except BaseException:

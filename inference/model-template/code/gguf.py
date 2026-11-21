@@ -563,8 +563,11 @@ class GgufMatrices:
             return fmt, found[0][1]
         return fmt, {"weight": torch.cat([t["weight"] for _, t in found])}
 
-    def load(self, bases, role, encode=None):
+    def load(self, bases, role, encode=None, rows=None):
         fmt, tensors = self.stacked(bases)
+        if rows is not None and tensors["weight"].shape[0] > rows:
+            raise ValueError(f"model-template: {bases[0]} stores {tensors['weight'].shape[0]} rows, the head predicts "
+                             f"{rows}: a GGUF's rows are taken whole")
         if encode is not None:
             return self.proj.load(tensors, fmt, role=role, encode=encode)
         return self.proj.load(tensors, fmt, role=role)

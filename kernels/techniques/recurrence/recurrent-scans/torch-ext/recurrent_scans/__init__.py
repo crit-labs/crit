@@ -41,6 +41,29 @@ def gated_delta_prefill(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, log_d
     return out
 
 
+CHUNK = 64   # delta-prefill-tc's chunk: the chunk-aligned exact form aligns rows to multiples of it
+
+
+def gated_delta_chunk_rows(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, log_decay: torch.Tensor, beta: torch.Tensor,
+                           meta: torch.Tensor, states_in: torch.Tensor, states_out: Optional[torch.Tensor] = None,
+                           scale: float = 1.0, widest: Optional[int] = None,
+                           out: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """The chunk-aligned exact form of delta-prefill-tc, many rows in one launch pair. Packed rows q, k [T, k_heads, dk],
+    v [T, v_heads, dv], log_decay, beta [T, v_heads]; meta int32 [rows, 4] on the device: (first, tokens, slot_in,
+    slot_out), row r being tokens first .. first + tokens - 1, chunked in CHUNK-token steps from its first token (the
+    caller starts it at a CHUNK-aligned position of its sequence), from states_in[slot_in] ([slots, v_heads, dk, dv]);
+    the state after the row's complete chunks goes to states_out[slot_out] (states_in by default; not written when
+    slot_out < 0 or the row completes no chunk). A row has the bits of gated_delta_prefill(tensor_cores=True) over its
+    tokens from that state, and a token's output depends on its chunk only through the chunk's tokens up to it, so a
+    decode step that recomputes its chunk so far from the chunk's start state gives the bits a prompt gives the token
+    (tests/test_chunk_exact.py). widest: the longest row's tokens (T by default; fixed for a captured graph)."""
+    out = _delta_out(v, out)
+    states_out = states_in if states_out is None else states_out
+    ops.gated_delta_chunk_rows_tc(out, states_out, states_in, q, k, v, log_decay, beta, meta,
+                                  int(q.shape[0] if widest is None else widest), scale)
+    return out
+
+
 def gated_delta_scan(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, log_decay: torch.Tensor, beta: torch.Tensor,
                      state: torch.Tensor, scale: float = 1.0, checkpoints: Optional[torch.Tensor] = None,
                      out: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -149,6 +172,16 @@ def conv_segments(out, window_in, window_out, x, weight, bias=None, silu=True):
     """One long row out of place from window_in ([channels][(width - 1) * dilation]: its width sets the dilation),
     the window after its last input to window_out: a thread per channel and 32 rows, the bits of pool_conv's."""
     ops.conv_segments(out, window_in, window_out, x, weight, bias, silu)
+    return out
+
+
+def conv_segments_rows(out, windows_in, windows_out, x, meta, weight, bias=None, silu=True, widest=None):
+    """Several long rows of conv_segments in one launch: row r's inputs are x rows meta[r] = (first, count) (int32
+    [rows][2] on the device), its window before them windows_in[r] and after them windows_out[r] ([rows][channels]
+    [(width - 1) * dilation]); widest the longest row's count (x's rows by default). Each row's outputs and window
+    have conv_segments' bits for that row alone."""
+    ops.conv_segments_rows(out, windows_in, windows_out, x, meta, weight, bias,
+                           int(x.shape[0] if widest is None else widest), silu)
     return out
 
 

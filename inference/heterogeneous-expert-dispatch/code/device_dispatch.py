@@ -1,7 +1,7 @@
 """Routed experts split between the device and the CPU inside one CUDA stream (captured graphs too).
 
 A layer's routes whose expert the slot table marks -2 (the expert cache's admission sent them to the CPU) are posted to
-the CPU tier through a slot of one of the host's handoffs (Core's, crit_plugins.host; cpu_routes.cu: one post kernel,
+the CPU tier through a slot of one of the host's handoffs (Core's, crit_plugins.host; crit's kernel cpu-routes: one post kernel,
 the tier's C handler on the host's service thread, the handoff's join, one scatter kernel); every other route is the
 device part's (its route_outputs over the slot store); then the device part's combine sums each token's routes in
 route order. Both parts compute the same declared
@@ -25,20 +25,25 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 
 
-def extension(arch=None):
-    """(module, None) for cpu_routes.cu built for this device (or `arch`, e.g. "12.0a") through Core's native build
-    (crit_plugins.native.extension) with Core's handoff header, or (None, why) where it does not build. For this
-    device it also asks Core for the device's joins, so Core's handoff is built and measured here too."""
-    from crit_plugins.host import INCLUDE, current
-    from crit_plugins.native import NativeUnavailable, extension as build
+KERNEL = "cpu-routes"   # crit's kernel of the in-stream CPU routes (plugin.json "kernels")
+
+
+def extension():
+    """(module, None) for crit's kernel cpu-routes built for this device by crit's kernel build
+    (crit_plugins.kernels.load_kernel, as the plugin whose package imports this code: heterogeneous-expert-dispatch or
+    expert-offload), or (None, why) where it does not build. It also asks Core for the device's joins, so Core's
+    handoff is built and measured here too."""
+    import torch
+    from crit_plugins.host import NativeUnavailable, current
+    from crit_plugins.kernels import fallbacks, load_kernel, plugin_folder
+    module = load_kernel(KERNEL, folder=plugin_folder(__name__, HERE.parent))
+    if module is None:   # no compiler or no crit_kernels: the host path serves
+        return None, f"the CPU routes' in-stream join did not build: {fallbacks().get(KERNEL, '')}"[:400]
     try:
-        module = build("crit_cpu_routes", [HERE / "cpu_routes.cu"], [INCLUDE], arch=arch)
-        if arch is None:
-            import torch
-            current().joins(torch.cuda.current_device())
-        return module, None
-    except NativeUnavailable as error:   # no compiler or a header mismatch: the host path serves
-        return None, f"the CPU routes' in-stream join did not build: {str(error).splitlines()[0][:300]}"
+        current().joins(torch.cuda.current_device())
+    except NativeUnavailable as error:   # Core's handoff did not build: the host path serves
+        return None, f"the host's handoff did not build: {str(error).splitlines()[0][:300]}"
+    return module, None
 
 
 def capturing():
@@ -103,13 +108,15 @@ class KernelRoutes:
     SCRATCH_ROUTES = 1 << 16   # the routes a call's rows take from the scratch; a larger call has its own buffers
 
     def __init__(self, kernel, layout, kernel_layout, format, hidden, inter, a4=None, scratch=None,
-                 activation="silu"):
+                 activation="silu", caps=None):
         self.kernel, self.format = kernel, format
         # W4A4 at the bundles' input scales: the tier's nvfp4 bundles carry them; a4=False runs weight-only W4A16 rows
         # (tensor arithmetic only: the declared order is W4A4)
         self.a4 = format == "nvfp4" if a4 is None else bool(a4)
-        # activation: the blocks' gate (silu: SwiGLU; gelu_tanh in the tensor arithmetic only)
-        self.layout = kernel_layout(layout) if activation == "silu" else kernel_layout(layout, activation)
+        # activation: the blocks' gate (silu: SwiGLU; gelu_tanh and softcapped_silu with its caps in the tensor
+        # arithmetic only)
+        self.layout = (kernel_layout(layout) if activation == "silu" else kernel_layout(layout, activation) if caps is None
+                       else kernel_layout(layout, activation, caps))
         self.hidden, self.inter = hidden, inter
         self.workspaces = {}
         self.scratch = scratch
@@ -208,7 +215,7 @@ class DeviceDispatch:
         self.max_tokens, self.mail_slots = int(max_tokens), int(mail_slots)
         self.host, self.owner = current(), owner   # the host's handoffs (Core's): this dispatch's is owner/cpu-routes
         self.ext = ext if tier.native else None
-        # box: the handoff; kernels: cpu_routes.cu's post and scatter over its slots
+        # box: the handoff; kernels: crit's kernel cpu-routes' post and scatter over its slots
         self.box, self.kernels, self.top, self.joins, self.buffers, self.posted = None, None, 0, None, {}, set()
         self.eager_calls = 0
         self.tensor_calls = 0   # prompt calls past max_tokens run in the tensor arithmetic

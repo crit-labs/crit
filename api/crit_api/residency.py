@@ -18,8 +18,9 @@ from .stream import StreamReader
 RESULT = {"kind", "command_id", "status", "error", "max_concurrent_requests", "cleanup_settled"}
 
 
-# Seconds a cancelled command has to settle before its host is retired (docs/SERVING.md): fixed, not an option.
-CANCEL_GRACE_SECONDS = 1
+# Seconds a cancelled command has to settle before its host is retired (docs/SERVING.md): fixed, not an option. It is
+# Core's cancel grace, the one a prompt step ends inside (crit_plugins.steps.GRACE).
+from crit_plugins.steps import GRACE as CANCEL_GRACE_SECONDS  # noqa: E402
 # Seconds between the lines crit serve prints of a load's reported work (crit_core.engine.LoadContext.working).
 WORK_REPORT_SECONDS = 30
 
@@ -136,7 +137,9 @@ class ResidentRuntime:
                         except ValueError:
                             pass  # a broken channel is reported below
                 if cancelled_at is not None and stamp - cancelled_at >= CANCEL_GRACE_SECONDS:
-                    self.announce(f"retired: the engine settled no cancel within {CANCEL_GRACE_SECONDS} s")
+                    # An unload is no request to cancel: one past its bound is a close that did not end.
+                    self.announce(f"retired: the engine did not close within {timeout:g} s" if action == "unload" else
+                                  f"retired: the engine settled no cancel within {CANCEL_GRACE_SECONDS:g} s")
                     self.close()
                     return self._cancelled({"status": "timed_out" if timed_out else "cancelled",
                                             "error": "Reply timed out" if timed_out else "Stopped",

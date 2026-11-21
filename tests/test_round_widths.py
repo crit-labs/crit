@@ -161,6 +161,46 @@ class DecodeTests(unittest.TestCase):
 
     PROMPTS = [[1, 2, 3], [4, 5], [6, 7, 8, 9]]
 
+    @unittest.skipUnless(DEVICE == "cuda", "calibrating times captured rounds on a GPU")
+    def test_calibrated_round_costs_are_a_recorded_decision_a_reopen_replays(self):
+        # The round times a rate policy weighs are a measured decision: a warm load's are recorded with the package,
+        # and a reopen (another process, another context) weighs the recorded table without timing a round.
+        import tempfile
+        from unittest import mock
+        from crit_plugins import decisions
+        from crit_plugins.rounds import RateWidth, Rounds
+        assembly = plugins({"drafter": "greedy-head-drafter", "verifier": "chain-verifier", "sampler": "token-sampling"},
+                           facts=HEAD)
+        target = Target(40, 21)
+        head = Head(40, max(WIDTHS), 22).like(target, 1.2)
+
+        def opened():
+            policy = RateWidth(column_cost=0.02)
+            rounds = Rounds(target, assembly["sampler"], rows=2, widest=max(WIDTHS), device=DEVICE,
+                            drafter=assembly["drafter"], head=head, verifier=assembly["verifier"], stops=2,
+                            vocabulary=40, widths=WIDTHS, width_policy=policy)
+            for rows in (1, 2):
+                for width in WIDTHS:
+                    rounds.capture(rows, width, "greedy")
+            return rounds, policy
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "decisions.json"
+            self.addCleanup(decisions.use_record, None)
+            decisions.use_record(None)
+            decisions.use_record(None)          # a warm load (the process's second): its measurement is recorded
+            rounds, policy = opened()
+            measured = rounds.calibrate("greedy")
+            self.assertEqual(decisions.settled("rounds", "width-costs:greedy")["source"], "measured")
+            self.assertTrue(all(v > 0 for row in measured for v in row))
+            decisions.write(path)
+            decisions.use_record(path)
+            again, policy = opened()
+            with mock.patch.object(Rounds, "_time_rounds", side_effect=AssertionError("timed a round")):
+                self.assertEqual(again.calibrate("greedy"), measured)
+            self.assertEqual(decisions.settled("rounds", "width-costs:greedy")["source"], "recorded")
+            self.assertTrue(torch.allclose(policy.costs, policy.costs.new_tensor(measured)))
+
     def test_greedy_rounds_emit_plain_greedy_decoding_at_every_policy(self):
         # Three rows, and one (its rounds narrower than the widest write a strided slice of the predictions).
         for prompts, counts in ((self.PROMPTS, [60, 41, 52]), (self.PROMPTS[:1], [60])):

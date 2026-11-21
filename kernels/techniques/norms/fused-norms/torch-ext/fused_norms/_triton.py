@@ -131,7 +131,7 @@ def _rows_body(pid, x_ptr, sxa, sxb, r_ptr, sra, srb, z_ptr, sza, szb, w_ptr, gr
     tl.store(y_ptr + y_rows[:, None] + d[None, :], y.to(y_ptr.dtype.element_ty), mask=m)
 
 
-@triton.jit(do_not_specialize=["n_rows"])
+@triton.jit(do_not_specialize=["n_rows", "B"])
 def rows_kernel(x_ptr, sxa, sxb, r_ptr, sra, srb, z_ptr, sza, szb, w_ptr, groups, swg, y_ptr, sya, syb,
                 pos_ptr, f_ptr, sf, n_table, n_rows, B, n_blocks, D, R, eps, offset, scale, xw_ptr, sxwa, sxwb,
                 NORM: tl.constexpr, HAS_RES: tl.constexpr, HAS_W: tl.constexpr, GROUPED: tl.constexpr,
@@ -164,7 +164,7 @@ def pair_kernel(x_ptr, sxa, sxb, w_ptr, groups, swg, y_ptr, sya, syb, B, n_block
                    NORM, False, HAS_W, GROUPED2, 0, ROPE, TABLE, IN_PLACE2, False, HB, BD)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=[])
 def softplus_decay_kernel(x_ptr, sxa, b_ptr, rate_ptr, g_ptr, sga, y_ptr, sya, beta_ptr, sba, N, n_blocks,
                           HAS_GATE: tl.constexpr, BLOCK: tl.constexpr):
     """y[t][i] = -rate[i] * softplus(x[t][i] + bias[i]) (softplus(v) = v past 20, log1p(exp(v)) below), and with a
@@ -185,7 +185,7 @@ def softplus_decay_kernel(x_ptr, sxa, b_ptr, rate_ptr, g_ptr, sga, y_ptr, sya, b
         tl.store(beta_ptr + t * sba + i, beta.to(beta_ptr.dtype.element_ty), mask=m)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["B"])
 def long_rows_kernel(x_ptr, sxa, sxb, r_ptr, sra, srb, z_ptr, sza, szb, w_ptr, groups, swg, y_ptr, sya, syb, B, D, eps,
                      offset, NORM: tl.constexpr, HAS_RES: tl.constexpr, HAS_W: tl.constexpr, GATE: tl.constexpr,
                      CHUNK: tl.constexpr, ONE_PASS: tl.constexpr = False, PDL: tl.constexpr = 0):
@@ -267,7 +267,7 @@ def long_rows_kernel(x_ptr, sxa, sxb, r_ptr, sra, srb, z_ptr, sza, szb, w_ptr, g
         tl.store(y_row + d, y.to(y_ptr.dtype.element_ty), mask=dm)
 
 
-@triton.jit(do_not_specialize=["n_rows"])
+@triton.jit(do_not_specialize=["n_rows", "B"])
 def act_mul_kernel(g_ptr, sga, sgb, u_ptr, sua, sub, y_ptr, sya, syb, n_rows, B, N, n_blocks,
                    ACT: tl.constexpr, INTERLEAVED: tl.constexpr, BLOCK: tl.constexpr, PDL: tl.constexpr = 0):
     """y[row][i] = act(g[row][i]) * u[row][i] for BLOCK columns of one row a program; INTERLEAVED: g and u alternate
@@ -299,7 +299,7 @@ def act_mul_kernel(g_ptr, sga, sgb, u_ptr, sua, sub, y_ptr, sya, syb, n_rows, B,
         gdc_launch_dependents()
 
 
-@triton.jit
+@triton.jit(do_not_specialize=[])
 def stream_sum_kernel(x_ptr, sxt, sxs, g_ptr, sgt, sgs, sgd, y_ptr, syt, S, D, n_blocks, scale,
                       HAS_GATE: tl.constexpr, ACT: tl.constexpr, BLOCK: tl.constexpr):
     """y[t][d] = scale * the sum over s = 0 .. S - 1, in that order, of act(g[t][s][d]) * x[t][s][d] (g one value per
@@ -318,7 +318,7 @@ def stream_sum_kernel(x_ptr, sxt, sxs, g_ptr, sgt, sgs, sgd, y_ptr, syt, S, D, n
     tl.store(y_ptr + t * syt + d, (acc * scale).to(y_ptr.dtype.element_ty), mask=m)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=[])
 def stream_add_kernel(h_ptr, sht, shs, x_ptr, sxt, w_ptr, swt, sws, S, D, n_blocks,
                       HAS_W: tl.constexpr, BLOCK: tl.constexpr):
     """h[t][s][d] += w[t][s] * x[t][d] for every stream s (w 1 without weights), in place, BLOCK values of one token a

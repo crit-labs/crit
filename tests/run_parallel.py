@@ -133,7 +133,7 @@ def main():
         for future in as_completed([pool.submit(run, unit, options.verbose, locks) for unit, _ in chosen]):
             unit, code, output, seconds = future.result()
             took[unit] = round(seconds, 1)
-            print(f"===== {unit}: {'ok' if code == 0 else 'FAILED'} in {seconds:.0f} s", flush=True)
+            print(f"===== {unit}: {'ok' if code == 0 else f'FAILED (exit code {code}' + (f' = {code & 0xFFFFFFFF:#x}' if code < 0 or code > 255 else '') + ')'} in {seconds:.0f} s", flush=True)
             if code != 0 or options.verbose:
                 print(output, flush=True)
             if code != 0:

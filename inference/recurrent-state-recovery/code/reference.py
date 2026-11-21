@@ -123,3 +123,35 @@ def verify_chain(matrix, nodes, path, geometry, *, prefix_after=0):
         outputs.append(output)
         parent = physical
     return VerifiedChain(Snapshot(prefix_after, matrix), geometry, tuple(frozen), path, tuple(outputs))
+
+
+def ssd_sequential(state, x, dt, a, b, c, d=None):
+    """Mamba-2's state-space recurrence token by token in FP64: per head h, S = e^(dt_t a_h) S + dt_t x_t b_t^T and
+    y_t = S c_t (+ d_h x_t). state [heads][P][N], x [tokens][heads][P], dt [tokens][heads], a [heads], b and c
+    [tokens][groups][N] (group h // (heads / groups)), d [heads] or None (nested lists) -> (y, final state)."""
+    heads, groups = len(a), len(b[0])
+    per = heads // groups
+    S = [[list(row) for row in head] for head in state]
+    ys = []
+    for t in range(len(x)):
+        y = []
+        for h in range(heads):
+            decay, step, bt, ct = math.exp(dt[t][h] * a[h]), dt[t][h], b[t][h // per], c[t][h // per]
+            out = []
+            for p, row in enumerate(S[h]):
+                for n in range(len(row)):
+                    row[n] = decay * row[n] + step * x[t][h][p] * bt[n]
+                out.append(math.fsum(row[n] * ct[n] for n in range(len(row))) + (d[h] * x[t][h][p] if d else 0.0))
+            y.append(out)
+        ys.append(y)
+    return ys, S
+
+
+def causal_conv_rows(rows, weight, window=None, bias=None):
+    """The causal depthwise convolution in FP64: rows [tokens][channels] after the carried window [W - 1][channels]
+    (zeros without), weight [channels][W] (tap W - 1 the current row), bias [channels] or None -> [tokens][channels]."""
+    channels, width = len(weight), len(weight[0])
+    before = [list(r) for r in window] if window is not None else [[0.0] * channels for _ in range(width - 1)]
+    full = before + [list(r) for r in rows]
+    return [[math.fsum(full[t + i][ch] * weight[ch][i] for i in range(width)) + (bias[ch] if bias else 0.0)
+             for ch in range(channels)] for t in range(len(rows))]

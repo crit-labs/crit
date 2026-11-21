@@ -30,6 +30,10 @@ Triton kernels for attention over paged KV caches, used by crit's attention-stat
   reduction than `attend`'s (FP32 row sums in one pass over 32- or 64-position blocks): its outputs and a decode's
   differ by the readers' rounding (up to 1.6e-2 in BF16 outputs over a few dozen positions, 2.4e-4 over 12K); a chunk
   that must have its tokens' decode bits reads through `attend(..., fused=True)` as windows of 64 columns.
+- **`prefill_rows`**: several sequences' prompt chunks in one launch of `prefill`'s Triton chunk (a step's prompt
+  rows: row i's tokens `q[starts[i]:starts[i] + counts[i]]` at positions `positions[i]..` over `tables[i]`): each
+  block of a row's tokens is the program the row's own launch runs, so a token has the bits `prefill` gives it; its
+  block map and metadata cross to the device once a set of rows (every layer of a step takes the same).
 - **`attend(..., flash=True)`, `prefill(..., flash=True)`**: the flash structures (`_flash.py`, its online softmax
   the kernel core's `crit_kcore.attention_softmax`), the mechanisms of FlashInfer's batch prefill over paged KV
   (Apache-2.0) in Triton. A program's query tile packs a row's columns times a KV head's query heads (tile row `j`:
@@ -91,7 +95,7 @@ Triton kernels for attention over paged KV caches, used by crit's attention-stat
   group before its own, which hold earlier tickets and run already. A fused launch whose partials would fit
   `FUSED_PARTIALS` bytes (workspace_floats of every split its page tables hold, no `offsets`, no caller workspace) runs
   as the window launch and the staged merge instead (the same bits; `FUSED_PARTIALS` 0 keeps every fused launch on its
-  ring): its tile's folds run one after another, where the merge spreads over the GPU. Trees, `lse`, `offsets`, `counts`, `fresh` rows, every page kind and FP16 queries as the
+  ring): its tile's folds run one after another, where the merge spreads over the GPU. Where a fused launch's tiles fill the GPU by themselves (`FUSED_SERIAL`, 50 percent of the programs the device holds at once, cuda-fused's knob `SERIAL`) it runs its **serial form** instead: one program a tile, which walks its row's splits in turn and folds each into the tile's running state as it ends (the merge's steps on the split's state as a split program writes it, its outputs rounded to BF16), the queries of 64 query rows in shared memory, the running outputs in registers up to 128 value columns a program and in the launch's workspace past them. The same states folded in the same order: the split launch's bits, with no partials, ring or sync words, and the tile's keys and values read once a tile as a prompt chunk reads them. A step's prompt rows in the decode's reduction (prompt_reader decode, pieces of up to 64 columns) are such launches: the exact prompt path. Trees, `lse`, `offsets`, `counts`, `fresh` rows, every page kind and FP16 queries as the
   flash launch takes them; head widths 64, 128 and 256. A column's bits depend on its own query, keys and values, the
   page kind, `BLOCK_N` and `CHUNK` only: not on the rows beside it, the warps or the tile (the same alone, in any
   window, packed, fused or split). Prompt chunks (`prefill`): the chunk as one row, its positions split on the device
@@ -198,11 +202,15 @@ KIND is the page kind's number (0 16-bit, 1 `fp8`, 2 `fp8:row`, 3 `int8`), INT8 
   chunk)` splits a partial row.
 - `flash-prefill` gives up row invariance for speed (its splits follow the chunk's length): its knobs are all speed
   knobs; the earlier `prefill` stays selectable (`flash=False`, the default).
-- `cuda-window`'s untuned `CHUNK` comes from the GPU: a decode row of 90,112 positions spread over two programs an
-  SM, the KV heads counted by their square root, `90,112 x sqrt(KV heads) / (2 x SMs)` to the nearest 128 positions,
-  128 to 2,048 (on an RTX 5090: 384 positions for 2 KV heads, 768 for 8). Small splits fill the GPU on short rows,
-  large ones keep long rows' merges short (at 131K positions a split of 256 is 1.3x slower than 1,024); more KV
-  heads already give more programs. Fixed per cache (the GPU and the cache's KV heads), never by the batch.
+- `cuda-window`'s untuned `CHUNK` comes from the GPU: a decode row of 90,112 positions spread over six programs an
+  SM, the KV heads counted by their square root, `90,112 x sqrt(KV heads) / (6 x SMs)` to the nearest 128 positions,
+  128 to 2,048 (on an RTX 5090: 128 positions for 2 KV heads, 256 for 8), with the untuned `RAMP` 1 (a row's first 16
+  splits half as long). Small splits fill the GPU on short rows, large ones keep long rows' merges short; more KV
+  heads already give more programs. Fixed per cache (the GPU and the cache's KV heads), never by the batch, so a
+  decode row's bits never depend on the rows beside it. Measured on an RTX 5090 over 1 to 32 rows of 1K to 64K
+  positions and four cache geometries (24 / 2 x 256 BF16 and FP8, 56 / 8 x 128 INT8 and BF16; 92 cases): 0.885x the
+  split-KV reader's decode time (geometric mean; the worst 1.18x, one row of 1K-4K positions), where the earlier rule
+  (two programs an SM, no ramp) took 1.05-1.10x, up to 3.3x on short rows.
 - `cuda-window`'s `CHUNK` and `BLOCK_N` decide a cuda column's bits: `cuda_chunk(...)` and `cuda_block(...)` return
   the tuning's for the cache's geometry, and every cuda launch over the cache (decode, verify windows, fused prompt
   rows) takes them. The warps, stages and value split change speed only (each warp owns 16 query rows and their
@@ -276,6 +284,27 @@ window above took 670 us that way). The reason: their tensor cores take four war
 64-row tile there would give a window's column other bits than the same column decoded alone; a two-warp 64-row tile
 stays mma.sync but runs about 2x slower, and two 32-row dots in four warps spill. Wide windows at short contexts over
 many rows are bound by the partials (FP32, value width per query head, column and partition).
+
+The exact prompt path and the serial form (2026-11-21, one RTX 5090, default knobs, CUDA graph replays after an
+L2-flushing write; us). A step's prompt rows as attention-state reads them under the default `exact` level: pieces of up
+to 64 columns in one fused launch, before through the split-KV reader (reader split's Triton fused launch), now
+through the CUDA tile's serial form; the repeatable prompt chunks and FlashInfer 0.7.3 beside them:
+
+| Heads, pages | Rows x tokens @ cached | split fused (exact before) | cuda serial (exact) | cuda-prefill (repeatable) | FlashInfer |
+| --- | --- | --- | --- | --- | --- |
+| 24 / 2 x 256, BF16 | 1 x 2,048 @ 1,024 | 2,828 | 828 | 699 | 634 |
+| 24 / 2 x 256, BF16 | 1 x 8,192 @ 0 | 11,135 | 5,690 | 4,964 | 4,234 |
+| 24 / 2 x 256, BF16 | 4 x 512 @ 2,048 | 1,731 | 1,002 | 1,180 | 670 |
+| 24 / 2 x 256, FP8 | 1 x 2,048 @ 1,024 | 3,049 | 1,020 | 734 | 760 |
+| 56 / 8 x 128, INT8 | 8 x 256 @ 4,096 | 2,390 | 1,897 | 2,334 | 1,305 |
+| 32 / 8 x 128, BF16 | 1 x 2,048 @ 1,024 | 793 | 611 (ring 498) | 441 | 465 |
+
+The serial form takes a launch whose tiles fill the GPU (FUSED_SERIAL); with few tiles over long rows (one 64-token
+piece at 16K positions: 1,614 serial against 199 for the ring) the ring keeps it, and on 128-wide heads with 4 query
+heads a KV head the ring measured faster at 2,048 tokens too: SERIAL is a speed knob the sweep sets per shape. Decode
+rows stay on reader split by default: one row at 4K positions took 19.0 us there against 39.5 on the CUDA window
+launch (16 rows: 128 against 97). `prefill_rows` (reader split's prompt rows in one launch): 8 rows of 256 tokens at
+4,096 cached, 3,088 a launch a row against 1,850; 4 x 512, 1,578 against 1,025.
 
 ## Yardstick
 

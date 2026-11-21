@@ -69,21 +69,41 @@ def silu(v):
     return v / (1.0 + math.exp(-v))
 
 
-ACTIVATIONS = ("silu", "gelu_tanh")   # a routed block's gate: silu(gate) * up (SwiGLU) or GELU's tanh form
+# a routed block's gate: silu(gate) * up (SwiGLU), GELU's tanh form, or SwiGLU whose linear gate factor and up are
+# capped by a tanh each (softcapped_silu: caps (gate, up), cap * tanh(v / cap); the sigmoid sees the raw gate)
+ACTIVATIONS = ("silu", "gelu_tanh", "softcapped_silu")
 
 
 def gelu_tanh(v):
     return 0.5 * v * (1.0 + math.tanh(math.sqrt(2.0 / math.pi) * (v + 0.044715 * v * v * v)))
 
 
-def moe_block(x, ids, weights, gate_up, down, inter, tokens=None, activation="silu"):
+def _capped(v, cap):
+    return cap * math.tanh(v / cap)
+
+
+def moe_block(x, ids, weights, gate_up, down, inter, tokens=None, activation="silu", caps=None):
     """[token][hidden] outputs of a routed gated block (SwiGLU by default). x [tokens][hidden]; ids, weights [tokens]
     [top_k]; gate_up(e) and down(e) return expert e's decoded [2 * inter][hidden] and [hidden][inter] matrices
     (decode_matrix), called once per expert used. tokens: the token rows to compute (all by default). activation: the
-    gate of the block's product, act(gate) * up (ACTIVATIONS)."""
+    gate of the block's product, act(gate) * up (ACTIVATIONS); caps: softcapped_silu's (gate cap, up cap)."""
     if activation not in ACTIVATIONS:
         raise ValueError(f"a routed block's activation is {' or '.join(ACTIVATIONS)}, not {activation!r}")
-    silu = globals()["silu"] if activation == "silu" else gelu_tanh
+    if activation == "softcapped_silu":
+        if not caps or len(caps) != 2 or min(caps) <= 0:
+            raise ValueError("softcapped_silu takes two positive caps: (gate, up)")
+        gate_cap, up_cap = caps
+
+        def silu(v):   # the linear gate factor capped, the sigmoid of the raw gate
+            return _capped(v, gate_cap) / (1.0 + math.exp(-v))
+
+        def up(v):
+            return _capped(v, up_cap)
+    else:
+        silu = globals()["silu"] if activation == "silu" else gelu_tanh
+
+        def up(v):
+            return v
     cache_gu, cache_dn = {}, {}
     rows = range(len(x)) if tokens is None else tokens
     out = {}
@@ -94,8 +114,8 @@ def moe_block(x, ids, weights, gate_up, down, inter, tokens=None, activation="si
                 continue
             gu = cache_gu.get(e) or cache_gu.setdefault(e, gate_up(e))
             dn = cache_dn.get(e) or cache_dn.setdefault(e, down(e))
-            act = [silu(math.fsum(a * b for a, b in zip(gu[i], x[t]))) * math.fsum(a * b for a, b in zip(gu[inter + i], x[t]))
-                   for i in range(inter)]
+            act = [silu(math.fsum(a * b for a, b in zip(gu[i], x[t])))
+                   * up(math.fsum(a * b for a, b in zip(gu[inter + i], x[t]))) for i in range(inter)]
             for h in range(len(acc)):
                 acc[h] += w * math.fsum(a * b for a, b in zip(dn[h], act))
         out[t] = acc

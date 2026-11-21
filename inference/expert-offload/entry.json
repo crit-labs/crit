@@ -3,7 +3,7 @@
   "category": "experts",
   "summary": "One plugin for a mixture of experts larger than the device: it decides where the routed experts live (device, host memory, a file), keeps those routed last in a device cache that takes every byte the device has free while the engine serves, computes misses on the CPU while the link copies them in beside the round, and runs a routed layer in one call",
   "implementation_status": "native_source",
-  "implementation_scope": "ExpertOffload (code/offload.py): the decision tree (choose_tier, cache_slots, choose_misses), FileStore for the disk tier, the one-call forward over device-expert-cache's ExpertCache under recent residency, expert-tensors' BundleStore, host-expert-tier's CpuTier behind heterogeneous-expert-dispatch's DeviceDispatch and grouped-experts' kernel (KernelRoutes); the cache's memory through the device's memory (crit_plugins.memory: the cache is an elastic range and a giver, filled once Core says the load is over) and Core's step frames (begin_step, end_step: an elastic cache gives a prompt step the room its chunk was measured to take, prompt_bytes, and grows back) or a KV pool's spare bytes and idle pages; route recording, routing profiles and a one-line diagnosis. code/bench.py runs the plugin alone on a store file and a recorded trace. No arithmetic of its own: every row is grouped-experts' kernel or the CPU tier's declared order.",
+  "implementation_scope": "ExpertOffload (code/offload.py): the decision tree (choose_tier, cache_slots, choose_misses), FileStore for the disk tier, the one-call forward over device-expert-cache's ExpertCache under recent residency, expert-tensors' BundleStore, host-expert-tier's CpuTier behind heterogeneous-expert-dispatch's DeviceDispatch and grouped-experts' kernel (KernelRoutes); the cache's memory through the device's memory (crit_plugins.memory: the cache is an elastic range and a giver, filled once Core says the load is over) and the device's step frames (Core's: the device keeps the run's headroom and gives a prompt step the room its chunk was measured to take, the cache giving and growing back) or a KV pool's spare bytes and idle pages; route recording, routing profiles and a one-line diagnosis. code/bench.py runs the plugin alone on a store file and a recorded trace. No arithmetic of its own: every row is grouped-experts' kernel or the CPU tier's declared order.",
   "agent_guidance": {
     "use_when": "The routed experts do not all fit on the device beside the model's weights and the KV cache at the required context (recon's placement scenario sparse_device_host or sparse_device_host_disk), or the engine should not care whether they fit: it places them by itself",
     "avoid_when": "A model without routed experts; an engine that must place experts by a rule of its own the decision tree does not take (pin it with the tier and misses options first)",
@@ -11,7 +11,7 @@
       "begin() decides the tier from the experts' bytes, the device's free memory less the model's own needs, and host memory",
       "open() makes the device expert cache in the free memory past reserve_mib (or in a KV pool's spare bytes and idle pages) and builds the CPU tier, or copies every miss over the link",
       "Recent residency beside the CPU tier: a missed expert is computed by the CPU now, copied in beside the round and served from the next round, in the slot of the expert routed longest ago",
-      "An elastic cache through Core's step frames: every free byte but margin_mib (the run's VRAM headroom) after the warm requests; a prompt step gets the room a chunk of its size was measured to take, from the blocks torch's allocator kept of earlier prompts first, and the cache grows back after the prompt's last step",
+      "An elastic cache, a giver of the device's memory: every free byte the device does not keep (the run's VRAM headroom, Core's) after the warm requests; a prompt step gets the room a chunk of its size was measured to take, from the blocks torch's allocator kept of earlier prompts first, and the cache grows back after the prompt's last step",
       "forward(layer, x, ids, weights, rows, prompt) per routed layer: decode plans, CPU posts and joins, prompt staging, captured rounds",
       "Facts that say what it decided and why, telemetry with a one-line diagnosis, recorded routes for crit plugins offload --trace and for bench.py, which times the plugin alone on the engine's store"
     ],
@@ -26,7 +26,7 @@
       "Copies beside the round, never on a layer's path: the CPU tier computes the miss its layer needs"
     ],
     "adapt": [
-      "tier, misses and policy to pin a decision; margin_mib is the run's VRAM headroom (crit plugins offload writes it), reserve_mib what a load's graphs and first prompts take",
+      "tier, misses and policy to pin a decision; reserve_mib is what a load's graphs and first prompts take (the run's VRAM headroom is the device's, Core's)",
       "swaps and fill_blocks from a recorded trace: crit plugins offload --trace replays residency in seconds, bench.py times the plugin alone on the real experts in minutes",
       "prompt_arithmetic tensor for a speed engine whose prefill the declared order bounds"
     ]
@@ -57,7 +57,7 @@
     "output": "Each token's routed SwiGLU sum, FP32 [tokens][hidden], the bits of every expert on the device in the path's arithmetic",
     "ownership": "The plugin owns the store, the cache, the CPU tier and the kernel workspaces; the model owns its pools (a KV pool it lends)",
     "failure": "No grouped-experts kernel, experts that do not fit the chosen tier, a load after open() or of another format raise; a CPU tier that does not build falls back to link copies, recorded in the facts",
-    "core_boundary": "A plugin of the experts slot. Core tells it of the steps it runs (step frames: begin_step, end_step) and its captured rounds find it in its slot; the cache is an elastic range and a giver of the device's memory (crit_plugins.memory), which Core tells when the load is over"
+    "core_boundary": "A plugin of the experts slot. Core tells it of the steps it ends (end_step) and frames every step with the device's memory and its captured rounds find it in its slot; the cache is an elastic range and a giver of the device's memory (crit_plugins.memory), which Core tells when the load is over"
   },
   "dependencies": [
     "device-expert-cache",

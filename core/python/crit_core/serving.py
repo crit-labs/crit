@@ -98,9 +98,11 @@ THINKING_BUDGET_CAPABILITY = "chat-thinking-budget-v1"
 # quantized matrices' prompt GEMMs (crit-eval's prefill ceilings by activation format), and prompt_cache false when it
 # keeps no prompt cache (crit-eval then sends it no follow-up turns). plugins: the plugin filling each slot of an
 # engine built from plugins (crit_plugins.Assembly.facts), so a client sees which ones the loaded engine runs.
+# decode_via_prompt: a score may decode its continuation through the model's prompt arithmetic (crit smoke tells a
+# decode gap's rounding from a fault by it).
 ENGINE_FACTS = ("speculative", "plain", "draft_width", "bytes_per_pass", "host_bytes_per_pass", "draft_bytes_per_step",
                 "draft_ms", "kv_bytes_per_token", "prompt_activations", "prompt_cache", "plugins", "kernels", "matrices",
-                "exactness")
+                "exactness", "approximations", "decode_via_prompt")
 # What a generation's timing may report beside its phases, for crit serve's telemetry and an Eval adapter's results:
 # the drafting facts (drafts accepted and made per round, device time in verify passes and draft steps), which plain
 # decoding has none of, and the device expert cache's routed reads and hits, which every decode has.
@@ -223,8 +225,9 @@ def capabilities(text, sampling=(), *, stream=True, config=True, tool_format=Non
 
 def engine_facts(engine):
     """The ENGINE_FACTS a resident engine holds in its `facts` (crit_core.native's engines hold their info there):
-    booleans for speculative, plain and prompt_cache, {"link", "cpu"} byte counts for host_bytes_per_pass, non-negative finite
-    numbers for the rest; plain only on a speculative engine that sets `plain`. None when it reports none."""
+    booleans for speculative, plain, prompt_cache and decode_via_prompt, {"link", "cpu"} byte counts for
+    host_bytes_per_pass, non-negative finite numbers for the rest; plain only on a speculative engine that sets
+    `plain`. None when it reports none."""
     import math
     found = getattr(engine, "facts", None)
     if not isinstance(found, dict):
@@ -235,7 +238,7 @@ def engine_facts(engine):
         if key == "prompt_activations":
             if prompt_activations(value):
                 out[key] = value
-        elif key in ("speculative", "plain", "prompt_cache"):
+        elif key in ("speculative", "plain", "prompt_cache", "decode_via_prompt"):
             if isinstance(value, bool):
                 out[key] = value
         elif key == "plugins":
@@ -276,24 +279,22 @@ def engine_facts(engine):
     return out or None
 
 
-EXACTNESS_LEVELS = ("repeatable", "row-exact", "exact", "declared")   # crit_kernels.exactness.LEVELS
-
-
 def exactness_fact(value):
     """The engine fact "exactness" as crit serve publishes it, or None where it is not one: {"asked": {"decode":
     level, "prompt": level} or None, "decode" and "prompt": the lowest level the plugins keep (a phase none states
     left out), "plugins": {plugin: {phase: level}}}."""
+    from crit_plugins.exactness import LEVELS, PHASES
     def levels(found, whole=False):
-        return (isinstance(found, dict) and set(found) <= {"decode", "prompt"} and (len(found) == 2 or not whole)
-                and all(level in EXACTNESS_LEVELS for level in found.values()))
+        return (isinstance(found, dict) and set(found) <= set(PHASES) and (len(found) == 2 or not whole)
+                and all(level in LEVELS for level in found.values()))
     if not isinstance(value, dict) or not (value.get("asked") is None or levels(value["asked"], whole=True)):
         return None
     plugins = value.get("plugins") or {}
     if not isinstance(plugins, dict) or not all(isinstance(k, str) and levels(v) for k, v in plugins.items()):
         return None
     out = {"asked": dict(value["asked"]) if value.get("asked") else None}
-    for phase in ("decode", "prompt"):
-        if value.get(phase) in EXACTNESS_LEVELS:
+    for phase in PHASES:
+        if value.get(phase) in LEVELS:
             out[phase] = value[phase]
     if plugins:
         out["plugins"] = {k: dict(v) for k, v in plugins.items()}
@@ -319,6 +320,17 @@ def prompt_activations(value):
                 or not math.isfinite(share) or share < 0 for key, share in mix.items()):
             return False
     return True
+
+
+def activations_served(asked, served):
+    """Whether an engine whose facts declare prompt activations `served` (per stored format) serves the ones it is
+    asked (`asked`: a plan's prompt_activations, one activation for every quantized format or one per format). An
+    engine that declares none multiplies no quantized format's prompt rows, whatever is asked."""
+    if served is None:
+        return True
+    if isinstance(asked, str) and isinstance(served, dict):
+        asked = {name: asked for name in served}
+    return served == asked
 
 
 def continued_timing(timings, tokens):
@@ -551,12 +563,14 @@ class ResidentChat:
     scores = False
     plain = False
     prompt_cache = False
+    decode_via_prompt = False
     grammars = False
     constraints = False
     tool_format = None
     reasoning_format = None
     images = False
     max_concurrent_requests = 1
+    priorities = False   # generate_tokens takes priority= (Core's adapter: Core's runtime orders waiting requests)
     prompt_token_cache = True
     loop_stop = None
 
@@ -630,7 +644,10 @@ class ResidentChat:
         Continuation rows score each continuation token as decoding after that prefill produces it, every step
         forced to the continuation (a speculative engine's drafts accepted only while they equal it, each
         correction and bonus token taken from it): the first from the prefill's last position, the others from
-        decode steps. Return None for the rows when cancelled() turned true. timing: prefill_ms, decode_ms."""
+        decode steps. Return None for the rows when cancelled() turned true. timing: prefill_ms, decode_ms.
+        An engine whose `decode_via_prompt` is True also takes decode_via_prompt=True (a request's debug option): the
+        decode steps then run the model's prompt arithmetic, each row a one-token prompt chunk, with the same KV and
+        positions; ResidentChat.score refuses the option on another engine and passes it only when set."""
         raise NotImplementedError
 
     def score(self, request, cancellation):
@@ -640,8 +657,13 @@ class ResidentChat:
         "format": "packed", which holds the same values without a JSON row per position."""
         ids, continuation = list(request["prompt_ids"]), list(request["continuation_ids"])
         top_k, wanted = request["top_logprobs"], request["prompt_rows"]
+        via_prompt = request.get("decode_via_prompt", False)
+        if type(via_prompt) is not bool or via_prompt and not self.decode_via_prompt:
+            raise ValueError("decode_via_prompt is true or false, on an engine whose model plugin routes decode rows "
+                             "through its prompt path (its info's decode_via_prompt)")
         prompt_rows, continuation_rows, timing = self.score_tokens(ids, continuation, top_k, cancellation.is_set,
-                                                                   wanted)
+                                                                   wanted, **({"decode_via_prompt": True}
+                                                                              if via_prompt else {}))
         if prompt_rows is None or continuation_rows is None:
             cancellation.check()
             raise ValueError("The engine stopped scoring without being cancelled")
@@ -909,6 +931,11 @@ class ResidentChat:
             push(tokens)
 
         options = {} if alternatives is None else {"logprobs": alternatives}
+        priority = request.get("priority") or 0
+        if type(priority) is not int:
+            raise ValueError("priority is an integer")
+        if priority and self.priorities:
+            options["priority"] = priority
         if plain:
             options["plain"] = True
         if cached is False:

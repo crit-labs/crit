@@ -41,6 +41,11 @@ NORM_EPS_KEYS = tuple(_KEYS["norm_eps"])
 DTYPE_KEYS = tuple(_KEYS["dtype"])
 LAYER_TYPE_KEYS = tuple(_KEYS["layer_types"])
 LAYER_COUNT_KEYS = tuple(_KEYS["layer_count_from"])
+SLIDING_LAYER_ID_KEYS = tuple(_KEYS["sliding_layer_ids"])
+SLIDING_WINDOW_KEYS = tuple(_KEYS["sliding_window"])
+ROUTED_SCALING_KEYS = tuple(_KEYS["routed_scaling_factor"])
+LAYER_PASS_KEYS = tuple(MappingProxyType(dict(entry)) for entry in _KEYS["layer_passes"])
+LAYER_TYPE_NAMES = MappingProxyType(dict(_KEYS["layer_type_names"]))
 
 FULL_ATTENTION = "full_attention"
 SLIDING_ATTENTION = "sliding_attention"
@@ -207,6 +212,7 @@ class ModelConfig(_Picklable):
     quantization: QuantizationConfig | None = None
     intermediate_sizes: tuple = ()
     rope_by_layer_type: tuple = ()
+    layer_passes: tuple = ()
 
     def get(self, key, default=None):
         """A key of the text section, falling back to the root (the text_config merge rule)."""
@@ -246,6 +252,9 @@ class ModelConfig(_Picklable):
 
     def effective_kv_heads(self):
         return effective_kv_heads(self.section, source=self.source)
+
+    def layer_applications(self):
+        return layer_applications(self.section, source=self.source)
 
 
 # Typed reads. Each returns None for an absent key or JSON null and raises ConfigError for any other wrong value.
@@ -493,9 +502,68 @@ def text_section(config, source=CONFIG_NAME):
 
 
 def _layer_types(config, source):
-    # The first LAYER_TYPE_KEYS entry the config has (layers_block_type: "mamba", "moe", "mlp", "attention").
+    # The first LAYER_TYPE_KEYS entry the config has (layers_block_type: "mamba", "moe", "mlp", "attention"); else,
+    # where the config lists the layers that attend a sliding window (SLIDING_LAYER_ID_KEYS), "sliding_attention" for
+    # those and "full_attention" for the others.
     key = next((key for key in LAYER_TYPE_KEYS if key in config), None)
-    return _strings(config, key, source) if key else None
+    if key:   # a family's own names of the types read as the names they stand for (config_keys.json)
+        found = _strings(config, key, source)
+        return None if found is None else tuple(LAYER_TYPE_NAMES.get(name, name) for name in found)
+    key = next((key for key in SLIDING_LAYER_ID_KEYS if key in config), None)
+    ids = _integers(config, key, source) if key else None
+    if ids is None:
+        return None
+    layers = _integer(config, "num_hidden_layers", source)
+    if not layers:
+        _fail(source, key, "lists sliding-window layers of a config without num_hidden_layers")
+    if any(index >= layers for index in ids) or len(set(ids)) != len(ids):
+        _fail(source, key, f"names layers outside 0..{layers - 1} or one twice")
+    sliding = set(ids)
+    return tuple(SLIDING_ATTENTION if index in sliding else FULL_ATTENTION for index in range(layers))
+
+
+def _sliding_window(config, source):
+    # The first SLIDING_WINDOW_KEYS entry the config has.
+    return _first(config, SLIDING_WINDOW_KEYS, _integer, source)[0]
+
+
+def _layer_passes(config, source):
+    """((start, end, passes), ...): the spans of layers a looped decoder runs more than once (LAYER_PASS_KEYS), in
+    order, without overlaps and inside the layers; () where the config has none."""
+    spans = []
+    for spec in LAYER_PASS_KEYS:
+        if spec["object"] is None:   # the config's own keys
+            value, label = (config, "") if spec["start"] in config else (None, "")
+        else:
+            value, label = _object(config, spec["object"], source), spec["object"] + "."
+        if value is None:
+            continue
+        start = _integer(value, spec["start"], source, label + spec["start"])
+        end = _integer(value, spec["end"], source, label + spec["end"])
+        passes = _integer(value, spec["passes"], source, label + spec["passes"])
+        if start is None or end is None or passes is None:
+            _fail(source, spec["object"] or spec["start"], f"needs {spec['start']}, {spec['end']} and "
+                                                           f"{spec['passes']}")
+        spans.append((start, end, passes))
+    if not spans:
+        return ()
+    layers = _layer_count(config, source)
+    spans.sort()
+    for i, (start, end, passes) in enumerate(spans):
+        if not (0 <= start < end) or (layers and end > layers) or passes < 1 or                 (i and start < spans[i - 1][1]):
+            _fail(source, "layer passes", f"span [{start}, {end}) x {passes} is empty, overlaps another or lies "
+                                          f"outside the {layers} layers")
+    return tuple(spans)
+
+
+def _passes_of(config, source):
+    # How many times each layer runs a token: 1, or a looped span's passes.
+    layers = _layer_count(config, source) or 0
+    runs = [1] * layers
+    for start, end, passes in _layer_passes(config, source):
+        for index in range(start, min(end, layers)):
+            runs[index] = passes
+    return runs
 
 
 def _layer_count(config, source):
@@ -616,7 +684,8 @@ def kv_elements_per_token(config, source=CONFIG_NAME):
     """K and V elements one token adds to the cache over every layer whose cache grows with the context, or None.
 
     Multi-head latent attention (kv_lora_rank) caches the latent plus one shared rope key per layer. Full-attention
-    layers cache their own geometry (attention_geometry), one tensor where their keys equal their values.
+    layers cache their own geometry (attention_geometry), one tensor where their keys equal their values. A layer a
+    looped decoder runs several times (layer_passes) keeps a cache for each pass.
     """
     config = _mapping_of(config, source)
     layers = _integer(config, "num_hidden_layers", source)
@@ -627,6 +696,12 @@ def kv_elements_per_token(config, source=CONFIG_NAME):
     if not shape:
         return None
     full, _, head_dim, kv_heads = shape
+    runs = _passes_of(config, source)
+    types = _layer_types(config, source)
+    if types and any(count > 1 for count in runs):
+        full = sum(count for kind, count in zip(types, runs) if kind in ("full_attention", "attention"))
+    elif any(count > 1 for count in runs):
+        full = sum(runs) if full == len(runs) else full
     tensors = attention_geometry(config, source)[FULL_ATTENTION][2]
     return tensors * kv_heads * head_dim * full
 
@@ -635,15 +710,22 @@ def fixed_state_bytes(config, kv_bytes_per_element, source=CONFIG_NAME):
     """Bytes of state that does not grow with the context: the linear-attention recurrence (FP32 state, BF16
     convolution window of linear_conv_kernel_dim - 1, default kernel 4), the Mamba-2 recurrence of "mamba" layers
     (FP32 state, BF16 convolution window of conv_kernel - 1) and the KV cache of sliding_attention layers
-    at kv_bytes_per_element. Layer kinds come from layer_types only; the linear_* sizes are read only for
-    linear_attention layers and sliding_window only for sliding_attention layers."""
+    at kv_bytes_per_element. Layer kinds come from layer_types (or the sliding layers' ids); the linear_* sizes are
+    read only for linear_attention layers and the sliding window only for sliding_attention layers. A layer a looped
+    decoder runs several times (layer_passes) keeps its state once a pass."""
     element = kv_bytes_per_element
     if _finite_real(element) is None or element < 0:
         raise ValueError(f"kv_bytes_per_element must be a finite non-negative number, not {_describe(element)}")
     config = _mapping_of(config, source)
     types = _layer_types(config, source) or ()
+    runs = _passes_of(config, source)
+    runs = runs if len(runs) == len(types) else [1] * len(types)
+
+    def count(kind):
+        return sum(n for name, n in zip(types, runs) if name == kind)
+
     total = 0
-    mamba = types.count("mamba")
+    mamba = count("mamba")
     m_heads = _integer(config, "mamba_num_heads", source) if mamba else None
     m_dim = _integer(config, "mamba_head_dim", source) if m_heads else None
     m_state = _integer(config, "ssm_state_size", source) if m_dim else None
@@ -652,7 +734,7 @@ def fixed_state_bytes(config, kv_bytes_per_element, source=CONFIG_NAME):
         channels = m_heads * m_dim + 2 * (_integer(config, "n_groups", source) or 1) * m_state
         conv = max(0, (_integer(config, "conv_kernel", source) or 4) - 1) * channels
         total += mamba * (m_heads * m_dim * m_state * 4 + conv * 2)
-    linear = types.count("linear_attention")
+    linear = count("linear_attention")
     hv = _integer(config, "linear_num_value_heads", source) if linear else None
     dk = _integer(config, "linear_key_head_dim", source) if hv else None
     dv = _integer(config, "linear_value_head_dim", source) if dk else None
@@ -660,9 +742,9 @@ def fixed_state_bytes(config, kv_bytes_per_element, source=CONFIG_NAME):
         hk = _integer(config, "linear_num_key_heads", source) or hv
         conv = max(0, (_integer(config, "linear_conv_kernel_dim", source) or 4) - 1) * (2 * hk * dk + hv * dv)
         total += linear * (hv * dk * dv * 4 + conv * 2)
-    sliding = types.count("sliding_attention")
+    sliding = count("sliding_attention")
     head_dim = _head_dim(config, source)   # crit eval computes it for every config
-    window = _integer(config, "sliding_window", source) if sliding else None
+    window = _sliding_window(config, source) if sliding else None
     if window and head_dim:
         kv_heads = _integer(config, "num_key_value_heads", source) or _integer(config, "num_attention_heads", source)
         if kv_heads is None:
@@ -681,7 +763,8 @@ def fixed_state_bytes(config, kv_bytes_per_element, source=CONFIG_NAME):
 def layer_kinds(config, source=CONFIG_NAME):
     """One kind per layer: layer_types mapped ("attention" counts as full, unknown names as OTHER) and required to
     have num_hidden_layers entries; else every full_attention_interval-th layer full and the rest linear attention
-    (the layer_types Hugging Face derives from that key); else all full. The FULL_ATTENTION count always equals
+    (the layer_types Hugging Face derives from that key); else all full. layer_types may be the list of the layers that
+    attend a sliding window (config_keys.json sliding_layer_ids). The FULL_ATTENTION count always equals
     attention_shape's full layers."""
     config = _mapping_of(config, source)
     layers = _layer_count(config, source) if "num_hidden_layers" not in config else None
@@ -714,6 +797,24 @@ def routed_layers(config, source=CONFIG_NAME):
     step = _integer(config, "decoder_sparse_step", source) or 1
     dense_only = set(_integers(config, "mlp_only_layers", source) or ())
     return tuple(i for i in range(dense, layers) if (i + 1) % step == 0 and i not in dense_only)
+
+
+def layer_applications(config, source=CONFIG_NAME):
+    """The checkpoint layer each layer application of a token runs, in order: range(num_hidden_layers) for a plain
+    decoder; for a looped one (layer_passes) each looped span repeated its passes in a row, so a span [6, 18) of 3
+    passes runs 0..5, 6..17, 6..17, 6..17, 18.. . The applications of one layer share its weights and keep their own
+    state (KV, convolution windows) each."""
+    config = _mapping_of(config, source)
+    layers = _layer_count(config, source) if "num_hidden_layers" not in config else None
+    if not layers:
+        layers = _positive(config, "num_hidden_layers", source)
+    order, index = [], 0
+    for start, end, passes in _layer_passes(config, source):
+        order.extend(range(index, start))
+        order.extend(list(range(start, end)) * passes)
+        index = end
+    order.extend(range(index, layers))
+    return tuple(order)
 
 
 def effective_head_dim(config, source=CONFIG_NAME):
@@ -806,7 +907,7 @@ def _moe(section, source):
                      topk_group=_integer(section, "topk_group", source),
                      mlp_only_layers=_integers(section, "mlp_only_layers", source),
                      norm_topk_prob=_boolean(section, "norm_topk_prob", source),
-                     routed_scaling_factor=_real(section, "routed_scaling_factor", source),
+                     routed_scaling_factor=_first(section, ROUTED_SCALING_KEYS, _real, source)[0],
                      scoring_func=_string(section, "scoring_func", source) or "",
                      topk_method=_string(section, "topk_method", source) or "")
 
@@ -873,7 +974,7 @@ def parse_model_config(config, source=CONFIG_NAME):
         tie_word_embeddings=_boolean(section, "tie_word_embeddings", source),
         dtype=dtype or "",
         rope=rope,
-        sliding_window=_integer(section, "sliding_window", source),
+        sliding_window=_sliding_window(section, source),
         full_attention_interval=_integer(section, "full_attention_interval", source),
         layer_types=_layer_types(section, source) or (),
         moe=_moe(section, source), mla=_mla(section, source), linear=_linear(section, source),
@@ -882,7 +983,7 @@ def parse_model_config(config, source=CONFIG_NAME):
         bos_token_id=_token_id(section, "bos_token_id", source),
         pad_token_id=_token_id(section, "pad_token_id", source),
         quantization=_quantization(section, source), intermediate_sizes=intermediate_sizes,
-        rope_by_layer_type=rope_by_layer_type)
+        rope_by_layer_type=rope_by_layer_type, layer_passes=_layer_passes(section, source))
 
 
 def _parse_json(read):

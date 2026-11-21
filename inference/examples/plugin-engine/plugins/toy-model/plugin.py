@@ -207,6 +207,8 @@ class ToyModel:
                       [[((ids[t] + a) % v, -0.5 - 0.25 * a) for a in range(top_k)] for t in targets] if top_k else None)
 
     def close(self):
+        if self.cache is not None:   # the prompt cache leaves the device's givers
+            self.cache.close()
         self.closed = True
 
 

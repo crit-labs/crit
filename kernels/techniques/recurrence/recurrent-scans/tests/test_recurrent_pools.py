@@ -322,6 +322,29 @@ def test_pool_convolution_keeps_each_sequences_window(width, dtype):
 
 
 @pytest.mark.kernels_ci
+@pytest.mark.parametrize("width,dilation", [(2, 1), (4, 1), (4, 3)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_conv_segments_rows_give_each_row_conv_segments_bits(width, dilation, dtype):
+    """conv_segments_rows: rows of 70, 1, 33 and 130 inputs (shorter and longer than a segment and the window) in one
+    launch, each from its own window: every row's outputs and window are conv_segments' for that row alone."""
+    g = torch.Generator(device="cpu").manual_seed(width * 10 + dilation)
+    C, S = 300, (width - 1) * dilation
+    counts = [70, 1, 33, 130]
+    firsts = [sum(counts[:i]) for i in range(len(counts))]
+    x = torch.randn(sum(counts), C, generator=g).to(dev).to(dtype)
+    weight = torch.randn(C, width, generator=g).to(dev)
+    bias = torch.randn(C, generator=g).to(dev)
+    windows = torch.randn(len(counts), C, S, generator=g).to(dev)
+    meta = torch.tensor([[f, n] for f, n in zip(firsts, counts)], dtype=torch.int32, device=dev)
+    out, after = torch.full_like(x, float("nan")), torch.full_like(windows, float("nan"))
+    rs.conv_segments_rows(out, windows, after, x, meta, weight, bias, widest=max(counts))
+    for r, (f, n) in enumerate(zip(firsts, counts)):
+        alone, alone_window = torch.empty_like(x[f:f + n]), torch.empty(C, S, device=dev)
+        rs.conv_segments(alone, windows[r].clone(), alone_window, x[f:f + n], weight, bias)
+        assert torch.equal(out[f:f + n], alone) and torch.equal(after[r], alone_window), r
+
+
+@pytest.mark.kernels_ci
 @pytest.mark.parametrize("variant", ["no-norm-keys", "no-norm-queries", "epsilon", "fp16"])
 def test_geometry_variants_match_the_recurrence(variant):
     kh, vh, dk, dv = 2, 4, 64, 64

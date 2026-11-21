@@ -179,7 +179,7 @@ class PlanRecordTests(PlanFixture, unittest.TestCase):
         self.assertEqual(view["errors"], [])
         self.assertEqual(view["state"]["plans"], [{"plan_id": "plan-0001", "segment_id": "segment-0001",
                          "parent_candidate_id": None, "decision": "build", "supersedes": None, "superseded_by": None,
-                         "candidate_id": "candidate-0001"}])
+                         "candidate_id": "candidate-0001", "retroactive": False}])
         events = [read_json(path) for path in sorted((self.directory / "events").glob("event-*.json"))]
         recorded_event = next(e for e in events if e["event_type"] == "plan_recorded")
         self.assertEqual(recorded_event["reference"]["path"], "plans/plan-0001/plan.json")
@@ -877,6 +877,43 @@ class PlanRecordTests(PlanFixture, unittest.TestCase):
                          ["state"]["stopping_reason"], "search_exhausted")
 
 
+class RetroactivePlanTests(PlanFixture, unittest.TestCase):
+    def test_a_plan_recorded_after_its_change_was_measured_says_so_everywhere_it_is_shown(self):
+        parent = self.first()["candidate_id"]
+        recorded = self.store.plan(self.run_id, plan(parent, retroactive=True))
+        self.assertIs(recorded["retroactive"], True)
+        self.assertIs(read_json(self.directory / "plans" / recorded["plan_id"] / "plan.json")["retroactive"], True)
+        state = {row["plan_id"]: row for row in self.store.get(self.run_id)["state"]["plans"]}
+        self.assertEqual((state["plan-0001"]["retroactive"], state[recorded["plan_id"]]["retroactive"]), (False, True))
+        events = [read_json(path) for path in sorted((self.directory / "events").glob("event-*.json"))]
+        details = [e["detail"] for e in events if e["event_type"] == "plan_recorded"]
+        self.assertEqual([detail.get("retroactive") for detail in details], [None, True])
+        # Its candidate is built from it as from any plan, and its outcome keeps the flag beside the forecast.
+        child = self.candidate(parent_candidate_id=parent, plan_id=recorded["plan_id"])["candidate_id"]
+        outcome = self.store.plan_outcome(self.run_id, child, self.evaluated(child, status(decode=125.0)))
+        self.assertIs(outcome["retroactive"], True)
+        self.assertIs(self.store.plan_outcome(self.run_id, parent, attempt_of(self, parent))["retroactive"], False)
+        # At hand-off crit run ... next names it for summary.md.
+        self.store.stop(self.run_id, "cancelled")
+        found = self.store.next(self.run_id)
+        self.assertEqual(found["step"], "hand_off")
+        self.assertIn(f"Retroactive plans, recorded after their change was measured: {recorded['plan_id']}", found["why"])
+
+    def test_the_flag_is_true_or_left_out_and_refused_on_a_stop_plan(self):
+        parent = self.first()["candidate_id"]
+        for value in (False, "yes", 1):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "retroactive is true for a plan recorded after"):
+                    self.store.plan(self.run_id, plan(parent, retroactive=value))
+        stop = plan(parent, decision="stop", decode=False, prefill=False, levers=[], forecast=None,
+                    gaps=limit_causes("decode", "prefill"), retroactive=True)
+        with self.assertRaisesRegex(ValueError, "a stop plan plans no change"):
+            self.store.plan(self.run_id, stop, check=True)
+        # A run with no retroactive plan hands off without naming any.
+        self.store.stop(self.run_id, "cancelled")
+        self.assertNotIn("Retroactive", self.store.next(self.run_id)["why"])
+
+
 def attempt_of(test, candidate_id):
     return sorted((test.directory / "candidates" / candidate_id / "eval").glob("attempt-*.json"))[0].stem
 
@@ -1401,6 +1438,61 @@ class CandidateLadderTests(PlanFixture, unittest.TestCase):
             evaluation.evaluate(self.store, self.run_id, c2, self.root / "no-data", certify=True)
         self.assertEqual(list((self.directory / "candidates" / c2 / "attempts").glob("attempt-*")), [])
 
+    def test_a_rung_eval_cannot_reach_is_recorded_and_plans_go_on_from_the_newest_build(self):
+        from unittest import mock
+        from crit.run import evaluation, ladder
+        first = self.store.plan(self.run_id, plan(levers=[], forecast=None))
+        c1 = self.built(first["plan_id"])
+        second = self.store.plan(self.run_id, plan(c1))
+        c2 = self.candidate(plan_id=second["plan_id"], parent_candidate_id=c1)["candidate_id"]
+        self.served(c2)
+        self.assertEqual(self.store.get(self.run_id)["ladder"], {"rung_unreachable": None, "certified": None})
+        # Eval's refusal of the run's model is the run's state, recorded before any attempt is reserved.
+        refusal = "transformers 5.0 has no modeling code for model type 'fixture'"
+        with mock.patch("crit.run.ladder.eval_refusal", return_value=refusal), \
+                self.assertRaisesRegex(ValueError, f"records rung unreachable: {refusal}\\. Seal {c2} built"):
+            evaluation.evaluate(self.store, self.run_id, c2, self.root / "no-data")
+        self.assertEqual(list((self.directory / "candidates" / c2 / "attempts").glob("attempt-*")), [])
+        found = self.store.get(self.run_id)["ladder"]
+        self.assertEqual({key: found["rung_unreachable"][key] for key in ("record_kind", "candidate_id", "scope",
+                                                                          "segment_id", "reason")},
+                         {"record_kind": "rung_unreachable", "candidate_id": c2, "scope": "small",
+                          "segment_id": "segment-0001", "reason": refusal})
+        self.assertTrue(found["certified"].startswith(f"No candidate is certified: rung unreachable: {refusal}"))
+        self.assertEqual(ladder.state_text(found["rung_unreachable"]), f"rung unreachable: {refusal}")
+        step = self.store.next(self.run_id)
+        self.assertEqual((step["step"], step["candidate"]), ("seal", c2))
+        self.assertIn(f"rung unreachable: {refusal}", step["why"])
+        self.store.seal(self.run_id, c2, "built")
+        c3 = self.built(self.store.plan(self.run_id, plan(c2))["plan_id"], c2)
+        # The parent rule: the newest candidate on the ladder, never an older one.
+        with self.assertRaisesRegex(ValueError, f"newest candidate on the ladder, {c3}, not {c2}"):
+            self.store.plan(self.run_id, plan(c2))
+        c4 = self.built(self.store.plan(self.run_id, plan(c3))["plan_id"], c3)
+        fifth = self.store.plan(self.run_id, plan(c4))
+        self.assertEqual(self.rung(fifth), (5, "crit_round", "full"))
+        c5 = self.candidate(plan_id=fifth["plan_id"], parent_candidate_id=c4)["candidate_id"]
+        self.served(c5)
+        # A later refusal keeps the first record; next seals the full rung built, which puts it on the ladder.
+        with mock.patch("crit.run.ladder.eval_refusal", return_value="another reason"), \
+                self.assertRaisesRegex(ValueError, f"rung unreachable: {refusal}"):
+            evaluation.evaluate(self.store, self.run_id, c5, self.root / "no-data")
+        self.assertEqual(self.store.next(self.run_id)["step"], "seal")
+        self.store.seal(self.run_id, c5, "built")
+        self.assertEqual(list(ladder.counted(self.directory)), [c1, c2, c3, c4, c5])
+        # The plan from the full rung's build freezes no Eval, as from a rung that skipped its Eval.
+        self.assertIsNone(self.store.plan(self.run_id, self.critique(c5), check=True)["inputs"]["eval"])
+        # The stop selects none, and the hand-off says no candidate is certified and why.
+        step = self.store.next(self.run_id)
+        self.assertEqual(step["step"], "stop")
+        self.assertIn("No candidate is certified: rung unreachable", step["why"])
+        self.store.stop(self.run_id, "budget_exhausted", critique="critique", headroom=self.account)
+        step = self.store.next(self.run_id)
+        self.assertEqual(step["step"], "hand_off")
+        self.assertIn(f"No candidate is certified: rung unreachable: {refusal} (Eval refused {c2}'s small Eval",
+                      step["why"])
+        self.assertEqual(self.store.get(self.run_id)["errors"], [])
+
 
 class ReachTests(PlanFixture, unittest.TestCase):
     """The strategy's ceiling is the limit: a forecast whose best case stays below half of a needed family's limit
@@ -1437,6 +1529,53 @@ class ReachTests(PlanFixture, unittest.TestCase):
              "evidence": ObjectiveTests.evidence(self, "prefill.json")}], levers=[lever()],
             forecast={**plan()["forecast"], "prefill": {"low": 1000.0, "expected": 1000.0, "high": 1000.0}}))
             ["inputs"]["reach"])
+
+
+class PlanKvResolutionTests(PlanFixture, unittest.TestCase):
+    """A plan's kv_bytes_per_token is checked, as its candidate is created, against what the candidate's engine takes
+    before any load (its plugins' resolve(): crit plugins resolve), at the run's context."""
+
+    def answering(self, figure=None, error=None):
+        from unittest import mock
+        asked = []
+
+        def resolve_package(package, model, configuration=None, **options):
+            asked.append(options)
+            if error is not None:
+                raise error
+            return {"facts": {} if figure is None else {"kv_bytes_per_token": figure},
+                    "by": {"kv_bytes_per_token": "model-template"}}
+        return mock.patch("crit_core.engine.resolve_package", resolve_package), asked
+
+    def test_a_plan_that_budgets_another_kv_than_its_engine_takes_is_refused_as_its_candidate_is_created(self):
+        # The build's recon priced FP8 KV at 12,288 bytes a token; its engine took BF16 pages and indexer keys.
+        recorded = self.store.plan(self.run_id, {**plan(levers=[], forecast=None), "kv_bytes_per_token": 12288})
+        patched, asked = self.answering(29952)
+        with patched:
+            with self.assertRaisesRegex(ValueError, "budgets 12,288 KV bytes a token, and the candidate's engine "
+                                                    "takes 29,952 \\(model-template's answer before a load"):
+                self.candidate(plan_id=recorded["plan_id"])
+        kv_tokens = read_json(self.store.directory(self.run_id) / "run.json")["spec"]["hardware_constraints"]["kv_tokens"]
+        self.assertEqual(asked[0]["context_tokens"], kv_tokens)   # at the context its serve checks load it at
+        patched, _ = self.answering(error=ValueError("model-template: fp8 KV pages take the checkpoint's static "
+                                                    "k_scale and v_scale"))
+        with patched:
+            with self.assertRaisesRegex(ValueError, "do not say what their engine takes before a load: ValueError: "
+                                                    "model-template: fp8 KV pages"):
+                self.candidate(plan_id=recorded["plan_id"])
+        patched, _ = self.answering(12300)   # within 1%
+        with patched:
+            self.candidate(plan_id=recorded["plan_id"])
+
+    def test_a_plan_without_a_kv_figure_or_an_engine_that_resolves_none_is_left_to_the_serve_check(self):
+        patched, asked = self.answering(29952)
+        with patched:
+            self.assertIsNone(plans.check_kv({"plan_id": "plan-0001"}, "package", "model", {"plugins": {}}))
+        self.assertEqual(asked, [])   # nothing asked of the plugins
+        patched, _ = self.answering(None)
+        with patched:
+            self.assertIsNone(plans.check_kv({"plan_id": "plan-0001", "kv_bytes_per_token": 12288}, "package",
+                                             "model", {"plugins": {}}))
 
 
 class PromptActivationTests(PlanFixture, unittest.TestCase):
@@ -1490,6 +1629,23 @@ class PromptActivationTests(PlanFixture, unittest.TestCase):
         recorded = self.store.plan(self.run_id, {**first, "gaps": [rejection]})
         self.assertEqual(recorded["inputs"]["activation_evidence"]["path"], rejection["evidence"])
         self.assertEqual(recorded["inputs"]["activation_evidence"]["over_budget_sets"], ["long-4096/prompt"])
+
+    def test_a_candidate_asks_its_engine_for_the_activations_its_plan_declared(self):
+        # crit writes the plan's prompt_activations into the candidate's configuration: Core tells the plugins and
+        # refuses an engine serving others wherever it loads, so a candidate and its plan cannot state two.
+        from crit.run.store import with_activations
+        recorded = self.store.plan(self.run_id, {**plan(levers=[], forecast=None), "prompt_activations": self.stored})
+        candidate = self.candidate(plan_id=recorded["plan_id"])
+        self.assertEqual(candidate["configuration"]["prompt_activations"], self.stored)
+        configuration = {"plugins": {"use": {}}}
+        self.assertEqual(with_activations(configuration, {"plan_id": "plan-0001"}), configuration)   # none declared
+        self.assertEqual(with_activations({**configuration, "prompt_activations": "stored"},
+                                          {"plan_id": "plan-0001", "prompt_activations": "stored"}),
+                         {**configuration, "prompt_activations": "stored"})
+        with self.assertRaisesRegex(ValueError, 'configuration.prompt_activations "bf16" differs from what plan-0001 '
+                                                r'declared \("stored"\)'):
+            with_activations({**configuration, "prompt_activations": "bf16"},
+                             {"plan_id": "plan-0001", "prompt_activations": "stored"})
 
     def test_a_candidate_serves_what_its_plan_declared(self):
         recorded = self.store.plan(self.run_id, {**plan(levers=[], forecast=None), "prompt_activations": self.stored})

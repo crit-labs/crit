@@ -50,6 +50,19 @@ class DeviceTests(PluginTestCase):
     def test_it_has_the_device_form_and_the_rounds_methods(self):
         self.assertImplements()
 
+    def test_closing_the_plugin_gives_every_pools_range_back_to_the_device(self):
+        # The Flash-Next build's leak: the device's registry of ranges kept a closed engine's state pools.
+        from crit_plugins import memory
+        if self.dev != "cuda" or not memory.of("cuda").elastic_ranges:
+            self.skipTest("an elastic range is the CUDA driver's")
+        plugin = self.assemble(options={"elastic": True})["recurrence"]
+        ranges = [self.pool(plugin).elastic.range for _ in range(2)]
+        device = memory.of("cuda")
+        self.assertEqual(sum(made in ranges for made in device.ranges.values()), 2)
+        plugin.close()
+        self.assertFalse([key for key, made in device.ranges.items() if made in ranges])
+        self.assertTrue(all(not made.base for made in ranges))
+
     def test_decode_rows_have_the_bits_of_the_reference_plugins(self):
         torch = self.torch
         mine, base = self.assemble()["recurrence"], self.reference()["recurrence"]
@@ -58,6 +71,31 @@ class DeviceTests(PluginTestCase):
             (a, xa), (b, xb) = (self.step(p, pool, t, 1) for p, pool in zip((mine, base), pools))
             self.assertTrue(torch.equal(a, b) and torch.equal(xa, xb))
         self.assertTrue(torch.equal(pools[0].state(0, "a"), pools[1].state(0, "a")))
+
+    def test_a_steps_prompt_rows_together_have_each_rows_bits(self):
+        """Two prompt rows in one step (one convolution launch for both) give each row's outputs, window and state
+        the bits of its own step."""
+        torch = self.torch
+        plugin = self.assemble(options={"exact_rows": 16})["recurrence"]
+        together = self.pool(plugin)
+        together.open("b")
+        batch = StepBatch.build([("a", 0, 40), ("b", 0, 70)], self.dev)
+        q, k, v, g, b, x = (torch.cat([self.inputs[n][:40], self.inputs[n][40:110]]) for n in "qkvgbx")
+        xo = plugin.convolve(0, x, self.weight, None, together, batch)
+        out = plugin.forward(0, q, k, v, g, b, together, batch, self.geometry)
+        together.accept("a", 40)
+        together.accept("b", 70)
+        for name, first, count in (("a", 0, 40), ("b", 40, 70)):
+            alone = plugin.pool([0], self.h, self.dk, self.dv, self.dev, 4, 0, (24, 4), self.kh, 1)
+            alone.open(name)
+            one = StepBatch.build([(name, 0, count)], self.dev)
+            span = slice(first, first + count)
+            xa = plugin.convolve(0, x[span], self.weight, None, alone, one)
+            oa = plugin.forward(0, q[span], k[span], v[span], g[span], b[span], alone, one, self.geometry)
+            alone.accept(name, count)
+            self.assertTrue(torch.equal(xa, xo[span]) and torch.equal(oa, out[span]), name)
+            self.assertTrue(torch.equal(alone.window(0, name), together.window(0, name)), name)
+            self.assertTrue(torch.equal(alone.state(0, name), together.state(0, name)), name)
 
     def test_both_scan_structures_give_the_same_bits(self):
         """The scan option (recurrent-scans' pool-delta or pool-delta-pipe) changes no bit: decode rows, verify rows

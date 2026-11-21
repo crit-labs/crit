@@ -17,6 +17,7 @@
     "experts:bundles",
     "experts:routes",
     "experts:activations",
+    "experts:mxfp8",
     "rounds:experts",
     "prompts:experts"
   ],
@@ -41,9 +42,11 @@
       "default": "tensor",
       "choices": [
         "tensor",
-        "declared"
+        "declared",
+        "fp4",
+        "fp8"
       ],
-      "description": "tensor: BF16 tensor cores for every format (the fastest); declared: crit's integer block order (host-expert-arithmetic's host_int.h), the bits crit's CPU expert tier gives on the same bundles, for NVFP4 experts W4A4 (with activations nvfp4) and int4 experts W4A8 (8-bit activations, a quantization of its own for speed runs), so a dispatch that sends some routes to the CPU changes no token; only crit's kernel grouped-experts computes it (refused without it)"
+      "description": "tensor: BF16 tensor cores for every format (the fastest); declared: crit's integer block order (host-expert-arithmetic's host_int.h), the bits crit's CPU expert tier gives on the same bundles, for NVFP4 experts W4A4 (with activations nvfp4) and int4 experts W4A8 (8-bit activations, a quantization of its own for speed runs), so a dispatch that sends some routes to the CPU changes no token; only crit's kernel grouped-experts computes it (refused without it); fp4: NVFP4 experts W4A4 (activations nvfp4, matrices carrying input_scale; hidden and inter multiples of 128) on the block-scaled FP4 tensor cores (the sm_120 family): the same quantized operands as tensor's W4A4 as E2M1 codes and UE4M3 scales, the weights' own codes, one MMA chain an output (decode and prompt items give a route the same bits: exact), another arithmetic than tensor's W4A4; only crit's kernel grouped-experts on such a GPU computes it (refused elsewhere, and for other formats); fp8: FP8 experts (fp8 with channel or 128 x 128 block scales; hidden and inter multiples of 128) W8A8 on the E4M3 tensor cores (8.9 on): inputs and intermediates quantized per 128 values in E4M3 at amax / 448 (crit's declared group quantizer), each 128-k block's sum folded by the two scales, decode and prompt items with the same bits (exact); only crit's kernel grouped-experts computes it (refused elsewhere, and for other formats)"
     },
     "workspace_mib": {
       "type": "int",

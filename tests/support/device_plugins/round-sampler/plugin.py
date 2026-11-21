@@ -2,18 +2,7 @@
 package's token-sampling plugin in every respect, with greedy device predictions for a round (each column's argmax,
 the lower id among equals, as token-sampling's device form picks a greedy row's token) and the staged rules of each
 round slot, greedy only."""
-from pathlib import Path
-
-from crit_plugins import Registry
-from crit_plugins.assemble import load_module
-from crit_plugins.manifest import options_for
-
-
-def library_plugin(context, plugin_id, parts, options=None):
-    """The package's plugin `plugin_id` (copied in beside this stand-in), created as Core's loader creates a plugin."""
-    manifest = Registry.discover(Path(context.package) / "plugins")[plugin_id]
-    factory = getattr(load_module(manifest), manifest["entry"][1])
-    return factory(context, options_for(manifest, options or {}, f"plugins.options.{plugin_id}"), parts)
+from crit_plugins.compose import package_plugin
 
 
 class RoundSampler:
@@ -35,4 +24,4 @@ class RoundSampler:
 
 
 def create(context, options, parts):
-    return RoundSampler(library_plugin(context, options["inner"], parts))
+    return RoundSampler(package_plugin(context, options["inner"], parts))

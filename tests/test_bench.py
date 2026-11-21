@@ -22,6 +22,14 @@ for _name in [n for n in dir(PullTests) if n.startswith("test_")]:
 
 @unittest.skipIf(yaml is None, "PyYAML is not installed")
 class BenchTests(Installed):
+    def setUp(self):
+        super().setUp()
+        # crit serve's runtime owner of this test's own, as test_pull's served engines take one: the machine's default
+        # is another CRIT runtime's while one is alive there (another unit's, another tool's), and bench then refused.
+        environment = patch.dict("os.environ", {"CRIT_RUNTIME_DIRECTORY": str(self.root / "runtime-owner")})
+        environment.start()
+        self.addCleanup(environment.stop)
+
     def prepared_data(self):
         data = self.root / "data"
         data.mkdir()

@@ -132,7 +132,8 @@ Rules hold for every run, every model and every machine. Where crit enforces one
 
 1. **Core is model- and hardware-agnostic.** No layer arithmetic, no kernels beyond the backends' runtime services,
    no number or rule true only for one model family, dtype, GPU or backend. What engines share enters Core as
-   bookkeeping. Core and the plugin contract stay backend-neutral, so every backend can be added.
+   bookkeeping. Core and the plugin contract stay backend-neutral, so every backend can be added. What decides how
+   an engine computes and schedules on the device is Core's, defined once ([what Core decides](../core/README.md#what-core-decides)).
 2. **Every engine crit builds is Core plus plugins; plugins are the truth.** One plugin per slot, every need met, no conflict, one
    memory budget; a slot's arithmetic lives in that slot's plugin, never inline in the model plugin. Core's loader
    checks this. There is no other engine shape: a doc, example or engine that describes one is out of date and gets

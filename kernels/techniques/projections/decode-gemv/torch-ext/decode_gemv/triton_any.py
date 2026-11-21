@@ -16,11 +16,10 @@ The program's shape never depends on the call's row count, so a row's bits are t
 others. Every knob but MUL, BN (the dot's), BK and SPLIT only picks which rows a program takes and how it runs (the fma
 path's BLOCK_N included: tests check its tiles' bits); a tuning keeps one value of each order knob a matrix.
 
-The older per-format Triton GEMVs are this kernel: gemv_triton (structure gemv-nvfp4-triton) is the fma path on NVFP4,
-gemv_fp8_dot (gemv-fp8-dot) the dot path on FP8 (BF16 operands for either activation type, as it had), the same
-operations and so the same bits as before. A tuning made before gemv-triton still applies: for NVFP4 and FP8 an alias's
-table wins where it names a configuration other than its defaults, where a sweep selected one, or where the tuning
-tunes the alias and not gemv-triton.
+The older per-format Triton GEMVs are this kernel: gemv_triton is the fma path on NVFP4, gemv_fp8_dot the dot path on
+FP8 (BF16 operands for either activation type, as it had), the same operations and so the same bits as before. Their
+structures (gemv-nvfp4-triton, gemv-fp8-dot) are retired: a tuning that names them is migrated into gemv-triton's table
+when the kernel is built (kernel.json "retired").
 
 Untuned (every knob 0) the kernel picks from the format, the shape and the device: the dot path where K is a multiple
 of 128 and the format's values are exact in the dot's type (MXFP8, whose power of two can leave BF16's range, and BF16
@@ -217,7 +216,7 @@ def _fma_body(x_ptr, w_ptr, s_ptr, z_ptr, f_ptr, out_ptr, N, K, GROUP, stride_xm
 
 
 @triton.autotune(configs=GEMV_TILES, key=["N", "K", "HW", "WF"])
-@triton.jit
+@triton.jit(do_not_specialize=[])
 def _fma_kernel(x_ptr, w_ptr, s_ptr, z_ptr, f_ptr, out_ptr, N, K, GROUP, stride_xm, stride_om, M: tl.constexpr,
                 BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, WF: tl.constexpr, HW: tl.constexpr,
                 HW_FP8: tl.constexpr):
@@ -305,7 +304,7 @@ def _dot_nibbles(WF: tl.constexpr, w_ptr, s_ptr, z_ptr, nn, k0, K, GROUP, BN: tl
         return eh, (ve - eh.to(tl.float32)).to(DOT), oh, (vo - oh.to(tl.float32)).to(DOT)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["T"])
 def _dot_kernel(x_ptr, w_ptr, s_ptr, z_ptr, f_ptr, out_ptr, T, N, K, KS, GROUP, x_stride, out_stride,
                 BN: tl.constexpr, BK: tl.constexpr, SPLIT: tl.constexpr, WF: tl.constexpr, DOT: tl.constexpr,
                 HW: tl.constexpr, HW_FP8: tl.constexpr):
@@ -342,7 +341,7 @@ def _dot_kernel(x_ptr, w_ptr, s_ptr, z_ptr, f_ptr, out_ptr, T, N, K, KS, GROUP, 
         tl.store(out_ptr + pid_s * T * N + rows[:, None] * N + n[None, :], acc, mask=omask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["T"])
 def _reduce_kernel(part_ptr, f_ptr, out_ptr, T, N, out_stride, SPLIT: tl.constexpr, BN: tl.constexpr,
                    HAS_F: tl.constexpr):
     t = tl.program_id(1)
@@ -427,7 +426,7 @@ def dot_rule_nibbles(n: int, k: int, multiprocessors: int, int4: bool = False):
     return bn, bk, warps, split
 
 
-# ---- the structure gemv-triton: knobs from the tuning, an alias's where it applies ----
+# ---- the structure gemv-triton: knobs from the tuning ----
 
 def _lookup(structure, key, rows):
     """(configuration index, knobs) the build's tuning gives `structure` for the key and row count (_crit_tuning's
@@ -444,16 +443,10 @@ def _lookup(structure, key, rows):
     return 0, dict(t["configs"][0])
 
 
-def _alias_takes(alias, key, rows):
-    """An alias's configuration for this call, or None: where a sweep selected one, where its table names one other
-    than its defaults, or where the tuning tunes the alias and not gemv-triton (kernel.json's alias rule)."""
-    t = _crit_tuning.TUNING.get(alias)
-    if t is None:
-        return None
-    index, config = _lookup(alias, key, rows)
-    if alias in _crit_tuning.SELECTED or index != 0 or (t["table"] and not _crit_tuning.TUNING["gemv-triton"]["table"]):
-        return config
-    return None
+def tuned(weights, n, k, rows):
+    """gemv-triton's knobs for (weights, N, K) at a row count: the tuning's table, or its defaults (every knob 0, the
+    rule's)."""
+    return _lookup("gemv-triton", {"weights": weights, "N": n, "K": k}, rows)[1]
 
 
 def rule_mul(weights, k, x_dtype):
@@ -469,23 +462,9 @@ def rule_mul(weights, k, x_dtype):
 
 def plan(weights, n, k, rows, x_dtype=torch.bfloat16, device=None):
     """("fma", BLOCK_N, BLOCK_K, warps, stages) or ("dot", (BN, BK, warps, split)) for a call: gemv-triton's tuning
-    for (weights, N, K) and the row count, an alias's where it applies (NVFP4: gemv-nvfp4-triton, FP8:
-    gemv-fp8-dot), the rule for knobs left 0. A plan the matrix cannot take (the dot path's K not a multiple of
-    split * BK) falls back to the rule; K not a multiple of 128 always takes fma."""
-    key = {"weights": weights, "N": n, "K": k}
-    config = None
-    if weights == formats.NVFP4:
-        old = _alias_takes("gemv-nvfp4-triton", key, rows)
-        if old is not None:
-            config = {"MUL": MUL_FMA, "BN": old["BLOCK_N"], "BK": old["BLOCK_K"], "WARPS": old["WARPS"],
-                      "STAGES": old["STAGES"], "SPLIT": 0}
-    elif weights == formats.FP8:
-        old = _alias_takes("gemv-fp8-dot", key, 1)
-        if old is not None:
-            config = {"MUL": MUL_DOT, "BN": old["BN"], "BK": old["BK"], "WARPS": old["WARPS"], "STAGES": 0,
-                      "SPLIT": old["SPLIT"]}
-    if config is None:
-        config = _lookup("gemv-triton", key, rows)[1]
+    for (weights, N, K) and the row count, the rule for knobs left 0. A plan the matrix cannot take (the dot path's K
+    not a multiple of split * BK) falls back to the rule; K not a multiple of 128 always takes fma."""
+    config = _lookup("gemv-triton", {"weights": weights, "N": n, "K": k}, rows)[1]
     mul = config["MUL"] or rule_mul(weights, k, x_dtype)
     if mul == MUL_DOT and k % 128 == 0 and not (weights == formats.BF16 and x_dtype != torch.bfloat16):
         p = (config["BN"], config["BK"], config["WARPS"], config["SPLIT"])

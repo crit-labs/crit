@@ -89,6 +89,72 @@ class DeviceMatrixTests(PluginTestCase):
         with self.assertRaisesRegex(ValueError, "E8M0 scales"):
             plugin.load({**stored, "scale": stored["scale"][:, :4]}, "mxfp8")
 
+    def test_fp8_block_matrices_multiply_as_stored_on_fp8_block_rows(self):
+        """fp8:block (an FP8 block checkpoint's 128 x 128 FP32 scales, rows off the blocks) loads as stored: W8A8
+        against activations per 128 inputs, decode and prompt rows within E4M3's step of the exact product; with
+        prompt_gemm provider the declared staged GEMM, each prompt row the bits of the row decoded and of the row
+        alone; with auto the tensor-core GEMM within FP32 accumulation of the declared one."""
+        torch = self.torch
+        g = torch.Generator().manual_seed(8)
+        w = torch.randn(200, 256, generator=g).cuda() * 0.1
+        padded = torch.zeros(256, 256, device="cuda")
+        padded[:200] = w
+        scale = padded.view(2, 128, 2, 128).abs().amax((1, 3)) / 448
+        codes = (w / scale.repeat_interleave(128, 0)[:200].repeat_interleave(128, 1)).to(torch.float8_e4m3fn)
+        stored = {"weight": codes, "scale": scale, "block": (128, 128)}
+        x = torch.randn(40, 256, generator=torch.Generator().manual_seed(9)).cuda().to(torch.bfloat16)
+        from crit_plugins.assemble import load_module
+        codec = load_module(self.registry()["quantized-projections"]).device_matrices
+        found = {}
+        for gemm in ("provider", "auto"):
+            plugin = self.assemble(options={"prompt_gemm": gemm})["projections"]
+            m = plugin.load(stored, "fp8:block")
+            exact = x.double() @ codec.dense(m).double().t()
+            rows = {n: plugin.matmul(x[:n], m, torch.float32) for n in (1, 8, 9, 16, 40)}
+            for n, y in rows.items():
+                self.assertLess(float((y.double() - exact[:n]).abs().max() / exact[:n].abs().max()), 0.06, (gemm, n))
+            found[gemm] = rows
+            self.assertEqual(plugin.facts()["prompt_kernels"]["fp8"],
+                             ["fp8-block-rows gemm-staged" if gemm == "provider" else
+                              "fp8-block-rows gemm-native-blocks"])
+        staged = found["provider"]
+        self.assertTrue(torch.equal(staged[40][:16], staged[16]))   # prompt rows: the decode rows' bits
+        self.assertTrue(torch.equal(staged[40][:1], staged[1]) and torch.equal(staged[16][:8], staged[8]))
+        native = found["auto"][40].double()
+        self.assertLess(float((native - staged[40].double()).abs().max() / staged[40].abs().max()), 1e-5)
+        with self.assertRaisesRegex(ValueError, "FP32 scales"):
+            self.plugin.load({**stored, "scale": scale[:1]}, "fp8:block")
+
+    def test_prompt_gemm_auto_follows_the_sweeps_report_and_keeps_its_rule_without_one(self):
+        """prompt_gemm auto (_auto_gemm on crit_kernels.select): without a report for the shape the measured rule
+        (NATIVE_AUTO: native for every kind); with one, native where the native GEMM's tuned times are no slower than
+        its yardstick library's over the counts both timed, provider where the library was faster; a matrix loads
+        with what it picked."""
+        torch = self.torch
+        from crit_plugins.assemble import load_module
+        codec = load_module(self.registry()["quantized-projections"]).device_matrices
+        device = torch.device("cuda")
+        kind = codec._auto_kind("fp8:channel", "nvfp4", "bf16", "fp8", "bf16")
+        self.assertEqual(kind, "fp8_rows")
+        saved = codec._report
+        try:
+            codec._report = lambda name: None
+            self.assertEqual(codec._auto_gemm(kind, 96, 256, device), "native")
+            for library, picked in ((50.0, "native"), (5.0, "provider")):
+                report = {"structures": {"gemm-native-channel": [
+                    {"shape": {"N": 96, "K": 256}, "rows": r, "tuned_us": 10.0, "library_us": library}
+                    for r in (128, 512)]}}
+                codec._report = lambda name, report=report: ({}, report) if name == "fp8-block-rows" else None
+                self.assertEqual(codec._auto_gemm(kind, 96, 256, device), picked, library)
+                self.assertEqual(codec._auto_gemm(kind, 192, 256, device), "native")   # another shape: the rule
+            scale = self.w.abs().amax(dim=1) / 448
+            stored = (self.w / scale[:, None]).to(torch.float8_e4m3fn)
+            plugin = self.assemble(options={"prompt_gemm": "auto"})["projections"]
+            m = plugin.load({"weight": stored, "scale": scale}, "fp8:channel")
+            self.assertEqual(m.gemm, "provider")   # the last report: the library was faster at this shape
+        finally:
+            codec._report = saved
+
     def test_w4a4_decode_rows_take_the_prompt_rows_activations_unless_decode_bf16(self):
         torch = self.torch
         codec, stored = self.nvfp4_weight()
@@ -558,12 +624,19 @@ class DraftEncodingTests(PluginTestCase):
                            "encoded_bytes": 32 * 96 + 32 * 4}})
         self.assertNotIn("prompt_activations", facts)    # the target's prompts are priced by the target's matrices
         with self.assertRaisesRegex(ValueError, "re-encodes bf16 to nvfp4, not bf16 to fp8:channel"):
-            plugin.load({"weight": w}, "bf16", role="mtp.gate_up", encode="fp8")
+            plugin.load({"weight": w[:32]}, "bf16", role="mtp.gate_up", encode="fp8")   # a shape FP8 takes
         # The same role's matrices stored in another format are a group of their own.
         fp8 = plugin.load(self.matrices.reencode({"weight": w}, "bf16", "fp8")[0], "fp8:channel", role="mtp.gate_up",
                           encode="nvfp4")
         self.assertEqual(fp8.format, "nvfp4")
         self.assertEqual(plugin.facts()["draft_encoding"]["mtp.gate_up:fp8:channel"]["encoded"], "nvfp4")
+        # A matrix whose shape the encoded format does not take stays as stored, and the facts say why: the rest of
+        # its role re-encodes (a draft layer's 324 x 10240 matrix in FP8 failed the whole load).
+        odd = plugin.load({"weight": w[:36]}, "bf16", role="mtp.down", encode="fp8")
+        self.assertEqual(odd.format, "bf16")
+        kept = plugin.facts()["draft_encoding"]["mtp.down:kept"]
+        self.assertEqual((kept["encoded"], kept["asked"], kept["matrices"]), ("bf16", "fp8", 1))
+        self.assertIn("multiples of 16, not 36 x 96", kept["kept"])
         stored = plugin.load({"weight": w}, "bf16", role="mtp.norm", encode="bf16")   # nothing to re-encode
         self.assertEqual(stored.format, "bf16")
         self.assertEqual(plugin.facts()["draft_encoding"]["mtp.norm"],   # draft-only all the same, as stored
@@ -619,15 +692,23 @@ class DraftEncodingTests(PluginTestCase):
         with self.assertRaisesRegex(Exception, "head"):
             self.assemble(options={"head": "fp4"})
 
-    def test_mxfp8_matrices_take_their_stored_activations_in_quality_mode_speed_and_16_bit_ones_otherwise(self):
+    def test_mxfp8_matrices_take_the_asked_activations_else_their_stored_ones_in_speed_and_16_bit_ones_otherwise(self):
         from crit_plugins import kernels
         self.addCleanup(kernels.use_quality_mode, None)
-        for mode, options, activations, by in ((None, {}, "bf16", None), ("preserve", {}, "bf16", None),
-                                               ("speed", {}, "mxfp8", "speed"),
-                                               ("speed", {"mxfp8_activations": "bf16"}, "bf16", None),
-                                               ("preserve", {"mxfp8_activations": "mxfp8"}, "mxfp8", None)):
-            with self.subTest(mode=mode, options=options):
+        self.addCleanup(kernels.use_activations, None)
+        asked_bf16 = "the configuration's prompt_activations (bf16)"
+        for mode, asked, options, activations, by in (
+                (None, None, {}, "bf16", None), ("preserve", None, {}, "bf16", None),
+                ("speed", None, {}, "mxfp8", "quality mode speed"),
+                ("speed", None, {"mxfp8_activations": "bf16"}, "bf16", None),
+                ("preserve", None, {"mxfp8_activations": "mxfp8"}, "mxfp8", None),
+                # what the plan declared (the configuration's prompt_activations) over the mode
+                ("speed", {"mxfp8": "bf16"}, {}, "bf16", asked_bf16),
+                ("preserve", "stored", {}, "mxfp8", "the configuration's prompt_activations (stored)"),
+                ("speed", {"nvfp4": "stored"}, {}, "mxfp8", "quality mode speed")):
+            with self.subTest(mode=mode, asked=asked, options=options):
                 kernels.use_quality_mode(mode)
+                kernels.use_activations(asked)
                 plugin = self.assemble(options=options)["projections"]
                 self.assertEqual((plugin.mx_activations, plugin.mx_by), (activations, by))
         with self.assertRaisesRegex(Exception, "mxfp8_activations"):

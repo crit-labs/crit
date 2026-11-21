@@ -22,8 +22,11 @@ namespace crit::core {
 // "logit_bias" as {"id": bias}, a banned token's bias as -Infinity (Python's json spelling), "min_tokens"),
 // "stop_tokens" (the effective list), "logprobs" (alternatives per token),
 // "replay" (a forced continuation, ReplayContinuation), "plain" (decode without drafting, PlainDecoding, and every
-// constrained request) and "attachment" (the id of host-side state for the request, HostAttachment) with
-// "constrained" (every token masked by Core's host side; one token per row, never in a native round).
+// constrained request), "decode_via_prompt" (true: the engine computes each decode row as a one-token prompt chunk,
+// RequestOptions::decode_via_prompt; never in a native round) and "attachment" (the id of host-side state for the
+// request, HostAttachment) with
+// "constrained" (every token masked by Core's host side; one token per row, in a native round only where the rounds
+// mask, StepRounds::masks).
 struct StepRequest {
     std::uint64_t request = 0, generation = 0;
     std::uint32_t lane = 0, prompt_tokens = 0;
@@ -64,10 +67,10 @@ struct StepDecision {
 // that drafts, verifies, accepts and copies its result block to host memory), waits for the block and reports each
 // row's tokens, so nothing in the engine's language runs while its requests decode. The engine keeps its decoding rows
 // packed in slots 0 .. rows - 1 and names their sessions in slot_session (0 for a slot Core must not run natively);
-// every other step (prompt chunks, a row outside the slots, a constrained request, a request asking for more
-// alternatives than the rounds rank) goes to `step` as before. After a native round Core calls `commit` only when a
-// decision trims, ends or cancels a row, with last = {rows, width, 1} naming that round (last[2] is 0 after
-// a `step`).
+// every other step (prompt chunks, a row outside the slots, a constrained request where the rounds do not mask, a
+// request asking for more alternatives than the rounds rank) goes to `step` as before. After a native round Core
+// calls `commit` only when a decision trims, ends or cancels a row or the round ran a constrained row, with last =
+// {rows, width, 1} naming that round (last[2] is 0 after a `step`).
 struct StepRounds {
     void* user = nullptr;
     // Launches the round of slots 0 .. rows - 1 at `width` drafts; returns without waiting. 0 on success. Each round
@@ -110,6 +113,12 @@ struct StepRounds {
     // a round could run it, so the engine's own code runs between two rounds (to hand device memory another program
     // took back, say). The engine clears the word in that step.
     const std::uint32_t* boundary = nullptr;
+    // 1: the rounds mask a constrained request's row by the allowed set the engine staged for its slot, and cut its
+    // drafts, so it emits one token a round from that set. Core then runs constrained requests in native rounds and
+    // calls `commit` after every round that ran one: the engine checks the token against the set, advances the
+    // request's matcher and stages the slot's next set there, before Core launches the next round. 0: a constrained
+    // request decodes through `step`.
+    std::uint32_t masks = 0;
 };
 
 // Every callback but release returns 0 on success; any other value fails the engine, with error()'s message. Optional
@@ -161,6 +170,7 @@ struct StepCallbacks {
 // A NativeEngine (concurrent_requests set) around a step model. The configuration JSON holds "engine", Core's
 // settings: "implementation", "vocabulary" and "context" (required), "valid_vocabulary", "prefill_chunk" (default
 // min(512, context)), "stop_tokens", "max_concurrency" (default 8), "max_pending" (default max_concurrency),
+// "pending_timeout_ms" (how long a request may wait for a lane, default 30000),
 // "max_batch_tokens" (mixed batches; default prefill_chunk + max_concurrency * max_row_tokens, 0 separates prefill and
 // decode steps), "batch_policy" ("fair" or "decode_first"), "max_row_tokens" (most tokens one row reports, default 1),
 // "decode_token_work" (default 1), "prefill_work_quantum" (default 1: prompt work granted in its multiples, so the

@@ -63,11 +63,16 @@ beside its rules: `stage(slot, params)` keeps the slot's `allowed` words in a
 device buffer at a fixed address, and a round masks every logits row of a
 constrained slot before the law (predictions and log-probabilities) and cuts
 its drafts, so the slot emits one token a round, its column 0's, under the
-allowed set Core staged. So selecting token-constraints keeps captured rounds
-for every request.
+allowed set Core staged. `stage_mask(slot, allowed)` replaces only the slot's
+set (one copy of its bitmask words), which Core's step engine calls between two
+rounds once the request's matcher took the last round's token
+([native decode rounds](../../core/src/runtime/README.md#native-decode-rounds)).
+So selecting token-constraints keeps captured rounds for every request: the
+round driver's `Rounds.masks` is true with it, and a model plugin binds a
+constrained request at width 0.
 
 Sampled verification under a constraint stays the host form (`predictions`):
-Core decodes a constrained request plainly, one token per step
+Core decodes a constrained request plainly, one token a round or step
 (`StepRequest.plain`), because its matcher computes the allowed set of the next
 position only once the tokens before it are known. A verify window would need
 the mask at every draft position, from the matcher advanced along each draft

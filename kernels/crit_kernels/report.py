@@ -8,7 +8,10 @@ middle and the largest by the key's product), so a structure several models shar
 - gates   crit_kernels.gates (nonfinite, repeat, edges, sums; limits once a kernel with --limits)
 - speed   the default build's call and the yardstick's (kernel.json's structure "yardstick", the bench's yardstick())
           on the structure's first and last tune_rows, each timed as the sweep times (crit_kernels.sweep.Timer: L2
-          flushed by a write, a GPU spin before the call, a CUDA graph replay where it can be captured, the median)
+          flushed by a write, a GPU spin before the call, a CUDA graph replay where it can be captured, the median),
+          and each call's floor on this device (crit_kernels.floors: its bytes at the memory bandwidth or its
+          multiply-adds at its arithmetic's tensor rate, from a `crit eval probe` result or measured here) with
+          of_floor, the floor's share of the call's time (1.0: the device's limit)
 
 The JSON report holds every row; markdown() gives one line a kernel (gates passed or the failures, the slowest and
 fastest speed against the library) and one a structure."""
@@ -41,9 +44,11 @@ def chosen_shapes(bench, spec, models, most=3):
     return [found[i] for i in picks], errors
 
 
-def _speed(kernel_id, folder, manifest, chosen, timer, log):
-    """{structure: [{shape, rows, us, timed, library, library_us, vs_library | library_note}]}: the default build
-    against the yardstick, at each chosen shape's first and last tune_rows."""
+def _speed(kernel_id, folder, manifest, chosen, timer, log, ceilings=None):
+    """{structure: [{shape, rows, us, timed, library, library_us, vs_library | library_note, floor_us, of_floor,
+    bound}]}: the default build against the yardstick and the device's floor, at each chosen shape's first and last
+    tune_rows."""
+    from . import floors
     import torch
     from .sweep import _bench_class
     module = kbuild.load(kernel_id)
@@ -74,6 +79,8 @@ def _speed(kernel_id, folder, manifest, chosen, timer, log):
                         entry["vs_library"] = round(entry["library_us"] / entry["us"], 3)
                     elif library:
                         entry["library_note"] = "not installed here"
+                    if ceilings:
+                        floors.stamp(entry, bench, shape, rows, ceilings)
                     torch.cuda.synchronize()
                 except Exception as error:  # noqa: BLE001 - a shape a call cannot take is a fact to report
                     torch.cuda.synchronize()
@@ -81,20 +88,23 @@ def _speed(kernel_id, folder, manifest, chosen, timer, log):
                 entries.append(entry)
                 log(f"{kernel_id}/{s} {entry['shape']} rows {rows}: " + (
                     f"{entry.get('us')} us" + (f", {library} {entry['library_us']} us ({entry['vs_library']}x)"
-                                               if "library_us" in entry else "") if "error" not in entry
-                    else entry["error"]))
+                                               if "library_us" in entry else "") +
+                    (f", {100 * entry['of_floor']:.0f}% of the {entry['bound']} floor" if "of_floor" in entry else "")
+                    if "error" not in entry else entry["error"]))
         out[s] = entries
     return out
 
 
-def report(model_folders, kernels=None, most=3, gates_on=True, speed=True, limits=False, repeat=25, log=print):
-    """{"models", "kernels": {id: {"shapes": {structure: [shape]}, "gates", "speed", "passed", "notes"}}}."""
+def report(model_folders, kernels=None, most=3, gates_on=True, speed=True, limits=False, repeat=25, log=print,
+           probe=None):
+    """{"models", "ceilings", "kernels": {id: {"shapes": {structure: [shape]}, "gates", "speed", "passed",
+    "notes"}}}. probe: a `crit eval probe` result for the floors' ceilings (else measured when speed runs)."""
     from .gates import gates
     from .model import Model
     from .sweep import Timer, _bench_class
     models = [Model(f) for f in model_folders]
     ids = kernels or sorted(kbuild.manifests())
-    timer = None
+    timer = ceilings = None
     result = {"models": [str(f) for f in model_folders], "kernels": {}}
     for kernel_id in ids:
         folder, manifest = kbuild.find(kernel_id, None)
@@ -119,8 +129,11 @@ def report(model_folders, kernels=None, most=3, gates_on=True, speed=True, limit
             if speed and chosen:
                 if timer is None:
                     import torch
+                    from . import floors
                     timer = Timer(torch, 3, repeat)
-                entry["speed"] = _speed(kernel_id, folder, manifest, chosen, timer, log)
+                    ceilings = floors.from_probe(probe) if probe else floors.measure()
+                    result["ceilings"] = ceilings
+                entry["speed"] = _speed(kernel_id, folder, manifest, chosen, timer, log, ceilings)
         except Exception as error:  # noqa: BLE001 - one kernel that cannot build does not stop the report
             entry["error"] = f"{type(error).__name__}: {str(error)[:500]}"
             entry["passed"] = False
@@ -138,7 +151,13 @@ def _name(folder):
 def markdown(result):
     """The report as markdown: a line a kernel, then a table of its structures (gates, speed against the library)."""
     lines = ["# crit kernels report", "", "Models: " + ", ".join(_name(f) for f in result["models"]), ""]
-    lines += ["| Kernel | Gates | Structures | Speed against the library (default knobs) |", "|---|---|---|---|"]
+    if result.get("ceilings"):
+        c = result["ceilings"]
+        lines += [f"Floors: {c['bandwidth_gbs']:.0f} GB/s, " + ", ".join(f"{k} {v:.0f} TFLOPS" for k, v in
+                                                                        sorted(c["tflops"].items())) +
+                  f" ({c['source']}); of floor = the floor's share of the call's time.", ""]
+    lines += ["| Kernel | Gates | Structures | Speed against the library (default knobs) | Of the floor |",
+              "|---|---|---|---|---|"]
     detail = []
     for kid, e in result["kernels"].items():
         fails = [f"{s} {r['shape']}: {g['gate']} ({g.get('reason', '')[:80]})"
@@ -152,7 +171,10 @@ def markdown(result):
         ratios = [x["vs_library"] for rows in (e.get("speed") or {}).values() for x in rows if "vs_library" in x]
         speed = (f"{min(ratios):.2f}x .. {max(ratios):.2f}x (median {statistics.median(ratios):.2f}x, "
                  f"{len(ratios)} points)") if ratios else "no library timed"
-        lines.append(f"| {kid} | {gate_text} | {len(e['shapes'])} | {speed} |")
+        shares = [x["of_floor"] for rows in (e.get("speed") or {}).values() for x in rows if "of_floor" in x]
+        share = (f"{100 * min(shares):.0f}% .. {100 * max(shares):.0f}% (median {100 * statistics.median(shares):.0f}%)"
+                 if shares else "-")
+        lines.append(f"| {kid} | {gate_text} | {len(e['shapes'])} | {speed} | {share} |")
         detail.append(f"## {kid}")
         libraries = sorted({x["library"] for rows in (e.get("speed") or {}).values() for x in rows if x.get("library")})
         detail += [f"- library: {name}" for name in libraries]
@@ -162,7 +184,10 @@ def markdown(result):
             for x in rows:
                 text = x.get("error") or (f"{x['us']} us" + (
                     f", the library {x['library_us']} us: {x['vs_library']}x" if "library_us" in x else
-                    f" ({x['library_note']})" if "library_note" in x else ""))
+                    f" ({x['library_note']})" if "library_note" in x else "") + (
+                    f", {100 * x['of_floor']:.0f}% of the {x['bound']} floor ({x['floor_us']} us)" +
+                    (f"; its {x['unpriced']} multiply-adds unpriced (no rate for them: --probe)" if "unpriced" in x else "")
+                    if "of_floor" in x else ""))
                 detail.append(f"- {s} {x['shape']} rows {x['rows']}: {text}")
         detail.append("")
     return "\n".join(lines + [""] + detail)

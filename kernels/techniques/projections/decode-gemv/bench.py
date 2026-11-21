@@ -3,6 +3,8 @@ scales of the stored layout, BF16 activations whose row i is seeded by i alone, 
 values."""
 import torch
 
+from crit_kernels import contracts
+
 E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
 
 
@@ -12,7 +14,8 @@ def _activations(rows, k, device):
 
 
 class GemvNvfp4:
-    structure = "gemv-nvfp4"
+    """NVFP4 matrices, their activations and the FP64 reference (gemv-cuda's bench takes them for weights 0; the
+    per-format structures they benched are retired)."""
 
     def __init__(self):
         self._matrices, self._references = {}, {}
@@ -58,12 +61,7 @@ class GemvNvfp4:
         return torch.cat(values, dim=1), torch.cat(magnitudes, dim=1)
 
     def check(self, got, want, s):
-        value, magnitude = want
-        error = (got.double() - value).abs()
-        # FP32 sums of exact products (a relative 2^-20 or so of the magnitudes), then one BF16 rounding of the result
-        bound = magnitude * 1e-5 + value.abs() * 2.0 ** -8 + 1e-6
-        bad = int((error > bound).sum())
-        return None if bad == 0 else f"{bad} outputs beyond FP32 accumulation and one BF16 rounding"
+        return _bf16_bound(got, want)
 
     def first_row(self, out):
         return out[0]
@@ -91,12 +89,10 @@ def _chunked(x, rows_of, n, chunk=8192):
 
 
 def _bf16_bound(got, want):
-    value, magnitude = want
-    error = (got.double() - value).abs()
-    # FP32 sums of exact products (a relative 2^-20 or so of the magnitudes), then one BF16 rounding of the result
-    bound = magnitude * 1e-5 + value.abs() * 2.0 ** -8 + 1e-6
-    bad = int((error > bound).sum())
-    return None if bad == 0 else f"{bad} outputs beyond FP32 accumulation and one BF16 rounding"
+    """A projection's tolerance against its FP64 reference (value, magnitudes): FP32 sums of exact products (a relative
+    2^-20 or so of the magnitudes), then one BF16 rounding of the result (crit_kernels.contracts.Sums, every projection
+    operation's)."""
+    return contracts.check("nvfp4-projection", got, want)
 
 
 class _Cached:
@@ -143,8 +139,8 @@ def _fp8_yardstick(cache, s):
 
 
 class GemvFp8(_Cached):
-    """The model's FP8 matrices with row scales (MXFP8 runs the same kernel with one more byte a step)."""
-    structure = "gemv-fp8"
+    """The model's FP8 matrices with row scales (MXFP8 runs the same kernel with one more byte a step): gemv-cuda's
+    bench takes their codes and reference for weights 1 and 2."""
 
     def shapes(self, model):
         return [m for m in model.matrices() if m["format"] == "fp8"]
@@ -174,7 +170,7 @@ class GemvFp8(_Cached):
 
 
 class GemvBf16(_Cached):
-    structure = "gemv-bf16"
+    """BF16 matrices: gemv-cuda's bench takes their sums inputs and reference for weights 3."""
 
     def shapes(self, model):
         return [m for m in model.matrices() if m["format"] == "bf16"]
@@ -245,146 +241,6 @@ def _w4a16_yardstick(cache, s):
         cache[("blocked", n, k)] = _blocked(s["scales"])
     sb = cache[("blocked", n, k)]
     return lambda: flashinfer.mm_bf16_fp4(x, codes, sb, None, backend="cute-dsl-native")
-
-
-class GemvNvfp4Triton(GemvNvfp4):
-    """The Triton NVFP4 GEMV on the CUDA GEMV's matrices (K a multiple of 16, 1 to 8 rows)."""
-    structure = "gemv-nvfp4-triton"
-
-    def valid(self, knobs):
-        if knobs["BLOCK_N"] == 0:   # the autotuner: the other knobs are its own
-            return knobs["WARPS"] == 4 and knobs["STAGES"] == 3 and knobs["BLOCK_K"] == 512
-        return knobs["BLOCK_N"] * knobs["BLOCK_K"] <= 16384   # a program's tile within the registers of 8 rows
-
-    def run(self, module, s):
-        return module.gemv_triton(s["x"], s["codes"], s["scales"], s["inverse"], s["out"])
-
-    def yardstick(self, s):
-        return _w4a16_yardstick(self._matrices, s)
-
-    def _reference(self, s):
-        table = torch.tensor(E2M1, dtype=torch.float64, device=s["codes"].device)
-        codes, scales, inverse = s["codes"], s["scales"], s["inverse"]
-
-        def rows_of(lo, hi):
-            c = codes[lo:hi].long()
-            w = torch.stack((table[c & 15], table[c >> 4]), dim=-1).reshape(c.shape[0], -1)
-            w = (w.view(c.shape[0], -1, 16) * scales[lo:hi].double()[..., None]).reshape(c.shape[0], -1)
-            return w * inverse[lo:hi].double()[:, None]
-        return _chunked(s["x"], rows_of, codes.shape[0])
-
-
-class GemvFp8Dot(_Cached):
-    """The FP8 dot GEMV on the model's FP8 matrices whose K is a multiple of 128, through fp8_dot_tile (the plan the
-    plugin takes: the build's tuning for the shape, or the rule)."""
-    structure = "gemv-fp8-dot"
-
-    def shapes(self, model):
-        return [m for m in model.matrices() if m["format"] == "fp8" and m["K"] % 128 == 0]
-
-    def valid(self, knobs):
-        values = [knobs["BN"], knobs["BK"], knobs["WARPS"], knobs["SPLIT"]]
-        if 0 in values:
-            return values == [0, 0, 0, 0]   # the rule, all four from it
-        return knobs["BN"] * knobs["BK"] <= 32768   # a [BN x BK] E4M3 block a stage within shared memory
-
-    def inputs(self, shape, rows, device):
-        n, k = int(shape["N"]), int(shape["K"])
-        if (n, k) not in self._matrices:
-            self._matrices[(n, k)] = _fp8_codes(n, k, device)
-        codes, row_scale = self._matrices[(n, k)]
-        return {"x": _activations(rows, k, device), "codes": codes, "scales": row_scale,
-                "out": torch.empty(rows, n, device=device, dtype=torch.bfloat16), "key": (n, k, rows)}
-
-    def run(self, module, s):
-        if "plan" not in s:   # once a state (the first, untimed call): the timed calls launch the kernels alone
-            n, k = s["codes"].shape
-            sms = torch.cuda.get_device_properties(s["x"].device).multi_processor_count
-            s["plan"] = module.fp8_dot_tile(n, k, sms)
-            need = module.dot_partial_elements(module.DOT_ROWS, n, s["plan"][3])
-            s["partial"] = torch.empty(max(need, 1), dtype=torch.float32, device=s["x"].device)
-        return module.gemv_fp8_dot(s["x"], s["codes"], s["scales"], s["out"], s["plan"], s["partial"])
-
-    def yardstick(self, s):
-        return _fp8_yardstick(self._matrices, s)
-
-    def _reference(self, s):
-        codes, scales = s["codes"], s["scales"]
-        return _chunked(s["x"], lambda lo, hi: codes[lo:hi].view(torch.float8_e4m3fn).double() *
-                        scales[lo:hi].double()[:, None], codes.shape[0])
-
-    def bytes(self, shape, rows):
-        n, k = int(shape["N"]), int(shape["K"])
-        return n * k + n * 4 + rows * k * 2 + rows * n * 2
-
-
-# ---- gemv-cuda: the CUDA-core GEMV for every weight format (the key's weights), on the formats' helpers above ----
-
-WEIGHTS = {"nvfp4": 0, "fp8": 1, "mxfp8": 2, "bf16": 3, "int4_zp": 4}
-INT4_GROUP = 128   # a shape's group where it names none (AWQ's and GPTQ's usual)
-
-
-def int4_shapes(model):
-    """The model's AWQ or GPTQ matrices (qweight int32: AWQ [K][N / 8], GPTQ [K / 8][N]) as gemv-cuda keys."""
-    quant = model.quantization or {}
-    method = str(quant.get("quant_method", "")).lower()
-    if method not in ("awq", "gptq") or int(quant.get("bits", 4)) != 4:
-        return []
-    group = int(quant.get("group_size") or INT4_GROUP)
-    found = []
-    for name, (dtype, shape) in model.tensors.items():
-        if name.endswith(".qweight") and dtype == "I32" and len(shape) == 2:
-            n, k = (shape[1] * 8, shape[0]) if method == "awq" else (shape[1], shape[0] * 8)
-            if group > 0 and k % group == 0 and group % 32 == 0:
-                found.append({"name": name[:-8], "weights": WEIGHTS["int4_zp"], "N": n, "K": k, "group": group})
-    return found
-
-
-def _mx_codes(n, k, device):
-    codes, _ = _fp8_codes(n, k, device)
-    g = torch.Generator(device=device).manual_seed(n * 43 + k)
-    exps = torch.randint(118, 128, (n, k // 32), generator=g, dtype=torch.uint8, device=device)
-    return codes, exps
-
-
-def int4_matrix(n, k, group, device):
-    """Random INT4 rows with a zero point a group, as repack_awq / repack_gptq leave them: codes [N][K / 2], FP16
-    scales and zeros (0..16) [N][K / group]."""
-    g = torch.Generator(device=device).manual_seed(n * 47 + k + group)
-    codes = torch.randint(0, 256, (n, k // 2), generator=g, dtype=torch.uint8, device=device)
-    scales = ((torch.rand(n, k // group, generator=g, device=device) + 0.5) / 64).to(torch.float16)
-    zeros = torch.randint(0, 17, (n, k // group), generator=g, dtype=torch.uint8, device=device)
-    return codes, scales, zeros
-
-
-def int4_values(codes, scales, zeros, group, lo=0, hi=None):
-    """Rows lo..hi of an INT4 matrix in crit's rows as FP64 values (code - zero) * scale."""
-    c = codes[lo:hi].long()
-    q = torch.stack((c & 15, c >> 4), dim=-1).reshape(c.shape[0], -1).double()
-    z = zeros[lo:hi].double().repeat_interleave(group, 1)
-    s = scales[lo:hi].double().repeat_interleave(group, 1)
-    return (q - z) * s
-
-
-def _int4_yardstick(cache, s):
-    """torch's W4A16 INT4 group GEMM (torch._weight_int4pack_mm, tinygemm): the same codes repacked once, a BF16
-    scale and offset a group ((code - 8) * scale + offset, offset (8 - zero) * scale). None where torch lacks it or
-    refuses the shape."""
-    if not hasattr(torch, "_weight_int4pack_mm") or not hasattr(torch, "_convert_weight_to_int4pack"):
-        return None
-    codes, scales, zeros, group, x = s["codes"], s["scales"], s["zeros"], s["group"], s["x"]
-    n, k = codes.shape[0], codes.shape[1] * 2
-    if ("int4pack", n, k, group) not in cache:
-        try:
-            packed = torch._convert_weight_to_int4pack(codes.contiguous(), 8)
-            sz = torch.stack((scales.float(), (8 - zeros.float()) * scales.float()), -1)   # [N][K / group][2]
-            sz = sz.transpose(0, 1).contiguous().to(torch.bfloat16)                          # [K / group][N][2]
-            torch._weight_int4pack_mm(x, packed, group, sz)
-        except (RuntimeError, TypeError):
-            return None
-        cache[("int4pack", n, k, group)] = (packed, sz)
-    packed, sz = cache[("int4pack", n, k, group)]
-    return lambda: torch._weight_int4pack_mm(x, packed, group, sz)
 
 
 class GemvCuda(_Cached):

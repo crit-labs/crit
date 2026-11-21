@@ -30,8 +30,8 @@ out = experts.forward(layer, x, ids, weights, rows=batch.rows_t, prompt=is_promp
 ```
 
 `layers` counts every layer whose experts load, a draft layer's included. Nothing else is the model's to call: Core
-tells the plugin of every step it runs (`begin_step`, `end_step`: `crit_plugins.device.STEP_FRAMES`) and tells the
-device's memory when the load is over, and captured
+tells the plugin of every step it ends (`end_step`: `crit_plugins.device.STEP_FRAMES`), frames every step with the
+device's memory and tells that memory when the load is over, and captured
 rounds find the plugin in its slot (its `start_round` and `count_round` run inside the round).
 
 **The decision tree.**
@@ -46,7 +46,7 @@ rounds find the plugin in its slot (its `start_round` and `count_round` run insi
 | Prompt chunks | The layer's non-resident experts staged through the cache's ring by the copy engine, one layer ahead; nothing admitted. A short chunk borrows as many ring slots as it has routes. A staged layer serves every chunk that reads it, across steps (below) | every `forward(prompt=True)` |
 | A short prompt chunk's misses | Where the CPU tier computes decode misses and prompt rows keep its order (`prompt_arithmetic` declared), a chunk of fewer routes than a layer has experts sends its missed routes to the CPU tier when they cost less there than their experts over the link, by the two times `open()` measured (`miss_times_us`; under four fifths, as for decode misses): nothing copied, no ring borrowed, the same bits. Else, and in the tensor arithmetic, its routed misses are copied into the ring | every short `forward(prompt=True)`, from the times measured at `open()` |
 | What does the cache give back? | An elastic cache is a giver of the device's ledger: a prompt step's room, and the pages a KV pool backs as a sequence grows, come out of its coldest slots, down to its ring and, without a CPU tier, a layer's experts (over the link a miss needs a slot). A cache that keeps its size gives nothing back, so at `open()` it leaves the model's elastic pools the bytes they have reserved and not backed (`reasons.pools`) | the ledger's `need()` |
-| Layers stored otherwise | An NVFP4 checkpoint may store some layers' experts weight-only (W4A16: no input scales; a draft layer's) beside W4A4 ones. Where the CPU tier may serve misses those layers stay whole on the device, outside the cache and the tier (it computes W4A4 experts only), with or without a store file; where every miss goes over the link (misses `link`, a file tier, a store with compressed scales) they are cached as the others | `open()` |
+| Layers stored otherwise | An NVFP4 checkpoint may store some layers' experts weight-only (W4A16: no input scales; a draft layer's) beside W4A4 ones. The CPU tier computes W4A4 experts only, so where it serves the other layers' misses those layers are the cache's link layers under the recent policy: in the cache with the rest, each miss admitted in its own plan from a reserve of the round's victims and copied over the link before the layer reads it, their rows the kernel's tensor arithmetic (the bits they had held whole). The reserve is what one decode round routes in a layer, `begin(decode_rows=, top=)` (a model's requests at once times every row a captured round runs through the layer, times its top k; a layer's experts where the model does not say), so a tight cache keeps its prompt ring: FP4-Local Qwen3.8-Flash-Next's 512-expert draft layer takes 240 slots beside a ring's 512, where held whole it took 512 and left too few for the ring. A captured round plans the draft layer first (the drafter before the verify); a step decoding eagerly plans the decoder's layers first, whose hits and CPU-tier copies may take the round's every victim, so there a link layer's plan starts a round of its own. `reasons.link_layers` names them and the reserve. Under the ranked policy they stay whole on the device, outside the cache and the tier; where every miss goes over the link (misses `link`, a file tier, a store with compressed scales) they are cached as the others | `open()` |
 
 **Prompts: a layer's experts once a span.** A prompt chunk of a hundred tokens or more routes nearly every expert of
 a layer, so chunk by chunk every chunk brings every layer's non-resident experts over the link: on
@@ -80,44 +80,19 @@ CPU's way is for a slower link, where the same measurement already sends decode 
 system memory and everything that reads it slows down. So the cache never takes memory it was not shown to be free:
 
 - `open()` leaves `reserve_mib` free for what the model still makes (graphs, workspaces, its first prompts).
-- The cache is a giver of the device's memory (`crit_plugins.memory`). Once the engine's warm requests ran, Core
-  tells that memory the load is over (`serve()`): the cache grows into every free byte but `margin_mib` and a short
-  prompt's room. Its slots live in an elastic range (`crit_plugins.memory`: address space for every
-  expert, backed as it grows), so growing and shrinking moves no slot and breaks no captured round.
-- `margin_mib` is free at every moment: set it to the run's VRAM headroom (`crit plugins offload` writes it), and
-  the run's device-memory checks read at least that at every step's peak.
-- A step that runs prompt tokens takes temporaries from the device. Before it (`begin_step`), the cache makes room
-  for a chunk of that size: what such steps were measured to take from the device at their peak (`telemetry()`
-  lists it per chunk size), an eighth more and 32 MiB. The measurement is the device's, as the run's checks read
-  it: what the device holds outside the ledger's elastic ranges (whose growth asks the ledger for its own room)
-  over the step's start, torch's peak included, so blocks torch's
-  allocator keeps from a prompt's earlier steps cost a step nothing where it reuses them and count where it cannot
-  (a tensor larger than any kept block, as attention's grow with the context, takes new memory beside them).
-  That room is a forecast, and a forecast is off now and then (a step deeper in the context than any before it,
-  a plugin's temporaries outside the ledger), so the margin does not rest on it: the cache also looks at the step
-  as it runs, before every routed layer of every chunk, and keeps free beyond `margin_mib` never less than a
-  reserve of what such steps were seen to take from the device between two looks (the most of the last 64 steps,
-  half again and 32 MiB, 64 MiB at least). A step that outgrows its room is given its next stride before it takes
-  it, a look at a step that reuses its blocks reads torch's own count and costs nothing, and `telemetry()` counts
-  the looks that found the device had taken more and those at which the cache gave memory (`looks`, `extends`,
-  `reserve_bytes`).
-  Between prompts the cache leaves a short prompt's room free (`max_tokens` tokens), so a chat turn takes nothing
-  from it; only a step that takes more than such steps did has the cache give back its coldest slots. A chunk
-  larger than any measured is given the largest's room in proportion to its tokens and what a first step of its
-  kind left in use behind it so far (graphs, workspaces), for that one step: its own measurement follows. After
-  the last prompt step (`end_step`) the prompt's blocks go back to the device (3 ms) and the cache grows back, so
-  the next prompt's peak is its own: blocks kept from a larger prompt would count as every later one's room. It
-  grows back a bounded settle at a time (the device ledger's: 50 ms a step's frame), the rest in the following
-  steps' frames: backing two gigabytes at once took the driver over half a second under WSL, inside the last
-  prompt step and inside a cancel, past the cancel grace with the step's own work. A score's frame
-  (`begin_step(..., score=True)`) is measured apart: its rows' logits and their sort are a score's temporaries,
-  which a prompt step of as many tokens never makes, so they are no prompt chunk's room (learned as one, they
-  had every prompt give back and take again 1.7 GB the prompt did not use). A
-  peak measured while the engine loaded is a first step's (its graphs' captures took memory beside the chunk's
-  temporaries) and is forgotten once a served prompt of that size or larger took less: Qwen3.8-Flash-Next's
-  load measured 234 to 358 MiB for chunks of 7 to 37 tokens, a served prompt of 70 to 80 tokens takes 108 to 128.
-  A step without prompt tokens costs nothing. Until Core's fill the load's steps live on `reserve_mib` and the
-  cache keeps its size.
+- The cache is a giver of the device's memory (`crit_plugins.memory`), and nothing more: it gives back its
+  coldest slots when asked (`release`) and grows into free memory when told (`regrow`). Once the engine's warm
+  requests ran, Core tells that memory the load is over (`serve()`) and the cache grows into every free byte the
+  device does not keep. Its slots live in an elastic range (address space for every expert, backed as it grows), so
+  growing and shrinking moves no slot and breaks no captured round.
+- What stays free is the device's to say, not the cache's ([the device's memory](../../core/python/crit_plugins/memory.py)):
+  the run's VRAM headroom at every moment (Core's loader sets it from the configuration's `vram_headroom_bytes`,
+  which crit run writes into every candidate; nothing here sizes or tunes it) and the step arena, where a step's
+  temporaries live: Core allocates every byte a step takes and the arena is the most a step took while the engine
+  loaded. The cache is not asked during a step: it gives back only where something it holds is needed outside the
+  arena (a KV pool backing pages for a longer context, a kept prompt's room), and grows back once the device is
+  quiet. `telemetry()`'s `elastic` section repeats what the device keeps (`headroom_bytes`, `arena_bytes`). Until
+  Core's fill the load's steps live on `reserve_mib` and the cache keeps its size.
 - A KV pool allocated for the whole context holds memory its sequences rarely use. With attention-state's `elastic`
   option the pool backs only the pages sequences hold and asks the device's givers before it grows: the cache
   holds the rest and gives it back as KV grows (never out of the room of the prompt step in flight), with no call
@@ -149,6 +124,15 @@ run's kept stores together stay under `CRIT_PLUGIN_CACHE_GIB` (default 100) and 
 first. Where it cannot, `reasons.store` says why and the store is built in host memory as before. Set `CRIT_PLUGIN_CACHE` to another folder to share stores between runs,
 or to nothing for no cache.
 
+**The store between engines.** The ram tier's store is kept in host memory for the next engine built for the model in
+the same process (expert-tensors' `open_store(kept=)`, Core's `LoadContext.keep`): crit serve's model pool keeps it
+while the model is loaded, so an ablation's variants and a measurement's lower context reuse it, and crit eval's
+process keeps it for its next engine (`crit eval ab --package`'s rounds). It is keyed by the checkpoint, the experts'
+geometry and format, the layout and the package's plugin code, as the cache file is; the next engine gets it sealed,
+as the last engine left it (the bundles it left out for a pinned core stay out), and skips its loads (`complete`).
+Its bytes count as free host memory when the next engine chooses its tier, and an engine whose experts go to another
+tier closes it first.
+
 **The disk tier keeps each expert once.** Where host memory does not hold the experts, what it has free
 (`host_tier_mib`, by default all of it beside `ram_headroom_mib`) is a host tier between the file and the device
 cache. The cache hands an expert it evicts back to it (one copy down the link, far cheaper than the file's read),
@@ -169,8 +153,8 @@ copy itself), tens of milliseconds a round at a hundred misses. What costs nothi
 never leaves. `pinned` is that core's share of the cache's slots at `open()`: the experts the `profile` file
 ranks hottest are read once from the store file straight into slots no plan lists as a victim, no shrink gives
 back and no preload or prompt ring takes, and the store maps a filler over their pages before it is registered,
-so host memory never holds them (the layers kept whole on the device, W4A16 beside W4A4, leave it the same
-way). The slots left follow the routing as before, and every reply keeps its bits: a pinned expert is the same
+so host memory never holds them (the layers kept whole on the device, W4A16 beside W4A4 under the ranked policy,
+leave it the same way). The slots left follow the routing as before, and every reply keeps its bits: a pinned expert is the same
 bundle in a slot, and the miss path is the CPU tier's as before. The core comes from `profile` alone, never from
 `profile_save`, which follows whatever was served last: a core is a bet on what every workload routes, so it is
 made from routing recorded on general text.
@@ -223,7 +207,7 @@ The decisions are plain functions of sizes and measured times ([code/offload.py]
 a device:
 
 ```python
-from offload import GIB, cache_slots, choose_misses, choose_tier, learn, prompt_bytes
+from offload import GIB, cache_slots, choose_misses, choose_tier
 
 # 65.8 GB of routed experts, a 32 GB device with 6 GiB of the model's pools still to come, 80 GiB of host memory free.
 experts, free, pools, host = 65_800_000_000, 30 * GIB, 6 * GIB, 80 * GIB
@@ -236,15 +220,6 @@ assert cache_slots(24 * GIB, 3 * GIB, 2_780_176) == 8109    # every free byte pa
 assert choose_misses("nvfp4", True, measured={"cpu": 464.0, "link": 102.0}) == "link"
 assert choose_misses("nvfp4", True, measured={"cpu": 60.0, "link": 102.0}) == "cpu"
 assert choose_misses("bf16", True) == "link"                # a format the CPU tier does not compute
-
-# A prompt step's room, from the steps measured so far.
-peaks, first = {}, set()
-learn(peaks, first, 128, 40 << 20, serving=False)           # a step of the load: its graphs' captures included
-learn(peaks, first, 512, 96 << 20, serving=True)
-assert prompt_bytes(peaks, 320) == 68 << 20                 # between two measured sizes: the line through them
-assert prompt_bytes(peaks, 1024) == 192 << 20               # past the largest: in proportion to the tokens
-learn(peaks, first, 512, 30 << 20, serving=True)            # a served step of 512 took less than the load's of 128
-assert 128 not in peaks                                     # so the load's first-step peak no longer stands
 ```
 
 ## Tuning
@@ -279,7 +254,7 @@ give the cache what no option can. Measured there: the token table opened from t
 embeddings slot with the table's tensor: its rows in registered host memory, a `tables.` group of the placement)
 gave the cache 1.1 GiB, the replies bit for bit the same, and a round's lookup of 4 rows costs what it costs on
 the device (80 us either way; the registration takes no device memory); elastic recurrent states gave 0.9; a
-VRAM headroom of 0.25 GiB instead of 1 GiB (`margin_mib` 256) gave 0.7; and the round driver's `share_pool` (one
+VRAM headroom of 0.25 GiB instead of 1 GiB (the device's headroom, then this plugin's `margin_mib`) gave 0.7; and the round driver's `share_pool` (one
 memory pool for every captured round; the replies stayed the same bit for bit) gave 0.2. Together the cache went
 from 18.9 to 21.8 GiB (8,408 slots). What is left beside it and the weights is well under 1 GiB: the engine's
 scratch (Core's, `context.scratch`: the experts' route rows, the split-KV reader's partials, the sampler's launch
@@ -309,7 +284,6 @@ and the three largest tensors by shape (a vocabulary-sized table shows there), f
 | `fill_blocks` | 32 | Thread blocks of the copies' fill kernel: too few and a round waits for its copies |
 | `prompt_arithmetic` | `auto` | `tensor`: prompt chunks on tensor cores; `declared`: the decode rows' order. `auto` is `tensor` where the engine asks `repeatable` or `row-exact` prompt rows, else `declared` (the default level, `exact`, in both quality modes) |
 | `reserve_mib` | 3072 | Device memory left free at `open()`, until the warm requests ran |
-| `margin_mib` | 256 | Device memory the elastic cache leaves free at every moment: the run's VRAM headroom |
 | `elastic` | on | The cache grows and shrinks with the device's free memory; off, it keeps its size from `open()` |
 | `store_dir`, `store_path` | empty | Where the bundle store file is kept, or an existing complete store. With neither, the store goes to the host's plugin cache where there is one (below), else it is built in host memory at every load |
 | `profile`, `profile_save` | empty | A routing profile the cache starts from, and where the plugin writes the routing it counted |
@@ -351,9 +325,9 @@ A round of the last engine takes 40 to 56 ms: the CPU tier's misses 11 to 36 ms 
 the experts' device rows about 6 ms, and the rest is the model's own device work. A 35-token prompt's first token
 takes 0.5 to 0.6 s there, most of it its missed experts staged through the ring.
 
-With `margin_mib` 1024 that engine's least free device memory at a prompt step's peak (Core's step probe, what the
+With a headroom of 1 GiB that engine's least free device memory at a prompt step's peak (Core's step probe, what the
 run's full-context check reads) was 1,137 MiB over the 6,316-token prompt and the ten prompts after it, and 1,162
-to 1,275 MiB between requests; the long prompt had the cache give slots back once. With `margin_mib` 256 the
+to 1,275 MiB between requests; the long prompt had the cache give slots back once. With 0.25 GiB the
 device has 330 to 430 MiB free between requests.
 
 GGUF experts, measured on Unsloth's UD-IQ1_M Qwen3.8-Flash-Next (48 expert layers of 512, 34.8 GB stored) through

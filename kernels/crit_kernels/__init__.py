@@ -87,6 +87,8 @@ def parser():
     rep.add_argument("--no-speed", action="store_true")
     rep.add_argument("--limits", action="store_true", help="also the limits gate (builds for every architecture)")
     rep.add_argument("--repeat", type=int, default=25)
+    rep.add_argument("--probe", type=Path, help="a `crit eval probe` result: the device ceilings of the floors "
+                                                "(default: measured here)")
     rep.add_argument("--out", type=Path, help="write the JSON report here")
     rep.add_argument("--markdown", type=Path, help="write the markdown summary here")
     return parser
@@ -164,7 +166,7 @@ def main(argv=None):
         elif args.command == "report":
             from .report import markdown, report
             result = report(args.model, args.kernel or None, args.most, not args.no_gates, not args.no_speed,
-                            args.limits, args.repeat, log=lambda line: print(line, file=sys.stderr))
+                            args.limits, args.repeat, log=lambda line: print(line, file=sys.stderr), probe=args.probe)
             if args.out:
                 args.out.write_text(json.dumps(result, indent=2, ensure_ascii=False, default=str), encoding="utf-8",
                                     newline="\n")

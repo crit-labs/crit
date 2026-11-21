@@ -59,8 +59,7 @@
   ],
   "interactions": [
     "mtp-decode",
-    "device-speculative-round",
-    "session-scheduling"
+    "device-speculative-round"
   ],
   "techniques": [
     "token-constraints",

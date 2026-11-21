@@ -14,6 +14,8 @@ import math
 
 import torch
 
+from crit_kernels import contracts
+
 KINDS = {"bf16": 0, "fp16": 0, "fp8": 1, "fp8:row": 2, "int8": 3}
 STORE = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp8": torch.float8_e4m3fn, "fp8:row": torch.float8_e4m3fn,
          "int8": torch.int8}
@@ -140,13 +142,9 @@ class Pages:
 
 
 def attention(q, keys, values, seen, scale):
-    """q [T][hq][d] float64 over keys [n][hkv][d] and values [n][hkv][dv], seen [T][n] -> out [T][hq][dv]."""
-    hq, hkv = q.shape[1], keys.shape[1]
-    k = keys.repeat_interleave(hq // hkv, dim=1)
-    v = values.repeat_interleave(hq // hkv, dim=1)
-    s = torch.einsum("thd,nhd->thn", q, k) * scale
-    s = s.masked_fill(~seen[:, None, :], float("-inf"))
-    return torch.einsum("thn,nhd->thd", torch.softmax(s, -1), v)
+    """q [T][hq][d] float64 over keys [n][hkv][d] and values [n][hkv][dv], seen [T][n] -> out [T][hq][dv]: the
+    paged-attention operation's FP64 reference (crit_kernels.contracts)."""
+    return contracts.attention(q, keys, values, seen, scale)[0]
 
 
 def _queries(seeds, hq, d, dtype, device):
@@ -155,10 +153,9 @@ def _queries(seeds, hq, d, dtype, device):
         device, dtype)
 
 
-def _close(got, want, atol=8e-3, rtol=2e-2):
-    error = (got.double() - want).abs()
-    bad = int((error > atol + rtol * want.abs()).sum())
-    return None if bad == 0 else f"{bad} outputs beyond {atol} + {rtol} x |float64 attention|"
+def _close(got, want, arithmetic=None):
+    """The paged-attention operation's tolerance against its FP64 reference (crit_kernels.contracts)."""
+    return contracts.check("paged-attention", got, want, arithmetic=arithmetic)
 
 
 class _Base:
@@ -498,6 +495,7 @@ class CudaWindow(_Windows):
     bench's own."""
     structure = "cuda-window"
     flash = "cuda"
+    runtime = ("CHUNK", "RAMP")   # a split's positions and its ramp reach the tile as Params, not template arguments
 
     def variants(self, shape):
         return _cuda_variants(shape)
@@ -683,7 +681,7 @@ class Prefill(_Base):
 
     def check(self, got, want, s):
         # INT8 queries (int8_qk) approximate the queries: within 0.07 of the float64 attention of the BF16 ones
-        return _close(got[self._picked(s["rows"])], want, atol=7e-2 if s["int8"] else 8e-3)
+        return _close(got[self._picked(s["rows"])], want, "int8-queries" if s["int8"] else None)
 
 
 class FlashPrefill(Prefill):
@@ -700,6 +698,7 @@ class CudaPrefill(Prefill):
     """The CUDA flash tile's prompt chunk (prefill(..., flash="cuda")) over the same chunk and pages (BF16 queries)."""
     structure = "cuda-prefill"
     flash = "cuda"
+    runtime = ("SPLITS",)   # the programs a tile's positions split over: a launch's, not the tile's
 
     def variants(self, shape):
         return _cuda_variants(shape, prefill=True)

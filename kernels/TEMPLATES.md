@@ -64,7 +64,10 @@ technique's algorithm does stays in that technique. A change to the core rebuild
 }
 ```
 
-- `operations`: ids from `inference/*/operations.json` the kernel computes (its reference and tolerance live there).
+- `operations`: ids from `inference/*/operations.json` the kernel computes (its reference and tolerance live there,
+  and as code in `crit_kernels/contracts.py`). A structure that computes only some of them names those in its own
+  `operations` (a page write beside attention readers, a convolution beside scans); CI's `contracts.problems()`
+  refuses a kernel that names none or one no technique defines.
 - `language`: `cuda` (compiled with torch's extension builder for the current GPU) or `triton` (no compile step;
   CUDA sources beside the Triton modules: `cuda` below).
   CUDA is the backend built today; another backend adds its language and capability names.
@@ -113,7 +116,7 @@ technique's algorithm does stays in that technique. A change to the core rebuild
 
   `sources`: paths in the kernel's folder, compiled together with nvcc into one library a variant (`-shared`,
   C++17, `-I` the build's include folder: `crit_tuning.h` and the core headers they use); `structures`: the structures
-  whose knobs the sources read from `crit_tuning.h` (the sweep compiles their builds before it holds the GPU);
+  whose knobs the sources read from `crit_tuning.h` (the sweep compiles their builds on CPU workers and holds the GPU only to time a finished one);
   `variant`: each field's allowed values, passed as `-DCRIT_VARIANT_<field>=<value>`; `device`: variant fields filled
   from the GPU's properties (torch's names), so a library is built for the device it runs on; `check`: the variants
   `crit kernels build ID --arch ...` compiles for every architecture (the device fields left to the source's
@@ -161,6 +164,22 @@ block sizes and `num_warps`/`num_stages`. A structure whose knobs follow the row
 sets too (`variants("structure-id", key)`), so a request after load compiles nothing whatever its row count. A
 structure whose row count is a constant of its kernel compiles per row count anyway: its caller warms the counts it
 serves.
+
+Triton also specializes a launch's runtime arguments: an integer equal to 1 becomes a constant, one divisible by 16
+says so, a pointer says it is 16-byte aligned, and each mix is a kernel of its own. So every launched kernel (a
+`@triton.jit` function no other kernel of the package calls) states the runtime arguments that follow the request in
+`do_not_specialize`: token and key counts, positions, split counts, the stride of a buffer made per call (`[]` where
+none does), and a pointer to a slice at an offset the request sets (a slice of a request's token ends) in
+`do_not_specialize_on_alignment`. What the model fixes (a head dim, a weight's stride, a pool's table width) stays
+specialized, so the loads its divisibility allows stay vectorized. The build refuses a package whose launched kernel does not say, or
+names an argument it does not have (`crit_kernels.specialization`), and Core's compile watch names the argument whose
+specialization changed when a request compiles a kernel anyway (`crit_plugins.compiles`).
+
+```python
+@triton.jit(do_not_specialize=["T", "N"])   # tokens and keys follow the request; the strides are the model's
+def score_kernel(q_ptr, k_ptr, out_ptr, T, N, stride_qt, stride_kn, BLOCK: tl.constexpr):
+    ...
+```
 
 A Triton kernel with CUDA sources (kernel.json `cuda`): the package gets `_crit_cuda.py` too, and
 `_crit_cuda.library(device, **variant)` returns the variant's library (ctypes, compiled into the build folder on first

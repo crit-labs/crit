@@ -1,0 +1,16 @@
+{
+  "kind": "crit-technique-operations",
+  "technique": "device-expert-cache",
+  "operations": [
+    {
+      "id": "expert-residency",
+      "what": "one routed layer's plan on the device directory (the slot table of a step's routes: hits, admitted misses in route order into the policy's victim slots, the CPU tier's misses, a prompt chunk's ring slots; the copies and counters) and the fills that copy the admitted bundles into the slots",
+      "reference": {
+        "path": "inference/device-expert-cache/code/device_cache.py",
+        "symbol": "LayerDirectory (plan_layer, prompt_layer)"
+      },
+      "verify": "on the target, run the same step routes through the device directory and LayerDirectory: the same slot tables, copies, counters and failure bits plan for plan (clock, admission limits, prompt rings, recent residency; captured rounds too), and every filled slot byte for byte the store's bundle (tests/test_device.py)",
+      "invariance": "a plan's decisions depend on the directory's state and the step's routes in route order only, not on the launch or the grid"
+    }
+  ]
+}

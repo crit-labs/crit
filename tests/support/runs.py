@@ -39,6 +39,11 @@ class RunFixture:
             patched = patch("crit.run.ladder.scope_of", lambda *args, **kwargs: None)
             patched.start()
             self.addCleanup(patched.stop)
+        # The fixture's model is no model Eval's reference reads, so Eval refuses it only where a test says so
+        # (crit.run.ladder.eval_refusal: the rung-unreachable state).
+        refusal = patch("crit.run.ladder.eval_refusal", lambda model_path: None)
+        refusal.start()
+        self.addCleanup(refusal.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()

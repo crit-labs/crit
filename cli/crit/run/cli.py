@@ -4,33 +4,13 @@ import json
 from pathlib import Path
 import signal
 import sys
-import tomllib
 
 from crit.cli import default_project, named_project
+from crit.settings import SETTINGS, load as load_settings  # noqa: F401 - the machine's settings, read in crit.settings
 
+from .ladder import eval_refusal
 from .records import exploratory_reason, ineligibility, read_json, safe_path
 from .store import RunStore
-
-SETTINGS = {"wsl_run_root": str, "ram_headroom_gib": (int, float), "vram_headroom_gib": (int, float),
-            "context_reserve_gib": (int, float), "device": str, "context_tokens": int,
-            "eval_packages": str, "quality_mode": str}
-
-
-def load_settings(project):
-    """Machine settings from PROJECT/settings.toml; a missing file means none."""
-    path = Path(project) / "settings.toml"
-    if not path.is_file():
-        return {}
-    try:
-        value = tomllib.loads(path.read_text(encoding="utf-8"))
-    except tomllib.TOMLDecodeError as exc:
-        raise ValueError(f"{path}: {exc}") from exc
-    for key, item in value.items():
-        if key not in SETTINGS:
-            raise ValueError(f"{path}: unknown setting {key!r}; known: {', '.join(SETTINGS)}")
-        if isinstance(item, bool) or not isinstance(item, SETTINGS[key]):
-            raise ValueError(f"{path}: {key} has the wrong type")
-    return value
 
 
 def _candidate(store, run_id, candidate_id):
@@ -107,6 +87,9 @@ def parser():
     sub.add_argument("--force", action="store_true", help="Gather again over an existing work/recon.json")
     sub.add_argument("--drafter", type=Path, action="append", metavar="PATH", help="A companion drafter to record "
                      "(EAGLE-3, DFlash, DSpark or crit models drafter output); repeatable")
+    sub.add_argument("--data", type=Path, metavar="DATA", help="crit Eval's prepared data for the run's model with "
+                     "its reference scores (crit eval reference): record smoke's reference from them, which crit "
+                     "smoke's quality limits are relative to (on an existing recon.json, only that)")
     sub.add_argument("--compare", type=Path, metavar="MODEL", help="Instead: compare the run's model fingerprint with "
                      "another checkpoint's (architecture, weight layout, tokenizer, template) and print what differs")
     sub = subs.add_parser("capture", help="Write a case's chat request (captured/CASE/request.json) that renders to "
@@ -199,6 +182,11 @@ def parser():
     sub.add_argument("--variant", action="append", help="Serve only this variant (repeatable), e.g. full, base, "
                      "without:ID, only:ID; crit plugins variants lists them")
     sub.add_argument("--repetitions", type=int, default=3, help="Repetitions per case and variant (default 3)")
+    sub.add_argument("--rounds", type=int, default=1, help="Serve every variant this many times in alternating order "
+                     "(as listed, then reversed) and compare variants round by round, as crit eval ab pairs two "
+                     "engines: a KPI changed where every round's paired change is on the same side and their "
+                     "median beyond 0.5%%, so a 1%% change is measurable (default 1: one pass, judged against 3%% "
+                     "noise)")
     sub.add_argument("--data", type=Path, help="crit-eval's prepared data for the run's model: each variant also "
                      "decodes Eval's speed cases and held-out prompts at the model's sampling (--seeds seeds each), so "
                      "a plugin whose effect depends on the text is measured on the text Eval scores")
@@ -217,6 +205,19 @@ def parser():
                                           "tracing is not possible the report says why")
     sub.add_argument("--candidate", required=True)
     sub.add_argument("--nvcc", help="nvcc of a CUDA toolkit that ships CUPTI")
+    sub.add_argument("--seconds", type=float, help="Reservation length (default: the check process cap)")
+    sub = subs.add_parser("profile", help="Serve a packaged candidate with the kernel profiler its device has "
+                                          "(crit-eval's tracer: CUPTI, or rocprofiler-sdk on HIP; Linux) and print "
+                                          "per prompt and per decode token the GPU time and launches by kernel family "
+                                          "of one short request, and its decode step against recon's plain-pass "
+                                          "floor; where profiling is not possible the report says why")
+    sub.add_argument("--candidate", required=True)
+    sub.add_argument("--case", help="The resident case whose request is traced (default the run's first)")
+    sub.add_argument("--tokens", type=int, default=32, help="Output tokens of the traced request (default 32)")
+    sub.add_argument("--families", metavar="JSON", help="Kernel family rules ahead of the built-in ones, as JSON text or "
+                     "a file: [{\"match\": NAME_PART, \"family\": FAMILY}]")
+    sub.add_argument("--nvcc", help="nvcc of a CUDA toolkit that ships CUPTI")
+    sub.add_argument("--hipcc", help="hipcc of a ROCm that ships rocprofiler-sdk")
     sub.add_argument("--seconds", type=float, help="Reservation length (default: the check process cap)")
     sub = subs.add_parser("seal", help="Close a candidate (sealed candidates are immutable)")
     sub.add_argument("--candidate", required=True)
@@ -274,17 +275,6 @@ def main(argv=None):
         return act(command, args)
 
 
-def eval_refusal(model_path):
-    """Why crit-eval's reference cannot score the run's model (crit_eval.quality.checkpoints.scoring_refusal: no
-    layout for its GGUF architecture, no modeling code in the installed transformers, ...), or None, also when the
-    installed crit-eval has no such check."""
-    try:
-        from crit_eval.quality.checkpoints import scoring_refusal
-    except ImportError:
-        return None
-    return scoring_refusal(model_path)
-
-
 def act(command, args):
     """Run the parsed action: its result as JSON on stdout and 0, or the error on stderr and 1."""
     try:
@@ -337,7 +327,7 @@ def act(command, args):
         elif args.action == "recon" and args.compare:
             result = store.recon_compare(args.id, args.compare)
         elif args.action == "recon":
-            result = store.recon(args.id, args.force, args.drafter or ())
+            result = store.recon(args.id, args.force, args.drafter or (), args.data)
         elif args.action == "package":
             result = store.package(args.id, args.candidate, args.source, payload)
         elif args.action == "check" and args.from_eval:
@@ -389,10 +379,15 @@ def act(command, args):
             from .ablate import ablate
             result = ablate(store, args.id, args.candidate, args.seconds, args.variant, args.repetitions,
                             smoke=not args.no_smoke, smoke_tests=args.smoke_test, data=args.data, seeds=args.seeds,
-                            sets=args.set)
+                            sets=args.set, rounds=args.rounds)
         elif args.action == "kernels":
             from .external import kernels
             result = kernels(store, args.id, args.candidate, args.seconds, args.nvcc)
+        elif args.action == "profile":
+            from .profile import family_rules, profile, render
+            result = profile(store, args.id, args.candidate, args.seconds, args.nvcc, args.hipcc, args.case,
+                             args.tokens, family_rules(args.families))
+            print(render(result), file=sys.stderr)
         elif args.action == "seal":
             failure = {"message": args.failure} if args.failure else None
             result = store.seal(args.id, args.candidate, args.lifecycle, failure)

@@ -33,6 +33,9 @@ LOAD_BYTES_PER_SECOND = 200e6  # model bytes per second assumed by the default l
 # advanced under this many seconds ago: a first load that builds tens of gigabytes is long, not hung.
 LOAD_STALL_SECONDS = 300.0
 VERIFY_BYTES_PER_SECOND = 50e6  # with --verify-model: read, hash and copy every model file, then the engine load
+# The most a stop waits for the engine to close (the unload close() sends): a whole-checkpoint mixture of experts' close
+# took more than the 5 s it had, and its host was killed after a cancel an unload cannot settle.
+SHUTDOWN_UNLOAD_SECONDS = 120.0
 # What a tokenize request (chat-tokenize-v1) returns for each operation.
 TOKENIZED = {"tokenize": ("tokens",), "render": ("prompt", "tokens"), "detokenize": ("prompt",)}
 
@@ -178,7 +181,8 @@ def reply(value, request):
     if ("prompt" in value) != bool(request.get("echo")):
         raise ValueError("Reply prompt does not match the request")
     assistant, reasoning = response_content(value, tool_size(calls),
-                                            continued=bool(request.get("continue_final_message")), blank=raw)
+                                            continued=bool(request.get("continue_final_message")), blank=raw,
+                                            truncated=measured["output_tokens"] == limit)
     if calls:
         assistant = {"content": assistant, "tool_calls": calls}
     if reasoning:
@@ -362,7 +366,9 @@ class ServedEngine:
 
     Requests the engine cannot take yet wait in its queue: `max_queue` of them at most, each for `queue_timeout`
     seconds at most (None: no bound); past either a request raises Overloaded. `max_concurrency` (crit serve
-    --max-concurrency) caps the requests run at once below the engine's declared capacity.
+    --max-concurrency) caps the requests the engine holds at once below what it takes on its own: the host loads the
+    engine with it (limits.max_concurrent_requests), and Core's runtime applies it, as it orders the requests it holds
+    by their priority.
 
     The server owns the machine's crit runtime while it runs, also while its engine is unloaded: no other crit process
     can load an engine. With `idle_unload` (crit serve --idle-unload) the engine unloads after that many seconds
@@ -470,7 +476,7 @@ class ServedEngine:
         candidate_id = candidate_id or self.default
         if candidate_id not in self.specs:
             with verification_scope():
-                self.specs[candidate_id] = self._verify(candidate_id)
+                self.specs[candidate_id] = self.hosted(self._verify(candidate_id))
         return self.specs[candidate_id]
 
     def model_id(self, candidate_id=None):
@@ -546,16 +552,19 @@ class ServedEngine:
             raise ValueError(result["error"] or "Engine loading failed")
         self._loaded(self.default, result)
 
-    def admitted(self, declared):
-        """The requests admission runs at once for an engine that declares `declared`: at most max_concurrency."""
-        declared = int(declared or 1)
-        return declared if self.max_concurrency is None else min(declared, self.max_concurrency)
+    def hosted(self, spec):
+        """A verified candidate's spec as the host gets it with every command: its limits with crit serve's cap on the
+        requests the engine holds at once (--max-concurrency, limits.max_concurrent_requests), which Core's runtime
+        applies as the host loads the engine."""
+        if self.max_concurrency is None:
+            return spec
+        return {**spec, "limits": {**spec["limits"], "max_concurrent_requests": self.max_concurrency}}
 
     def capacity(self, candidate_id=None):
         """The max_concurrent_requests clients see for `candidate_id` (default: the default candidate): 1 for a package
         without chat-concurrent-v1; the loaded engine's declared capacity, capped by max_concurrency, while it is the
         one loaded; None while a concurrent package's engine is not loaded (it declares its capacity as it loads), or
-        before a default candidate is chosen."""
+        before a default candidate is chosen. Core applies --max-concurrency, so the engine reports the capped value."""
         if candidate_id is None and self.default is None:
             return None
         spec = self.spec(candidate_id)
@@ -564,7 +573,7 @@ class ServedEngine:
         status = self.runtime.status()
         if not self.loaded(candidate_id, status):
             return None
-        return self.admitted(status.get("max_concurrent_requests", 1))
+        return int(status.get("max_concurrent_requests", 1))
 
     def load_seconds(self, spec):
         """Bound on loading a candidate: --load-timeout, else 600 s plus the model's bytes at 200 MB/s, which the
@@ -667,7 +676,9 @@ class ServedEngine:
         `prompt`, {"text"} or {"ids"} in place of messages (None), asks a completion-v1 adapter to continue a raw
         prompt without the chat template; with `echo` the reply also returns the prompt, and with logprobs its rows
         (from a chat-score-v1 adapter's score path).
-        `priority` orders the request among those waiting for the engine, lower first (Admission.admit). `timeout`
+        `priority` orders the request among those waiting, lower first: in the engine's runtime (Core's scheduler,
+        which the request record carries it to) and, while the engine holds all it takes, in crit serve's queue by the
+        same rule (Admission.admit). `timeout`
         (seconds) bounds this request in place of the server's timeout, which caps it.
         `on_started(deadline)` receives the command's absolute monotonic deadline
         after dispatch, so response delivery can honor the same execution budget.
@@ -753,6 +764,7 @@ class ServedEngine:
                 candidate_id=spec["candidate_id"], package_sha256=spec["package_sha256"], created_at=now(),
                 model_path=spec["model_path"], package_path=spec["package_path"],
                 model_manifest=spec["model_manifest"], configuration=spec["configuration"], **text,
+                **({"priority": priority} if priority else {}),
                 limits={"max_output_tokens": max_tokens, "kv_tokens": limits["kv_tokens"], "timeout_seconds": timeout,
                         **{k: v for k, v in limits.items() if k.endswith("headroom_bytes")},
                         **({"fit_output": True} if fit_output else {}),
@@ -848,13 +860,13 @@ class ServedEngine:
         return None
 
     def _loaded(self, candidate_id, loaded):
-        """A completed load: counted for GET /metrics, then admission runs as many of the candidate's requests at once
-        as the engine declares (admitted)."""
+        """A completed load: counted for GET /metrics, then admission hands the engine as many of the candidate's
+        requests at once as it holds (its max_concurrent_requests, crit serve's cap applied by Core)."""
         if self.last_load not in (None, candidate_id):
             self.switches += 1
         self.loads += 1
         self.last_load = candidate_id
-        self.lock.configure(candidate_id, self.admitted(loaded.get("max_concurrent_requests", 1)))
+        self.lock.configure(candidate_id, int(loaded.get("max_concurrent_requests", 1)))
 
     def load(self, stop, candidate_id=None):
         """Load the candidate's engine (default: the default candidate's) without generating, as a request would:
@@ -921,14 +933,16 @@ class ServedEngine:
         return time.time() + max(0, self.lock.used + self.idle_unload - time.monotonic())
 
     def score(self, prompt_ids, continuation_ids, top_logprobs, stop, candidate_id=None, prompt_rows=True,
-              request_id=None, on_started=None, packed=False):
+              request_id=None, on_started=None, packed=False, decode_via_prompt=False):
         """Score fixed text through the engine's serving paths (chat-score-v1): every prompt position from its
         prefill (none with prompt_rows false) and every continuation token from its decode, forced to the
         continuation, each with the token's log-probability and top_logprobs ranked alternatives. Returns (status,
         scored, telemetry) as generate() does, scored {"prompt": rows, "continuation": rows} with rows
         [token, logprob, [[token, logprob], ...]], or with `packed` PackedScores; `request_id` is the request record's
         id and `on_started(deadline)` runs once the command goes to the engine, as for generate(). The request offers
-        the engine the packed format, so a ResidentChat's rows cross the host's channel as arrays."""
+        the engine the packed format, so a ResidentChat's rows cross the host's channel as arrays. decode_via_prompt
+        (a debug option the request record carries only when set) asks the engine to decode the continuation through
+        its model's prompt arithmetic, which an engine whose model plugin does not refuses."""
         candidate_id = candidate_id or self.default
         needs_load = self._admit(candidate_id, stop)
         if needs_load is None:
@@ -951,7 +965,8 @@ class ServedEngine:
                              candidate_id=spec["candidate_id"], package_sha256=spec["package_sha256"], created_at=now(),
                              prompt_ids=list(prompt_ids), continuation_ids=list(continuation_ids),
                              top_logprobs=top_logprobs, prompt_rows=bool(prompt_rows), format="packed",
-                             limits={"kv_tokens": limits["kv_tokens"], "timeout_seconds": self.timeout})
+                             limits={"kv_tokens": limits["kv_tokens"], "timeout_seconds": self.timeout},
+                             **({"decode_via_prompt": True} if decode_via_prompt else {}))
             status, scored = self._command("score", spec, request, stop, self.timeout,
                                            lambda response, request: score_reply(response, request, packed),
                                            on_started=on_started)
@@ -1062,7 +1077,11 @@ class ServedEngine:
                 try:
                     if self.runtime.tree and not self.ownership.blocked:
                         try:
-                            self.runtime.call("unload", {}, threading.Event(), 5)
+                            # The engine closes as an unload closes it (its plugins, its device leases), within the
+                            # same bound: a large engine's close (a mixture of experts' host tier, tens of gigabytes
+                            # of pinned memory) takes longer than a few seconds, and an unload cut short retires
+                            # the host instead of closing it.
+                            self.runtime.call("unload", {}, threading.Event(), min(self.timeout, SHUTDOWN_UNLOAD_SECONDS))
                         except (ValueError, OSError):
                             pass  # Retiring the whole process below also proves release.
                 finally:

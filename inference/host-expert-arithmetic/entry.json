@@ -149,8 +149,7 @@
   ],
   "interactions": [
     "heterogeneous-expert-dispatch",
-    "quantized-projections",
-    "host-work-mailbox"
+    "quantized-projections"
   ],
   "techniques": [
     "host-expert-arithmetic",

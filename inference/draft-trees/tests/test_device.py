@@ -11,7 +11,7 @@ def round_view(rows, width, mode, device, stops=1):
     return SpeculativeRounds(None, rows, width, device, stops=stops).view(rows, width, mode)
 
 
-FACTS = ["draft:head", "draft:head-device"]
+FACTS = ["draft:head", "draft:head-device", "draft:head-tree"]
 
 
 class Head:

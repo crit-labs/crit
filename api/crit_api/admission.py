@@ -1,13 +1,20 @@
-"""Admission of up to `capacity` requests for one resident identity, and exclusive lifecycle work.
+"""Admission of requests for one resident identity, and exclusive lifecycle work: crit serve's side of scheduling.
 
-Waiters queue until admitted or stopped, and those for one identity queued with no switch between them go by
-priority, lower values first, then arrival (Admission.head). The queue is unbounded unless `max_queue` or
-`queue_timeout` is set: then a request that finds `max_queue` already waiting, or that has waited `queue_timeout`
-seconds, is refused (Refused).
+The engine schedules the requests it holds (Core's runtime: which run at once, in what order by their priority,
+how many: crit_core.native.StepEngine). crit serve's queue keeps what the engine cannot: exclusivity of the loaded
+model (requests for another one wait for a switch, and lifecycle work for the requests before it), back-pressure at
+the engine's capacity (`capacity`: the requests the engine holds at once, as it reports them; Core applies crit
+serve's --max-concurrency), and the queue's bound and timeout that become HTTP 429. Those for one identity queued with
+no switch between them leave in Core's order (crit_core.native.next_request: lower priority values first, then
+arrival), so a request that waits here keeps the place it would have in the engine. The queue is unbounded unless
+`max_queue` or `queue_timeout` is set: then a request that finds `max_queue` already waiting, or that has waited
+`queue_timeout` seconds, is refused (Refused).
 """
 import itertools
 import threading
 import time
+
+from crit_core.native import next_request
 
 
 class Refused(Exception):
@@ -92,8 +99,8 @@ class Admission:
         that need its identity, up to the first that needs another. A waiter never overtakes a queued switch, and a
         switch never overtakes earlier waiters, so priority adds no switches."""
         first = self.waiters[0].identity
-        return min(itertools.takewhile(lambda waiter: waiter.identity == first, self.waiters),
-                   key=lambda waiter: waiter.priority)
+        group = list(itertools.takewhile(lambda waiter: waiter.identity == first, self.waiters))
+        return group[next_request(waiter.priority for waiter in group)]
 
     def acquire(self, blocking=True, timeout=-1):
         """Exclusive lifecycle work, queued with requests: it waits for the active ones to drain, and requests that

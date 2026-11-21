@@ -109,7 +109,7 @@ def _derived_scores(qrow, live, vrow, frow, onp, isf, rsc, pos, dt_ptr, eps, BLO
 
 
 # -- writes -----------------------------------------------------------------------------------------------------------
-@triton.jit
+@triton.jit(do_not_specialize=[])
 def _write_kernel(k_ptr, v_ptr, slot_ptr, kp_ptr, vp_ptr, ks_ptr, vs_ptr, stride_kt, stride_kh, stride_vt, stride_vh,
                   k_div, v_div, HKV: tl.constexpr, D: tl.constexpr, DV: tl.constexpr, BD: tl.constexpr,
                   KIND: tl.constexpr):
@@ -263,16 +263,20 @@ def _fresh_values(acc0, acc1, acc2, acc3, alpha, pv, vrow, frow, onp, isf, DV: t
 @triton.jit
 def _partition(b, n_pieces, n_parts, n_keys, qrow, live, lim, anc, first, count, k_ptr, v_ptr, ks_ptr, vs_ptr,
                tab_ptr, trow, tab_stride, tab_width, kvh, sm_scale, k_mult, v_mult, fk_ptr, fv_ptr, stride_fk,
-               stride_fv, fshift, ffirst, ones, vofs, win, wlo, BLOCK_M: tl.constexpr, PIECE: tl.constexpr, PAGE: tl.constexpr,
+               stride_fv, fshift, ffirst, ones, vofs, win, wlo, brow, extent, BLOCK_M: tl.constexpr,
+               PIECE: tl.constexpr, PAGE: tl.constexpr,
                HKV: tl.constexpr, D: tl.constexpr, DV: tl.constexpr, DVP: tl.constexpr, DC: tl.constexpr,
                KIND: tl.constexpr, HW_FP8: tl.constexpr, TREE: tl.constexpr, FRESH: tl.constexpr,
-               DERIVE: tl.constexpr = False, DW: tl.constexpr = False, ROT: tl.constexpr = 0):
+               DERIVE: tl.constexpr = False, DW: tl.constexpr = False, ROT: tl.constexpr = 0,
+               BIAS: tl.constexpr = False):
     """Partition b of a tile's query rows: pieces b, b + n_parts, ... of the row's keys (up to n_keys) in one online
     softmax -> (running maximum, sum, unnormalized output of the DVP value columns from vofs, in up to four DC-wide
     chunks). With FRESH the positions from ffirst on read their keys and values from the fresh rows (row = position -
     fshift; 16-bit, no page scales). win > 0: each row sees the win positions up to its own, and the pieces below
     wlo (the tile's lowest such position) are skipped, a piece no row sees changing no bit. DERIVE: the keys derived
-    from the value rows (pages or fresh) at their positions, their scale in the rows (the scores times sm_scale only)."""
+    from the value rows (pages or fresh) at their positions, their scale in the rows (the scores times sm_scale only).
+    BIAS: each row's scores for the positions 0 .. extent - 1 behind its own get the row's bias (brow: [BLOCK_M]
+    pointers to its FP32 [extent] row; d = the row's position - the key's), after the scale."""
     m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
     l_i = tl.zeros([BLOCK_M], tl.float32)
     acc0 = tl.zeros([BLOCK_M, DC], tl.float32)
@@ -322,6 +326,10 @@ def _partition(b, n_pieces, n_parts, n_keys, qrow, live, lim, anc, first, count,
             s = s * (tl.where(isf, 1.0, k_mult) * sm_scale)[None, :]
         else:
             s = s * (k_mult * sm_scale)
+        if BIAS:
+            behind = lim[:, None] - n[None, :]
+            near = live[:, None] & nm[None, :] & (behind >= 0) & (behind < extent)
+            s = s + tl.load(brow[:, None] + tl.where(near, behind, 0), mask=near, other=0.0)
         if TREE:
             w = n - first
             inw = (w >= 0) & (w < count)
@@ -356,17 +364,18 @@ def _partition(b, n_pieces, n_parts, n_keys, qrow, live, lim, anc, first, count,
     return m_i, l_i, acc0, acc1, acc2, acc3
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["stride_fr", "extent"])   # extent: a bias's reach, 1 without one (never specialized)
 def _window_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start_ptr, count_ptr, first_ptr, par_ptr,
                    off_ptr, po_ptr, pm_ptr, pl_ptr, out_ptr, lse_ptr, fk_ptr, fv_ptr, fshift_ptr, ffirst_ptr,
                    sink_ptr, stride_qt, stride_qh, stride_ot, stride_oh, stride_fk, stride_fv, stride_fr, tab_stride,
-                   tab_width, n_parts, sm_scale, k_mult, v_mult, count_all, win, COLS: tl.constexpr, CPT: tl.constexpr,
+                   tab_width, n_parts, sm_scale, k_mult, v_mult, count_all, win, bias_ptr, extent, COLS: tl.constexpr,
+                   CPT: tl.constexpr,
                    HQ: tl.constexpr, HKV: tl.constexpr, G: tl.constexpr, D: tl.constexpr, DV: tl.constexpr,
                    BLOCK_M: tl.constexpr, PIECE: tl.constexpr, PAGE: tl.constexpr, KIND: tl.constexpr,
                    HW_FP8: tl.constexpr, TREE: tl.constexpr, COUNTS: tl.constexpr, OFFSETS: tl.constexpr,
                    DC: tl.constexpr, FUSED: tl.constexpr, LSE: tl.constexpr, FRESH: tl.constexpr,
                    DVP: tl.constexpr, SINKS: tl.constexpr, DERIVE: tl.constexpr = False, DW: tl.constexpr = False,
-                   ROT: tl.constexpr = 0):
+                   ROT: tl.constexpr = 0, BIAS: tl.constexpr = False):
     """Program (column tile, partition b, row x KV head): the tile's query rows (its columns x the KV head's query
     heads) over pieces b, b + n_parts, ... of the row's keys, up to its last column's position; writes each row's
     unnormalized output, running maximum and sum into the partials. FUSED (grid (tiles, DV / DVP, rows x KV heads)):
@@ -403,6 +412,7 @@ def _window_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start
         g = j % G
         live = (j < CPT * G) & (c < count)
         qrow = q_ptr + (start + c) * stride_qt + (kvh * G + g) * stride_qh
+        brow = bias_ptr + ((start + c) * HQ + kvh * G + g) * extent   # BIAS: each row's [extent] scores
         lim = first + c
         anc = c
         if TREE:
@@ -426,8 +436,8 @@ def _window_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start
                 m_i, l_i, acc0, acc1, acc2, acc3 = _partition(
                     part, n_pieces, n_parts, n_keys, qrow, live, lim, anc, first, count, k_ptr, v_ptr, ks_ptr, vs_ptr,
                     tab_ptr, trow, tab_stride, tab_width, kvh, sm_scale, k_mult, v_mult, fk_ptr, fv_ptr, stride_fk,
-                    stride_fv, fshift, ffirst, ones, vofs, win, first + c0 - win + 1, BLOCK_M, PIECE, PAGE, HKV, D,
-                    DV, DVP, DC, KIND, HW_FP8, TREE, FRESH, DERIVE, DW, ROT)
+                    stride_fv, fshift, ffirst, ones, vofs, win, first + c0 - win + 1, brow, extent, BLOCK_M, PIECE,
+                    PAGE, HKV, D, DV, DVP, DC, KIND, HW_FP8, TREE, FRESH, DERIVE, DW, ROT, BIAS)
                 # One partition's state into the running one, in partition order (as the merge folds them).
                 m_new, l_new, keep, take = asm.fold(m_run, l_run, m_i, l_i, False)
                 use = part < held
@@ -470,15 +480,15 @@ def _window_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start
             m_i, l_i, acc0, acc1, acc2, acc3 = _partition(
                 b, n_pieces, n_parts, n_keys, qrow, live, lim, anc, first, count, k_ptr, v_ptr, ks_ptr, vs_ptr,
                 tab_ptr, trow, tab_stride, tab_width, kvh, sm_scale, k_mult, v_mult, fk_ptr, fv_ptr, stride_fk,
-                stride_fv, fshift, ffirst, ones, vofs, win, first + c0 - win + 1, BLOCK_M, PIECE, PAGE, HKV, D, DV,
-                DVP, DC, KIND, HW_FP8, TREE, FRESH, DERIVE, DW, ROT)
+                stride_fv, fshift, ffirst, ones, vofs, win, first + c0 - win + 1, brow, extent, BLOCK_M, PIECE, PAGE,
+                HKV, D, DV, DVP, DC, KIND, HW_FP8, TREE, FRESH, DERIVE, DW, ROT, BIAS)
             idx = ((_partial_row(off_ptr, r, COLS, OFFSETS) + c) * HQ + kvh * G + g) * n_parts + b
             _store_partials(po_ptr, idx, live, acc0, acc1, acc2, acc3, DV, DC)
             tl.store(pm_ptr + idx, m_i, mask=live)
             tl.store(pl_ptr + idx, l_i, mask=live)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=[])
 def _sparse_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start_ptr, count_ptr, first_ptr, par_ptr,
                    off_ptr, blk_ptr, blk_stride, n_blocks, block_size, po_ptr, pm_ptr, pl_ptr, stride_qt, stride_qh,
                    tab_stride, tab_width, n_parts, sm_scale, k_mult, v_mult, count_all, COLS: tl.constexpr,
@@ -555,7 +565,7 @@ def _sparse_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, trow_ptr, start
         tl.store(pl_ptr + idx, l_i, mask=live)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=[])
 def _merge_kernel(po_ptr, pm_ptr, pl_ptr, out_ptr, lse_ptr, start_ptr, count_ptr, first_ptr, off_ptr, sink_ptr, n_parts,
                   n_fixed, stride_ot, stride_oh, count_all, COLS: tl.constexpr, HQ: tl.constexpr, DV: tl.constexpr,
                   PIECE: tl.constexpr, COUNTS: tl.constexpr, OFFSETS: tl.constexpr, LSE: tl.constexpr,
@@ -615,20 +625,38 @@ def _prefill_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tab_ptr, out_ptr, lse_p
                     BLOCK_N: tl.constexpr, PAGE: tl.constexpr, KIND: tl.constexpr, HW_FP8: tl.constexpr,
                     INT8_QK: tl.constexpr, LSE: tl.constexpr, POS_T: tl.constexpr, FRESH: tl.constexpr,
                     FIRST_T: tl.constexpr, SINKS: tl.constexpr, DERIVE: tl.constexpr = False,
-                    DW: tl.constexpr = False, ROT: tl.constexpr = 0):
+                    DW: tl.constexpr = False, ROT: tl.constexpr = 0, map_ptr=None, meta_ptr=None, tab_stride=0,
+                    RAGGED: tl.constexpr = False):
     """Program (query block, query head): a chunk of one sequence's queries at positions pos0.. over its positions
     [0, own], causal: through its page table, or with FRESH the positions before `first` through it and the chunk's
     own from `first` on from its fresh keys and values (fk_ptr, fv_ptr: [T][HKV][D] in the queries' dtype, as the
     projections gave them; first: first0, or with FIRST_T read from first_ptr on the device, at least pos0); with POS_T
     pos0 is read from pos_ptr on the device. SINKS: the head's sink logit folded into every row's final state. win > 0:
     each query sees the win positions up to its own, the blocks below the tile's window skipped. DERIVE: the keys
-    derived from the value rows (pages or fresh) at their positions (_derived_keys; tables in ks_ptr, eps in k_mult)."""
-    if POS_T:
-        pos0 = tl.load(pos_ptr).to(tl.int32)
-    if FIRST_T:
-        first0 = tl.load(first_ptr).to(tl.int32)
+    derived from the value rows (pages or fresh) at their positions (_derived_keys; tables in ks_ptr, eps in k_mult).
+    RAGGED: several sequences' chunks in one launch, program 0's index a block of one of them (map_ptr [blocks][2]
+    int32: the row, its block; meta_ptr [rows][4] int64: first token, tokens, first position, first fresh position;
+    row r's table at tab_ptr + r tab_stride): each block the program the row's own launch gives it, the same bits."""
     mb = tl.program_id(0)
     head = tl.program_id(1)
+    if RAGGED:
+        r = tl.load(map_ptr + 2 * mb)
+        mb = tl.load(map_ptr + 2 * mb + 1)
+        start = tl.load(meta_ptr + 4 * r)
+        T = tl.load(meta_ptr + 4 * r + 1).to(tl.int32)
+        pos0 = tl.load(meta_ptr + 4 * r + 2).to(tl.int32)
+        first0 = tl.load(meta_ptr + 4 * r + 3).to(tl.int32)
+        tab_ptr += r.to(tl.int64) * tab_stride
+        q_ptr += start * stride_qt
+        out_ptr += start * stride_ot
+        lse_ptr += start * HQ
+        fk_ptr += start * stride_fk
+        fv_ptr += start * stride_fv
+    else:
+        if POS_T:
+            pos0 = tl.load(pos_ptr).to(tl.int32)
+        if FIRST_T:
+            first0 = tl.load(first_ptr).to(tl.int32)
     kvh = head // G
     rows = mb * BLOCK_M + tl.arange(0, BLOCK_M)
     rmask = rows < T

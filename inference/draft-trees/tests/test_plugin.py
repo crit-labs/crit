@@ -1,6 +1,6 @@
 from crit_plugins.testing import PluginTestCase
 
-FACTS = ["draft:head", "draft:head-device"]
+FACTS = ["draft:head", "draft:head-device", "draft:head-tree"]
 
 
 def head(paths, rows=None):
@@ -74,3 +74,13 @@ class DraftTreesTests(PluginTestCase):
         result = trees.accept(proposal, predictions, 10)
         self.assertEqual(result["path"][:2], [0, second])
         self.assertEqual(result["tokens"][0], proposal["tokens"][second])
+
+
+class ChainHeadTests(PluginTestCase):
+    def test_a_chain_only_draft_head_is_refused_at_resolve(self):
+        # model-template's MTP head drafts one chain a row (one feature a row, parents ignored): paired with it, a
+        # tree's frontier of several entries broke the sampled round's capture ("output with shape [1, 1] doesn't
+        # match the broadcast shape [1, 1, 3]"). The selection is refused before any load, naming draft:head-tree.
+        from crit_plugins.assemble import PluginError
+        with self.assertRaisesRegex(PluginError, "draft-trees needs draft:head-tree"):
+            self.assemble(facts=["draft:head", "draft:head-device"])

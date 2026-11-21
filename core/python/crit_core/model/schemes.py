@@ -10,7 +10,9 @@ tensors under `base.` and the model's quantization config (quantization_config, 
     nvfp4         E2M1 pairs (low nibble first) with E4M3 group-16 scales and an FP32 global factor:
                   compressed-tensors (U8 base.weight_packed, base.weight_global_scale as a divisor) or ModelOpt
                   (U8 base.weight, base.weight_scale_2 as a multiplier); ModelOpt's scales may be CSF-compressed
-                  (base.weight_scale.nvfp4_csf_fixed and .nvfp4_csf_exceptions, csf_scale_shape)
+                  (base.weight_scale.nvfp4_csf_fixed and .nvfp4_csf_exceptions, csf_scale_shape); or an amax over a
+                  denominator (U8 base.weight, the factor base.weight_amax / base.weight_outer_scale_denominator, one
+                  amax a matrix of a stack: experts stored as one tensor)
     int           compressed-tensors pack-quantized (I32 base.weight_packed) and int-quantized (I8 base.weight with
                   base.weight_scale)
     awq           AutoAWQ GEMM (base.qweight, base.qzeros, base.scales)
@@ -287,7 +289,10 @@ class StoredMatrix:
     `input_scale` names the static activation scale the checkpoint declares for its own inference, with
     `input_divides` alike (compressed-tensors input_global_scale divides, ModelOpt and FP8 input_scale multiply);
     None for dynamic or unquantized activations. `layout` is "compressed-tensors", "modelopt" or None.
-    `scale_encoding` "csf": `scales` names ModelOpt's CSF-compressed scales (csf_scale_shape), decoded to E4M3 first."""
+    `scale_encoding` "csf": `scales` names ModelOpt's CSF-compressed scales (csf_scale_shape), decoded to E4M3 first.
+    `global_denominator` (nvfp4 layout "amax-denominator"): the tensor the global factor is divided by, weight = code *
+    scale * global / denominator, where `global_scale` holds one amax for each matrix of a stack (shape[:-2]) or one
+    for all."""
     base: str
     scheme: str
     layout: str | None
@@ -301,6 +306,7 @@ class StoredMatrix:
     input_scale: str | None = None
     input_divides: bool = False
     scale_encoding: str | None = None
+    global_denominator: str | None = None
 
 
 def fp8_block(quantization, base, shape, scale_shape):
@@ -346,6 +352,8 @@ def matrix_parts(tensors, base, quantization=None):
         if has(".weight_packed"):
             packed, layout, global_scale, divides = ".weight_packed", "compressed-tensors", ".weight_global_scale", True
             input_scale, input_divides = ".input_global_scale", True
+        elif has(".weight_amax"):
+            return _amax_denominator(tensors, base)
         else:
             packed, layout, global_scale, divides = ".weight", "modelopt", ".weight_scale_2", False
             input_scale, input_divides = ".input_scale", False
@@ -379,6 +387,22 @@ def matrix_parts(tensors, base, quantization=None):
     layout = "compressed-tensors" if compressed else ("modelopt" if quant_method(quantization) == "modelopt" else None)
     return StoredMatrix(base, name, layout, shape, base + ".weight", base + scale, granularity, block,
                         input_scale=base + ".input_scale" if has(".input_scale") else None)
+
+
+def _amax_denominator(tensors, base):
+    """The StoredMatrix of NVFP4 weights whose global factor is an amax over a denominator: one amax for each matrix
+    of a stack ([experts]) or one for all, and one denominator."""
+    amax, denominator = base + ".weight_amax", base + ".weight_outer_scale_denominator"
+    if denominator not in tensors:
+        raise SchemeError(f"{base}: NVFP4 weights with {amax} and without {denominator}")
+    shape = _shape(tensors, base + ".weight")
+    if _elements(tensors, denominator) != 1:
+        raise SchemeError(f"{denominator}: expected one denominator, found shape {list(_shape(tensors, denominator))}")
+    if _elements(tensors, amax) not in (1, math.prod(shape[:-2])):
+        raise SchemeError(f"{amax}: expected one amax or one for each of the {math.prod(shape[:-2])} matrices of "
+                          f"{list(shape)}, found shape {list(_shape(tensors, amax))}")
+    return StoredMatrix(base, "nvfp4", "amax-denominator", shape[:-1] + (shape[-1] * 2,), base + ".weight",
+                        base + ".weight_scale", "group16", None, amax, False, global_denominator=denominator)
 
 
 def _elements(tensors, name):

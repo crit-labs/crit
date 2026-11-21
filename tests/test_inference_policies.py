@@ -132,45 +132,5 @@ class CheckpointPolicyTests(unittest.TestCase):
                 m.plan_captures(300, **args)
 
 
-class ReasoningGuardTests(unittest.TestCase):
-    def guard(self, **kwargs):
-        m = load("session-scheduling", "reasoning_guard.py")
-        config = dict(passage_words=3, repeats=3, window_words=12, history_words=30, threshold=.5)
-        config.update(kwargs)
-        return m.ReasoningLoopGuard(**config)
-
-    def test_split_unicode_and_whole_text_have_identical_coverage(self):
-        text = "Évaluer ces trois cas. évaluer ces trois cas. ÉVALUER ces trois cas. "
-        whole, streamed = self.guard(), self.guard()
-        whole.feed(text, final=True)
-        for char in text:
-            streamed.feed(char)
-        streamed.feed("", final=True)
-        self.assertEqual(whole.observe(), streamed.observe())
-        self.assertTrue(whole.observe().triggered)
-
-    def test_unique_text_warmup_aging_and_transactional_overflow(self):
-        guard = self.guard(max_word_chars=5)
-        guard.feed("a b c a b c ")
-        self.assertFalse(guard.observe().triggered)
-        guard.feed("a b c a b c ")
-        self.assertTrue(guard.observe().triggered)
-        before = guard.observe()
-        with self.assertRaises(ValueError):
-            guard.feed("x y toolong")
-        self.assertEqual(before, guard.observe())
-        guard.feed(" ".join(str(i) for i in range(40)), final=True)
-        self.assertEqual(guard.observe().history_words, 30)
-        self.assertEqual(guard.observe().coverage, 0)
-
-    def test_overlap_counts_union_not_sum_and_bounds(self):
-        guard = self.guard()
-        guard.feed("a " * 12)
-        self.assertEqual(guard.observe().coverage, 1)
-        for kwargs in ({"repeats": 1}, {"threshold": math.nan}, {"window_words": 31}, {"passage_words": 0}):
-            with self.assertRaises(ValueError):
-                self.guard(**kwargs)
-
-
 if __name__ == "__main__":
     unittest.main()

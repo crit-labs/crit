@@ -16,7 +16,8 @@ use. The build writes it where the kernel's code reads it:
   count and (where the structure declares "lengths") length (0 where the table has no entry; a table entry without a
   "length" range holds for every length, and a call without a length, -1, matches every entry's). A sweep build defines CRIT_SWEEP_BUILD, so a kernel may instantiate only what the
   sweep calls.
-- Triton: _crit_tuning.py in the package, with knobs(structure, key, rows, length=None) -> {knob: value},
+- Triton: every launched kernel states the runtime arguments that follow the request (do_not_specialize, [] where
+  none does: crit_kernels.specialization), or the build refuses the package. _crit_tuning.py in the package, with knobs(structure, key, rows, length=None) -> {knob: value},
   variants(structure, key) (every knob set a shape key gets over all row counts) and launch(kernel, structure, key,
   knobs, call), which launches a Triton kernel on a knob set and, at a compiled kernel's first launch, compiles the
   shape key's other knob sets too: a structure whose knobs follow the row count launches through it, so a request
@@ -144,12 +145,69 @@ def default_tuning(manifest):
     return {"schema": TUNING_SCHEMA, "kernel": manifest["id"], "structures": structures}
 
 
+def _complete(configs, base):
+    """A structure's configurations as check_tuning reads them: each over `base` (its defaults), the defaults first
+    (inserted where the tuning's first configuration is another), and the shift that puts on the table's indices."""
+    configs = [dict(base, **c) for c in configs or []]
+    if configs and configs[0] == base:
+        return configs, 0
+    return [dict(base), *configs], 1
+
+
+def retire(manifest, tuning):
+    """The tuning with each retired structure's table moved into the structure that replaced it (kernel.json
+    "retired": {old: {into, defaults, key, rename, knobs, rows}}), the one-time migration of a tuning written before a
+    structure left. An old table's entries name the new structure's configurations: each old configuration over the
+    old defaults, its knobs renamed (rename) and the new structure's own knobs fixed (knobs); its key gains the fields
+    `key` fixes, an entry for each of their values (weights: [1, 2], an entry a weight format); rows, where given,
+    replaces the entries' row ranges (an old structure tuned for every row count at once). The old rule stays: its
+    entries come first (the first match wins) where they name a configuration other than its defaults, and every one
+    of them where the tuning gives the new structure no table. Entries for every shape (key None) are dropped: the new
+    structure's own rules give those. Every other tuning is returned as it is."""
+    retired = manifest.get("retired") or {}
+    given = dict(tuning.get("structures") or {})
+    if not set(given) & set(retired):
+        return tuning
+    for old in [s for s in given if s in retired]:
+        spec, source = retired[old], given.pop(old) or {}
+        into = spec["into"]
+        if into not in manifest.get("structures", {}):
+            raise ValueError(f"{manifest['id']}: retired structure {old} names {into}, which does not exist")
+        base = defaults(manifest, into)
+        target = given.get(into) or {}
+        configs, shift = _complete(target.get("configs"), base)
+        own = [dict(e, config=e["config"] + shift) for e in target.get("table") or []]
+        old_configs, old_shift = _complete(source.get("configs"), dict(spec.get("defaults") or {}))
+        rename, fixed = spec.get("rename") or {}, spec.get("knobs") or {}
+        moved = []
+        for entry in source.get("table") or []:
+            index = entry["config"] + old_shift
+            if entry.get("key") is None or (index == 0 and own):
+                continue
+            config = dict(base, **{rename.get(k, k): v for k, v in old_configs[index].items()}, **fixed)
+            if config not in configs:
+                configs.append(config)
+            fields = [(name, list(values)) for name, values in (spec.get("key") or {}).items()]
+            keys = [dict(entry["key"])]
+            for name, values in fields:
+                keys = [dict(k, **{name: v}) for k in keys for v in values]
+            for key in keys:
+                found = {"key": key, "rows": list(spec.get("rows") or entry["rows"]), "config": configs.index(config)}
+                if entry.get("length") is not None:
+                    found["length"] = list(entry["length"])
+                moved.append(found)
+        given[into] = {"configs": configs, "table": moved + own}
+    return dict(tuning, structures=given)
+
+
 def check_tuning(manifest, tuning):
     """The tuning, checked against the manifest: every knob a declared one with a declared value, config 0 the
-    structure's defaults (filled in when missing), every table entry naming a configuration."""
+    structure's defaults (filled in when missing), every table entry naming a configuration. A tuning written before
+    a structure retired is migrated first (retire)."""
     if tuning.get("schema") != TUNING_SCHEMA or tuning.get("kernel") != manifest["id"]:
         raise ValueError(f"tuning is {tuning.get('schema')} for {tuning.get('kernel')!r}, expected {TUNING_SCHEMA} for "
                          f"{manifest['id']!r}")
+    tuning = retire(manifest, tuning)
     out = {}
     for sid, spec in manifest.get("structures", {}).items():
         given = (tuning.get("structures") or {}).get(sid) or {"configs": [], "table": []}
@@ -482,6 +540,44 @@ def _generator_digest():
     return hashlib.sha256((inspect.getsource(tuning_header) + inspect.getsource(tuning_module)).encode()).hexdigest()
 
 
+def core_sdk_include(manifest=None):
+    """Core's public headers (crit/*.h) for a kernel whose kernel.json says "core_include": true (a kernel that runs
+    Core's rules on the device, such as its sampler's draws): CRIT_CORE_INCLUDE, else the crit checkout's core/include
+    beside kernels/. None for any other kernel."""
+    if manifest is not None and not manifest.get("core_include"):
+        return None
+    found = os.environ.get("CRIT_CORE_INCLUDE")
+    return Path(found) if found else library().parent / "core" / "include"
+
+
+def host_include(manifest=None):
+    """Core's host-memory headers for plugins' native code (crit_plugins.host.INCLUDE: handoff_device.cuh, pool.h)
+    for a kernel whose kernel.json says "host_include": true (a kernel that posts to or joins one of the host's
+    handoffs): CRIT_HOST_INCLUDE, else the crit checkout's core/python/crit_plugins/host beside kernels/. None for any
+    other kernel."""
+    if manifest is not None and not manifest.get("host_include"):
+        return None
+    found = os.environ.get("CRIT_HOST_INCLUDE")
+    return Path(found) if found else library().parent / "core" / "python" / "crit_plugins" / "host"
+
+
+def _includes(manifest):
+    """The Core header folders a kernel builds with beyond the kernel core (core_include, host_include)."""
+    return [i for i in (core_sdk_include(manifest), host_include(manifest)) if i is not None]
+
+
+def _core_sdk_digest(manifest):
+    """The digest of the Core headers a kernel with core_include or host_include builds with ("" for the others)."""
+    h = hashlib.sha256()
+    for include, pattern in ((core_sdk_include(manifest), "crit/**/*.h"), (host_include(manifest), "*.[hc]*")):
+        if include is None:
+            continue
+        for path in sorted(include.glob(pattern)):
+            if path.suffix in (".h", ".cuh"):
+                h.update(str(path.relative_to(include)).encode() + path.read_bytes())
+    return h.hexdigest()
+
+
 def _build_key(folder, manifest, tuning, sweep, archs=None, swept=()):
     import torch
     parts = [_files_digest(folder), _core_digest(core_root(folder), folder), _generator_digest(), json.dumps(tuning, sort_keys=True), str(sweep), ",".join(sorted(swept)),
@@ -491,6 +587,8 @@ def _build_key(folder, manifest, tuning, sweep, archs=None, swept=()):
         parts.append(",".join(archs) if archs else device_arch()[0])
     if _mixed(manifest):
         parts.append(hashlib.sha256(_CUDA_MODULE.encode()).hexdigest())
+    if manifest.get("core_include") or manifest.get("host_include"):   # only such kernels' keys hold it
+        parts.append(_core_sdk_digest(manifest))
     if cross_aliases(manifest):   # only these kernels' keys hold it: every other kernel's key is as before
         import inspect
         parts.append(hashlib.sha256((_ALIAS_MODULE + inspect.getsource(alias_build_args) +
@@ -823,6 +921,12 @@ def build(kernel_id, *, tuning=None, knobs=None, configs=None, sweep=False, root
     mixed kernel compiles its kernel.json "cuda" "check" variants); variants: a mixed kernel's CUDA variants to compile
     now rather than on first use (a sweep's builds, before it holds the GPU)."""
     folder, manifest = find(kernel_id, root)
+    if manifest["language"] != "cuda":   # every launched Triton kernel says which arguments follow the request
+        from .specialization import problems
+        unsaid = problems(folder / "torch-ext" / manifest["package"])
+        if unsaid:
+            raise ValueError(f"{kernel_id}: " + "; ".join(unsaid) + " (crit_kernels.specialization: an argument that "
+                             "follows the request and stays specialized compiles a kernel on a request)")
     if knobs is not None:
         tuning = {"schema": TUNING_SCHEMA, "kernel": kernel_id,
                   "structures": {sid: {"configs": [dict(defaults(manifest, sid), **(knobs.get(sid) or {}))],
@@ -918,7 +1022,8 @@ def _compile(folder, manifest, tuning, sweep, stage, package, verbose, archs=Non
     build_dir.mkdir()
     core_include = str(core_folder(core_root(folder)) / "include")
     cpp_extension.load(name=package, sources=sources, extra_include_paths=[str(include), core_include, str(folder),
-                                                                           str(folder / "torch-ext")],
+                                                                           str(folder / "torch-ext")] +
+                       [str(i) for i in _includes(manifest)],
                        extra_cflags=cxx, extra_cuda_cflags=flags, extra_ldflags=ldflags, build_directory=str(build_dir),
                        is_python_module=False, with_cuda=True, verbose=verbose)
     built = list(build_dir.glob(f"{package}*.so")) + list(build_dir.glob(f"{package}*.pyd"))
@@ -995,5 +1100,6 @@ def read_tuning(path):
 __all__ = ["SCHEMA", "TUNING_SCHEMA", "alias_build_args", "alias_loaded", "build", "cross_aliases", "observe_aliases",
            "select", "use_tuning_source", "cache_root", "check_tuning", "core_root", "default_tuning", "defaults",
            "device_capability", "find", "foreign_tuning",
-           "import_build", "library", "load", "manifests", "read_tuning", "search_roots", "source_digest", "tuning_header",
+           "import_build", "library", "load", "manifests", "read_tuning", "retire", "search_roots", "source_digest",
+           "tuning_header",
            "tuning_module", "warn_foreign_tuning"]

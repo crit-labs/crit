@@ -88,6 +88,27 @@ and the final state within 8.5e-4 of the FP64 recurrence (1e-3 + 1e-3|x| allowed
 than `delta-prefill-rb`, and `exactness` repeatable like the FP32 prefill's: a prompt row's bits follow the prompt's
 length. dk 64 or 128, dv a multiple of 16; scratch `delta_tc_scratch_bytes` (FP16 K, Q, Tb, P and FP32 G per chunk).
 
+## The chunk-aligned exact form (`delta-chunk-rows`)
+
+`delta-prefill-tc`'s bits for a token depend on the prompt only through the token's 64-token chunk (counted from the
+prompt's first token) and the state at that chunk's start: a token's row of `A`, `T`, `Tb`, `P` and the deltas uses the
+chunk's tokens up to it only, the tokens past a row's end are zeros (keys, queries, values and beta; their log decays
+add zero to the cumulative sums), and the masked products of later tokens are exact zeros. So recomputing a chunk so far
+from its start state gives every token of it the bits the whole prompt gives it, however many of the chunk's later
+tokens the launch also holds, and the state after a complete chunk is the prompt's state there.
+
+`gated_delta_chunk_rows` runs many such rows in one launch pair (grid z the row; each row its own scratch): meta int32
+[rows, 4] = (first, tokens, slot_in, slot_out), row r the packed tokens first .. first + tokens - 1, chunked from its
+first token (the caller starts a row at a 64-aligned position of its sequence), from `states_in[slot_in]`; the state
+after the row's complete chunks goes to `states_out[slot_out]` (not written when slot_out < 0 or the row completes no
+chunk), the row's outputs to its tokens' rows of `out`. A decode step is a row of the chunk so far plus the new token
+from the chunk's start state, a verify window the same with more tokens (crossing a boundary when it reaches one), a
+prompt a row from position 0: all of them give a token the same bits, so an engine whose recurrent layers decode this
+way has exact prompt rows on tensor cores. The state kept per sequence is the last boundary's (written when a step
+completes a chunk) plus the chunk's tokens, not the running state. `tests/test_chunk_exact.py` checks token-by-token
+recompute against one prompt, mixed rows (decode, verify windows, a window across a boundary, a row completing its
+chunk) against each sequence's prompt with the boundary states, a CUDA graph replay, and a decode loop in place.
+
 ## Structures and knobs
 
 kernel.json lists each way the kernel computes as a structure; four of them have knobs a sweep tunes per layer shape
@@ -114,6 +135,13 @@ do not depend on its block, the stages and the overlap move the same bytes at ot
 The other structures (the prefill at dk 64, the commit replay, the pool convolutions, the single-sequence scans and
 convolution, Mamba-2) are listed without knobs: their blocks are either the pending counts' slots, which a tuning must
 not change between calls, or a path no plugin times.
+
+No plugin calls the Mamba-2 structures (`ssd-prefill`, `ssd-columns`) or the single-sequence convolution
+(`causal-conv`) today, and no sweep times them. They are kept anyway: they are crit's only device form of Mamba-2's
+state-space scan (operation `ssd-scan`) and of the causal convolution with its carried window that goes with it
+(operation `causal-conv`; the pool convolutions take pooled windows). Their tests hold them to a float64 recurrence,
+and the two operations' contracts are tied to recurrent-state-recovery's FP64 host forms (`ssd_sequential`,
+`causal_conv_rows`). Removing them would drop Mamba-2 from the device, which is a scope change, not a cleanup.
 
 ## Yardstick
 
@@ -230,7 +258,7 @@ step_out = rs.gated_delta_scan(q[T:], k[T:], v[T:], log_decay[T:], beta[T:], sta
 
 ## Functions
 
-`causal_conv1d`, `gated_delta_prefill`, `gated_delta_scan`, `ssd_prefill`, `ssd_scan`, `pool_delta`,
+`causal_conv1d`, `gated_delta_prefill`, `gated_delta_chunk_rows`, `gated_delta_scan`, `ssd_prefill`, `ssd_scan`, `pool_delta`,
 `pool_delta_replay`, `pool_conv`, `conv_segments`, `pool_conv_prompt`, and the pool layout helpers `pool_blocks`,
 `pool_half_floats`, `pool_conv_blocks`, `pool_conv_supported` (row kinds `STASH`, `CHECKPOINTS`, `RECOMPUTE`, `FINAL`,
 `FLUSH`; replay modes `REPLAY`, `FLUSH_PENDING`). Their arguments are in `torch-ext/recurrent_scans/__init__.py`.

@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -225,6 +226,38 @@ class AssemblyTests(PluginFixture, unittest.TestCase):
             fused["drafter"]
         self.assertIsNone(fused.get("drafter"))
 
+    def test_the_plugins_resolve_what_the_engine_will_state_before_any_is_made(self):
+        # resolve(context, options, dry) of each plugin's module, in creation order, with the selection alone: shares
+        # of an additive fact add up, two answers to another fact must agree, and a loaded engine is held to them.
+        from crit_plugins.assemble import resolution_problems, resolve
+        answers = {"kv-fp8": "{'kv_bytes_per_token': 96, 'kv_dtype': 'fp8'}",
+                   "draft-eagle": "{'kv_bytes_per_token': 32, 'width': options['width'], "
+                                  "'drafts': dry.plugin('drafter'), 'kv': dry.facts('kv_cache'), "
+                                  "'priced': dry.module('kv_cache').__name__ != '', 'none': dry.module('sampler')}"}
+        for plugin_id, answer in answers.items():
+            with open(self.root / plugin_id / "plugin.py", "a", encoding="utf-8") as source:
+                source.write(f"\n\ndef resolve(context, options, dry):\n    return {answer}\n")
+        registry = Registry.discover(self.root)
+        use, order, options = check(FULL, registry, ["taps:hidden"])
+        found = resolve(registry, use, order, options, {})
+        stated = {"kv_bytes_per_token": 128, "kv_dtype": "fp8", "width": 4, "drafts": "draft-eagle",
+                  "kv": ("kv:fp8",), "priced": True, "none": None}
+        self.assertEqual(found["facts"], stated)
+        self.assertEqual(found["by"]["kv_bytes_per_token"], "kv-fp8 + draft-eagle")
+        self.assertEqual(resolution_problems(found, stated), [])
+        self.assertEqual(resolution_problems(found, {**stated, "kv_bytes_per_token": 96}),
+                         ["kv-fp8 + draft-eagle's resolve() states kv_bytes_per_token 128, and the loaded engine 96"])
+        for answer, refusal in (("{'kv_dtype': 'bf16'}", "attn-fp8: resolve\\(\\) states kv_dtype 'bf16', which "
+                                                          "kv-fp8 states as 'fp8'"),
+                                ("{'kv_bytes_per_token': 1.5}", "attn-fp8: resolve\\(\\) states kv_bytes_per_token "
+                                                                "as bytes")):
+            with open(self.root / "attn-fp8" / "plugin.py", "a", encoding="utf-8") as source:
+                source.write(f"\n\ndef resolve(context, options, dry):\n    return {answer}\n")
+            for name in [name for name in sys.modules if name.startswith("crit_plugin_attn_fp8_")]:
+                del sys.modules[name]   # the plugin's module imported again with its new resolve()
+            with self.assertRaisesRegex(PluginError, refusal):
+                resolve(Registry.discover(self.root), use, order, options, {})
+
     def test_the_engines_exactness_is_what_it_asks_and_the_lowest_level_its_plugins_keep(self):
         sys.path.insert(0, str(ROOT / "kernels"))   # crit_kernels.exactness, the levels
         from crit_plugins import kernels
@@ -292,6 +325,16 @@ class AssemblyTests(PluginFixture, unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "attn-plain failed to create"):
             assemble(selection, self.registry, {})
         self.assertEqual(closed, ["kv-fp8"])
+
+    def test_code_a_plugin_imports_belongs_to_that_plugins_folder(self):
+        from crit_plugins.assemble import load_module
+        from crit_plugins.kernels import plugin_folder
+        module = load_module(self.registry["kv-fp8"])
+        top = module.__name__.split(".")[0]
+        folder = self.registry["kv-fp8"]["folder"]
+        self.assertEqual(plugin_folder(module.__name__, "own"), folder)
+        self.assertEqual(plugin_folder(f"{top}.lent.native", "own"), folder)   # a source's module under the plugin
+        self.assertEqual(plugin_folder("native", "own"), "own")                 # imported on its own
 
     def test_close_runs_every_plugins_close_and_raises_the_first_error(self):
         assembly = assemble({"use": {"attention": "attn-plain", "kv_cache": "kv-fp8"},
@@ -422,6 +465,11 @@ class EngineSelectionTests(unittest.TestCase):
             ("model-x", {"requires": ["model"]}, "requires names the other slots the plugin calls, not its own"),
             ("attn", {"devices": ["tpu"]}, "devices holds tpu"),
             ("attn", {"devices": ["host"]}, "attention computes on the device the engine serves on"),
+            ("attn", {"tool_format": "plugin.py:FORMAT"}, "tool_format is a model plugin's"),
+            ("model-x", {"tool_format": "calls"}, "tool_format is FILE.py:NAME"),
+            ("model-x", {"tool_format": "missing.py:FORMAT"}, "tool_format names missing.py, which is no file"),
+            ("attn", {"reasoning_format": "plugin.py:THINKING"}, "reasoning_format is a model plugin's"),
+            ("model-x", {"reasoning_format": "x.py"}, "reasoning_format is FILE.py:NAME"),
         ]
         for plugin_id, changes, message in cases:
             with self.subTest(message=message):
@@ -530,6 +578,29 @@ class PluginTestRunnerTests(unittest.TestCase):
         self.assertEqual(items["kv-fp8"]["state"], "failed")
         self.assertIn("no tests", items["kv-fp8"]["detail"])
 
+    def test_plugins_are_tested_at_once_and_reported_in_the_registrys_order(self):
+        slow = '''import time
+import unittest
+
+
+class SlowTests(unittest.TestCase):
+    def test_takes_a_while(self):
+        time.sleep(1.5)
+'''
+        with tempfile.TemporaryDirectory() as temp:
+            root = write_plugins(Path(temp) / "plugins", {k: PLUGINS[k] for k in
+                                                          ("attn-fp8", "kv-fp8", "attn-kv-fused", "attn-plain", "kv-bf16")},
+                                 tests={"attn-kv-fused": {"test_fused.py": slow},
+                                        "attn-plain": {"test_plain.py": slow}})
+            lines, started = [], time.perf_counter()
+            items = run_tests(root, only={"attn-kv-fused", "attn-plain"}, log=lines.append, jobs=2)
+            took = time.perf_counter() - started
+            order = [m["id"] for m in Registry.discover(root) if m["id"] in {"attn-kv-fused", "attn-plain"}]
+        self.assertEqual([i["name"] for i in items], order)
+        self.assertEqual([line.split()[1] for line in lines], order)   # logged in that order too
+        # each plugin's own process sleeps 1.5 s: at once, not one after the other
+        self.assertLess(took, sum(i["seconds"] for i in items) - 0.5, items)
+
 
     def test_skipped_tests_are_listed_with_their_reasons(self):
         skipping = PASSING + '''
@@ -555,12 +626,76 @@ class PluginTestRunnerTests(unittest.TestCase):
         found = items["attn-kv-fused"]
         self.assertEqual((found["state"], found["detail"]), ("passed", "3 tests, 2 skipped"), found)
         self.assertEqual(found["skipped"], [
-            {"test": "test_fused.FusedTests.test_against_the_model", "reason": "no CRIT_CORE_STEP_LIBRARY"},
-            {"test": "test_fused.FusedTests.test_on_cuda", "reason": "no CUDA device"}])
+            {"test": "test_fused.FusedTests.test_against_the_model", "reason": "no CRIT_CORE_STEP_LIBRARY",
+             "unchecked": False},
+            {"test": "test_fused.FusedTests.test_on_cuda", "reason": "no CUDA device", "unchecked": False}])
         self.assertTrue(any("skipped test_fused.FusedTests.test_on_cuda: no CUDA device" in line for line in lines))
         self.assertIn("1 passed, 0 failed; 2 tests skipped, which these passes do not cover:\n"
                       "  attn-kv-fused: test_fused.FusedTests.test_against_the_model: no CRIT_CORE_STEP_LIBRARY\n",
                       output.getvalue())
+
+    def test_a_skip_that_leaves_the_plugin_unchecked_fails_it_and_the_machines_skip_does_not(self):
+        # Core's runtime missing where an engine test gates on it (core_runtime() in setUpClass, as model-template's
+        # engines do) and a model plugin's reference comparison skipped (skipUnchecked) check nothing the plugin could
+        # have run here: the plugin fails, and no such pass is cached. A skip because no device the plugin runs on is
+        # here passes, listed.
+        unchecked = PASSING + '''
+    def test_scores_against_the_reference(self):
+        self.skipUnchecked("the reference model is not installed")
+
+
+class EngineTests(PluginTestCase):
+    @classmethod
+    def setUpClass(cls):
+        from unittest.mock import patch
+        from crit_plugins.testing import core_runtime
+        with patch("crit_core.native.step_library", return_value=None):
+            core_runtime()
+
+    def test_the_engine_on_cores_runtime(self):
+        pass
+'''
+        machine = PASSING + '''
+    def test_on_cuda(self):
+        self.skipTest("attn-kv-fused runs on cuda, none of which this machine has")
+'''
+        from unittest.mock import patch
+        from crit import plugins as cli
+        from crit_plugins.testing import NO_CORE_RUNTIME
+        for name, tests, state in (("unchecked", unchecked, "failed"), ("machine", machine, "passed")):
+            with self.subTest(skip=name), tempfile.TemporaryDirectory() as temp:
+                root = write_plugins(Path(temp) / "plugins", {k: PLUGINS[k] for k in ("attn-fp8", "kv-fp8",
+                                                                                      "attn-kv-fused", "attn-plain",
+                                                                                      "kv-bf16")},
+                                     tests={"attn-kv-fused": {"test_fused.py": tests}})
+                lines = []
+                with patch.dict("os.environ", {"CRIT_PLUGIN_TEST_CACHE": str(Path(temp) / "cache")}):
+                    found = run_tests(root, only={"attn-kv-fused"}, log=lines.append, cache=True)[0]
+                    again = run_tests(root, only={"attn-kv-fused"}, log=lambda line: None, cache=True)[0]
+                self.assertEqual(found["state"], state, found)
+                self.assertEqual(again.get("cached", False), state == "passed")
+                output = io.StringIO()
+                with patch.object(cli, "run_tests", lambda *a, **k: [found]), contextlib.redirect_stdout(output):
+                    self.assertEqual(cli.main(["test", str(root)]), 0 if state == "passed" else 1)
+                if name == "machine":
+                    self.assertEqual(found["detail"], "2 tests, 1 skipped")
+                    self.assertEqual(found["skipped"], [{
+                        "test": "test_fused.FusedTests.test_on_cuda", "unchecked": False,
+                        "reason": "attn-kv-fused runs on cuda, none of which this machine has"}])
+                    self.assertNotIn("unchecked", found)
+                    self.assertIn("1 passed, 0 failed; 1 tests skipped", output.getvalue())
+                    continue
+                self.assertEqual([(s["test"], s["reason"]) for s in found["unchecked"]], [
+                    ("test_fused.EngineTests.setUpClass", NO_CORE_RUNTIME),
+                    ("test_fused.FusedTests.test_scores_against_the_reference",
+                     "the reference model is not installed")])
+                self.assertEqual(found["detail"], "2 tests, 2 skipped; 2 of them leave its correctness unchecked: "
+                                 f"{NO_CORE_RUNTIME} (test_fused.EngineTests.setUpClass); the reference model is not "
+                                 "installed (test_fused.FusedTests.test_scores_against_the_reference)")
+                self.assertTrue(any("skipped test_fused.FusedTests.test_scores_against_the_reference: the reference "
+                                    "model is not installed (unchecked: fails the plugin)" in line for line in lines),
+                                lines)
+                self.assertIn("0 passed, 1 failed; 2 tests skipped", output.getvalue())
 
 
 class CoreRuntimeTests(unittest.TestCase):
@@ -571,6 +706,11 @@ class CoreRuntimeTests(unittest.TestCase):
         with patch("crit_core.native.step_library", return_value="/built/crit_core_steps.dll"):
             self.assertEqual(case.core_runtime(), "/built/crit_core_steps.dll")
         with patch("crit_core.native.step_library", return_value=None),                 self.assertRaisesRegex(unittest.SkipTest, "`crit core build` builds it"):
+            case.core_runtime()
+        # the skip leaves what the test checks unchecked, which crit plugins test fails
+        from crit_plugins.testing import UNCHECKED
+        with patch("crit_core.native.step_library", return_value=None), \
+                self.assertRaisesRegex(unittest.SkipTest, "^" + UNCHECKED):
             case.core_runtime()
 
 
@@ -600,6 +740,18 @@ class PluginTestCacheTests(unittest.TestCase):
 
 
 class AblationTests(PluginFixture, unittest.TestCase):
+    def test_a_paired_change_stands_out_from_its_rounds_spread(self):
+        from crit_plugins.ablation import NOISE, PAIRED_NOISE, _verdict
+        # The same engine served twice: four rounds that happen to fall on one side, scattered by more than their
+        # median (a loaded host's prefill), are no change.
+        same = [0.0023, 0.0118, 0.0055, 0.0119]
+        self.assertEqual(_verdict({"prefill_tps": (0.0087, min(same), max(same), same)}, PAIRED_NOISE), "neutral")
+        # A 1% slower round in every round, the rounds close together: a change.
+        slower = [-0.0105, -0.0094, -0.0112, -0.0099]
+        self.assertEqual(_verdict({"decode_tps": (-0.0102, min(slower), max(slower), slower)}, PAIRED_NOISE), "slows")
+        # A single pass has no spread: its change against the noise alone.
+        self.assertEqual(_verdict({"decode_tps": (0.05, 0.05, 0.05, None)}, NOISE), "pays")
+
     def test_variants_switch_each_plugin_off_and_on_alone(self):
         self.assertEqual(toggles(FULL), ["attn-fp8", "kv-fp8", "draft-eagle"])
         found = {v["name"]: v for v in variants(FULL, self.registry, facts=["taps:hidden"])}
@@ -630,6 +782,22 @@ class AblationTests(PluginFixture, unittest.TestCase):
         with self.assertRaisesRegex(PluginError, "no variant only:x"):
             variants(FULL, names={"only:x"})
 
+    def test_a_slot_a_plugin_in_use_requires_falls_back_to_its_plugin_and_not_to_nothing(self):
+        # The Flash-Next build: a base that did not name every slot the model plugin requires sent those slots to
+        # None, and the plugins refused every only: variant. A required slot is as filled as Core's required slots.
+        from crit_plugins.assemble import normalize
+        self.manifest("kv-fp8", requires=["drafter"])
+        self.registry = Registry.discover(self.root)
+        partial = {"use": dict(FULL["use"]), "base": {"attention": "attn-plain", "kv_cache": "kv-bf16"},
+                   "options": FULL["options"]}
+        self.assertIsNone(normalize(partial)["base"]["drafter"])   # no registry: nothing says the slot is required
+        self.assertEqual(normalize(partial, self.registry)["base"]["drafter"], "draft-eagle")
+        found = {name: v for v in variants(partial, self.registry, facts=["taps:hidden"])
+                 for name in [v["name"], *v.get("also", [])]}
+        self.assertEqual(found["only:kv-fp8"]["plugins"]["use"]["drafter"], "draft-eagle")
+        self.assertNotIn("error", found["only:kv-fp8"])
+        self.assertNotIn("without:draft-eagle", found)   # a required slot's plugin is no toggle
+
     def test_an_option_set_to_a_number_like_text_takes_the_type_the_option_declares(self):
         manifests = [dict(m) for m in self.registry]
         eagle = next(m for m in manifests if m["id"] == "draft-eagle")
@@ -640,6 +808,35 @@ class AblationTests(PluginFixture, unittest.TestCase):
         found = option_variants(FULL, ["draft-eagle.rows=0;draft-eagle.label=12;draft-eagle.width=2"], registry,
                                 facts=["taps:hidden"])
         self.assertEqual(found[0]["plugins"]["options"]["draft-eagle"], {"width": 2, "rows": "0", "label": "12"})
+
+    def test_an_option_that_approximates_the_model_says_so_and_the_engine_and_ablation_report_it(self):
+        from crit_plugins.assemble import approximations
+        from crit_plugins.manifest import _option
+        spec = {"type": "int", "default": 0, "min": 0, "description": "routes kept",
+                "approximates": {"exact": [0], "what": "routes past N are dropped"}}
+        self.assertEqual(_option("keep_routes", spec, "plugin.json")["approximates"]["exact"], [0])
+        for wrong in ({"exact": [], "what": "x"}, {"exact": [0]}, {"exact": [-1], "what": "x"}, "yes"):
+            with self.assertRaises(PluginError):
+                _option("keep_routes", dict(spec, approximates=wrong), "plugin.json")
+        registry = {"offload": {"options": {"keep_routes": spec}}, "other": {"options": {}}}
+        self.assertEqual(approximations(registry, {"offload": {"keep_routes": 0}, "other": {}}), [])
+        self.assertEqual(approximations(registry, {"offload": {"keep_routes": 6}}),
+                         [{"plugin": "offload", "option": "keep_routes", "value": 6, "exact": [0],
+                           "what": "routes past N are dropped"}])
+
+    def test_drafting_is_switched_as_one_unit(self):
+        # A variant without the drafter kept the verifier: the selection still drafted with nothing to draft, and
+        # Core's load refused it (info() declares speculative False, but the selection drafts).
+        drafts = {"use": {"attention": "attn-fp8", "kv_cache": "kv-fp8", "drafter": "draft-eagle",
+                          "verifier": "chain"},
+                  "base": {"attention": "attn-plain", "kv_cache": "kv-bf16", "drafter": None, "verifier": None},
+                  "options": {}}
+        found = {v["name"]: v for v in variants(drafts)}
+        use = found["without:draft-eagle"]["plugins"]["use"]
+        self.assertEqual((use["drafter"], use["verifier"]), (None, None))
+        self.assertIn("without:chain", found["without:draft-eagle"]["also"])   # the same plain engine
+        only = found["only:draft-eagle"]["plugins"]["use"]
+        self.assertEqual((only["drafter"], only["verifier"], only["attention"]), ("draft-eagle", "chain", "attn-plain"))
 
     def test_an_option_variant_can_set_the_level_the_engine_asks_of_its_rows(self):
         sys.path.insert(0, str(ROOT / "kernels"))   # crit_kernels.exactness, the levels
@@ -686,6 +883,34 @@ class AblationTests(PluginFixture, unittest.TestCase):
         mixed = [measured("full", 150, 800), {**measured("base", 100, 1000), "also": ["without:attn-fp8"]}]
         (row,) = blame(mixed, one)
         self.assertEqual(row["verdict"], "trades")
+
+    def test_rounds_are_combined_and_compared_round_by_round(self):
+        from crit_plugins.ablation import PAIRED_NOISE, combine
+
+        def rounds(name, decodes):
+            rows = [{"name": name, "state": "measured", "load_ms": 10.0 + i,
+                     "kpis": {"decode_tps": decode, "prefill_tps": 1000.0, "ttft_ms": 50.0},
+                     "cases": {"case-0001": {"decode_tps": decode}}} for i, decode in enumerate(decodes)]
+            rows[0]["smoke"] = {"failed": []}
+            return combine(rows)
+        one = {"use": {"attention": "attn-fp8"}, "base": {"attention": "attn-plain"}}
+        # The device drifts by 5% over the rounds; the plugin costs 1% within every round.
+        base = rounds("base", [100.0, 103.0, 105.0, 101.0])
+        self.assertEqual((base["kpis"]["decode_tps"], base["load_ms"], len(base["rounds"])), (102.0, 11.5, 4))
+        self.assertEqual(base["cases"]["case-0001"]["decode_tps"], 102.0)
+        full = rounds("full", [99.0, 101.97, 103.95, 99.99])
+        (row,) = blame([full, {**base, "also": ["without:attn-fp8"]}], one, PAIRED_NOISE)
+        self.assertEqual(row["verdict"], "slows")
+        self.assertEqual(len(row["paired"]["in_engine"]["decode_tps"]), 4)
+        self.assertAlmostEqual(row["in_engine"]["decode_tps"], -0.01)
+        self.assertIn("decode -1.0% (rounds -1.0% to -1.0%)", describe(row))
+        # A 1% median whose rounds disagree in sign is no change.
+        noisy = rounds("full", [102.0, 102.0, 104.0, 99.0])
+        (row,) = blame([noisy, {**base, "also": ["without:attn-fp8"]}], one, PAIRED_NOISE)
+        self.assertEqual(row["verdict"], "neutral")
+        # A variant that failed in a round is failed, with that round's reason.
+        failed = combine([dict(full["rounds"][0], name="full"), {"name": "full", "state": "failed", "detail": "OOM"}])
+        self.assertEqual((failed["state"], failed["detail"]), ("failed", "OOM"))
 
     def test_blame_compares_the_round_time_where_both_variants_draft(self):
         # A Qwen3.8-27B engine's own projections decode 1.9% faster than cuBLASLt's at 3.20 tokens a round against

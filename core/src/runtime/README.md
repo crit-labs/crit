@@ -30,10 +30,33 @@ readiness to wait for. See [current contracts](../../contracts/README.md).
 metadata, not device memory: the model must still admit each request's complete
 memory entitlement.
 
-Admission is first in, first out: a deferred head holds the requests behind it
-until it is ready, cancelled, failed or expired, and a score is always a barrier.
-Admission decisions come from the model; Core does not guess KV costs, evict live
-state or assume recomputation is safe.
+Admission goes by [priority](#request-priority), the oldest first among equal
+values: the next request, once deferred, holds the others until it is ready,
+cancelled, failed or expired, and a score is always a barrier. Admission
+decisions come from the model; Core does not guess KV costs, evict live state or
+assume recomputation is safe.
+
+## Request priority
+
+Core decides which waiting request runs next, for every way an engine is
+served (crit serve and crit Eval's in-process adapter alike). `RequestOptions::priority`
+(a 32-bit signed integer, default 0; the native ABI's `"priority"`) orders the
+generations waiting for a lane: of those queued before the first score, the
+lowest value is admitted first, the oldest among equal values
+([admission.cpp](admission.cpp), `next_waiting`). A running request is never
+preempted. A score stays an exclusive barrier: no request overtakes it, it
+overtakes none, and a score takes no priority (a nonzero one is a generation
+option, which scoring rejects). `crit_core.native.next_request` states the same
+rule for a server that holds requests before the engine takes them, so crit
+serve's queue hands them over in the order the engine would run them.
+
+How many requests the runtime holds and how long one may wait are Core's
+settings too, which `crit_core.native.StepEngine` takes from the engine's caller,
+not from the model plugin: `max_concurrent_requests` caps the requests held at
+once, lanes first (`max_concurrency`), then waiting places (`max_pending`), so
+crit serve's `--max-concurrency` is applied here; `pending_timeout` bounds the
+wait for a lane (the step engine's `pending_timeout_ms`; none unless a caller
+gives one, where `Profile.pending_timeout_ms` defaults to 30 s).
 
 Submission checks the outstanding allowance before retaining payload memory.
 Requests reserve their maximum accepted-token staging buffer at
@@ -252,7 +275,7 @@ library exports ([step_library.cpp](step_library.cpp)) and `crit_core.native` re
 engine with the model plugin's step callbacks (`crit_engine_open_steps`, `crit_engine_open_steps_rounds`), reports
 `ModelInfo` merged with the model's facts (`crit_engine_info`), runs requests and scores, and closes it. Errors return
 -1 with the message from `crit_engine_last_error()`; nothing throws across the boundary. `crit_core.native` refuses a
-library of another ABI version (8): rebuild it against this crit's headers.
+library of another ABI version (10): rebuild it against this crit's headers.
 
 A request is opened with `crit_engine_request_open(engine, prompt, count, output_tokens, options)` and waited on
 with `crit_engine_request_wait` (tokens to a callback that can cancel) or `crit_engine_request_wait_output`; it has
@@ -261,7 +284,9 @@ waiting, before the engine closes. The Python bridge polls cancellation independ
 cancellation during prefill reaches Core; physical work still settles before release. Cancellation predicates passed
 to the bridge must be thread-safe and nonblocking: an independent monitor may call them while token delivery runs.
 Its options are the request's sampling fields, `stop_tokens` (`[]` disables them), `replay` (a continuation the
-session decodes by, so every engine decodes the same text), `plain` (one token per target pass, no drafting) and
+session decodes by, so every engine decodes the same text), `plain` (one token per target pass, no drafting),
+`decode_via_prompt` (a debug request whose decode rows the model computes as one-token prompt chunks, never in a
+native round: crit smoke's [rounding or fault](../../../smoke/README.md#rounding-or-fault)) and
 `logprobs` (alternatives per token): `crit_engine_request_wait_output`'s callback receives each published token with
 its log-probability and its most likely alternatives as two ranked arrays, the [TokenLogprob](#log-probabilities) rows
 of `Handle::wait_output`. `crit_engine_request_wait`'s callback receives the tokens published since its last call
@@ -293,7 +318,7 @@ Core's loader is what constructs one, over an assembly whose model plugin it che
 | Model method | Called with | Returns |
 | --- | --- | --- |
 | `info()` | | Facts plus Core's settings: `vocabulary` and `context` (required), `max_concurrency` (2 or more), `max_pending`, `max_batch_tokens` (mixed batches; 0 separates prefill and decode steps), `prefill_chunk`, `prefill_work_quantum` (prompt work granted in its multiples: the prefill chunk keeps a prompt's chunk boundaries whatever shares its steps, which a model whose chunked kernels give other bits at other boundaries declares), `prefill_pass_tokens` and `prefill_pass_steps` ([prefill passes](#model-progress): the most prompt tokens a request holds in a pass, and the most steps in a row its prefill takes without consuming a prompt token), `batch_policy`, `max_row_tokens` (most tokens a row reports), `sampling`, `token_logprobs`, `max_top_logprobs`, `scoring`, `score_paths` |
-| `open(request)` | `StepRequest`: key, prompt, output limit, set sampling fields, effective stop tokens, `logprobs`, `replay`, `plain` | A session object |
+| `open(request)` | `StepRequest`: key, prompt, output limit, set sampling fields, effective stop tokens, `logprobs`, `replay`, `plain`, `decode_via_prompt` | A session object |
 | `step(rows)` | One `StepRow` per scheduled request: session, prefill grant, output allowance, token work, prefill complete, and a constrained request's `allowed` | One `StepResult` per row: prompt tokens consumed, tokens produced, prefill complete, reused prefix, token work, log-probability rows, for a decode row the drafts its round verified (`drafted`), and the prompt tokens the row holds in a prefill pass after the step (`pass_tokens`) |
 | `commit(decisions)` | Core's `StepDecision` per row of the last step (tokens kept, terminal, cancelled) | |
 | `retire(session, finish)` | `length`, `stop`, `cancelled` or `failed` | |
@@ -304,13 +329,14 @@ Core's loader is what constructs one, over an assembly whose model plugin it che
 
 A constrained request (`StepEngine.generate(..., constraint=...)`: json mode, a compiled grammar, or a fixed token
 set) reaches the runtime as a host attachment (`HostAttachment` in [native_engine.h](../../include/crit/native_engine.h):
-the options' `attachment` id with `constrained`): Core decodes it plainly and never in a native round, and on the
-Python side keeps its matcher ([structured output](../constraints/README.md), through the exports of
+the options' `attachment` id with `constrained`): Core decodes it plainly, one token a row, and on the Python side
+keeps its matcher ([structured output](../constraints/README.md), through the exports of
 [constraint_library.cpp](constraint_library.cpp); `StepEngine.constrain(vocabulary)` gives Core the model's byte
 vocabulary). Before each step its row carries the tokens the matcher allows next (`StepRow.allowed`, a
 `crit_plugins.Allowed`); after it Core checks the token the row produced and appends it once `commit` keeps it. A
 token outside the mask, a second token, or a constraint that cannot continue fails that request alone with
-`NativeError`, as a cancel whose tokens are never published.
+`NativeError`, as a cancel whose tokens are never published. In [native rounds](#native-decode-rounds) that mask, a
+constrained request decodes as the others do, its mask staged between rounds.
 
 Every generation's result carries its request facts. Core counts each decode row after prefill as one round
 (`rounds`): its accepted drafts (a native round's telemetry word, else the row's tokens less one) and drafts (a native
@@ -352,13 +378,31 @@ log-probability form (`logprobs` 1: it writes the rounds' log-probability buffer
 requests that ask, and runs rows that follow a continuation of their own) when a row's request asks for
 log-probabilities or replays a continuation, else its plain form, which costs less; `runs` counts the rounds
 of each. It also skips the engine's `commit` unless a decision trims, ends or cancels a row (`last`
-names the round then). Every other step (prompt chunks, a row outside the slots, a constrained request, one
-asking for more alternatives than the rounds rank) goes to `step()` as before, and the engine binds and unbinds slots in its own
+names the round then). Every other step (prompt chunks, a row outside the slots, a constrained request where the
+rounds do not mask, one asking for more alternatives than the rounds rank) goes to `step()` as before, and the engine binds and unbinds slots in its own
 `step`, `commit` and `retire`. Core reads a row count's width (`widths`, the engine's own array) before
 each round, so the engine may change it between steps: a draft-width policy whose captured round copies
 the next round's widths into that array chooses each round's width with no host code in between. Every
 width stays within `widest`, the widest round, which Core checks the engine's grants against when it
 opens; a row count without a width at open stays on `step()`.
+
+Rounds that mask (`StepRounds::masks`; `NativeRounds(stage=...)`, which the round driver passes when its
+sampler has `stage_mask`, token-constraints' `rounds:sampler`) run constrained requests too. A round masks
+every logits row of a constrained slot by the allowed set staged for it and cuts its drafts, so the slot
+emits one token a round (width 0) from that set while the other rows of the round draft as they do. The
+set of round n + 1 depends on round n's token, and nothing runs on the host inside a round, so Core stages
+it between the two: after every native round that ran a constrained row Core calls `commit` (it skips it
+otherwise), and there `crit_core.native` reads the slot's token from the block, checks it against the set
+staged, appends it to the request's matcher, lets the model commit, and stages the matcher's next set for
+the slot (`stage(slot, allowed)`: one copy of the bitmask words, vocabulary / 32 words, on the rounds'
+stream) before Core launches the next round. A set is also staged after the `step()` that binds a
+constrained request and after a `retire` that moves one to another slot. A constrained request so costs
+every round it shares one host hop: the commit callback, a matcher step (a walk of the vocabulary's piece
+trie, or its allowed-set cache) and the copy, on the critical path of every row of the round, where an
+unconstrained round goes from one launch to the next with no Python. No pipelining hides it: the set is
+not known before the token that decides it. A request whose constraint failed is staged nothing more and
+keeps its last set until Core ends it, its tokens never published. Whether constrained decoding comes
+within 10% of an unconstrained width-0 request's speed is a GPU measurement still to make.
 
 `crit_rounds_cuda_*` (exported by `crit_core_steps`, `NativeRounds.cuda`) is the launcher over captured
 CUDA graphs. It loads the CUDA driver API at run time, so Core still builds without a CUDA toolkit, and
@@ -370,7 +414,8 @@ pool's `commit_round`) into one captured round per (rows, width, mode) and form,
 round over an engine's own hooks. The [step engine check](../../../tests/core/step_engine_check.py) runs a toy
 model whose round is a host callback: the oracle's tokens, no `step()` for decode rows, a commit only for rows
 that end, a row count without a width decoded through `step()`, settings that cannot hold the rounds refused at
-open, each round's form from its requests (plain for plain requests, the log-probability form's values for a
+open, constrained requests in rounds that mask with `step()`'s tokens (a set staged before every round, after a
+move too, and a round's token outside it failing its request alone), each round's form from its requests (plain for plain requests, the log-probability form's values for a
 request asking and a replay's continuation, a plain request beside them decoding its own tokens), and each
 request's facts from the block's words (accepted drafts, the engine's `round_counters`) with the model's merged in
 round by round.

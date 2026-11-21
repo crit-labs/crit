@@ -1,5 +1,5 @@
 """crit Core for Python: model files, model config and the text layer (tokenizer, chat templates, stops)."""
-__version__ = "0.21.0"
+__version__ = "0.22.0"
 
 
 def cache_home(*parts):

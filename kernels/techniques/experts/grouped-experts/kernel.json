@@ -11,6 +11,7 @@
   "sources": [
     "grouped_experts_cuda/binding.cu",
     "grouped_experts_cuda/grouped_experts.cu",
+    "grouped_experts_cuda/mma_experts.cu",
     "torch-ext/torch_binding.cpp"
   ],
   "capabilities": [
@@ -224,6 +225,284 @@
         "library": "FlashInfer grouped GEMM (flashinfer.grouped_mm.grouped_mm_bf16, cuDNN MoE backend) on the pass's weights widened to BF16 once, the routes' inputs gathered in expert order and (gate/up) the SwiGLU in torch: no library takes every stored format against BF16 inputs one pass at a time"
       },
       "bench": "bench.py:PromptWide"
+    },
+    "fp4-decode": {
+      "what": "nvfp4 W4A4 items of 8 routes (decode rows) on the block-scaled FP4 tensor cores (mma.sync kind::mxf4nvf4 m16n8k64, the sm_120 family): every route's inputs quantized once by crit's declared NVFP4 quantizer at its expert's input scale (E2M1 codes, UE4M3 block scales), the weights' own codes and scales the A operand, K cut into k_parts(K) parts at fixed 128-k block boundaries (4 from 2,048 k, 2 from 512, else 1: K's alone), one MMA chain an output a part over its 64-blocks in order, the parts' sums added in part order in FP32 (mma_experts.cu's mainloop, its FP4 atom); a part a warp, the parts added through shared memory, the routes' operands read straight from global memory, DEPTH weight steps (128 k) in flight; the intermediate quantized the same way at the down's input scale in the gate/up epilogue (another arithmetic than the BF16 path's W4A4: the same operands, the tensor core's own sums)",
+      "call": "route_outputs",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        1,
+        2,
+        4,
+        8,
+        32
+      ],
+      "key": [
+        "gate_up",
+        "hidden",
+        "inter"
+      ],
+      "exactness": "row-exact",
+      "knobs": {
+        "WARPS": {
+          "values": [
+            2,
+            4,
+            8
+          ],
+          "default": 4,
+          "what": "warps a block, each owning TILES row tiles of one expert"
+        },
+        "TILES": {
+          "values": [
+            1,
+            2,
+            4
+          ],
+          "default": 1,
+          "what": "MMA row tiles a warp owns (gate/up: 8 inter rows each, run in pairs: a warp holds the intermediate's 16-row blocks; down: 16 output rows), sharing each B fragment"
+        },
+        "DEPTH": {
+          "values": [
+            1,
+            2,
+            3,
+            4,
+            6
+          ],
+          "default": 3,
+          "what": "weight steps of 128 k (64 bytes of a row) in flight a warp"
+        },
+        "FETCH": {
+          "values": [
+            0,
+            1
+          ],
+          "default": 0,
+          "what": "how a lane reads a weight step (128 k, 64 bytes of a row) and the route's: 0 its 16 contiguous bytes, then a quad transpose into its fragment words; 1 its four fragment words directly (4-byte loads 16 bytes apart): the same registers and bits, fewer instructions a step; the default takes 1 at one token (RTX 5090: 2048 x 768 FP4 1.34x, FP8 1.17x a layer, level on 4096 x 1536) and 0 from 2 tokens, where the transpose's one 16-byte load a row is as fast or faster"
+        }
+      },
+      "default_rows": [
+        {
+          "rows": [
+            1,
+            1
+          ],
+          "knobs": {
+            "FETCH": 1
+          }
+        }
+      ],
+      "yardstick": {
+        "library": "FlashInfer grouped GEMM (flashinfer.grouped_mm.grouped_mm_bf16, cuDNN MoE backend) on the pass's weights widened to BF16 once, as the BF16 path's benches: no library takes grouped NVFP4 W4A4 one pass at a time"
+      },
+      "bench": "bench.py:Fp4Decode"
+    },
+    "fp4-prompt": {
+      "what": "nvfp4 W4A4 items of 32 or 64 routes (prompt chunks) with fp4-decode's bits: the same parts, chains and part-order sum an output (a warp runs the parts one after another, adding each into a second accumulator), the routes' codes and scales staged in shared memory a CHUNK at a time by cp.async (the next landing while the current one computes), each weight fragment feeding the item's 4 or 8 n-tiles",
+      "call": "route_outputs",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        256,
+        1024,
+        4096
+      ],
+      "key": [
+        "gate_up",
+        "hidden",
+        "inter"
+      ],
+      "exactness": "exact",
+      "bits_of": "fp4-decode",
+      "knobs": {
+        "WARPS": {
+          "values": [
+            2,
+            4,
+            8
+          ],
+          "default": 4,
+          "what": "warps a block, each owning TILES row tiles of one expert"
+        },
+        "TILES": {
+          "values": [
+            1,
+            2,
+            4
+          ],
+          "default": 2,
+          "what": "MMA row tiles a warp owns (gate/up at least 2), sharing each B fragment"
+        },
+        "DEPTH": {
+          "values": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "default": 2,
+          "what": "weight steps of 128 k in flight a warp"
+        },
+        "CHUNK": {
+          "values": [
+            128,
+            256,
+            512
+          ],
+          "default": 256,
+          "what": "k values of the item's operands staged a pass by cp.async (two halves of shared memory)"
+        }
+      },
+      "yardstick": {
+        "library": "FlashInfer grouped GEMM (flashinfer.grouped_mm.grouped_mm_bf16, cuDNN MoE backend) on the pass's weights widened to BF16 once, as the BF16 path's benches: no library takes grouped NVFP4 W4A4 one pass at a time"
+      },
+      "bench": "bench.py:Fp4Prompt"
+    },
+    "fp8-decode": {
+      "what": "fp8:channel and fp8:block W8A8 items of 8 routes (decode rows) on the E4M3 tensor cores (mma.sync e4m3 m16n8k32, 8.9 on; kind::mxf8f6f4 with unit scales on the sm_120 family): every route's inputs and the intermediate quantized by crit's declared group quantizer (each 128 values of a row in E4M3 at amax / 448), the weights' own E4M3 codes the A operand, K cut into k_parts(K) parts at fixed 128-k block boundaries as fp4-decode's, each part's 128-k block sums folded into its running sum with one fmaf by the activation's scale times the weight's (fp8:block's grid; fp8:channel's row scale on the finished sum), the parts' sums added in part order in FP32 (a part a warp, through shared memory), the routes' operands read straight from global memory, DEPTH weight steps (64 k) in flight (mma_experts.cu's mainloop, its FP8 atom)",
+      "call": "route_outputs",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        1,
+        2,
+        4,
+        8,
+        32
+      ],
+      "key": [
+        "format",
+        "gate_up",
+        "hidden",
+        "inter"
+      ],
+      "exactness": "row-exact",
+      "knobs": {
+        "WARPS": {
+          "values": [
+            2,
+            4,
+            8
+          ],
+          "default": 4,
+          "what": "warps a block, each owning TILES row tiles of one expert"
+        },
+        "TILES": {
+          "values": [
+            1,
+            2,
+            4
+          ],
+          "default": 1,
+          "what": "MMA row tiles a warp owns (gate/up: 8 inter rows each, down: 16 output rows), sharing each B fragment"
+        },
+        "DEPTH": {
+          "values": [
+            1,
+            2,
+            3,
+            4,
+            6
+          ],
+          "default": 4,
+          "what": "weight steps of 64 k (64 bytes of a row) in flight a warp"
+        },
+        "FETCH": {
+          "values": [
+            0,
+            1
+          ],
+          "default": 0,
+          "what": "how a lane reads a weight step (64 k, 64 bytes of a row) and the route's: 0 its 16 contiguous bytes, then a quad transpose into its fragment words; 1 its four fragment words directly (4-byte loads 16 bytes apart): the same registers and bits, fewer instructions a step; the default takes 1 at one token (RTX 5090: 2048 x 768 FP4 1.34x, FP8 1.17x a layer, level on 4096 x 1536) and 0 from 2 tokens, where the transpose's one 16-byte load a row is as fast or faster"
+        }
+      },
+      "default_rows": [
+        {
+          "rows": [
+            1,
+            1
+          ],
+          "knobs": {
+            "FETCH": 1
+          }
+        }
+      ],
+      "yardstick": {
+        "library": "FlashInfer grouped GEMM (flashinfer.grouped_mm.grouped_mm_bf16, cuDNN MoE backend) on the pass's weights widened to BF16 once, as the BF16 path's benches: no library takes grouped NVFP4 W4A4 one pass at a time"
+      },
+      "bench": "bench.py:Fp8Decode"
+    },
+    "fp8-prompt": {
+      "what": "fp8:channel and fp8:block W8A8 items of 32 or 64 routes (prompt chunks) with fp8-decode's bits: the same parts, MMA chains, block folds and part-order sum an output, the routes' codes and scales staged in shared memory a CHUNK at a time by cp.async, each weight fragment feeding the item's 4 or 8 n-tiles",
+      "call": "route_outputs",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        256,
+        1024,
+        4096
+      ],
+      "key": [
+        "format",
+        "gate_up",
+        "hidden",
+        "inter"
+      ],
+      "exactness": "exact",
+      "bits_of": "fp8-decode",
+      "knobs": {
+        "WARPS": {
+          "values": [
+            2,
+            4,
+            8
+          ],
+          "default": 8,
+          "what": "warps a block, each owning TILES row tiles of one expert"
+        },
+        "TILES": {
+          "values": [
+            1,
+            2,
+            4
+          ],
+          "default": 4,
+          "what": "MMA row tiles a warp owns, sharing each B fragment"
+        },
+        "DEPTH": {
+          "values": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "default": 1,
+          "what": "weight steps of 64 k in flight a warp"
+        },
+        "CHUNK": {
+          "values": [
+            128,
+            256,
+            512
+          ],
+          "default": 128,
+          "what": "k values of the item's operands staged a pass by cp.async (two halves of shared memory)"
+        }
+      },
+      "yardstick": {
+        "library": "FlashInfer grouped GEMM (flashinfer.grouped_mm.grouped_mm_bf16, cuDNN MoE backend) on the pass's weights widened to BF16 once, as the BF16 path's benches: no library takes grouped NVFP4 W4A4 one pass at a time"
+      },
+      "bench": "bench.py:Fp8Prompt"
     },
     "declared": {
       "what": "crit's integer block order (nvfp4 W4A4, int4 W4A8) for the CPU tier's bits: a half-warp per output row, dp4a block sums, the halving tree; the declared quantizers and SwiGLU",

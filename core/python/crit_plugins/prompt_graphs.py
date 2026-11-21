@@ -12,29 +12,26 @@ after (commit_prompt). Each bucket is captured once at load (two warm-ups of pad
 then the capture), in a graph memory pool of its own, and the memory the captures take is planned through the
 placement plugin (the entry "prompts:captures").
 
-The graphs slot's plugin chooses, chunk by chunk, between the model's eager path and a padded bucket (its choose():
-the offers carry each bucket's measured replay time, the eager time measured at the bucket and the arithmetic each
-computes, "bits": a timing may choose only among offers of the same bits); without one, the smallest bucket runs. A chunk past the largest bucket, a selection whose plugins cannot run inside a captured graph
-(prompt_problems: a slot's plugin lacks prompts:<slot>, or its round_problems() gives a reason) and a host device run
-the eager path. Mechanism and policy split as for decode rounds: Core owns the batch, the captures, their memory and
-the facts check; the graphs slot (a policy slot, on the host) only chooses among the offers.
+Core chooses the bucket by the chunk's length alone, never by a time: the smallest captured bucket that holds it. A
+replay computes the padded chunk, whose bits need not be the unpadded eager path's (below), so the length must decide
+which arithmetic a chunk runs, in every process alike. A chunk past the largest bucket, a selection whose plugins
+cannot run inside a captured graph (prompt_problems: a slot's plugin lacks prompts:<slot>, or its round_problems()
+gives a reason) and a host device run the eager path; a model that wants its prompt chunks eager captures no buckets.
 
 The output equals the eager prompt path's over the same padded batch exactly (the same plugins' calls, replayed); it
 equals the unpadded eager path's where every plugin's prompt form is row-invariant (a row's result independent of the
 rows beside it and of the token count), which plugins promise per slot.
 """
-import gc
-import time
-
+from .captures import capture_graph, capture_problems
 from .device import PromptBatch
 from .manifest import POLICY_SLOTS, PluginError
 from .memory import of as memory_of
-from .rounds import _method, _own_problems, capture_stream, capture_workspaces
+from .rounds import _method, capture_stream
 
 BUCKETS = (16, 64, 128, 512)
 # Replays of a captured bucket before its time is measured (the first ones upload the graph and warm its caches), and
 # replays timed: the offer carries their median.
-WARM_REPLAYS, TIMED_REPLAYS = 8, 25
+WARM_REPLAYS = 8
 PHASE = "prefill"
 IDENTITY = ("prompt-graphs",)
 # The slots only decoding calls: a prompt chunk's forward never does.
@@ -55,21 +52,10 @@ def prompt_problems(parts, uses=None):
     (the slots the model's prompt forward calls; by default every filled computing slot but the decoding ones) provides
     prompts:<slot>, and each of those plugins that has round_problems() (the reasons its configuration keeps it out of
     a captured graph) gives none."""
-    filled = [slot for slot in parts.slots() if parts.plugin(slot)]
     if uses is None:
-        uses = [slot for slot in filled if slot != "model" and slot not in POLICY_SLOTS and slot not in DECODE_SLOTS]
-    problems = []
-    for slot in dict.fromkeys(uses):
-        plugin = parts.plugin(slot)
-        if plugin is None:
-            problems.append(f"no plugin fills {slot}, which the prompt chunk calls")
-        elif prompt_fact(slot) not in parts.facts(slot):
-            problems.append(f"{plugin} in {slot} does not provide {prompt_fact(slot)}: its prompt form is not known to "
-                            "run inside a captured graph")
-        else:
-            problems += [f"{plugin} in {slot} cannot run inside a captured graph as configured: {reason}"
-                         for reason in _own_problems(parts, slot, plugin)]
-    return problems
+        uses = [slot for slot in parts.slots() if parts.plugin(slot) and slot != "model" and slot not in POLICY_SLOTS
+                and slot not in DECODE_SLOTS]
+    return capture_problems(parts, uses, prompt_fact, "the prompt chunk", "prompt form")
 
 
 class PromptGraphs:
@@ -78,8 +64,7 @@ class PromptGraphs:
     buckets: the token counts captured; pools and extra_parts: the objects that stage and settle a chunk's sequence
     (stage_prompt(batch) before, commit_prompt(batch) after each run) and put back what the warm-ups changed
     (reset_capture()); parts (the model factory's) and uses (the slots forward calls) check the selection's prompt facts
-    (prompt_problems), give the graphs slot's plugin (parts.get("graphs")) its choice and the placement plugin the
-    captures' memory. share_pool: the buckets share one graph memory pool, the engine's where Core's loader
+    (prompt_problems) and give the placement plugin the captures' memory. share_pool: the buckets share one graph memory pool, the engine's where Core's loader
     assembled the engine (its rounds capture into it too: crit_plugins.rounds' rule for the plugins holds), else
     one of the driver's own; None (the default) shares where the engine has a pool, False gives each bucket its
     own."""
@@ -101,18 +86,15 @@ class PromptGraphs:
         self._checked = (parts, uses)
         get = getattr(parts, "get", None) if parts is not None else None
         self._placement = get("placement") if callable(get) else None
-        self._chooser = get("graphs") if callable(get) else None
         self._observer = getattr(parts, "observer", None) if parts is not None else None
         self.slot_calls = {}  # bucket -> the slots its capture called (each replay counts as a call of each)
         self.problems = self._problems()
         self.graphs = {}      # bucket -> (graph, its output)
-        self.costs = {}       # bucket -> {"eager_ns", "graph_ns", "bytes"}
         self.captured_bytes, self._planned = 0, 0
         self._engine_pool = getattr(getattr(parts, "context", None), "graphs", None)
         self.share_pool = bool(share_pool) or (share_pool is None and self._engine_pool is not None)
         self._pool = None
         self.counts = {"graph_chunks": 0, "eager_chunks": 0, "tokens": 0, "padding": 0}
-        self._chosen = {}     # chunk size -> its bucket or None, while the offers stay as they are
 
     def _problems(self):
         parts, uses = self._checked
@@ -124,49 +106,12 @@ class PromptGraphs:
         """The smallest captured bucket of at least `count` tokens, or None."""
         return next((b for b in self.buckets if b >= count and b in self.graphs), None)
 
-    def offers(self, count):
-        """The graphs slot's offers for a chunk of `count` tokens: the model's eager path (its time measured at the
-        smallest bucket that holds the chunk) and each captured bucket that holds it, padded (its replay measured).
-        Each offer's "bits" names the arithmetic it computes: a bucket's replay runs the slots' prompt forms over the
-        padded chunk (a PromptBatch), which need not give a row the bits the model's eager path (a StepBatch) gives it,
-        nor the bits of another bucket's padding, so every bucket is its own ("padded:<bucket>"), one of exactly the
-        chunk's tokens included, and the eager path is "eager". A graphs plugin chooses by time only among offers of
-        the same bits."""
-        shape = {"phase": PHASE, "tokens": count, "rows": 1, "identity": IDENTITY}
-        fitting = [b for b in self.buckets if b >= count and b in self.graphs]
-        eager_ns = self.costs[fitting[0]]["eager_ns"] if fitting else 0
-        offers = [{"name": "eager", "mode": "eager", "shape": shape, "run_ns": eager_ns, "workspace_bytes": 0,
-                   "resident_bytes": 0, "setup_ns": 0, "setup_peak_bytes": 0, "ready": True, "bits": "eager"}]
-        for bucket in fitting:
-            offers.append({"name": f"graph:{bucket}", "mode": "full", "shape": {**shape, "tokens": bucket},
-                           "run_ns": self.costs[bucket]["graph_ns"], "workspace_bytes": 0,
-                           "resident_bytes": self.costs[bucket]["bytes"], "setup_ns": 0, "setup_peak_bytes": 0,
-                           "ready": True, "bits": f"padded:{bucket}"})
-        return shape, offers
-
     def choose(self, count):
-        """The bucket a chunk of `count` tokens runs in, or None for the model's eager path: the graphs slot's choice
-        among the offers when the selection fills it, else the smallest captured bucket that holds the chunk. Asked
-        once per chunk size; a capture changes the offers and asks again."""
-        if count in self._chosen:
-            return self._chosen[count]
-        bucket = self._choose(count)
-        self._chosen[count] = bucket
-        return bucket
-
-    def _choose(self, count):
-        if self.problems or not 1 <= count or self.bucket_for(count) is None:
+        """The bucket a chunk of `count` tokens runs in, or None for the model's eager path: the smallest captured
+        bucket that holds the chunk, where the selection's plugins run inside a captured graph."""
+        if self.problems or not 1 <= count:
             return None
-        if self._chooser is None:
-            return self.bucket_for(count)
-        shape, offers = self.offers(count)
-        free = self.torch.cuda.mem_get_info(self.device)[0]
-        name = self._chooser.choose(shape, offers, int(free))
-        if name == "eager":
-            return None
-        if not isinstance(name, str) or not name.startswith("graph:") or int(name[6:]) not in self.graphs:
-            raise PluginError(f"the graphs plugin chose {name!r}, which is none of the offers")
-        return int(name[6:])
+        return self.bucket_for(count)
 
     # Running ----------------------------------------------------------------------------------------------------------
 
@@ -230,9 +175,9 @@ class PromptGraphs:
 
     def capture(self, bucket):
         """Capture the chunk of `bucket` tokens: two eager warm-ups of padding alone (no sequence staged: they change
-        no state), the second timed, then the capture on the process's capture stream with no garbage collection
-        inside it (the batch's derive() and the forward), then WARM_REPLAYS replays of padding and TIMED_REPLAYS
-        timed, their median the offer's time. The device memory it took is planned through the placement plugin."""
+        no state), then the capture on the process's capture stream with no garbage collection inside it (the batch's
+        derive() and the forward), then WARM_REPLAYS replays of padding. The device memory it took is planned through
+        the placement plugin."""
         torch = self.torch
         self.problems = self._problems()
         if self.problems:
@@ -247,33 +192,21 @@ class PromptGraphs:
         stream.wait_stream(torch.cuda.current_stream(self.device))
         with torch.cuda.stream(stream):
             self._reset()
-            eager_ns = None
-            for _ in range(2):
+            for _ in range(2):   # warm-ups of padding alone, which change no state
                 self._stage(bucket, None, 0, [])
-                started = time.perf_counter_ns()
                 self.forward(self.batch)
                 stream.synchronize()
-                eager_ns = time.perf_counter_ns() - started
             self._reset()
-            graph = torch.cuda.CUDAGraph()
             memory = memory_of(self.device)
             if self.share_pool and self._pool is None:
                 self._pool = self._engine_pool or memory.pool("prompts", "every bucket")
             pool = self._pool if self.share_pool else memory.pool("prompts", f"{bucket} tokens")
             self._stage(bucket, None, 0, [], derive=False)
-            collecting = gc.isenabled()
-            gc.collect()   # nothing dead is freed inside the capture (pinned host memory freed there breaks the next)
-            gc.disable()
-            observed = self._observer.snapshot() if self._observer is not None else None
-            try:
-                capture_workspaces(stream)
-                with memory.capturing(pool), torch.cuda.graph(graph, pool=pool, stream=stream):
-                    self.batch.derive()
-                    output = self.forward(self.batch)
-            finally:
-                if collecting:
-                    gc.enable()
-            self.slot_calls[bucket] = self._observer.called_since(observed) if observed is not None else []
+
+            def chunk():
+                self.batch.derive()
+                return self.forward(self.batch)
+            graph, output, self.slot_calls[bucket] = capture_graph(self.device, stream, pool, chunk, self._observer)
         torch.cuda.current_stream(self.device).wait_stream(stream)
         torch.cuda.synchronize(self.device)
         self._reset()
@@ -281,18 +214,10 @@ class PromptGraphs:
         for _ in range(WARM_REPLAYS):
             graph.replay()
         torch.cuda.synchronize(self.device)
-        timings = []
-        for _ in range(TIMED_REPLAYS):
-            started = time.perf_counter_ns()
-            graph.replay()
-            torch.cuda.synchronize(self.device)
-            timings.append(time.perf_counter_ns() - started)
         grown = max(torch.cuda.memory_allocated(self.device) - allocated,
                     torch.cuda.memory_reserved(self.device) - reserved, 0)
         self.captured_bytes += grown
         self.graphs[bucket] = (graph, output)
-        self.costs[bucket] = {"eager_ns": eager_ns, "graph_ns": sorted(timings)[len(timings) // 2], "bytes": grown}
-        self._chosen.clear()
         self._plan()
         return graph
 

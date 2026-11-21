@@ -51,6 +51,16 @@
       },
       "verify": "on the target against the FP64 rows within FP32 rounding (2e-6 relative), and bit for bit against torch's own softplus and sigmoid on CUDA in FP32",
       "invariance": "a token's bits independent of the other tokens of the call and of the token count"
+    },
+    {
+      "id": "rms-norm-quantize",
+      "what": "rms_norm rows quantized in the same launch for the next projection: FP8 E4M3 rows with a scale a row, or NVFP4 blocks (E2M1 codes, an E4M3 scale per 16 at the matrix's global input scale)",
+      "reference": {
+        "path": "inference/fused-norms/code/rows.py",
+        "symbol": "rms_norm_rows"
+      },
+      "verify": "on the target, the normed rows within rms-norm's tolerance before quantizing, and the codes and scales those the format's quantizer gives the kernel's normed rows, bit for bit",
+      "invariance": "a row's codes independent of the rows beside it; the same bits on a repeat"
     }
   ]
 }

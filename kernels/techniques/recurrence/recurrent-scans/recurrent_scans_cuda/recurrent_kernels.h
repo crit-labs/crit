@@ -86,6 +86,18 @@ bool delta_tc_supported(const DeltaShape&);
 std::size_t delta_tc_scratch_bytes(const DeltaShape&, int rows);
 cudaError_t enqueue_delta_prefill_tc(const DeltaShape&, const DeltaInputs&, int rows, float* state, void* scratch, float* out,
                                      std::size_t out_stride, cudaStream_t stream);
+// The chunk-aligned exact form on the same code: `count` rows in one launch pair, meta [count][4] int32 (16-byte
+// aligned) = (first, tokens, slot_in, slot_out) per row: tokens first .. first + tokens - 1 of the packed inputs (at most
+// `widest`), chunked in 64s from the first (the caller starts a row at a 64-token boundary of its sequence), from
+// states_in[slot_in] ([v_heads][dk][dv] slots); the state after the row's complete chunks goes to states_out[slot_out]
+// (not written when slot_out < 0 or the row has no complete chunk), its outputs to its tokens' rows of `out`. A row's
+// outputs and state have the bits of enqueue_delta_prefill_tc over its tokens from that state, and a token's output
+// depends only on its chunk's tokens up to it: a decode step that recomputes its chunk so far gives the prompt's bits.
+// scratch: delta_tc_rows_scratch_bytes(shape, count, widest), 16-byte aligned.
+std::size_t delta_tc_rows_scratch_bytes(const DeltaShape&, int count, int widest);
+cudaError_t enqueue_delta_chunk_rows_tc(const DeltaShape&, const DeltaInputs&, const int* meta, int count, int widest,
+                                        const float* states_in, float* states_out, void* scratch, float* out,
+                                        std::size_t out_stride, cudaStream_t stream);
 // Column scan: `rows` tokens one after another from state_in (which may alias state_out), writing outputs and, with
 // checkpoints, the state after each token ([rows][v_heads][dk][dv]).
 cudaError_t enqueue_delta_columns(const DeltaShape&, const DeltaInputs&, int rows, const float* state_in, float* state_out,

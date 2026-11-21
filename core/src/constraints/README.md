@@ -6,8 +6,9 @@ constraints and forced tool calls require. Core's runtime applies it to every
 engine: crit_core.native keeps one matcher per constrained request through the
 exports of [constraint_library.cpp](../runtime/constraint_library.cpp) (listed in
 [native_engine.h](../../include/crit/native_engine.h)), puts each row's allowed set
-on the model plugin's `StepRow.allowed`, checks the token the row produced and
-appends the one Core keeps. Native code:
+on the model plugin's `StepRow.allowed` (in captured rounds that mask, stages
+it for the request's round slot between rounds), checks the token the row
+produced and appends the one Core keeps. Native code:
 [constraints.h](../../include/crit/constraints.h), [constraints.cpp](constraints.cpp)
 and [grammar.cpp](grammar.cpp); masks reach sampling before the
 [sampling rules](../sampling/README.md).

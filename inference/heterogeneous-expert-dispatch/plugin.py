@@ -293,7 +293,7 @@ class SplitExperts:
         return "tensor" if self.asked == "repeatable" and kernel_part else "declared"
 
     def exactness(self):
-        """The level its rows keep (crit_kernels.exactness; Core compares it with the level the configuration asks):
+        """The level its rows keep (crit_plugins.exactness; Core compares it with the level the configuration asks):
         the declared order, the CPU tier's bits, on the CPU and on the device part alike; with prompt_arithmetic
         tensor a call past max_tokens that sends no route to the CPU runs the kernel's tensor arithmetic, so a prompt
         row's bits follow the call it is in (repeatable). Nothing before an expert is loaded."""

@@ -214,6 +214,11 @@ def make(store, run_id, at, out, count=1, before=None):
         from .plans import load
         plan = load(source, load_run(source), ident(before, "plan"))
         at = plan["parent_candidate_id"]
+        if plan.get("retroactive"):
+            # Its change was measured in the work tree before it was recorded: the run just before it already holds
+            # the answer the replay's agent would plan toward.
+            raise ValueError(f"{before} is retroactive, recorded after its change was measured: the run before it holds "
+                             f"that measurement, so replay at {at or 'a candidate'} (--at) instead")
         if at is not None and not (plan.get("inputs") or {}).get("eval"):
             raise ValueError(f"{before} starts from no Eval of {at}: replay at {at} instead")
     if not 1 <= count <= 16:

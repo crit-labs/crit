@@ -21,12 +21,13 @@ residuals the template has.
 | Part | What it does | File |
 | --- | --- | --- |
 | Layouts | Data: which block each layer kind of the config runs (`layer_types`: full_attention, sliding_attention, linear_attention, or the config's own name of a layer type), the FFN of each layer (`auto`: a mixture of experts on the layers the config routes, `crit_core.model.routed_layers`, a SwiGLU MLP elsewhere), how the blocks join the residual (`residual`), blocks that add rows into the residual ahead of some layers (`before`), the norm offset (1 for zero-centred RMSNorms), an attention output gate, the draft layer's prefix, and the config values the family's reference assumes where config.json is silent (`defaults`) | [code/layouts](code/layouts) |
-| Residuals | `pre-norm`: one stream, an RMSNorm before each block, the block's output added to the stream, a final norm. `streams`: several residual streams (hyper-connections); each block reads one row mixed from the streams' norms by weights the streams compute themselves (low-rank maps over all of them), its output is added to every stream by weights of its own, and a last mix gives the row the head reads. `sandwich`: one stream, each block between two norms (its normed output added to the stream), a scalar a layer, and the stream before the FFN's norm given to an FFN that reads it (`Context.residual`) | [code/residual.py](code/residual.py) |
-| Blocks | The arithmetic of each layer part over the other slots' plugins: `attention` (grouped-query softmax attention: one stacked q, k, v matrix, biases, query/key norms where the checkpoint stores them, rotary positions from the config's rope table (its layer type's where the config keys its rope by layer type, the `proportional` type included), partial rotation, sliding windows, sinks, a sigmoid output gate; for families whose layer kinds differ in shape, a kind's own head width and key/value heads, a fixed scale, value norms, and values taken from the key projection's rows where a layer stores no value projection), `indexed-attention` (block-sparse attention: an indexer scores the complete blocks of positions before a token and the token reads its best ones, within a budget, and its own block; the index keys in a pool of keys only, the choice on crit's kernel sparse-indexer where it loads), `latent-attention` (multi-head latent attention in its absorbed form: one cached row a position, its latent and a rotary key every head shares, in a pool of keys only; low-rank queries multiplied into the latent space, the attention slot's `latent=`, the values' up-projection after it), `gated-delta` (the delta rule through the recurrence slot, either projection layout a checkpoint stores, the gated norm's activation by the config), `ngram-rows` (a `before` block: rows of a hashed n-gram table, held on the device or read where the checkpoint stores it, gated into every stream, with a dilated causal convolution through the recurrence slot), `swiglu` (the gated MLP, its gate SiLU or tanh-GELU by the config's activation), `moe` (the router slot's selection with the router's rule checked against the config, the experts slot over any experts plugin, expert-offload included, a shared expert and its gate), `parallel-moe` (a dense MLP and a mixture of experts side by side, each normed and summed, the router scoring the residual stream itself with a scale an expert; experts gated by GELU need an experts plugin that provides `experts:activations`) | [code/blocks.py](code/blocks.py) |
+| Residuals | `pre-norm`: one stream, an RMSNorm before each block, the block's output added to the stream, a final norm. `streams`: several residual streams (hyper-connections); each block reads one row mixed from the streams' norms by weights the streams compute themselves (low-rank maps over all of them), its output is added to every stream by weights of its own, and a last mix gives the row the head reads. `sandwich`: one stream, each block between two norms (its normed output added to the stream), a scalar a layer, and the stream before the FFN's norm given to an FFN that reads it (`Context.residual`). `block-attention`: attention residuals over blocks of layers (each block input an attention over the blocks' summaries and the row so far by a learned query, the summaries growing a block at a time), with a looped span of layers run several times, its later passes started again from the row before the span and taking messages from the pass before through gates | [code/residual.py](code/residual.py) |
+| Blocks | The arithmetic of each layer part over the other slots' plugins: `attention` (grouped-query softmax attention: one stacked q, k, v matrix, biases, query/key norms where the checkpoint stores them, rotary positions from the config's rope table (its layer type's where the config keys its rope by layer type, the `proportional` type included), partial rotation, sliding windows, sinks, a sigmoid output gate; for families whose layer kinds differ in shape, a kind's own head width and key/value heads, a fixed scale, value norms, and values taken from the key projection's rows where a layer stores no value projection), `indexed-attention` (block-sparse attention: an indexer scores the complete blocks of positions before a token and the token reads its best ones, within a budget, and its own block; the index keys in a pool of keys only, the choice on crit's kernel sparse-indexer where it loads), `latent-attention` (multi-head latent attention in its absorbed form: one cached row a position, its latent and a rotary key every head shares, in a pool of keys only; low-rank queries multiplied into the latent space, the attention slot's `latent=`, the values' up-projection after it), `gated-delta` (the delta rule through the recurrence slot, either projection layout a checkpoint stores, the gated norm's activation by the config), `ngram-rows` (a `before` block: rows of a hashed n-gram table, held on the device or read where the checkpoint stores it, gated into every stream, with a dilated causal convolution through the recurrence slot), `swiglu` (the gated MLP, its gate SiLU or tanh-GELU by the config's activation), `moe` (the router slot's selection with the router's rule checked against the config, the experts slot over any experts plugin, expert-offload included, a shared expert and its gate), `parallel-moe` (a dense MLP and a mixture of experts side by side, each normed and summed, the router scoring the residual stream itself with a scale an expert; experts gated by GELU need an experts plugin that provides `experts:activations`), `relative-attention` (softmax attention with a relative-position bias each token computes for the positions just behind it, the attention slot's `bias=`, learned sinks a token applied through the log-sum-exp, L2-clipped queries and keys, short convolutions over keys and values through the recurrence slot, dynamic ones with taps a token where the checkpoint stores them, a gated output, and the convolutions its residual runs after the attention and the FFN) | [code/blocks.py](code/blocks.py) |
 | The draft layer | The checkpoint's multi-token-prediction layer as the device draft head of Core's captured rounds: one decoder layer of the model's own blocks in its own pools, entered and left as the residual does it (pre-norm: fc over the normed embedding and the normed target hidden state, the final norm; streams: every stream of the target through fc_hidden, the normed embedding through fc_embedding added to each, the layer's own last mix) | [code/model.py](code/model.py) `MtpHead`, [code/residual.py](code/residual.py) |
 | The serving contracts | Exact rows and prompt spans ([below](#the-serving-contracts)) | [code/rows.py](code/rows.py) |
 | The step model | Core's model interface over the blocks: the placement plan of every device tensor, the pools, `step`, `commit`, `retire`, `score`, admission, Core's captured rounds (greedy and sampled, drafted), captured prompt chunks, Core's prompt cache, constrained, replayed and plain requests, info, facts and telemetry | [code/model.py](code/model.py) |
-| compose() | The model plugin's object from a layout and the blocks it names | [code/compose.py](code/compose.py) |
+| compose() | The model plugin's object from a layout and the blocks it names; its twin resolve(), the engine's KV before any load | [code/compose.py](code/compose.py) |
+| The shape | The model before its weights: layer kinds, each layer's mixer, the residual, the draft layer, the decoder's tensor prefix and the KV pools (which layers share one, heads, widths, positions, page type), the same for a load and a dry resolve | [code/shape.py](code/shape.py) |
 | The checkpoint | Its safetensors files, or a GGUF file read under the same names ([below](#gguf-checkpoints)): the tensors the blocks read and the matrices as the projections and experts slots load them | [code/checkpoint.py](code/checkpoint.py), [code/gguf.py](code/gguf.py) |
 
 The library's layouts:
@@ -37,6 +38,7 @@ The library's layouts:
 | `gated-hybrid` | qwen3_next, qwen3_5, qwen3_5_text, qwen3_5_moe, qwen3_5_moe_text | Qwen3-Next (gated delta, gated attention, a gated shared expert); Qwen3.5 text with an MTP layer, drafting |
 | `latent` | deepseek_v3 | DeepSeek V3: latent attention with low-rank queries and interleaved rotary pairs, a dense MLP on the first layer, experts routed by sigmoid scores within the best group, a shared expert |
 | `gated-streams` | qwen4_exp, qwen4_exp_text | Qwen4Exp: four residual streams, gated delta layers, hashed n-gram rows ahead of one of them, gated block-sparse attention below and past its budget, routed experts with a gated shared expert; its draft layer drafting (transformers runs no draft layer for this architecture: [below](#not-covered-yet)) |
+| `looped-blocks` | inkling2_loop, inkling2_loop_text | Inkling 2 loop: its middle span of layers run three times with the same weights (each pass its own KV and convolution windows, the later passes taking messages from the pass before), attention residuals over blocks of layers, sliding and full layers of relative attention (dynamic key and value convolutions in the full layers, log-scaled queries past a position), experts routed by sigmoid scores with a correction bias and gated by a capped SwiGLU (experts-reference), a head of fewer rows than the vocabulary; the checkpoint's own tensor names through the layout's `names` rules |
 | `sandwich` | gemma4, gemma4_text | Gemma 4 with its mixture-of-experts block: every block between two norms with a scalar a layer, sliding-window layers beside full layers of another head shape whose values are the key projection's rows and whose rotary table turns a quarter of each head, value norms, a GELU-gated MLP beside GELU-gated experts routed from the residual stream, scaled embeddings, capped logits (experts-reference, and expert-offload with the experts in host memory); a config with the experts switched off composes its layers dense |
 
 ## The serving contracts
@@ -46,40 +48,47 @@ The library's layouts:
 round's columns, draft steps, logits rows) in calls of at most `invariant_rows(projections)` rows, so each row has
 the bits it has alone. Norms, rotary positions and gated products are the norms slot's. A request decodes the same
 alone and beside others, and a step's decode rows never take the prompt path: with expert-offload a step's decode
-rows and its prompt chunks are separate calls.
+rows and its prompt chunks are separate calls. The one exception is a debug request that asks `decode_via_prompt`
+([decode through the prompt path](../../docs/PLUGINS.md#decode-through-the-prompt-path), crit smoke's rounding or
+fault): its decode rows run as one-token prompt chunks in step(), after the step's other decode rows, never in a
+round slot (info `decode_via_prompt: true`).
 
 **Prompt spans within the cancel grace.** Core cancels a request between steps, and crit serve retires the engine
 whose cancel does not settle within its grace (one second): `serve --check` fails a candidate whose slowest prompt
-step at the full context takes longer. A prompt chunk ends at its span, a function of the position it starts at
-only, so chunk boundaries never depend on what shares a step. At load the template times three prompt steps on a
-sequence of its own (a short and a full `prefill_chunk` at position 0, a full one at the deepest position the engine
-serves, its earlier KV written with zeros), fits `seconds = c + a * rows + b * rows * (position + rows)` and the peak
-bytes a row takes, and gives each position the longest span within `span_seconds` (0.75 s by default: three quarters
-of the grace, since a step's fixed part, such as an experts plugin's copies of a chunk's routed experts, is paid once
-a step and a smaller budget pays it for fewer tokens; where that part alone passes the budget, the span that prefills
-fastest, and the facts' `spans.over_budget` says so beside each step's predicted seconds and rate) and within the
-device's room (its free memory less `headroom_mib`, where the experts plugin does not make room itself). The fit is a
-[measured decision](../../docs/PLUGINS.md#measured-decisions): `crit plugins decisions` records it in the package so
-every process spans its prompts alike. Fixed-text scores run in the same spans. The engine's facts carry the fit
-(`spans`). The fit and the spans it gives are plain functions ([code/rows.py](code/rows.py)):
+step at the full context takes longer. A prompt chunk ends at its span, which Core's prompt-step budget gives
+(`crit_plugins.steps.StepBudget`, through the load context's `steps`): Core times every prompt step the engine runs,
+the template says which chunks a step ran, and the budget keeps, per depth, what the steps there took over what the
+load's form `seconds = c + a * rows + b * rows * (position + rows)` predicted (a slower step taken at once, faster ones
+averaged in), so a deep step that runs past the bound shrinks the next chunks at that depth and never the shallow
+ones, whatever the load predicted. The load's calibration gives the form: the template times three prompt steps on
+a sequence of its own (a short and a full `prefill_chunk` at position 0, a full one at the deepest position the
+engine serves, its earlier KV written with zeros), and Core's step plan settles them as the template's decision and
+fits the form and the peak bytes a row takes (`steps.calibrated`), a
+[measured decision](../../docs/PLUGINS.md#measured-decisions) `crit plugins decisions` records in the package. The
+bound is Core's (`steps.seconds`), `span_seconds` a tighter one where it is lower (0.75 s by default, Core's most: three
+quarters of the grace, since a step's fixed part, such as an
+experts plugin's copies of a chunk's routed experts, is paid once a step and a smaller one pays it for fewer tokens;
+where that part alone passes the bound, the span that prefills fastest, and the facts' `spans.over_budget` says so),
+within the device's room (its free memory less the run's VRAM headroom). Where the engine asks its prompt rows below
+row-exact a chunk's boundaries change its rows' bits, so the spans stay the calibration's (`adaptive` false) and the
+budget only counts the steps that ran past the bound. The engine's facts carry the calibration, the ratio per depth,
+the steps timed and those past the bound (`spans`). Fixed-text scores run in the same spans.
 
 ```python
-from rows import Spans, fit
+from crit_plugins.steps import StepBudget
+from rows import fit
 
 # Three prompt steps timed at load: a short and a full chunk at position 0, a full chunk at the deepest position.
 costs = fit({(128, 0): 0.060, (512, 0): 0.210, (512, 200_000): 0.290}, peaks={512: 96 << 20})
-spans = Spans(512, costs, seconds=0.75, deepest=200_000)
-assert spans.rows(0) == 512 and spans.rows(200_000) == 512      # every step within the budget: whole chunks
+spans = StepBudget(512, prior=costs, seconds=0.75, deepest=200_000)
+assert spans.rows(0) == 512 and spans.rows(200_000) == 512      # every step within the bound: whole chunks
 
-slow = Spans(512, {**costs, "b": 2e-8}, seconds=0.75, deepest=200_000)
-assert slow.rows(0) == 512 and slow.rows(200_000) == 160        # a deep position takes a shorter span
-assert slow.predicted(160, 200_000) <= 0.75 < slow.predicted(176, 200_000)
-
-# A fixed part past the budget: no span meets it, so the span is the one that prefills fastest, and the facts say so.
-swept = Spans(512, {**costs, "c": 2.4}, seconds=0.75, deepest=200_000)
-assert swept.rows(0) == 512 and "over_budget" in swept.facts()
-# A pass ends a step between a chunk through one layer and the next: a span's time is that unit's.
-assert "over_budget" not in Spans(512, {**costs, "c": 2.4}, 0.75, deepest=200_000, units=48).facts()
+# The engine's deep steps take longer than the calibration said: the budget learns it from the steps it times.
+for _ in range(12):
+    rows = spans.rows(200_000)
+    spans.ran(rows, 200_000)
+    spans.observe(0.05 + 3e-4 * rows + 1e-8 * rows * (200_000 + rows))
+assert spans.rows(200_000) < 512 and spans.rows(0) == 512 and spans.facts()["over_bound"] > 0
 ```
 
 **Prompts layer by layer (passes).** Chunk by chunk, each prompt chunk runs through every layer before the next
@@ -133,18 +142,24 @@ temporaries); the routed experts are left out of the plan where the experts plug
 (`experts:offload`), which is begun with the device bytes the model still allocates and opened after its pools. A
 lookup table a block reads rows of (the token embeddings, a hashed n-gram table) is planned as `tables.<name>`, which
 a placement plugin may put off the device (device-placement's `off_device: "tables."`): the block then reads it where
-the checkpoint stores it through an embeddings plugin with `embeddings:host` (lookup-table-rows). A prompt or a score
-that ends hands torch's cached blocks back when the device has less than `release_below_mib` free.
+the checkpoint stores it through an embeddings plugin with `embeddings:host` (lookup-table-rows, from the files;
+memory-table-rows, read once into registered host memory). A prompt or a score that ends hands torch's cached blocks
+back through Core's step plan (`LoadContext.steps.release()`) when the device has less free than the next step needs
+(the headroom and the step arena; the configuration's `release_below_mib` overrides it)
+([step settings](../../docs/PLUGINS.md#step-settings)).
 
-**Drafting and batching.** The model declares `max_concurrency` (option `concurrency`), `max_row_tokens` and
+**Drafting and batching.** The model declares `max_concurrency`, the lanes Core's step plan gives it (`steps.lanes`:
+at most option `concurrency`, within crit serve's `--max-concurrency`; its waiting places likewise, option `pending`),
+and sizes its states and captured rounds for them, `max_row_tokens` and
 `decode_token_work` of the widest round, `prefill_work_quantum` equal to its prefill chunk, with passes
 `prefill_pass_tokens` and `prefill_pass_steps`, token log-probabilities
 with 20 alternatives, fixed-text and query scores, replays and Core's sampling fields; with `mtp` and a drafter in the
 selection it drafts from the checkpoint's MTP layer in captured rounds (a drafter that asks the model's draft head:
 `greedy-head-drafter` for the layer's chain, `mtp-decode` with an `override` for long prompt copies over it; one that
 never asks it, mtp-decode at its default, is refused), decodes plainly on request, and states
-`draft_bytes_per_step`. Requests decode in Core's native rounds once their prompt is in; constrained requests, long
-replays and rows the rounds cannot hold decode through `step()`. Its info names the round counters its rounds'
+`draft_bytes_per_step`. Requests decode in Core's native rounds once their prompt is in, a greedy constrained
+request at width 0 where the sampler's rounds mask (token-constraints: Core stages its allowed set between rounds);
+other constrained requests, long replays and rows the rounds cannot hold decode through `step()`. Its info names the round counters its rounds'
 parts count (`round_counters`: an expert cache's `expert_reads` and `expert_hits`), which the round driver collects
 from the parts themselves.
 
@@ -158,12 +173,12 @@ An engine for a covered checkpoint takes the plugin as it is:
 
 ```sh
 crit plugins add ENGINE/plugins model-template attention-state softmax-attention quantized-projections \
-  token-sampling device-placement fused-norms memory-table-rows sequential-recurrence
+  token-constraints device-placement fused-norms memory-table-rows sequential-recurrence
 ```
 
 ```json
 {"plugins": {"use": {"model": "model-template", "placement": "device-placement", "projections": "quantized-projections",
-                     "attention": "softmax-attention", "kv_cache": "attention-state", "sampler": "token-sampling",
+                     "attention": "softmax-attention", "kv_cache": "attention-state", "sampler": "token-constraints",
                      "norms": "fused-norms", "embeddings": "memory-table-rows", "recurrence": "sequential-recurrence"},
              "options": {"model-template": {"context": 262144, "concurrency": 4, "prefill_chunk": 1024}}}}
 ```
@@ -176,7 +191,10 @@ the router's options must state the checkpoint's rule (the template refuses one 
 `mixers` by layer kind, `ffn` (with `auto`, `routed` and `dense` may name the blocks of routed and dense layers),
 `residual`, `norm_offset`, `draft`, and where the family has them `embed_scale` (`sqrt_hidden`), `logit_softcap`
 (the config key of a tanh cap on the logits), `routed_if` (the config key that switches the family's experts on) and
-`requires` (config values the layout's blocks compute for; any other value is refused at load))
+`requires` (config values the layout's blocks compute for; any other value is refused at load), `names` (rules that rename a
+checkpoint's own tensor names to the ones the blocks read: [pattern, replacement] regular expressions, a third entry
+shifting the number the first group matched), `head_rows` (the config key of the rows the head predicts where it
+stores more) and `expert_caps` (the config keys of a capped SwiGLU's two caps))
 beside the plugin and name it with the option `layout`. Where
 a layer part needs arithmetic no block has, write the block in the engine's own model plugin and compose with it:
 
@@ -185,7 +203,7 @@ a layer part needs arithmetic no block has, write the block in the engine's own 
 #                                                             "rope": "../attention-state/code"}
 from pathlib import Path
 from .template.blocks import Attention
-from .template.compose import compose, tuning
+from .template.compose import compose, resolve as resolve_composed, tuning
 
 class WindowedAttention(Attention):          # a block: __init__(model, layer, prefix, spec), forward(h, ctx)
     def forward(self, h, ctx):
@@ -196,7 +214,17 @@ def create(context, options, parts):
     tuning(options, folder)
     return compose(context, options, parts, layout="layout.json", folder=folder,
                    blocks={"windowed-attention": WindowedAttention})
+
+def resolve(context, options, dry):         # the engine's KV before any load: the same layout and blocks
+    return resolve_composed(context, options, dry, layout="layout.json", folder=Path(__file__).resolve().parent,
+                            blocks={"windowed-attention": WindowedAttention})
 ```
+
+The plugin's module-level `resolve()` (compose's `resolve`) is the model before its weights (code/shape.py's
+`Shape`: layer kinds, residual, draft layer, the decoder's prefix and the KV pools, each pool's layers, heads,
+widths, positions and page type), over the checkpoint's headers alone, its pools priced by the kv_cache plugin's
+`position_bytes`: `crit plugins resolve` prints its `kv_bytes_per_token` in seconds. The load is the same `Shape` and
+makes exactly the pools it lists, and Core refuses a load whose facts are not what its plugins resolved.
 
 A mixer block has `pool` (the key of the pool its layer's state lives in: `"kv"`, `("kv", window)`, `"states"`, or a pool it declares, with `keeps_kv = False` where its layers keep no KV in the model's pools),
 `forward(h, ctx)` and, where a draft layer may run it, `write(h, ctx)` (its rows' state written, nothing read); an
@@ -251,6 +279,14 @@ its MTP layer, Qwen4Exp with its draft layer, Gemma 4 with its experts and DeepS
 tests/test_model_template.py), their matrices Q8_0.
 
 ## Not covered yet
+
+The `looped-blocks` layout reads its relative attention through crit's split-KV kernel (one pipeline stage; no
+flash structure, prompt reader or FlashInfer takes the bias), its capped SwiGLU on experts-reference and
+grouped-experts (expert-offload refuses it by name), its MXFP8 experts as their BF16 values where the experts plugin
+has no MXFP8 bundles (grouped-experts: twice their bytes), and leaves out the checkpoint's draft layer (a block
+drafter) and vision tower. The bias and the attention residuals' sums are torch's products, row-exact on the CPU and
+not yet held to the exact rows on a GPU. The released Inkling-2-Mini loads on an RTX 5090 in 42 s at 22.6 GB (context
+8,192) and decodes about 46 tokens a second greedy over grouped-experts and quantized-projections.
 
 An indexer that scores every position's own key with weighted heads (`indexed-attention` is the block-pooled form:
 unweighted heads over the mean keys of fixed blocks), a draft layer for the `latent` layout, latent attention's

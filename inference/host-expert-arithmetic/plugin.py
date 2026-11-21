@@ -214,7 +214,7 @@ class HostProjections:
         return found
 
     def exactness(self):
-        """The level the loaded matrices' rows keep (crit_kernels.exactness; Core compares it with the level the
+        """The level the loaded matrices' rows keep (crit_plugins.exactness; Core compares it with the level the
         configuration asks). Block-scaled matrices run the declared order on the CPU and on int-block-experts, a
         prompt row among them, but W4A4 prompt rows on CUDA through gemm-native (prompt_gemm native), whose sums
         follow the tile and the row count: repeatable. A 16-bit matrix multiplies through torch one row at a time,

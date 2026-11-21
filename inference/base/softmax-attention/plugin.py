@@ -35,12 +35,12 @@ class SoftmaxAttention:
 
     # -- the device form ---------------------------------------------------------------------------------------------------
     def forward(self, layer, queries, pool, batch, scale=None, blocks=None, block_size=None, parents=None, lse=False,
-                sinks=None, sliding=0, latent=0):
+                sinks=None, sliding=0, latent=0, bias=None):
         """queries [tokens][heads][dim] of a StepBatch or a RoundBatch over the pool's KV (written for this step
         already); each token sees its sequence's positions up to its own (device_attention.DeviceAttention.forward:
-        blocks, parents, lse, sinks, sliding, latent)."""
+        blocks, parents, lse, sinks, sliding, latent, bias)."""
         return self.device_form.forward(layer, queries, pool, batch, scale, blocks, block_size, parents, lse,
-                                        sinks=sinks, sliding=sliding, latent=latent)
+                                        sinks=sinks, sliding=sliding, latent=latent, bias=bias)
 
     def facts(self):
         """The device form's engine facts (device_attention.DeviceAttention.facts)."""

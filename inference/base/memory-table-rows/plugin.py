@@ -1,7 +1,8 @@
 """A lookup table in memory in the embeddings slot: rows of numbers (host form), or tables whose rows are indexed
 (device form): store(rows) returns a table handle (lookup-table-rows' Table: lookup(ids), close()), on the device, or
 with the `host` option in registered host memory read over the link (lookup-table-rows' HostRows), which frees the
-table's device memory. A plugin holds any number of tables; its own lookup(ids) reads the last one stored. Either
+table's device memory; open() (embeddings:host) reads a table the plan put off the device, from a checkpoint's files,
+into registered host memory. A plugin holds any number of tables; its own lookup(ids) reads the last one stored. Either
 lookup captures in a CUDA graph."""
 from .memory import host_memory
 from .rows import device_rows
@@ -44,6 +45,17 @@ class MemoryTableRows:
         return self.device_rows.open(rows.cpu(), rows.shape[1] * 2, dtype or torch.bfloat16, device,
                                      format=format, scales=scales.cpu(), scale=scale)
 
+    def open(self, source, width, dtype, device, format=None, scales=None, scale=1.0):
+        """A table that lies off the device (embeddings:host): source a CPU tensor of rows, or files as
+        lookup-table-rows' open() takes them ({paths, offsets, rows}, a path or a list of paths), whose rows are read
+        once into registered host memory and gathered over the link, whatever the `host` option (the table was put
+        off the device). Returns its handle."""
+        return self.device_rows.open(source, width, dtype, device, format=format, scales=scales, scale=scale,
+                                     resident=True)
+
+    def prefetch(self, ids):
+        """Nothing to read ahead: the table is in memory."""
+
     def lookup(self, ids):
         """The rows of `ids` from the last table stored. Ids outside the table raise IndexError, checked with one read
         of the device; inside a CUDA graph capture the check is left to the step that built the ids (a capture cannot
@@ -53,7 +65,9 @@ class MemoryTableRows:
     def facts(self):
         if self.device_rows.last is None:
             return {}
-        return {"embeddings": {"table": "host" if self.host else "device", "tables": len(self.device_rows.tables)}}
+        last = self.device_rows.last
+        held = "device" if last.mode == "device" else "host"
+        return {"embeddings": {"table": held, "tables": len(self.device_rows.tables)}}
 
     def close(self):
         self.device_rows.close()

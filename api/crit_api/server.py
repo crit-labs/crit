@@ -485,13 +485,14 @@ class Api:
 
     def score_request(self, body):
         """A fixed-text score request (chat-score-v1, POST /v1/crit/score): {"model", "prompt_ids",
-        "continuation_ids", "top_logprobs", "prompt_rows", "format"}, ids as the model's tokenizer numbers them;
-        prompt_rows false (default true) returns no prompt rows; format "packed" (default "json") returns each part's
-        rows as packed arrays (packed_rows)."""
+        "continuation_ids", "top_logprobs", "prompt_rows", "format", "decode_via_prompt"}, ids as the model's
+        tokenizer numbers them; prompt_rows false (default true) returns no prompt rows; format "packed" (default
+        "json") returns each part's rows as packed arrays (packed_rows); decode_via_prompt true (a debug option, on an
+        engine whose facts say decode_via_prompt) decodes the continuation through the model's prompt arithmetic."""
         if not isinstance(body, dict):
             raise RequestError("The request body must be a JSON object")
         unknown = sorted(set(body) - {"model", "prompt_ids", "continuation_ids", "top_logprobs", "prompt_rows",
-                                      "format"})
+                                      "format", "decode_via_prompt"})
         if unknown:
             raise RequestError("Unknown score parameter " + unknown[0], param=unknown[0])
         candidate = self.candidate(body.get("model"))
@@ -509,9 +510,12 @@ class Api:
             raise RequestError("prompt_rows must be a boolean", param="prompt_rows")
         if body.get("format", "json") not in SCORE_FORMATS:
             raise RequestError("format must be json or packed", param="format")
+        via_prompt = body.get("decode_via_prompt", False)
+        if type(via_prompt) is not bool:
+            raise RequestError("decode_via_prompt must be a boolean", param="decode_via_prompt")
         return {"model": body.get("model") or self.model, "candidate": candidate, "prompt_ids": body["prompt_ids"],
                 "continuation_ids": body.get("continuation_ids", []), "top_logprobs": top, "prompt_rows": prompt_rows,
-                "format": body.get("format", "json")}
+                "format": body.get("format", "json"), "decode_via_prompt": via_prompt}
 
     @contextmanager
     def tracked(self, request_id, client_id, cancel):
@@ -773,8 +777,27 @@ class Api:
             raise RequestError("Cannot serve " + model + ": " + str(exc), 409, param="model") from exc
         return candidate
 
+    def servable(self):
+        """engine.candidates() less those that do not verify (a package an older crit sealed, a model file gone):
+        they cannot be served, and a request naming one is refused with the reason (409), so the model lists leave
+        them out instead of failing for every client. The answer is kept as long as engine.candidates() keeps its
+        list, so a candidate that fails is not verified again on every listing."""
+        listed = self.engine.candidates()
+        kept = getattr(self, "_servable", None)
+        if kept is not None and kept[0] is listed:
+            return kept[1]
+        found = []
+        for candidate in listed:
+            try:
+                self.engine.spec(candidate["candidate_id"])
+            except (ValueError, EngineError):
+                continue
+            found.append(candidate)
+        self._servable = (listed, found)
+        return found
+
     def models(self):
-        return [self.card(candidate) for candidate in self.engine.candidates()]
+        return [self.card(candidate) for candidate in self.servable()]
 
     def capacity(self):
         """The default model's max_concurrent_requests (ServedEngine.capacity), None when it cannot be told (no
@@ -1375,10 +1398,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/metrics":
             return self.send_text(200, self.api.metrics.render(self.api.engine), "text/plain; version=0.0.4; charset=utf-8")
         if path == "/api/tags":
-            return self.send_json(200, {"models": [self.api.api_chat_card(c) for c in self.api.engine.candidates()]})
+            return self.send_json(200, {"models": [self.api.api_chat_card(c) for c in self.api.servable()]})
         if path == "/api/ps":
             status = self.api.engine.status()
-            loaded = [c for c in self.api.engine.candidates() if self.api.engine.loaded(c["candidate_id"], status)]
+            loaded = [c for c in self.api.servable() if self.api.engine.loaded(c["candidate_id"], status)]
             return self.send_json(200, {"models": [self.api.api_chat_card(c, status) for c in loaded]})
         self.unknown(path)
 
@@ -1583,6 +1606,7 @@ class Handler(BaseHTTPRequestHandler):
                                                               request["top_logprobs"], cancel, request["candidate"],
                                                               prompt_rows=request["prompt_rows"],
                                                               packed=request["format"] == "packed",
+                                                              decode_via_prompt=request["decode_via_prompt"],
                                                               request_id=self.request_id,
                                                               on_started=lambda _: self.api.metrics.dispatched(timing))
         except EngineError as exc:

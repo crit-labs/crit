@@ -391,9 +391,10 @@ class DraftExpertTierTests(t.Engines):
     """A checkpoint as published ones store their experts: the decoder's NVFP4 with input scales (W4A4), the draft
     layer's weight-only (W4A16). The class's engine has every expert on the device and drafts from the draft layer;
     the same package then serves with the experts in host memory. Where the CPU tier computes misses the draft
-    layer's experts stay whole on the device, outside the tier (it computes W4A4 experts only): the engine loads,
-    drafts in captured rounds and answers within rounding of the device tier's engine. Over the link every layer is
-    cached and the replies are the device tier's, token for token."""
+    layer is the cache's link layer (the tier computes W4A4 experts only): its misses admitted at once from a reserve
+    of the round's victims, as many as a decode round routes in it, and copied over the link before it reads them;
+    the engine loads, drafts in captured rounds and answers within rounding of the device tier's engine. Over the
+    link every layer is cached and the replies are the device tier's, token for token."""
     library = t.BASE + ["sequential-recurrence", "topk-router", "expert-offload", "expert-tensors",
                         "greedy-head-drafter"]
     use = {**t.USE, **MOE, "experts": "expert-offload", "recurrence": "sequential-recurrence",
@@ -423,13 +424,20 @@ class DraftExpertTierTests(t.Engines):
     def replies(self, engine):
         return [engine.generate(p, 16, stop_tokens=[], sampling=GREEDY) for p in self.prompts(3, 15)]
 
-    def test_the_cpu_tier_serves_the_decoders_misses_and_leaves_the_draft_layer_on_the_device(self):
+    def test_the_cpu_tier_serves_the_decoders_misses_and_the_link_the_draft_layers(self):
         offloaded = self.tier(tier="ram", misses="cpu")
         facts = offloaded.facts["expert_offload"]
         if facts["misses"] != "cpu":
             self.skipTest(f"no CPU tier here: {facts['reasons'].get('misses')}")
-        experts = offloaded.model.experts
-        self.assertEqual(sorted(experts.resident), [offloaded.model.expert_ids[offloaded.model.layers]])
+        experts, model = offloaded.model.experts, offloaded.model
+        draft = model.expert_ids[model.layers]
+        self.assertEqual((experts.resident, experts.link_layers), ({}, [draft]))
+        # what a captured decode round routes in it: every request's catch-up of width + 1 columns and its chain's
+        # width - 1 steps, top routes each
+        rows = model.concurrency * (model.width + 1 + model.width - 1)
+        reserve = min(experts.shape[1], rows * model.config.moe.experts_per_token)
+        self.assertEqual((sorted(experts.cache.link_layers), experts.cache.link_slots), ([draft], reserve))
+        self.assertIn("link_layers", facts["reasons"])
         self.assertEqual(offloaded.model.facts()["rounds"]["problems"], [])
         (ids,) = self.prompts(1, 150)
         scored, want = offloaded.score(ids, 1, "prefill").target, self.engine.score(ids, 1, "prefill").target
@@ -438,6 +446,19 @@ class DraftExpertTierTests(t.Engines):
             self.assertEqual(len(tokens), 16)
             self.assertEqual(result["drafted"], [2] * result["rounds"])
             self.assertGreater(result["expert_reads"], 0, result)
+
+    def test_the_draft_layer_over_the_link_replies_as_the_engine_that_holds_it_whole(self):
+        # The ranked policy keeps the draft layer whole on the device, as every policy did before link layers; under
+        # recent residency it is a link layer in the cache. Its rows are the kernel's tensor arithmetic either way
+        # and the CPU tier computes the same W4A4 misses, so the drafted replies are the same, token for token.
+        whole, link = self.tier(tier="ram", misses="cpu", policy="ranked"), self.tier(tier="ram", misses="cpu")
+        if link.facts["expert_offload"]["misses"] != "cpu":
+            self.skipTest(f"no CPU tier here: {link.facts['expert_offload']['reasons'].get('misses')}")
+        draft = link.model.expert_ids[link.model.layers]
+        self.assertEqual((sorted(whole.model.experts.resident), whole.model.experts.link_layers), ([draft], []))
+        self.assertEqual((link.model.experts.resident, link.model.experts.link_layers), ({}, [draft]))
+        self.assertEqual([tokens for tokens, _ in self.replies(link)], [tokens for tokens, _ in self.replies(whole)])
+        self.assertEqual(link.model.experts.cache.telemetry(sync=True)["failure"], 0)   # no route lost
 
     def test_over_the_link_every_layer_is_cached_and_replies_are_the_device_tiers(self):
         offloaded = self.tier(tier="ram", misses="link")
@@ -492,6 +513,7 @@ class HybridDraftTests(t.Layout):
     def test_drafted_greedy_replies_are_the_plain_ones(self):
         info = self.drafting.info()
         self.assertTrue(info["speculative"])
+        self.assertEqual(info["draft_width"], 2)   # an engine fact crit-eval's drafted ceilings read
         self.assertGreater(self.drafting.model.info()["draft_bytes_per_step"], 0)
         prompts = self.prompts(3, 13)
         plain = [self.engine.generate(p, 20, stop_tokens=[], sampling=GREEDY)[0] for p in prompts]
@@ -773,6 +795,24 @@ class OffDeviceTablesTests(StreamsTests):
 
 
 @unittest.skipIf(torch is None, "torch")
+@unittest.skipIf(sys.platform == "win32", "host memory regions need libc's mmap")
+class OffDeviceMemoryTablesTests(StreamsTests):
+    """The same off-device tables through memory-table-rows (embeddings:host): the plain embeddings plugin reads
+    each table the plan put off the device from the checkpoint's files once into registered host memory (the
+    Flash-Next build's candidate that refused at load with "does not provide embeddings:host"), and every comparison
+    of StreamsTests holds."""
+    plugin_options = {**StreamsTests.plugin_options, "device-placement": {"off_device": "tables."}}
+
+    def test_the_tables_the_plan_puts_off_the_device_are_held_in_host_memory(self):
+        model = self.engine.model
+        self.assertTrue(any(name.startswith("tables.") for name in model.placed))
+        self.assertEqual({name: place for name, place in model.placed.items() if name.startswith("tables.")},
+                         {name: "host" for name in model.placed if name.startswith("tables.")})
+        self.assertEqual(model.embed.mode, "mapped")
+        self.assertEqual(model.decoder[1].before[0].table.mode, "mapped")
+
+
+@unittest.skipIf(torch is None, "torch")
 class PublishedStreamsTests(StreamsTests):
     """The Qwen4Exp checkpoint stored as NVIDIA's NVFP4 Flash-Next stores its own: the hashed n-gram table as E4M3
     codes with one BF16 multiplier for the table (weight_scale), the draft layer's routed experts a matrix each in
@@ -990,6 +1030,97 @@ class SandwichHostTierTests(SandwichTests):
         self.assertEqual((facts["tier"], facts["misses"], facts["slots"]), ("ram", "link", 16))
         self.assertEqual(self.engine.model.experts.activation, "gelu_tanh")
         self.assertTrue(self.engine.model.facts()["passes"]["on"])
+
+
+LOOPED = dict(vocab_size=288, unpadded_vocab_size=272, hidden_size=64, num_hidden_layers=6, num_attention_heads=4,
+              num_key_value_heads=2, head_dim=16, swa_num_attention_heads=4, swa_num_key_value_heads=2, swa_head_dim=16,
+              sliding_window_size=8, d_rel=4, rel_extent=8, log_scaling_n_floor=4, qk_l2_clip_threshold=2.0,
+              rel_l2_clip_threshold=1.0, n_layers_per_attn_res_block=2, moe_intermediate_size=64, n_routed_experts=8,
+              num_experts_per_tok=2, loop_layer_index_start=2, loop_layer_index_end=4, loop_num_passes=3,
+              loop_gate_rank=8, eos_token_id=2, pad_token_id=0,
+              layer_types=["hybrid_sliding", "hybrid", "hybrid_sliding", "hybrid", "hybrid_sliding", "hybrid"])
+
+
+@unittest.skipIf(torch is None, "torch")
+class LoopedTests(t.Layout):
+    """The looped-blocks layout: an Inkling 2 loop checkpoint (its middle span of layers run three times, the later
+    passes taking messages from the pass before; attention residuals over blocks of two layers; sliding and full layers
+    of relative attention with learned sinks a token, short convolutions over keys and values, dynamic ones in the full
+    layers, and after the attention and the FFN; experts routed by sigmoid scores with a correction bias, gated by a
+    capped SwiGLU; a head of fewer rows than the vocabulary), its BF16 weights computed by transformers in FP32. The
+    window and the bias's reach are 8 positions and the log scaling starts at position 4, so the prompts here cross
+    all three."""
+    library = t.BASE + ["sequential-recurrence", "topk-router", "experts-reference", "expert-tensors"]
+    use = {**t.USE, **MOE, "recurrence": "sequential-recurrence"}
+    plugin_options = {"topk-router": {"scoring": "sigmoid", "score_before_selection": True, "renormalize": True,
+                                      "scaling": 8.0}}
+    reference_fp32 = on_average = sharp_routes = True
+    flips = 0.02   # sigmoid scores near 1 under the sharpened router may tie within BF16's step: a route flips
+
+    @classmethod
+    def checkpoint(cls, root):
+        try:
+            from transformers.models.inkling2_loop.configuration_inkling2_loop import Inkling2LoopTextConfig
+            from transformers.models.inkling2_loop.modeling_inkling2_loop import Inkling2LoopForCausalLM
+        except ImportError:
+            return None
+        model = Inkling2LoopForCausalLM(Inkling2LoopTextConfig(**LOOPED))
+        with torch.no_grad():   # the parts the reference starts at zero or one, random so each one counts
+            for name, parameter in model.named_parameters():
+                if name.endswith((".query", "static_weight", "e_score_correction_bias")):
+                    parameter.normal_(0.0, 0.5)
+                elif name.endswith(".scale"):
+                    parameter.copy_(1.0 + 0.3 * torch.randn_like(parameter))
+                elif "conv" in name and name.endswith("conv1d.weight"):
+                    parameter.normal_(0.0, 0.3)
+            for name, buffer in model.named_buffers():
+                if name.endswith("e_score_correction_bias"):
+                    buffer.normal_(0.0, 0.05)
+        return cls.save(model, root)
+
+    def test_each_pass_of_a_looped_layer_keeps_its_own_kv_and_windows_and_shares_its_weights(self):
+        model = self.engine.model
+        self.assertEqual(model.facts()["layout"], "looped-blocks")
+        self.assertEqual(model.sources, (0, 1, 2, 3, 2, 3, 2, 3, 4, 5))
+        self.assertEqual(model.layers, 10)
+        first, again = model.decoder[2].mixer, model.decoder[4].mixer
+        self.assertIs(first.query_rows[0], again.query_rows[0])   # one checkpoint layer's matrices, loaded once
+        self.assertEqual(sorted(model.pools[("kv", 8)].layers), [0, 2, 4, 6, 8])
+        self.assertEqual(sorted(model.pools["kv"].layers), [1, 3, 5, 7, 9])
+        self.assertEqual(model.expert_ids[2], model.expert_ids[4])
+
+
+@unittest.skipIf(torch is None, "torch")
+class LoopedGroupedTests(LoopedTests):
+    """The looped engine with grouped-experts in the experts slot: its kernel's capped SwiGLU over the BF16 experts."""
+    library = t.BASE + ["sequential-recurrence", "topk-router", "grouped-experts", "expert-tensors"]
+    use = {**LoopedTests.use, "experts": "grouped-experts"}
+    devices = ("cuda",)
+
+
+@unittest.skipIf(torch is None, "torch")
+class LoopedOffloadTests(LoopedTests):
+    """The looped engine with expert-offload in the experts slot, every expert on the device: each pass of a looped
+    layer reads the same layer's experts (one experts slot a checkpoint layer)."""
+    library = t.BASE + ["sequential-recurrence", "topk-router", "expert-offload", "expert-tensors"]
+    use = {**LoopedTests.use, "experts": "expert-offload"}
+    devices = ("cuda",)
+    plugin_options = {**LoopedTests.plugin_options, "expert-offload": {"tier": "device", "misses": "link"}}
+
+
+@unittest.skipIf(torch is None, "torch")
+class LoopedHostTierTests(LoopedOffloadTests):
+    """The looped engine with its experts in host memory behind a device cache of half of them: a looped layer's
+    passes come back to experts the cache may have let go (24 slots of the 48 experts)."""
+    plugin_options = {**LoopedTests.plugin_options,
+                      "expert-offload": {"tier": "ram", "misses": "link", "settings": "offload.json"}}
+
+    @classmethod
+    def checkpoint(cls, root):
+        (root / "package").mkdir(parents=True, exist_ok=True)
+        (root / "package" / "offload.json").write_text('{"options": {"expert-offload": {"slots": 24}}}',
+                                                       encoding="utf-8")
+        return super().checkpoint(root)
 
 
 if __name__ == "__main__":

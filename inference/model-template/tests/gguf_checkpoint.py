@@ -160,10 +160,11 @@ def _write(path, metadata, tensors):
     path.write_bytes(head + bytes(body))
 
 
-def write_gguf(folder, out, arch, quantize=True):
+def write_gguf(folder, out, arch, quantize=True, dense=()):
     """The safetensors checkpoint in `folder` written to out/model.gguf as GGUF's converter writes `arch`; returns
     (the GGUF's path, {hf name: the values the file stores, FP32 in the Hugging Face layout} of every quantized
-    tensor)."""
+    tensor). dense: Hugging Face name endings of matrices kept F32 as the file's other tensors (a GGUF stores some
+    matrices so: routers, small gates)."""
     import numpy as np
     import torch
     from safetensors.torch import load_file
@@ -188,7 +189,7 @@ def write_gguf(folder, out, arch, quantize=True):
     def stored(hf_name, w, rows=None, inputs=None):
         """A matrix's stored tensor data and kind: Q8_0 (its values to the reference) or F32, orders applied."""
         w = w.float().numpy()
-        matrix = quantize and w.ndim == 2 and w.shape[1] % 32 == 0 and w.shape[0] > 1
+        matrix = quantize and w.ndim == 2 and w.shape[1] % 32 == 0 and w.shape[0] > 1 and not hf_name.endswith(dense)
         if matrix:
             raw, back = q8_0(w)
             values[hf_name] = back

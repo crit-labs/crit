@@ -115,6 +115,10 @@
   ],
   "kernels": [
     {
+      "name": "cpu-routes",
+      "fallback": "the host path: the CPU tier served outside the stream, a synchronization a layer (not capture-safe)"
+    },
+    {
       "name": "grouped-experts",
       "fallback": "DeclaredRoutes: the declared order in torch, one route at a time (exact, slow)"
     }

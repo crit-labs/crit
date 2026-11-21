@@ -89,6 +89,52 @@ class PackageCheckTests(PackageFixture, unittest.TestCase):
                 check_package(self.package, self.model, {**self.configuration(), "exactness": wrong}, device="cpu")
         check_package(self.package, self.model, {**self.configuration(), "exactness": "row-exact"}, device="cpu")
 
+    def test_a_quality_mode_asks_its_levels_wherever_the_package_loads(self):
+        # One resolution of the levels, crit run's and the loader's: a configuration that states a quality mode and no
+        # exactness asks the mode's levels, and one that names a phase takes the mode's for the other.
+        sys.path.insert(0, str(ROOT / "kernels"))
+        from crit_core.engine import exactness_levels
+        exact = {"decode": "row-exact", "prompt": "exact"}
+        self.assertEqual(exactness_levels({"quality_mode": "speed"}), exact)
+        self.assertEqual(exactness_levels({"quality_mode": "preserve"}), exact)
+        self.assertEqual(exactness_levels({"quality_mode": "speed", "exactness": {"prompt": "repeatable"}}),
+                         {"decode": "row-exact", "prompt": "repeatable"})
+        with self.assertRaisesRegex(PluginError, 'configuration "quality_mode"'):
+            exactness_levels({"quality_mode": "fast"})
+
+    def test_the_run_s_vram_headroom_is_the_device_s_to_keep(self):
+        # crit run writes the run's headroom into every candidate (vram_headroom_bytes); the loader gives it to the
+        # device, which keeps it free at every moment of the engine's steps, and no plugin option sizes it.
+        from crit_core.engine import headroom_of
+        from crit_plugins import memory
+        self.assertEqual(headroom_of({}), memory.HEADROOM)
+        self.assertEqual(headroom_of({"vram_headroom_bytes": 1 << 30}), 1 << 30)
+        for wrong in (-1, 0.5, "1GiB", True):
+            with self.subTest(wrong=wrong), self.assertRaisesRegex(PluginError, 'configuration "vram_headroom_bytes"'):
+                check_package(self.package, self.model, {**self.configuration(), "vram_headroom_bytes": wrong},
+                              device="cpu")
+
+    def test_a_configuration_asks_prompt_activations_in_the_form_eval_reads(self):
+        from crit_core.engine import activation_problems, activations_of
+        self.assertIsNone(activations_of({}))
+        self.assertEqual(activations_of({"prompt_activations": "stored"}), "stored")
+        self.assertEqual(activations_of({"prompt_activations": {"nvfp4": "stored", "fp8": "fp8"}}),
+                         {"nvfp4": "stored", "fp8": "fp8"})
+        for wrong in ("int4", {"nvfp4": "int4"}, {}, 3):
+            with self.subTest(wrong=wrong), self.assertRaisesRegex(PluginError, 'configuration "prompt_activations"'):
+                check_package(self.package, self.model, {**self.configuration(), "prompt_activations": wrong},
+                              device="cpu")
+        # What the engine's facts serve against what is asked: one activation for every format, or one each.
+        served = {"prompt_activations": {"nvfp4": "stored", "mxfp8": "bf16"},
+                  "chosen": {"mxfp8_activations": "mxfp8_activations auto by quality mode preserve"}}
+        self.assertEqual(activation_problems(None, served), [])
+        self.assertEqual(activation_problems({"nvfp4": "stored", "mxfp8": "bf16"}, served), [])
+        self.assertEqual(activation_problems("stored", {}), [])   # no quantized format's prompt rows
+        problem, = activation_problems("stored", served)
+        self.assertIn('multiply {"mxfp8": "bf16", "nvfp4": "stored"}', problem)
+        self.assertIn("mxfp8_activations auto by quality mode preserve", problem)
+        self.assertIn('asks "stored"', problem)
+
     def test_an_engine_fills_every_required_slot_on_its_device(self):
         configuration = self.configuration()
         del configuration["plugins"]["use"]["sampler"]
@@ -542,6 +588,116 @@ class LoadTests(PackageFixture, unittest.TestCase):
         self.addCleanup(second.close)
         self.assertEqual((second.info()["speculative"], second.info()["plugins"]["drafter"]), (False, None))
 
+    def test_core_counts_the_drafts_of_the_requests_it_retires(self):
+        # Core's own count of drafting (telemetry core.drafts), which crit run serve --check judges whatever the model
+        # plugin is: the rounds that drafted, the drafts proposed where every round's count is known, those accepted.
+        engine = load(write_package(self.root / "drafting-counts", drafting=True), self.model, device="cpu")
+        self.addCleanup(engine.close)
+        before = engine.telemetry()["core"].get("drafts") or {}   # the warm requests drafted at load
+        _, result = engine.generate([5, 6], 6, stop_tokens=[])
+        after = engine.telemetry()["core"]["drafts"]
+        self.assertEqual(after["requests"] - before.get("requests", 0), 1)
+        self.assertEqual(after["rounds"] - before.get("rounds", 0), len(result["accepted"]))
+        self.assertEqual(after["accepted"] - before.get("accepted", 0), sum(result["accepted"]))
+        self.assertGreater(after["accepted"], 0)
+        engine.generate([5, 6], 4, stop_tokens=[], plain=True)   # a plain request drafts nothing
+        self.assertEqual(engine.telemetry()["core"]["drafts"]["requests"], after["requests"])
+
+    def test_the_loader_gives_the_device_the_configured_headroom_and_frames_every_step_with_it(self):
+        from unittest import mock
+        from crit_plugins import memory
+        device = memory.of("cpu")
+        self.addCleanup(setattr, device, "headroom", device.headroom)
+        seen = []
+        begin, end = device.begin_step, device.end_step
+        with mock.patch.object(device, "begin_step", lambda tokens, score=False: (seen.append(("begin", tokens)),
+                                                                                  begin(tokens, score))),                 mock.patch.object(device, "end_step", lambda open_=False: (seen.append(("end", open_)), end(open_))):
+            engine = load(self.package, self.model, {**self.configuration(), "vram_headroom_bytes": 3 << 28},
+                          device="cpu")
+            try:
+                self.assertEqual(device.headroom, 3 << 28)
+                del seen[:]
+                engine.generate([5, 6, 7], 2, stop_tokens=[])
+                self.assertEqual(seen[0], ("begin", 3))   # the prompt step, then its decode steps
+                self.assertIn(("end", False), seen)
+            finally:
+                engine.close()
+
+    def test_the_warm_requests_reach_every_length_the_model_says_its_paths_switch_at(self):
+        # A sparse attention selects its blocks past a budget no short warm prompt reaches: its kernels compiled on
+        # the first long request. A model states such lengths (info's warm_prompts) and Core serves each at load.
+        from crit_core.engine import WARM_PROMPTS, warm_requests
+
+        class Stub:
+            def __init__(self, info):
+                self._info, self.lengths = info, []
+
+            def info(self):
+                return self._info
+
+            def generate(self, prompt, output_tokens, **options):
+                self.lengths.append(len(prompt))
+                return [1] * output_tokens, {}
+
+            def score(self, *args, **kwargs):
+                return None
+        stub = Stub({"vocabulary": 100, "context": 8192, "warm_prompts": [3109, 3109, 0, "x"]})
+        ran = warm_requests(stub)
+        self.assertIn("prompt:3109", ran)
+        self.assertEqual(stub.lengths.count(3109), 1)
+        for length in WARM_PROMPTS:
+            self.assertIn(f"prompt:{length}", ran)
+        short = Stub({"vocabulary": 100, "context": 2048, "warm_prompts": [3109]})   # bounded by the context
+        self.assertIn(f"prompt:{2048 - 4 - 1}", warm_requests(short))
+
+    def test_the_warm_requests_run_the_largest_prompt_and_score_steps_the_arena_is_measured_by(self):
+        # The step arena is what the load's steps took: an 8-token score left a long score's logits and their ranking
+        # at a full slice of rows unmeasured. Core serves a prompt and a scored text of the longest chunk a budget gives.
+        from crit_core.engine import TOP_LOGPROBS, WARM_PROMPTS, warm_requests
+
+        class Stub:
+            def __init__(self, context):
+                self.context, self.prompts, self.scores = context, [], []
+
+            def info(self):
+                return {"vocabulary": 100, "context": self.context}
+
+            def generate(self, prompt, output_tokens, **options):
+                self.prompts.append(len(prompt))
+                return [1] * output_tokens, {}
+
+            def score(self, ids, first_target, path="", top_k=0, **options):
+                self.scores.append((len(ids), top_k))
+        stub = Stub(8192)
+        ran = warm_requests(stub, largest=2048)
+        self.assertIn((2048, TOP_LOGPROBS), stub.scores)
+        self.assertIn(2048, stub.prompts)
+        self.assertIn("score:2048", ran)
+        stub = Stub(8192)
+        warm_requests(stub)   # no budget: a score as long as the longest warm prompt
+        self.assertIn((WARM_PROMPTS[-1], TOP_LOGPROBS), stub.scores)
+        stub = Stub(1024)
+        warm_requests(stub, largest=2048)   # within the context
+        self.assertIn((1023, TOP_LOGPROBS), stub.scores)
+
+    def test_core_watches_what_an_engine_compiles_once_its_load_is_over(self):
+        try:
+            import torch.utils.cpp_extension as extension
+        except ImportError:
+            self.skipTest("torch is not installed")
+        original = extension._jit_compile
+        extension._jit_compile = lambda name, *args, **kwargs: f"built {name}"   # stands in for a real build
+        self.addCleanup(setattr, extension, "_jit_compile", original)
+        engine = load(self.package, self.model, device="cpu")
+        try:
+            self.assertEqual(engine.telemetry()["core"]["compiles_after_load"], {"count": 0, "first": []})
+            self.assertEqual(extension._jit_compile("crit_toy_kernels"), "built crit_toy_kernels")
+            self.assertEqual(engine.telemetry()["core"]["compiles_after_load"],
+                             {"count": 1, "first": ["torch extension build or load of crit_toy_kernels"]})
+        finally:
+            engine.close()
+        self.assertEqual(extension._jit_compile("again"), "built again", "the builder is put back at close")
+
     def test_resident_serves_chat_requests_concurrently(self):
         context = types.SimpleNamespace(configuration={"label": "run"}, limits={"kv_tokens": 1024},
                                         model_file=lambda name: str(self.model / name))
@@ -746,7 +902,7 @@ class PackageExactnessTests(PackageFixture, unittest.TestCase):
         self.assertEqual(self.kernels.quality_mode(), "speed")
         self.assertIsNone(core_engine.package_quality_mode({}))   # a package that states none: every option decides
         self.assertIsNone(self.kernels.quality_mode())
-        with self.assertRaisesRegex(PluginError, 'configuration "quality_mode" is one of speed, preserve, '
+        with self.assertRaisesRegex(PluginError, 'configuration "quality_mode" is one of preserve, speed, '
                                                  "not 'fast'"):
             core_engine.package_quality_mode({"quality_mode": "fast"})
 
@@ -754,8 +910,26 @@ class PackageExactnessTests(PackageFixture, unittest.TestCase):
         self.assertEqual(core_engine.package_exactness({"exactness": {"decode": "row-exact", "prompt": "repeatable"}}),
                          {"decode": "row-exact", "prompt": "repeatable"})
         self.assertEqual(self.kernels.asks("prompt"), "repeatable")
+        # a quality mode alone asks its levels (exact in both modes), as crit run completes a candidate
+        self.assertEqual(core_engine.package_exactness({"quality_mode": "speed"}),
+                         {"decode": "row-exact", "prompt": "exact"})
+        self.assertEqual(self.kernels.asks("prompt"), "exact")
         self.assertIsNone(core_engine.package_exactness({}))
         self.assertIsNone(self.kernels.exactness())
+
+    def test_the_asked_prompt_activations_are_told_to_the_plugins(self):
+        self.addCleanup(self.kernels.use_activations, None)
+        self.assertEqual(core_engine.package_activations({"prompt_activations": {"nvfp4": "stored", "mxfp8": "bf16",
+                                                                                 "fp8": {"fp8": 1.0}}}),
+                         {"nvfp4": "stored", "mxfp8": "bf16", "fp8": {"fp8": 1.0}})
+        self.assertEqual(self.kernels.activation("nvfp4"), "stored")
+        self.assertEqual(self.kernels.activation("mxfp8"), "bf16")
+        self.assertIsNone(self.kernels.activation("fp8"))     # a mix asks nothing of the format
+        self.assertIsNone(self.kernels.activation("int4_zp"))
+        core_engine.package_activations({"prompt_activations": "fp8"})
+        self.assertEqual(self.kernels.activation("nvfp4"), "fp8")
+        self.assertIsNone(core_engine.package_activations({}))
+        self.assertIsNone(self.kernels.activation("nvfp4"))
 
     @unittest.skipUnless(STEP_LIBRARY, "Core's runtime crit_core_steps is not built: `crit core build` builds it")
     def test_an_engine_says_what_it_asks_and_one_that_keeps_less_is_refused(self):
@@ -764,9 +938,10 @@ class PackageExactnessTests(PackageFixture, unittest.TestCase):
         asked = {"decode": "row-exact", "prompt": "exact"}
         configuration = {**self.configuration(), "exactness": "exact"}
         engine = load(self.package, self.model, configuration, device="cpu")
-        try:   # the toy's plugins state no level: the engine says what it asks
+        try:   # the toy's plugins state no level: the engine says what it asks, in its own policy
             self.assertEqual(engine.facts["exactness"], {"asked": asked})
-            self.assertEqual(self.kernels.exactness(), asked)
+            self.assertEqual(engine.policy.exactness, asked)
+            self.assertIsNone(self.kernels.exactness())   # outside the engine the process asks nothing
         finally:
             engine.close()
         kept = {"asked": asked, "decode": "row-exact", "prompt": "repeatable",
@@ -778,9 +953,63 @@ class PackageExactnessTests(PackageFixture, unittest.TestCase):
         engine = load(self.package, self.model, device="cpu")   # a package that asks nothing
         try:
             self.assertNotIn("exactness", engine.facts)
-            self.assertIsNone(self.kernels.exactness())
+            self.assertIsNone(engine.policy.exactness)
         finally:
             engine.close()
+
+    @unittest.skipUnless(STEP_LIBRARY, "Core's runtime crit_core_steps is not built: `crit core build` builds it")
+    def test_an_engine_that_serves_other_prompt_activations_than_asked_is_refused_at_load(self):
+        from unittest import mock
+        from crit_plugins.assemble import Assembly
+        self.addCleanup(self.kernels.use_activations, None)
+        facts = Assembly.facts
+        served = {"nvfp4": "stored", "mxfp8": "bf16"}
+
+        def serving(assembly):
+            return {**facts(assembly), "prompt_activations": dict(served)}
+        configuration = {**self.configuration(), "prompt_activations": "stored"}
+        with mock.patch.object(Assembly, "facts", serving):
+            with self.assertRaisesRegex(PluginError, 'the engine is not what it is asked: its prompt rows multiply '
+                                                     r'\{"mxfp8": "bf16", "nvfp4": "stored"\}'):
+                load(self.package, self.model, configuration, device="cpu")
+            engine = load(self.package, self.model, {**configuration, "prompt_activations": served}, device="cpu")
+            engine.close()
+
+    @unittest.skipUnless(STEP_LIBRARY, "Core's runtime crit_core_steps is not built: `crit core build` builds it")
+    def test_an_engine_that_is_not_what_its_plugins_resolved_before_the_load_is_refused(self):
+        # The plugins' resolve() runs before any plugin is made (no weights, no device): a load that makes another
+        # engine than it resolved is refused, so the answer crit run checks a plan against is what every load gives.
+        from unittest import mock
+        self.assertEqual(core_engine.resolve_package(self.package, self.model, device="cpu"),
+                         {"facts": {}, "by": {}})   # the toy's plugins resolve nothing
+        wrong = {"facts": {"kv_bytes_per_token": 64}, "by": {"kv_bytes_per_token": "toy-model"}}
+        with mock.patch.object(core_engine, "resolve_selection", lambda *args: wrong):
+            with self.assertRaisesRegex(PluginError, "not what its plugins resolved it to be before the load: "
+                                                     "toy-model's resolve\\(\\) states kv_bytes_per_token 64, and "
+                                                     "the loaded engine None"):
+                load(self.package, self.model, device="cpu")
+        right = {"facts": {"plugins": self.configuration()["plugins"]["use"]}, "by": {"plugins": "toy-model"}}
+        with mock.patch.object(core_engine, "resolve_selection", lambda *args: right):
+            engine = load(self.package, self.model, device="cpu")
+        try:
+            self.assertEqual(engine.telemetry()["load"]["resolved"], right["facts"])
+        finally:
+            engine.close()
+
+    def test_crit_plugins_resolve_prints_what_the_plugins_answer_before_a_load(self):
+        import contextlib
+        import io
+        from crit.plugins import main
+        from crit.resolve import render
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            self.assertEqual(main(["resolve", str(self.package), "--model", str(self.model), "--json"]), 0)
+        self.assertEqual(json.loads(printed.getvalue()), {"facts": {}, "by": {}, "context": None})
+        self.assertIn("no plugin of the selection resolves anything", render({"facts": {}, "by": {}}))
+        self.assertEqual(render({"facts": {"kv_bytes_per_token": 1 << 20}, "by": {"kv_bytes_per_token": "a + b"}},
+                                2048),
+                         "kv_bytes_per_token: 1048576  (a + b)\nKV at 2,048 tokens: 2.00 GiB (sliding windows' "
+                         "rings apart)")
 
 
 class PackageTuningTests(unittest.TestCase):
@@ -801,8 +1030,105 @@ class PackageTuningTests(unittest.TestCase):
 
 
 class ReleaseThresholdTests(unittest.TestCase):
-    def test_the_release_threshold_is_the_engines_or_the_runs_headroom_never_a_constant(self):
-        self.assertEqual(core_engine.release_threshold({}, {"vram_headroom_bytes": 3 << 30}), 3 << 30)
-        self.assertEqual(core_engine.release_threshold({"release_below_mib": 640}, {"vram_headroom_bytes": 1}), 640 << 20)
-        self.assertIsNone(core_engine.release_threshold({"release_below_mib": 0}, {"vram_headroom_bytes": 1 << 30}))
-        self.assertIsNone(core_engine.release_threshold({}, {}))
+    def test_the_release_threshold_is_the_configurations_or_what_the_next_step_needs_never_a_constant(self):
+        import types
+        from crit_plugins.steps import Steps
+        memory = types.SimpleNamespace(headroom=3 << 30, arena=1 << 30)
+        self.assertEqual(Steps(memory=memory).threshold(), 4 << 30)   # the run's headroom and the step arena
+        override = core_engine.release_override({"release_below_mib": 640})
+        self.assertEqual(Steps(release_below=override, memory=memory).threshold(), 640 << 20)
+        self.assertIsNone(Steps(release_below=core_engine.release_override({"release_below_mib": 0}),
+                                memory=memory).threshold())
+        self.assertIsNone(Steps().threshold())   # no device memory: nothing to hand back
+        self.assertIsNone(core_engine.release_override({}))
+        with self.assertRaises(PluginError):
+            core_engine.release_override({"release_below_mib": -1})
+
+
+class KeptStoreTests(PackageFixture, unittest.TestCase):
+    """A host-side store a plugin builds from the checkpoint (LoadContext.keep) is kept for the next engine built for
+    the model: by its keeper, one store a name, replaced (and closed first) when asked under another key."""
+
+    def test_a_keeper_keeps_one_store_a_name_until_it_closes(self):
+        from crit_core.kept import Kept
+        kept, closed = Kept(), []
+        first = kept.keep("store", {"layout": 1}, lambda: ["a"], closed.append, nbytes=64)
+        kept.release("store")
+        self.assertIs(kept.keep("store", {"layout": 1}, lambda: ["b"], closed.append), first)
+        self.assertEqual(kept.report(), {"store": {"nbytes": 64, "users": 1, "reused": 1}})
+        with self.assertRaisesRegex(ValueError, "held by an engine under another key"):
+            kept.keep("store", {"layout": 2}, lambda: ["c"], closed.append)
+        with self.assertRaisesRegex(ValueError, "an engine still holds: store"):
+            kept.close()
+        kept.release("store")
+        other = kept.keep("store", {"layout": 2}, lambda: ["c"], closed.append)
+        self.assertEqual((other, closed), (["c"], [["a"]]))   # the old one closed before the new one was built
+        self.assertEqual(kept.nbytes("store"), 0)   # held: no engine to come has its memory
+        kept.release("store")
+        kept.keep("other", 1, lambda: ["d"], closed.append, nbytes=32)
+        kept.release("other")
+        self.assertEqual(kept.nbytes("other"), 32)
+        kept.drop("other")   # an engine that will not ask for it frees it first
+        self.assertEqual((kept.nbytes("other"), closed[-1]), (0, ["d"]))
+        kept.close()
+        self.assertEqual((closed, kept.report()), ([["a"], ["d"], ["c"]], {}))
+
+    def test_a_load_context_keeps_its_stores_where_its_keeper_is(self):
+        from crit_core.engine import LoadContext
+        from crit_core.kept import Kept
+        builds, closed = [], []
+
+        def build():
+            builds.append(1)
+            return {"store": len(builds)}
+        keeper = Kept()
+        for _ in range(2):   # two engines in one process: the second gets the first one's store
+            context = LoadContext(self.package, self.model, {}, device="cpu", kept=keeper)
+            self.assertEqual(context.keep("toy:store", ["ckpt", 1], build, closed.append), {"store": 1})
+            context.release_kept()
+        self.assertEqual((len(builds), closed), (1, []))
+        keeper.close()
+        self.assertEqual(closed, [{"store": 1}])
+        # Without a keeper the store is the engine's, closed with it.
+        alone = LoadContext(self.package, self.model, {}, device="cpu")
+        alone.keep("toy:store", ["ckpt", 1], build, closed.append)
+        alone.release_kept()
+        self.assertEqual(closed, [{"store": 1}, {"store": 2}])
+
+    def test_crit_evals_engines_keep_stores_for_one_model_at_a_time(self):
+        from crit_core.engine import eval_kept, eval_release
+        self.addCleanup(eval_release)
+        closed = []
+        kept = eval_kept(self.model)
+        self.assertIs(eval_kept(self.model), kept)
+        kept.keep("toy:store", ["ckpt"], lambda: "a", closed.append)
+        kept.release("toy:store")
+        other = eval_kept(self.root / "another-model")   # another model: the first one's stores go
+        self.assertIsNot(other, kept)
+        self.assertEqual(closed, ["a"])
+        other.keep("toy:store", ["ckpt"], lambda: "b", closed.append)
+        other.release("toy:store")
+        eval_release()
+        self.assertEqual(closed, ["a", "b"])
+
+    @unittest.skipUnless(STEP_LIBRARY, "needs Core's crit_core_steps library")
+    def test_evals_next_engine_finds_the_store_its_plugin_kept(self):
+        # The toy projections plugin keeps a store; crit-eval opens two engines of the package one after the other
+        # (crit eval ab's rounds) and the second one's plugin gets the first one's store without building it.
+        plugin = self.package / "plugins" / "toy-projections" / "plugin.py"
+        builds = self.root / "builds.txt"
+        plugin.write_text(plugin.read_text(encoding="utf-8").replace(
+            "def create(context, options, parts):\n    return Projections()",
+            "def create(context, options, parts):\n"
+            "    def build():\n"
+            f"        with open({str(builds)!r}, 'a') as out:\n"
+            "            out.write('built' + chr(10))\n"
+            "        return ['store']\n"
+            "    context.keep('toy:store', ['ckpt'], build)\n"
+            "    return Projections()"), encoding="utf-8")
+        from crit_core.engine import eval_release
+        self.addCleanup(eval_release)
+        for _ in range(2):
+            engine = eval_v1({"model": str(self.model), "config": {"package": str(self.package)}})
+            engine.close()
+        self.assertEqual(builds.read_text(encoding="utf-8"), "built\n")

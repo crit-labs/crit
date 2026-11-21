@@ -9,6 +9,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
           "Tensor beta, float scale) -> ()");
   ops.def("gated_delta_prefill_tc(Tensor! out, Tensor! state, Tensor q, Tensor k, Tensor v, Tensor log_decay, "
           "Tensor beta, float scale) -> ()");
+  ops.def("gated_delta_chunk_rows_tc(Tensor! out, Tensor! states_out, Tensor states_in, Tensor q, Tensor k, Tensor v, "
+          "Tensor log_decay, Tensor beta, Tensor meta, int widest, float scale) -> ()");
   ops.def("gated_delta_scan(Tensor! out, Tensor! state, Tensor q, Tensor k, Tensor v, Tensor log_decay, "
           "Tensor beta, float scale, Tensor? checkpoints) -> ()");
   ops.def("ssd_prefill(Tensor! out, Tensor! state, Tensor x, Tensor dt, Tensor B, Tensor C, Tensor A, Tensor? D) -> ()");
@@ -24,12 +26,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
           "int layer, int layers, int capacity, bool silu) -> ()");
   ops.def("conv_segments(Tensor! out, Tensor window_in, Tensor! window_out, Tensor x, Tensor weight, Tensor? bias, "
           "bool silu) -> ()");
+  ops.def("conv_segments_rows(Tensor! out, Tensor windows_in, Tensor! windows_out, Tensor x, Tensor meta, Tensor weight, "
+          "Tensor? bias, int widest, bool silu) -> ()");
   ops.def("pool_conv_prompt(Tensor! out, Tensor! window, Tensor stash, Tensor! pending, Tensor x, Tensor weight, "
           "Tensor? bias, Tensor meta, int layer, int capacity, bool silu) -> ()");
 #if defined(CUDA_KERNEL)
   ops.impl("causal_conv1d", torch::kCUDA, &causal_conv1d);
   ops.impl("gated_delta_prefill", torch::kCUDA, &gated_delta_prefill);
   ops.impl("gated_delta_prefill_tc", torch::kCUDA, &gated_delta_prefill_tc);
+  ops.impl("gated_delta_chunk_rows_tc", torch::kCUDA, &gated_delta_chunk_rows_tc);
   ops.impl("gated_delta_scan", torch::kCUDA, &gated_delta_scan);
   ops.impl("ssd_prefill", torch::kCUDA, &ssd_prefill);
   ops.impl("ssd_scan", torch::kCUDA, &ssd_scan);
@@ -37,6 +42,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("pool_delta_replay", torch::kCUDA, &pool_delta_replay);
   ops.impl("pool_conv", torch::kCUDA, &pool_conv);
   ops.impl("conv_segments", torch::kCUDA, &conv_segments);
+  ops.impl("conv_segments_rows", torch::kCUDA, &conv_segments_rows);
   ops.impl("pool_conv_prompt", torch::kCUDA, &pool_conv_prompt);
 #endif
 }

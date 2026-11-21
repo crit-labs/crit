@@ -65,6 +65,6 @@ weight, check it against the FP64 product of the dequantized operands and for ro
 and 4096 rows. Plugins load it with `crit_plugins.kernels.load_kernel("pinned-gemm", ...)`, built with the engine's
 tuning (`CRIT_KERNEL_TUNING`) or the default knobs.
 
-The cuBLASLt calls follow crit's recorded-selection technique (pinned GEMMs, Apache-2.0), with the choice made
-without timing and the library opened from the process.
+The cuBLASLt calls follow the pinned GEMMs of crit's former recorded-selection technique (Apache-2.0), with the
+choice made without timing and the library opened from the process.
 

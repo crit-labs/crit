@@ -123,6 +123,9 @@ declares and the official code ignores).
 - Is the model-specific part, if there is one, in the engine package behind a general
   interface?
 - Does the change add a second copy of something crit already has?
+- Does it decide how an engine computes or schedules on the device (a level, a default, a budget, the order of
+  requests)? Then it is Core's ([what Core decides](../core/README.md#what-core-decides)), and every other place
+  reads Core's answer.
 - Do the host suite and, for native code, the CMake suite pass?
 
 When the answer to any of these is unclear, keep the change in the engine and record

@@ -894,6 +894,17 @@ class SwiGLU:
         return ctx.mm(gated, self.down)
 
 
+def _mx_values(torch, stored):
+    """An MXFP8 matrix's exact values in BF16: each E4M3 code times 2 ** (its E8M0 scale - 127), one scale a 32."""
+    codes, scales = stored["weight"], stored["scale"]
+    factors = torch.exp2(scales.float() - 127.0).repeat_interleave(32, dim=-1)[..., :codes.shape[-1]]
+    values = codes.float() * factors
+    found = values.to(torch.bfloat16)
+    if not torch.equal(found.float(), values):
+        raise ValueError("model-template: an MXFP8 matrix's values do not fit BF16 exactly")
+    return found.contiguous()
+
+
 def router_rule(moe, defaults=None):
     """The routing rule a checkpoint's config states, in topk-router's option names; defaults: what the family's
     reference assumes where config.json is silent (the layout's `defaults`: norm_topk_prob)."""
@@ -933,6 +944,10 @@ class MoE:
         if m.matrices.has(prefix + "shared_expert_gate"):
             self.shared_gate = m.matrices.load([prefix + "shared_expert_gate"], "shared_gate")
         self.prefix = prefix + spec.get("experts", "experts.")
+        # A gate_up stack that keeps each gate row beside its up row (the spec's gate_up: interleaved)
+        self.interleaved = spec.get("gate_up") == "interleaved"
+        # The routing weights at the hidden dtype, as most references round them, or FP32 (the spec's weights)
+        self.fp32_weights = spec.get("weights") == "fp32"
 
     def load_experts(self):
         """Every routed expert of the layer into the experts slot: per-expert matrices, or a fused gate_up_proj
@@ -960,6 +975,20 @@ class MoE:
             for e in range(self.count):
                 m.experts.load(self.slot, e, gate_up[e].contiguous().to(torch.bfloat16),
                                down[e].contiguous().to(torch.bfloat16))
+            return
+        if m.matrices.has(fused):   # two stacks as matrices (fused.weight with its scales): each expert as stored
+            for e in range(self.count):
+                fmt, gate_up, down = m.matrices.stacked_expert(fused, self.prefix + "down_proj", e, self.interleaved,
+                                                               device)
+                if fmt == "mxfp8" and "experts:mxfp8" not in m.parts.facts("experts"):
+                    # an experts plugin without MXFP8 bundles: the values exactly, in BF16 (an E4M3 code times a
+                    # power of two is a BF16 value)
+                    fmt, gate_up, down = "bf16", _mx_values(torch, gate_up), _mx_values(torch, down)
+                    m.__dict__.setdefault("experts_decoded", set()).add(self.layer)
+                if fmt == "bf16":
+                    m.experts.load(self.slot, e, gate_up, down)
+                else:
+                    m.experts.load(self.slot, e, gate_up, down, fmt)
             return
         # The draft layer's experts in the format the slot holds the others in, re-encoded where stored otherwise.
         from crit_plugins.encodings import SOURCES
@@ -1001,7 +1030,8 @@ class MoE:
     def forward(self, h, ctx):
         torch, m = self.m.torch, self.m
         ids, weights = m.router.select(ctx.mm(h, self.router).float(), self.top, bias=self.bias)
-        weights = weights.to(h.dtype).float()   # the routing weights at the hidden dtype, as the reference rounds them
+        if not self.fp32_weights:
+            weights = weights.to(h.dtype).float()   # the routing weights at the hidden dtype, as the reference rounds them
         routed = self.routed(h, ids, weights, ctx)
         if self.shared is None:
             return routed.to(h.dtype)
@@ -1053,7 +1083,202 @@ class ParallelMoE(MoE):
         routed = self.routed(m._norm(r, self.norm_in), ids, weights, ctx)
         return (dense.float() + m._norm(routed.to(r.dtype), self.norm_out).float()).to(h.dtype)
 
+def _clipped(torch, x, threshold, scale=None):
+    """Each head vector of x [.., heads, dim] (times its learned scale [heads][dim], where given) shortened to
+    `threshold` where its L2 norm is longer (norm + 1e-6), in FP32: the norm a row sum in one fixed order."""
+    x = x.float() if scale is None else x.float() * scale
+    norm = row_sum(x * x).sqrt()
+    return x * (threshold / (norm + 1e-6)).clamp(max=1.0)[..., None]
+
+
+class RelativeAttention:
+    """Softmax attention with a relative-position bias a token computes for itself, learned sinks a token, short
+    convolutions over the keys and values, and a gated output. Its rows: queries, keys and values may each come from
+    rows of their own (forward((q_in, k_in, v_in), ctx), each normed by the residual; a single row for all three):
+
+        q = clip(q_proj(q_in) * q_scale)           each head shortened to the config's qk_l2_clip_threshold
+        k = clip(conv(k_proj(k_in)))               the convolution: (taps over the last `kernel` rows + the row) /
+        v = rms_norm(conv(v_proj(v_in)))           sqrt(kernel + 1); with stored static taps and a projection of
+                                                   the input (dynamic), each token's taps are the static ones plus
+                                                   its own, one set a key/value head, / sqrt(2 * kernel + 1)
+        r = clip(relative_proj(q_in) * r_scale)    each head's relative state, d_rel values, clipped to the config's
+        bias[d] = r . proj[:, d]                     rel_l2_clip_threshold: its score for the position d behind it
+        out = sigmoid(lse - sink) * attention(q, k, v, bias)    sink = sink_proj(q_in), a logit with no value
+        y = o_proj(out * sigmoid(gate_proj(q_in)))
+
+    With `log_scaling` (the full layers) the queries and the relative states are scaled after their clip by
+    1 + alpha * log(max((position + 1) / floor, 1)) (the config's log_scaling_alpha and log_scaling_n_floor). The
+    bias reaches `extent` positions back: the sliding window, or the config's rel_extent. The block also holds the
+    convolutions its layer's residual runs after the attention and after the FFN (`post_convolution(name, y, ctx)`):
+    each convolution keeps its window in a pool the block declares (the recurrence slot's convolve), one a layer, so a
+    looped layer's passes keep their own. Tensor names are transformers'; spec keys: heads, kv_heads and head_dim (the
+    config keys of this kind's shape), log_scaling, post (the residual's convolutions: {name: tensor prefix under the
+    layer})."""
+
+    keeps_kv = True
+
+    @classmethod
+    def _config(cls, model, spec):
+        found = {key: model.setting(name) for key, name in (
+            ("kernel", "conv_kernel_size"), ("d_rel", "d_rel"), ("qk", "qk_l2_clip_threshold"),
+            ("rel", "rel_l2_clip_threshold"), ("alpha", "log_scaling_alpha"), ("floor", "log_scaling_n_floor"),
+            ("rel_extent", "rel_extent"))}
+        if not found["kernel"]:
+            found["kernel"] = model.setting("sconv_kernel_size")
+        missing = [key for key in ("kernel", "d_rel", "qk", "rel") if not found[key]]
+        if missing:
+            raise ValueError(f"model-template: relative attention takes the config's {', '.join(missing)}")
+        return found
+
+    @classmethod
+    def _dynamic(cls, model, layers, spec):
+        p = model.layer_prefix(layers[0]) + spec.get("prefix", "self_attn.")
+        return p + "k_proj.sconv.static_weight" in model.ck
+
+    @classmethod
+    def pools(cls, model, spec, layers):
+        """The windows of the layers' convolutions: keys and values (a dynamic convolution keeps `kernel` copies of
+        each input, one a tap), and the residual's after the attention and after the FFN."""
+        found = cls._config(model, spec)
+        kv_heads, head_dim = model.kv_shape(layers[0], spec)
+        taps = found["kernel"] if cls._dynamic(model, layers, spec) else 1
+        kind = spec.get("kind", "")
+        windows = [(f"{kind}.k", taps * kv_heads * head_dim), (f"{kind}.v", taps * kv_heads * head_dim)]
+        windows += [(f"{kind}.{name}", model.hidden) for name in (spec.get("post") or {})]
+        return [{"key": key, "kind": "window", "layers": list(layers), "channels": channels,
+                 "kernel": found["kernel"]} for key, channels in windows]
+
+    def __init__(self, model, layer, prefix, spec):
+        m = self.m = model
+        torch = m.torch
+        self.layer = layer
+        found = self._config(m, spec)
+        self.kernel, self.d_rel = int(found["kernel"]), int(found["d_rel"])
+        self.qk, self.rel = float(found["qk"]), float(found["rel"])
+        self.log_scaling = bool(spec.get("log_scaling"))
+        self.alpha, self.floor = float(found["alpha"] or 0.0), float(found["floor"] or 1.0)
+        self.heads = int(m.setting(spec["heads"]) if spec.get("heads") else m.heads)
+        self.kv_heads, self.head_dim = m.kv_shape(layer, spec)
+        kind = spec.get("kind", "")
+        window = spec.get("window")
+        if window is None and kind == "sliding_attention":
+            window = m.config.sliding_window
+        self.window = int(window or 0)
+        self.extent = self.window or int(found["rel_extent"] or 0)
+        if not self.extent:
+            raise ValueError("model-template: relative attention's bias reaches the sliding window or the config's "
+                             "rel_extent")
+        for fact in ("attention:distance-bias", "attention:lse") + (("attention:sliding",) if self.window else ()):
+            if fact not in m.parts.facts("attention"):
+                raise ValueError(f"model-template: relative attention needs the attention plugin's {fact}")
+        if m.recurrence is None:
+            raise ValueError("model-template: relative attention's convolutions keep their windows in the "
+                             "recurrence slot: the selection leaves it empty")
+        self.pool = ("kv", self.window) if self.window else "kv"
+        names = ["q_proj.linear", "o_proj.gate_proj", "sink_proj", "relative_position_bias.linear"]
+        q_rows = self.heads * self.head_dim
+        rows = [q_rows, q_rows, self.heads, self.heads * self.d_rel]
+        for name, want in zip(names, rows):
+            if m.matrices.rows(prefix + name) != want:
+                raise ValueError(f"model-template: {prefix}{name} gives {m.matrices.rows(prefix + name)} rows, the "
+                                 f"layer's {self.heads} heads take {want}")
+        self.query_rows = m.matrices.together([prefix + n for n in names], "qkv")   # one input: the query rows'
+        self.k, self.v = (m.matrices.load([prefix + n + "_proj.linear"], "qkv") for n in "kv")
+        self.o = m.matrices.load([prefix + "o_proj.linear"], "o")
+        self.q_scale = _tensor(m, prefix + "q_proj.norm.scale").float().view(self.heads, self.head_dim)
+        self.r_scale = _tensor(m, prefix + "relative_position_bias.norm.scale").float().view(self.heads, self.d_rel)
+        proj = _tensor(m, prefix + "relative_position_bias.proj").float()
+        if tuple(proj.shape) != (self.d_rel, self.extent):
+            raise ValueError(f"model-template: {prefix}relative_position_bias.proj is {list(proj.shape)}, the bias "
+                             f"takes [{self.d_rel}, {self.extent}]")
+        self.proj = proj.contiguous()
+        channels = self.kv_heads * self.head_dim
+        self.dynamic = prefix + "k_proj.sconv.static_weight" in m.ck
+        self.taps = {}
+        for n in "kv":
+            if self.dynamic:   # static taps [kernel][channels] by lag (0: the token's own), a projection of the input
+                static = _tensor(m, prefix + n + "_proj.sconv.static_weight").float()
+                self.taps[n] = (static.contiguous(), m.matrices.load([prefix + n + "_proj.sconv.weight_proj"], "conv"))
+            else:              # [channels][kernel], the last tap the token's own: the recurrence slot's order
+                self.taps[n] = _tensor(m, prefix + n + "_proj.sconv.conv1d.weight").float().reshape(channels, -1)
+        if self.dynamic:   # x repeated once a tap, each copy read through one tap: copy i the input i rows back
+            k = self.kernel
+            pick = torch.zeros(k, channels, k, dtype=torch.float32, device=m.device)
+            for lag in range(k):
+                pick[lag, :, k - 1 - lag] = 1.0
+            self.pick = pick.reshape(k * channels, k).contiguous()
+        self.post = {name: _tensor(m, m.layer_prefix(layer) + at + "conv1d.weight").float().reshape(m.hidden, -1)
+                     for name, at in (spec.get("post") or {}).items()}
+        self.windows = [f"{kind}.k", f"{kind}.v"] + [f"{kind}.{name}" for name in self.post]
+        self.ones = torch.ones(self.head_dim, dtype=torch.float32, device=m.device)
+
+    def _log_scale(self, x, ctx):
+        """x [tokens][heads][dim] times 1 + alpha * log(max((position + 1) / floor, 1)) of its token."""
+        torch = self.m.torch
+        tau = 1.0 + self.alpha * torch.log(((ctx.positions.float() + 1.0) / self.floor).clamp(min=1.0))
+        return x * tau[:, None, None]
+
+    def _convolve(self, key, x, weight, ctx):
+        """(convolution + x) / sqrt(kernel + 1) of rows x [tokens][channels] over the window `key`, in FP32."""
+        m = self.m
+        y = m.recurrence.convolve(self.layer, x.float().contiguous(), weight, None, m.pools[key], ctx.batch,
+                                  activation=None)
+        return (y.float() + x.float()) / math.sqrt(self.kernel + 1)
+
+    def _projected(self, n, x_in, ctx):
+        """Keys or values: the projection, its convolution, then per head the clip (keys) or the norm (values)."""
+        m, torch = self.m, self.m.torch
+        rows = ctx.mm(x_in, self.k if n == "k" else self.v)
+        t, channels = rows.shape[0], self.kv_heads * self.head_dim
+        kind_key = self.windows[0 if n == "k" else 1]
+        if self.dynamic:
+            static, proj = self.taps[n]
+            own = ctx.mm(x_in, proj).float().view(t, self.kv_heads, 1, self.kernel)
+            copies = rows.float().repeat(1, self.kernel)                                  # [t][kernel * channels]
+            back = m.recurrence.convolve(self.layer, copies.contiguous(), self.pick, None, m.pools[kind_key],
+                                         ctx.batch, activation=None).float()
+            back = back.view(t, self.kernel, self.kv_heads, self.head_dim)               # back[:, lag]: lag rows back
+            taps = static.view(self.kernel, self.kv_heads, self.head_dim) + own.permute(0, 3, 1, 2)
+            y = (row_sum((back * taps).permute(0, 2, 3, 1)).reshape(t, channels) + rows.float()) \
+                / math.sqrt(2 * self.kernel + 1)
+        else:
+            y = self._convolve(kind_key, rows, self.taps[n], ctx)
+        y = y.to(rows.dtype).view(t, self.kv_heads, self.head_dim)
+        if n == "k":
+            return _clipped(torch, y, self.qk).to(rows.dtype)
+        return m.norms.rms_norm(y.contiguous(), None, m.eps).to(rows.dtype)
+
+    def post_convolution(self, name, y, ctx):
+        """The residual's convolution `name` (after the attention, after the FFN) of rows y, in y's dtype."""
+        return self._convolve(f"{self.windows[0].rsplit('.', 1)[0]}.{name}", y, self.post[name], ctx).to(y.dtype)
+
+    def forward(self, h, ctx):
+        m, torch = self.m, self.m.torch
+        q_in, k_in, v_in = h if isinstance(h, tuple) else (h, h, h)
+        t, dtype = q_in.shape[0], q_in.dtype
+        found = [ctx.mm(q_in, matrix) for matrix in self.query_rows]
+        rows = found[0] if len(found) == 1 else torch.cat(found, dim=-1)
+        qw = self.heads * self.head_dim
+        q = _clipped(torch, rows[:, :qw].view(t, self.heads, self.head_dim), self.qk, self.q_scale)
+        r = _clipped(torch, rows[:, 2 * qw + self.heads:].view(t, self.heads, self.d_rel).to(dtype).float(), self.rel,
+                     self.r_scale)
+        if self.log_scaling:
+            q = self._log_scale(q.to(dtype).float(), ctx)
+            r = self._log_scale(r.to(dtype).float(), ctx)
+        q = q.to(dtype).contiguous()
+        bias = (r.to(dtype).float() @ self.proj).to(dtype).float().contiguous()          # [t][heads][extent]
+        sink = rows[:, 2 * qw:2 * qw + self.heads].float()
+        k, v = self._projected("k", k_in, ctx), self._projected("v", v_in, ctx)
+        pool = m.pools[self.pool]
+        pool.write(self.layer, ctx.slots[self.pool], k, v)
+        a, lse = m.attention.forward(self.layer, q, pool, ctx.batch, scale=self.head_dim ** -0.5, lse=True,
+                                     bias=bias, **({"sliding": self.window} if self.window else {}))
+        a = a.float() * torch.sigmoid(lse - sink)[..., None]                              # the sink: no value
+        gated = (a.reshape(t, qw) * torch.sigmoid(rows[:, qw:2 * qw].float())).to(dtype)
+        return ctx.mm(gated, self.o)
+
+
 
 BLOCKS = {"attention": Attention, "indexed-attention": IndexedAttention, "latent-attention": LatentAttention,
           "ngram-rows": NgramRows, "gated-delta": GatedDelta, "swiglu": SwiGLU, "moe": MoE,
-          "parallel-moe": ParallelMoE}
+          "parallel-moe": ParallelMoE, "relative-attention": RelativeAttention}

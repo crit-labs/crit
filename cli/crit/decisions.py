@@ -1,8 +1,10 @@
 """Record an engine's measured decisions: `crit plugins decisions`.
 
 A plugin that chooses between two ways by timing them at load (crit_plugins.decisions) can choose otherwise in the
-next process. This command loads the package's engine once, lets every such decision measure, and writes what was
-decided to a record inside the package. The configuration's "decisions" names that file, and every later load
+next process. This command loads the package's engine twice: the first load pays what only a first load does (stores
+built, the checkpoint's pages read cold, kernels compiled) and its measurements are dropped; the second, warm load lets
+every such decision measure, and what it decided is written to a record inside the package, each decision with how it
+was measured. The configuration's "decisions" names that file, and every later load
 replays it instead of timing again, so the package Eval measures decides as the package served does.
 
 Run it on the machine and model the engine serves, with nothing else on the device, before the candidate is sealed.
@@ -17,8 +19,8 @@ DEFAULT = "decisions.json"
 
 
 def record(package, model, context=None, out=None, log=None):
-    """Load the engine with no record, so every decision measures, and write the record. Returns {"path", "rows":
-    the decisions, "named": whether the configuration names the file}."""
+    """Load the engine twice with no record, so every decision measures on a warm load, and write the second load's
+    record. Returns {"path", "rows": the decisions, "named": whether the configuration names the file}."""
     from crit_core.engine import load, read_configuration
     from crit_plugins import decisions
     say = log or (lambda text: None)
@@ -27,10 +29,12 @@ def record(package, model, context=None, out=None, log=None):
     name = configuration.get("decisions")
     path = Path(out) if out else package / (name if isinstance(name, str) else DEFAULT)
     fresh = {key: value for key, value in configuration.items() if key != "decisions"}
-    say("loading the engine")
+    say("loading the engine once to warm it (its measurements are dropped)")
+    load(package, model, fresh, context_tokens=context).close()
+    say("loading it again, warm: its decisions are the record")
     engine = load(package, model, fresh, context_tokens=context)
     try:
-        rows = decisions.report()["decisions"]
+        rows = engine.policy.decisions.report()["decisions"]   # what this engine settled (crit_plugins.policy)
     finally:
         engine.close()
     decisions.write(path, rows)

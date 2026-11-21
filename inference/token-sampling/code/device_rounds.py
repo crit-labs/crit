@@ -24,8 +24,8 @@ so a draw within ~1e-5 of a cumulative boundary may differ from the FP64 host fo
 64 tokens has no sparse form, so it is verified by the target's own draw where the host form (with the law) would use
 the rejection rule: the same law, other tokens.
 
-On CUDA the arithmetic is token-sampling's sampling law (sampling.cu, with the binding sampling_torch.cpp), built at
-load through torch's extension builder (native()): greedy rows and 1 <= top_k <= 64 on its fast path (stage blocks of
+On CUDA the arithmetic is crit's kernel token-sampling (kernels/techniques/sampling/token-sampling: sampling.cu and its
+torch ops, built by crit's kernel build for the device, with the engine's tuning or its default knobs; native()): greedy rows and 1 <= top_k <= 64 on its fast path (stage blocks of
 4,096 logits keep their best top_k + 1 processed candidates, one law block per row merges them and runs Core's steps 7
 to 12 in FP64, the verify rule included), open rows settled there when top_p or min_p closes the kept set within the
 top 64 or the draw lands among them, every other row on a one-block full-vocabulary law (FP32 values and weights: a draw
@@ -45,7 +45,6 @@ same way whatever rows are beside it, by its length and its address modulo 16 by
 vocabulary that is a multiple of 4). The ranked alternatives are those values in Core's order (higher first, the lower
 id among equals): the CUDA sampler ranks the rows as given (enqueue_ranked_logprobs), the torch law by a stable sort.
 """
-import os
 from pathlib import Path
 import warnings
 
@@ -59,6 +58,7 @@ ONE = 0x3F800000                                 # the bits of FP32 1.0
 KERNELS = ("native", "torch")                    # sampling.cu built at load, or the torch law
 
 _NATIVE = {}
+KERNEL = "token-sampling"   # crit's kernel of the sampling law (plugin.json "kernels")
 
 
 class Native:
@@ -113,43 +113,23 @@ class Native:
 
 
 def native(device):
-    """token-sampling's sampling law (sampling.cu with sampling_torch.cpp) built for `device`'s architecture through
-    Core's native build (crit_plugins.native.extension), once a process and cached across processes under a name
-    hashed from the sources' paths and contents (each engine's copy of the plugin builds its own); None where it
-    does not build (no CUDA compiler, no Core headers) or on a CPU device, and the torch law serves."""
+    """crit's kernel token-sampling (the sampling law, built for `device` by crit's kernel build with the engine's
+    tuning or its default knobs, crit_plugins.kernels.load_kernel; recorded in the engine's facts) as Native, once a
+    process; None on a CPU device or where it does not build here (no CUDA compiler, no crit_kernels: recorded as
+    the kernel's fallback with its reason), and the torch law serves."""
     device = torch.device(device)
     if device.type != "cuda":
         return None
-    major, minor = torch.cuda.get_device_capability(device)
-    arch = f"{major}.{minor}"   # no architecture-specific instructions: the plain target
-    if arch not in _NATIVE:
-        from crit_plugins.native import extension
-        try:
-            core = _core_include()
-            if core is None:
-                raise FileNotFoundError("Core's headers (crit/sampling.h) were not found; set CRIT_CORE_INCLUDE")
-            module = extension("crit_sampling", [HERE / "sampling.cu", HERE / "sampling_torch.cpp"], [HERE, core],
-                               arch=arch, cuda_flags=("-O3", "-std=c++20", "--expt-relaxed-constexpr"))
-            _NATIVE[arch] = Native(module)
-        except Exception as error:   # no compiler, or headers that do not match: the torch law serves
-            warnings.warn(f"token-sampling: the sampling law did not build for {arch} ({error}); rounds sample with "
-                          "the torch law instead")
-            _NATIVE[arch] = None
-    return _NATIVE[arch]
-
-
-def _core_include():
-    """Core's public headers: CRIT_CORE_INCLUDE, else the crit checkout this plugin lies in (inference/... beside
-    core/include), else the crit_core package's checkout."""
-    found = os.environ.get("CRIT_CORE_INCLUDE")
-    candidates = [Path(found)] if found else []
-    candidates += [parent / "core" / "include" for parent in HERE.parents]
-    try:
-        import crit_core
-        candidates.append(Path(crit_core.__file__).resolve().parents[2] / "include")
-    except ImportError:
-        pass
-    return next((c for c in candidates if (c / "crit" / "sampling.h").is_file()), None)
+    key = str(device)
+    if key not in _NATIVE:
+        from crit_plugins.kernels import load_kernel, plugin_folder
+        # the plugin whose package imports this code: token-sampling, or token-constraints over it as a source
+        module = load_kernel(KERNEL, folder=plugin_folder(__name__, HERE.parent))
+        if module is None:
+            warnings.warn("token-sampling: crit's kernel token-sampling did not build here; rounds sample with the "
+                          "torch law instead")
+        _NATIVE[key] = Native(module) if module is not None else None
+    return _NATIVE[key]
 
 
 # --- Core's Philox draw in torch (int64 arithmetic, exact): the torch law's uniforms -------------------------------
