@@ -1,5 +1,5 @@
 """The Triton side of decode-gemv: an NVFP4 W4A16 GEMV (1 to 8 rows, its own order: the format-generic Triton GEMV's
-fma path, structure gemv-nvfp4-triton an alias of gemv-triton) and the decoders that write a matrix's values for a
+fma path, gemv-triton's knobs for NVFP4) and the decoders that write a matrix's values for a
 provider's GEMM (BF16/FP16, or FP8 rows in units of a row scale).
 
 An E2M1 code's FP16 bit pattern (sign at bit 15, magnitude bits at 11..9) is its value times 2^-14; the kernels build
@@ -11,9 +11,8 @@ import torch
 import triton
 import triton.language as tl
 
-from ._crit_tuning import knobs
 
-from .triton_any import BLOCK_K, GEMV_TILES, _HW, fma, hardware
+from .triton_any import BLOCK_K, GEMV_TILES, MUL_DOT, _HW, fma, hardware, tuned
 
 MAX_ROWS = 8
 
@@ -27,20 +26,23 @@ def _e2m1(codes):
 def gemv_triton(x, codes, scales, inverse, out):
     """x [M][K] (M <= 8, unit column stride) times the NVFP4 matrix (codes [N][K / 2] uint8, scales [N][K / 16] E4M3,
     inverse [N] FP32) -> out [M][N] (any float dtype, unit column stride), FP32 accumulation. The fma path of the
-    format-generic Triton GEMV (triton_any, structure gemv-triton) on NVFP4 with gemv-nvfp4-triton's knobs: the same
-    operations, so the same bits, as this GEMV had."""
+    format-generic Triton GEMV (triton_any, structure gemv-triton) on NVFP4 with gemv-triton's fma knobs for the
+    matrix (a configuration of the dot path leaves them at their defaults): the same operations, so the same bits, as
+    this GEMV had."""
     M, K = x.shape
     N = codes.shape[0]
     if not 1 <= M <= MAX_ROWS or K % 16 or codes.shape[1] * 2 != K or x.stride(-1) != 1 or out.stride(-1) != 1:
         raise ValueError(f"gemv_triton: x [1..{MAX_ROWS}][K] (K a multiple of 16, unit column stride) for codes "
                          f"[N][K / 2], not x {tuple(x.shape)} and codes {tuple(codes.shape)}")
-    tuned = knobs("gemv-nvfp4-triton", {"N": N, "K": K}, M)
-    # BLOCK_N 0: the autotuner's tile, as before the knobs
-    return fma(0, x, codes, scales.view(torch.uint8), None, inverse, out, 0, tuned["BLOCK_N"], tuned["BLOCK_K"],
-               tuned["WARPS"], tuned["STAGES"])
+    knobs = tuned(0, N, K, M)   # weights 0: NVFP4
+    if knobs["MUL"] == MUL_DOT or knobs["BN"] > 32:
+        knobs = dict(knobs, BN=0, BK=0, WARPS=0, STAGES=0)
+    # BN 0: the autotuner's tile, as before the knobs
+    return fma(0, x, codes, scales.view(torch.uint8), None, inverse, out, 0, knobs["BN"], knobs["BK"] or BLOCK_K,
+               knobs["WARPS"] or 4, knobs["STAGES"] or 3)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=[])
 def _decode_kernel(w_ptr, s_ptr, f_ptr, out_ptr, K, BLOCK_K: tl.constexpr):
     row = tl.program_id(0)
     k0 = tl.program_id(1) * BLOCK_K
@@ -64,7 +66,7 @@ def decode(codes, scales, inverse, out):
     return out
 
 
-@triton.jit
+@triton.jit(do_not_specialize=[])
 def _decode_fp8_kernel(w_ptr, s_ptr, f_ptr, out_ptr, K, BLOCK_K: tl.constexpr):
     row = tl.program_id(0)
     k0 = tl.program_id(1) * BLOCK_K

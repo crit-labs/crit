@@ -6,10 +6,11 @@ device law: sample(logits, params) per step, and staged(rows, device, vocabulary
 whose masks sit in a buffer at a fixed address that set(params) fills from the host's bitmask words before the
 launch. Inside captured decode rounds (rounds:sampler) it is token-sampling's round form (device_rounds.py) with each
 slot's mask staged beside its rules (RoundMasks): every logits row of a constrained slot masked before the law, and
-its drafts cut, so it emits one token a round, its column 0's, whose allowed set is the one Core staged. Core decodes
-constrained requests plainly (one token per step, Core's StepRequest.plain): a verify window under a constraint needs
-the matcher's mask at every draft position, which Core computes on the host only once the tokens before it are known;
-predictions() stays the host form of that."""
+its drafts cut, so it emits one token a round, its column 0's, whose allowed set is the one Core staged (stage_mask,
+between rounds, from the request's matcher after the last round's token). Core decodes constrained requests plainly
+(one token a round, Core's StepRequest.plain): a verify window under a constraint needs the matcher's mask at every
+draft position, which Core computes on the host only once the tokens before it are known; predictions() stays the
+host form of that."""
 from .constraints import constrained
 from .token_sampling import device_law, sampling
 
@@ -104,6 +105,11 @@ class ConstrainedSampler:
         """The rules of the request in round slot `slot` (select()'s params; its allowed, a crit_plugins.Allowed or
         sorted ids over the vocabulary, the mask of its next token), in the round's device buffers. Outside a capture."""
         self._round_sampling().stage(slot, params)
+
+    def stage_mask(self, slot, allowed):
+        """The allowed set (a crit_plugins.Allowed, or sorted ids) of the next token of the constrained request in
+        round slot `slot`, its rules as staged: Core's step engine stages it between two rounds. Outside a capture."""
+        self._round_sampling().stage_mask(slot, allowed)
 
     def laws(self, rows, width):
         return self._round_sampling().inner.laws(rows, width)
@@ -218,13 +224,20 @@ class RoundMasks:
         return state
 
     def stage(self, slot, params):
+        if self.d_words is None:
+            raise ValueError("reserve(rows, widest, vocab, device) the sampler's round buffers before staging")
+        if not 0 <= slot < self.rows:
+            raise ValueError(f"round slot {slot} outside the {self.rows} reserved")
+        self.inner.stage(slot, {k: v for k, v in params.items() if k != "allowed"})
+        self.stage_mask(slot, params.get("allowed"))
+
+    def stage_mask(self, slot, allowed):
+        """Only the slot's allowed set (None: unconstrained), its rules as they are: one copy of the bitmask words."""
         import torch
         if self.d_words is None:
             raise ValueError("reserve(rows, widest, vocab, device) the sampler's round buffers before staging")
         if not 0 <= slot < self.rows:
             raise ValueError(f"round slot {slot} outside the {self.rows} reserved")
-        allowed = params.get("allowed")
-        self.inner.stage(slot, {k: v for k, v in params.items() if k != "allowed"})
         if allowed is None:
             self._masks.pop(int(slot), None)
             self.d_masked[slot] = False

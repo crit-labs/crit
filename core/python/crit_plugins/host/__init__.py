@@ -68,31 +68,30 @@ TASK = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_size_t)
 
 
 def memory_bytes():
-    """The host's memory in bytes: {"total", "available"} (what a process can take without paging: Linux's
-    MemAvailable, Windows' available physical memory); 0 where the OS does not say."""
-    out = {"total": 0, "available": 0}
+    """The host's memory in bytes: {"total": its physical memory, "available": what a process can take that the OS
+    can back, "binding": which observation set it}, 0 (and binding None) where the OS does not say. available is the
+    tightest of Core's host memory observations (crit_plugins.host.memory: memory obtainable without paging, the
+    commit headroom where the OS enforces commit, the cgroup's headroom), so every host allocation sized from it, Core's
+    and the plugins', is one the OS admits."""
+    from .memory import observe, parse_meminfo
+    total = 0
     try:
         with open("/proc/meminfo", encoding="utf-8") as f:
-            for line in f:
-                name, _, rest = line.partition(":")
-                if name == "MemTotal":
-                    out["total"] = int(rest.split()[0]) * 1024
-                elif name == "MemAvailable":
-                    out["available"] = int(rest.split()[0]) * 1024
-        return out
+            total = parse_meminfo(f.read()).get("MemTotal", 0)
     except OSError:
-        pass
-    if os.name == "nt":
-        class Status(ctypes.Structure):
-            _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong), ("total", ctypes.c_ulonglong),
-                        ("available", ctypes.c_ulonglong), ("page_total", ctypes.c_ulonglong),
-                        ("page_available", ctypes.c_ulonglong), ("virtual_total", ctypes.c_ulonglong),
-                        ("virtual_available", ctypes.c_ulonglong), ("extended", ctypes.c_ulonglong)]
-        status = Status()
-        status.length = ctypes.sizeof(Status)
-        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
-            out = {"total": int(status.total), "available": int(status.available)}
-    return out
+        if os.name == "nt":
+            class Status(ctypes.Structure):
+                _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong), ("total", ctypes.c_ulonglong),
+                            ("available", ctypes.c_ulonglong), ("page_total", ctypes.c_ulonglong),
+                            ("page_available", ctypes.c_ulonglong), ("virtual_total", ctypes.c_ulonglong),
+                            ("virtual_available", ctypes.c_ulonglong), ("extended", ctypes.c_ulonglong)]
+            status = Status()
+            status.length = ctypes.sizeof(Status)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                total = int(status.total)
+    limits = observe().limits()
+    binding = min(limits, key=lambda k: (limits[k], k)) if limits else None
+    return {"total": total, "available": limits[binding] if binding else 0, "binding": binding}
 
 
 def _declare(lib):
@@ -133,8 +132,11 @@ class Pool:
     def run(self, tasks, task):
         """task(i) for i in range(tasks) on the workers and the calling thread; returns when all have finished and
         raises the first exception a task raised. Python tasks hold the interpreter's lock one at a time: this is
-        for tests and paths where the tasks release it (native calls)."""
+        for tests and paths where the tasks release it (native calls). The tasks run with the caller's engine policy
+        active (crit_plugins.policy.carried): the pool's threads serve every engine of the process."""
+        from ..policy import carried
         errors = []
+        task = carried(task)
 
         def one(_, index):
             try:

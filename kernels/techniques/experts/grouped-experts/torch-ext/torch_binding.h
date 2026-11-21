@@ -42,3 +42,27 @@ void declared_rows(const torch::Tensor& values, const torch::Tensor& scales, con
 void declared_intermediate(const torch::Tensor& gate_up, const torch::Tensor& store, c10::ArrayRef<int64_t> layout,
                            const torch::Tensor& item_slot, const torch::Tensor& item_routes,
                            const torch::Tensor& item_count, torch::Tensor& values, torch::Tensor& scales);
+// The FP4 tensor-core arithmetic (grouped_experts.h): whether this build multiplies on this device's FP4 tensor
+// cores; the planned routes' gate/up operands as E2M1 codes [routes][hidden / 2] and UE4M3 scales [routes][hidden /
+// 16]; the gate/up rows into the intermediate's codes and scales; the down rows into y [routes][hidden] FP32.
+bool fp4_available();
+void fp4_inputs(const torch::Tensor& x, int64_t top, const torch::Tensor& store, c10::ArrayRef<int64_t> layout,
+                const torch::Tensor& item_slot, const torch::Tensor& item_routes, const torch::Tensor& item_count,
+                torch::Tensor& codes, torch::Tensor& scales);
+void fp4_gate_up(const torch::Tensor& codes, const torch::Tensor& scales, const torch::Tensor& store,
+                 c10::ArrayRef<int64_t> layout, const torch::Tensor& item_slot, const torch::Tensor& item_routes,
+                 const torch::Tensor& item_count, torch::Tensor& h_codes, torch::Tensor& h_scales, int64_t tokens);
+void fp4_down(const torch::Tensor& h_codes, const torch::Tensor& h_scales, const torch::Tensor& store,
+              c10::ArrayRef<int64_t> layout, const torch::Tensor& item_slot, const torch::Tensor& item_routes,
+              const torch::Tensor& item_count, torch::Tensor& y, int64_t tokens);
+// The FP8 tensor-core arithmetic (grouped_experts.h): whether this build has the E4M3 MMA for this device; rows quantized
+// per 128 values (codes [routes][K], FP32 scales [routes][K / 128]); the gate/up rows into h BF16; the down rows.
+bool fp8_available();
+void fp8_inputs(const torch::Tensor& rows, int64_t div, const torch::Tensor& item_slot, const torch::Tensor& item_routes,
+                const torch::Tensor& item_count, torch::Tensor& codes, torch::Tensor& scales);
+void fp8_gate_up(const torch::Tensor& codes, const torch::Tensor& scales, const torch::Tensor& store,
+                 c10::ArrayRef<int64_t> layout, const torch::Tensor& item_slot, const torch::Tensor& item_routes,
+                 const torch::Tensor& item_count, torch::Tensor& h, int64_t tokens);
+void fp8_down(const torch::Tensor& h_codes, const torch::Tensor& h_scales, const torch::Tensor& store,
+              c10::ArrayRef<int64_t> layout, const torch::Tensor& item_slot, const torch::Tensor& item_routes,
+              const torch::Tensor& item_count, torch::Tensor& y, int64_t tokens);

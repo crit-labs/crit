@@ -3,7 +3,7 @@
   "category": "experts",
   "summary": "Ready device expert cache: the directory on the device (capture-safe layer plans and fills from a mapped bundle store), a prompt staging ring that never admits, KV lending, residency-profile warm start, admission limits that send misses to a CPU tier, ranked background swaps, telemetry, and portable policy replay",
   "implementation_status": "native_source",
-  "implementation_scope": "An expert cache whose directory lives on the device: pinned clock replacement, admission limits (quota, quota by miss count, second-touch) that bypass misses to the store, bundle copies and profile preload, as CUDA ops built at load (directory_ops.cu) with torch ops as the fallback; recent and ranked residency policies; Python directory reference; residency profile builder with a held-out check; CPU/link split table from measured layer times. Independent portable replay compares LRU/LFU/clock/hindsight eviction and optional second-touch admission over arbitrary byte-sized bundles. Expert arithmetic (device and CPU), the predictor and phase switching remain engine supplied.",
+  "implementation_scope": "An expert cache whose directory lives on the device: pinned clock replacement, admission limits (quota, quota by miss count, second-touch) that bypass misses to the store, bundle copies and profile preload, as CUDA ops (crit's kernel expert-directory) with torch ops as the fallback; recent and ranked residency policies; Python directory reference; residency profile builder with a held-out check; CPU/link split table from measured layer times. Independent portable replay compares LRU/LFU/clock/hindsight eviction and optional second-touch admission over arbitrary byte-sized bundles. Expert arithmetic (device and CPU), the predictor and phase switching remain engine supplied.",
   "agent_guidance": {
     "use_when": "Routed experts live in device-readable host memory behind a device slot cache, and per-layer host round trips dominate short decode steps; use portable replay to screen replacement/admission policies on retained demand traces before native adaptation",
     "avoid_when": "All experts fit on the device, the host plan already overlaps device work, or large prefill batches touch most experts of a layer anyway",
@@ -96,15 +96,11 @@
     },
     {
       "path": "inference/device-expert-cache/code/device_directory.py",
-      "purpose": "The device form's directory in device tensors: the layer plan, the prompt plan and the fill (directory_ops.cu, or torch ops with the same rule), and the host-driven changes (slots unavailable or available, preload, swaps)"
-    },
-    {
-      "path": "inference/device-expert-cache/code/directory_ops.cu",
-      "purpose": "The device form's plan of one routed layer (route-order distinct experts, pinned hits, quota and second touch to the CPU tier, windowed clock victims as LayerDirectory's scan), its recent plan (misses to the CPU tier, their copies into the round's victim slots), its prompt plan into ring slots and the bundle fill from a device-readable store; built at load through torch's extension builder; the program fill that rebuilds slots from a store in another layout (CSF scales decoded a slab of 16 rows per block, then the exception words)"
+      "purpose": "The device form's directory in device tensors: the layer plan, the prompt plan and the fill (crit's kernel expert-directory, or torch ops with the same rule), and the host-driven changes (slots unavailable or available, preload, swaps)"
     },
     {
       "path": "inference/device-expert-cache/code/native.py",
-      "purpose": "Builds directory_ops.cu at load (hashed name, the device's architecture), None where it does not build"
+      "purpose": "Loads crit's kernel expert-directory (crit_plugins.kernels.load_kernel, for the plugin whose package imports the code), None where it does not build"
     },
     {
       "path": "inference/device-expert-cache/code/expert_cache.py",
@@ -124,7 +120,7 @@
     }
   ],
   "requires": {
-    "hardware": "Python 3.11+ standard library for the reference; portable replay uses only Python's standard library and needs no device. The device form needs torch: directory_ops.cu built at load for the device's architecture (all of sm_80..121a compile; CUDA only, torch's builder would hipify it on ROCm, untested), the torch ops anywhere torch runs (CPU included)",
+    "hardware": "Python 3.11+ standard library for the reference; portable replay uses only Python's standard library and needs no device. The device form needs torch: crit's kernel expert-directory built for the device (all of sm_80..121a compile; CUDA only), the torch ops anywhere torch runs (CPU included)",
     "model": "Routed experts as fixed-size bundles (a multiple of 16 bytes); the C++ component plans at most 32 distinct routes per call, the device form any routes of a step (duplicates and -1 allowed) of up to a few thousand experts a layer (9 bytes of shared memory per expert); offline replay accepts arbitrary complete bundle sizes and group widths",
     "workload": "Decode steps where host planning latency per routed layer is significant and expert reuse is high; replay also supports recorded grouped accesses under byte pressure independently of CUDA geometry"
   },

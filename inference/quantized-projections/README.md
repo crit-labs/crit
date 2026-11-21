@@ -406,7 +406,10 @@ A model plugin may pass each matrix's role (`load(tensors, format, role)`, in th
 `encode="fp8"` takes a BF16 one to E4M3 with one FP32 scale per row. The encoders are torch operations in FP64 at load.
 The model plugin passes `encode` only for draft-only roles, the stored target still verifies every draft (the run's
 `as_stored` weights rule covers target weights, not draft-only ones), and the facts record each re-encoded role under
-`draft_encoding` (stored and encoded format, matrices, bytes before and after). A draft step reading an MTP layer and
+`draft_encoding` (stored and encoded format, matrices, bytes before and after). A matrix whose shape the encoded
+format's kernels do not take (FP8 through cuBLASLt: rows and columns in multiples of 16; NVFP4: columns in multiples
+of 16) stays as stored, its role's group `ROLE:kept` naming the asked encoding and why (`encoding_problem(encode,
+rows, columns)` says so before a load). A draft step reading an MTP layer and
 head of a 27B model (hidden 5,120, vocabulary 248,320) moves about 0.95 GB as NVFP4 instead of 1.7 GB as FP8.
 
 **The output head in FP8.** The model's own output head, the matrix the model plugin loads with role `head`, is held

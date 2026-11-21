@@ -121,8 +121,8 @@ stop rules, accepted-state agreement and output bounds. Window lengths, occurren
 retention, proposer, batch shape and state layout are adaptable. A shorter
 proposal saves nothing if the verifier still executes the same rectangle.
 [Attention state](../attention-state/README.md) supplies a provisional KV
-transaction and [concurrent requests](../concurrent-request-execution/README.md)
-supply per-row commit counts.
+transaction and Core's [runtime](../../core/src/runtime/README.md) (concurrent requests)
+supplies per-row commit counts.
 
 Greedy speculation reproduces greedy output only if each verifier column gets
 exactly the logits of a one-token step; kernels whose summation order depends on

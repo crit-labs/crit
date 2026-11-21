@@ -56,6 +56,20 @@ KERNEL_KINDS = ("bf16", "fp16", "fp8", "fp8:row", "int8")
 # Page types that store keys and values at a lower precision than the projections gave them: a prompt chunk's own
 # keys and values are kept fresh beside them for its attention (fresh_rows).
 QUANTIZED = ("fp8", "fp8:row", "int8")
+ELEMENT = {"bf16": 2, "fp16": 2, "fp32": 4, "fp8": 1, "fp8:row": 1, "int8": 1}   # bytes a stored value
+
+
+def position_bytes(layers, kv_heads, head_dim, dtype="bf16", value_dim=None):
+    """The device bytes one position takes in a pool of `layers` layers (KVPool's arguments): its keys and values at
+    the page type's width and, for a row-scaled type, their FP32 scales: what the plugin's facts() count a token,
+    priced without making the pool (a model plugin's resolve()). value_dim 0: a pool of keys only."""
+    if dtype not in DTYPES:
+        raise ValueError(f"a KV pool stores {', '.join(DTYPES)}, not {dtype!r}")
+    values = head_dim if value_dim is None else int(value_dim)
+    found = int(layers) * int(kv_heads) * (int(head_dim) + values) * ELEMENT[dtype]
+    if dtype in ROW_SCALED:
+        found += 2 * int(layers) * int(kv_heads) * 4
+    return found
 
 
 # An elastic pool backs its pages BACK at a time (4,096 tokens of 16-token pages).
@@ -240,6 +254,15 @@ class KVPool:
             raise ValueError(f"sequence {sequence!r} is open already")
         self.tables[sequence], self.lengths[sequence] = [], 0
         self.reached[sequence] = 0
+
+    def discard(self):
+        """The pool is over (its engine closes): an elastic pool's range goes back to the device now. The device's
+        registry of ranges (crit_plugins.memory.DeviceMemory.ranges) holds a range until it is closed, so without this
+        the pool's backed pages would outlive the engine and an engine opened next in the process would start with
+        less free device memory. Nothing reads the pool afterwards."""
+        elastic, self.elastic = self.elastic, None
+        if elastic is not None:
+            elastic.close()
 
     def close(self, sequence):
         if sequence in self.slot_of:

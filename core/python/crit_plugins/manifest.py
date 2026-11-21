@@ -31,7 +31,6 @@ SLOTS = {
     "drafter": "draft proposals for speculative decoding",
     "verifier": "the speculative round: verify, accept and repair",
     "sampler": "token sampling and its constraints",
-    "graphs": "graph capture and replay of the passes",
     "embeddings": "token embedding and lookup-table rows",
 }
 
@@ -42,7 +41,7 @@ REQUIRED_SLOTS = ("model", "placement", "projections", "attention", "kv_cache", 
 # their code may run on the host beside any device, "devices": ["host"]. A plugin in any other slot computes on the
 # device the engine serves on. Scheduling is no slot: Core's concurrent runtime schedules every engine's steps (mixed
 # prefill and decode, admission, chunks from the model's info), since every engine batches.
-POLICY_SLOTS = ("placement", "graphs", "expert_residency", "expert_source", "drafter", "verifier")
+POLICY_SLOTS = ("placement", "expert_residency", "expert_source", "drafter", "verifier")
 # The devices a plugin can run on; "host" is a policy plugin's.
 DEVICES = ("cuda", "rocm", "metal", "vulkan", "cpu")
 HOST = "host"
@@ -78,10 +77,20 @@ def _needs(value, where):
 def _option(name, spec, where):
     if not SLOT.fullmatch(name) or not isinstance(spec, dict):
         raise PluginError(f"{where}: option {name!r} needs a lowercase name and an object")
-    unknown = set(spec) - {"type", "default", "min", "max", "choices", "description"}
+    unknown = set(spec) - {"type", "default", "min", "max", "choices", "description", "approximates"}
     if unknown or "type" not in spec or "default" not in spec or spec["type"] not in OPTION_TYPES:
         raise PluginError(f"{where}: option {name} has a type ({', '.join(OPTION_TYPES)}) and a default, and nothing "
-                          f"but min, max, choices and description beside them")
+                          f"but min, max, choices, description and approximates beside them")
+    if "approximates" in spec:
+        # An option that drops or approximates the model's work (routes left out, a KV cache quantized beyond what
+        # the checkpoint stores): the values at which it computes the model as stored, and what the others change.
+        found = spec["approximates"]
+        if (not isinstance(found, dict) or set(found) != {"exact", "what"} or not isinstance(found["exact"], list)
+                or not found["exact"] or not isinstance(found["what"], str) or not found["what"].strip()):
+            raise PluginError(f"{where}: option {name}'s approximates is {{\"exact\": [the values that compute the "
+                              "model as stored], \"what\": what the other values change}")
+        for value in found["exact"]:
+            check_option(name, spec, value, where)
     if spec["type"] == "choice":
         if not isinstance(spec.get("choices"), list) or not spec["choices"]:
             raise PluginError(f"{where}: option {name} of type choice lists its choices")
@@ -157,6 +166,33 @@ def _sources(value, folder, where):
     return out
 
 
+def source_plugin(source):
+    """Whether a source (a manifest's sources entry) is another plugin's folder, one holding its plugin.json: its code
+    then imports as in its own plugin, its own sources nested under it (crit_plugins.assemble.load_module)."""
+    return (Path(source["folder"]) / MANIFEST).is_file()
+
+
+def _extends(value, manifest, folder, where, through):
+    """extends: the name of one of the plugin's sources that is another plugin's folder, the plugin it extends (a
+    subclass of its object, or a wrapper around it: crit_plugins.compose). The plugin takes that plugin's options,
+    its own options adding to them or replacing one of the same name; it states its own fills, needs and provides
+    (what the base promises, a capture-safe form, is not the extension's until its tests show it). Returns {source:
+    the name, id: the base plugin's id} or None."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in manifest["sources"]:
+        raise PluginError(f"{where}: extends names one of the plugin's sources, the folder of the plugin it extends")
+    source = manifest["sources"][value]
+    if not source_plugin(source):
+        raise PluginError(f"{where}: extends names source {value}, whose folder {source['path']} holds no {MANIFEST}")
+    here = folder.resolve()
+    if here in through:
+        raise PluginError(f"{where}: extends goes round in a circle")
+    base = load_manifest(source["folder"], (*through, here))
+    manifest["options"] = {**base["options"], **manifest["options"]}
+    return {"source": value, "id": base["id"]}
+
+
 KERNEL = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 
 
@@ -185,7 +221,7 @@ def _kernels(value, where):
     return out
 
 
-def load_manifest(folder):
+def load_manifest(folder, _through=()):
     """The checked manifest of the plugin in `folder`, with `folder` added. Its id is the folder's name."""
     folder = Path(folder)
     path = folder / MANIFEST
@@ -200,7 +236,8 @@ def load_manifest(folder):
         raise PluginError(f"{where} is a JSON object")
     required = {"schema", "id", "title", "fills", "entry"}
     optional = {"provides", "needs", "needs_when", "conflicts", "options", "reference", "test_with", "sources",
-                "tests", "description", "requires", "requires_when", "devices", "kernels"}
+                "tests", "description", "requires", "requires_when", "devices", "kernels", "tool_format",
+                "reasoning_format", "extends"}
     missing, unknown = required - set(data), set(data) - required - optional
     if missing or unknown:
         raise PluginError(f"{where}: " + "; ".join(
@@ -247,6 +284,9 @@ def load_manifest(folder):
     if ".." in Path(file).parts or not (folder / file).is_file():
         raise PluginError(f"{where}: entry names {file}, which is no file of the plugin")
     manifest["entry"] = (file, function)
+    manifest["tool_format"] = _text_format("tool_format", data.get("tool_format"), manifest, folder, where)
+    manifest["reasoning_format"] = _text_format("reasoning_format", data.get("reasoning_format"), manifest, folder,
+                                                where)
     options = data.get("options", {})
     if not isinstance(options, dict):
         raise PluginError(f"{where}: options is an object of option specs")
@@ -261,6 +301,7 @@ def load_manifest(folder):
     if data["id"] in manifest["test_with"]:
         raise PluginError(f"{where}: test_with names the other plugins its tests use")
     manifest["sources"] = _sources(data.get("sources", {}), folder, where)
+    manifest["extends"] = _extends(data.get("extends"), manifest, folder, where, _through)
     manifest["kernels"] = _kernels(data.get("kernels", []), where)
     tests = data.get("tests", "tests")
     if not isinstance(tests, str) or ".." in Path(tests).parts:
@@ -270,6 +311,26 @@ def load_manifest(folder):
         if fact in manifest["conflicts"]:
             raise PluginError(f"{where}: {fact} is both provided and in conflicts")
     return manifest
+
+
+TEXT_FORMATS = {"tool_format": ("ToolFormat", "tool calls"), "reasoning_format": ("ReasoningFormat", "reasoning")}
+
+
+def _text_format(key, value, manifest, folder, where):
+    """A model plugin's own syntax for tool calls (tool_format) or reasoning (reasoning_format), FILE.py:NAME: NAME
+    is a crit_core.text.ToolFormat or ReasoningFormat in FILE, a module that imports only the standard library and
+    crit_core, for a model whose chat template writes a syntax crit_core.text does not register."""
+    if value is None:
+        return None
+    kind, what = TEXT_FORMATS[key]
+    if manifest["fills"] != ["model"]:
+        raise PluginError(f"{where}: {key} is a model plugin's: the model's syntax for {what}")
+    if not isinstance(value, str) or not ENTRY.fullmatch(value):
+        raise PluginError(f"{where}: {key} is FILE.py:NAME, the {kind} the model writes {what} in")
+    file, name = value.rsplit(":", 1)
+    if ".." in Path(file).parts or not (folder / file).is_file():
+        raise PluginError(f"{where}: {key} names {file}, which is no file of the plugin")
+    return (file, name)
 
 
 def options_for(manifest, given, where=None):

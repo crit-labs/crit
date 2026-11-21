@@ -17,7 +17,7 @@ from support.plugins import write_plugins  # noqa: E402
 class ExtensionTests(unittest.TestCase):
     def test_every_extension_names_a_fact_and_documents_its_methods(self):
         for fact, methods in DEVICE_EXTENSIONS.items():
-            self.assertRegex(fact, r"^[a-z_]+:[a-z_-]+$")
+            self.assertRegex(fact, r"^[a-z_]+:[a-z0-9_-]+$")
             for name, text in methods.items():
                 self.assertTrue(text.startswith(name + "("), f"{fact}.{name}: {text}")
 

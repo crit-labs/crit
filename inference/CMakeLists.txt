@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(crit_inference VERSION 0.21.0 LANGUAGES CXX)
+project(crit_inference VERSION 0.22.0 LANGUAGES CXX)
 # The fixtures of Inference's native code (what plugins build at load) and of its host references. Inference uses Core only through its public SDK
 # (crit::core); Core never builds or includes Inference code.
 find_package(Threads REQUIRED)
@@ -8,7 +8,7 @@ option(CRIT_INFERENCE_CUDA "Build Inference's CUDA reference kernels and their f
 option(CRIT_INFERENCE_INSTALLED_CORE "Use an installed Core SDK (CMAKE_PREFIX_PATH) instead of this checkout's core/" OFF)
 if(NOT TARGET crit::core)
   if(CRIT_INFERENCE_INSTALLED_CORE)
-    find_package(critCore 0.21.0 CONFIG REQUIRED)
+    find_package(critCore 0.22.0 CONFIG REQUIRED)
   else()
     add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../core" "${CMAKE_CURRENT_BINARY_DIR}/core")
   endif()
@@ -171,7 +171,10 @@ function(crit_inference_kernels target code source)
   target_link_libraries(${target} PUBLIC CUDA::cudart)
 endfunction()
 
-crit_inference_kernels(crit_token_sampling ${INFERENCE}/token-sampling/code sampling.cu)
+# token-sampling's law is crit's kernel token-sampling (kernels/techniques/sampling/token-sampling): its fixtures build
+# its sampling.cu with the kernel core's headers (crit_kcore/radix.cuh) and the default knobs (no crit_tuning.h).
+crit_inference_kernels(crit_token_sampling ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/techniques/sampling/token-sampling/sampling_cuda sampling.cu)
+target_include_directories(crit_token_sampling PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../kernels/core/include)
 # The fixtures' host oracle of Core's sampling rules (tests/inference/host_sampler.h).
 add_library(crit_host_sampler STATIC ${FIXTURES}/host_sampler.cpp)
 target_include_directories(crit_host_sampler PUBLIC ${FIXTURES})
@@ -183,7 +186,7 @@ crit_inference_test(crit_token_sampling 120 crit_token_sampling_tests)
 crit_inference_executable(crit_token_law_tests SOURCES ${FIXTURES}/token_law_tests.cpp LINK crit_token_sampling)
 crit_inference_test(crit_token_law 300 crit_token_law_tests)
 
-# The host's handoffs, Core's too (crit_plugins.host): the mailbox of the host-work-mailbox entry.
+# The host's handoffs, Core's (crit_plugins.host, core/python/crit_plugins/host/README.md): its CUDA fixture.
 crit_inference_kernels(crit_host_mailbox ${_core_host} handoff.cu)
 add_library(crit_host_mailbox_fixture STATIC ${FIXTURES}/host_mailbox_fixture.cu)
 target_link_libraries(crit_host_mailbox_fixture PUBLIC crit_host_mailbox)

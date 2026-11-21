@@ -11,7 +11,7 @@ from crit_kernels.build import load
 
 gx = load("grouped-experts")
 dev = torch.device("cuda")
-FORMATS = {"bf16": 0, "fp8:channel": 1, "fp8:block": 2, "nvfp4": 3, "int4": 4, "mxfp4": 5, "int4_zp": 6}
+FORMATS = {"bf16": 0, "fp8:channel": 1, "fp8:block": 2, "nvfp4": 3, "int4": 4, "mxfp4": 5, "int4_zp": 6, "mxfp8": 7}
 GROUP = 64   # int4_zp's inputs a scale and zero point (AWQ, GPTQ: 32 to 128)
 E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 E2M1_SIGNED = torch.tensor(E2M1 + [-v for v in E2M1], dtype=torch.float64)
@@ -24,6 +24,8 @@ def cdiv(a, b):
 def components(fmt, H, I):
     if fmt == "bf16":
         return [("gate_up", 4 * I * H), ("down", 2 * H * I)]
+    if fmt == "mxfp8":   # E4M3 codes, an E8M0 byte a 32
+        return [("gate_up", 2 * I * H), ("gate_up_scale", 2 * I * H // 32), ("down", H * I), ("down_scale", H * I // 32)]
     if fmt.startswith("fp8"):
         gs, ds = ((8 * I, 4 * H) if fmt == "fp8:channel" else   # fp8:block: gate's grid, then up's
                   (4 * 2 * cdiv(I, 128) * cdiv(H, 128), 4 * cdiv(H, 128) * cdiv(I, 128)))
@@ -60,6 +62,11 @@ def matrix(fmt, rows, cols, g):
     if fmt == "bf16":
         w = (torch.randn(rows, cols, generator=g) * 0.05).bfloat16()
         return {"": w.view(torch.uint8).reshape(-1)}, w.double()
+    if fmt == "mxfp8":
+        codes = e4m3_bytes_of(torch.randn(rows, cols, generator=g) * 64)
+        s = torch.randint(112, 119, (rows, cols // 32), dtype=torch.uint8, generator=g)
+        v = codes.view(torch.float8_e4m3fn).double()
+        return {"": codes.reshape(-1), "scale": s}, v * torch.pow(2.0, s.double() - 127).repeat_interleave(32, 1)
     if fmt.startswith("fp8"):
         codes = e4m3_bytes_of(torch.randn(rows, cols, generator=g) * 64)
         v = codes.view(torch.float8_e4m3fn).double()
@@ -139,9 +146,10 @@ def quantize_codes(v, g):
 
 
 class Experts:
-    def __init__(self, fmt, E=6, H=256, I=128, seed=0, a4=False, activation="silu"):
+    def __init__(self, fmt, E=6, H=256, I=128, seed=0, a4=False, activation="silu", caps=None):
         g = torch.Generator().manual_seed(seed)
         self.fmt, self.E, self.H, self.I, self.a4, self.activation = fmt, E, H, I, a4, activation
+        self.caps = caps
         self.inputs = [(float(torch.rand(1, generator=g)) * 200 + 300, float(torch.rand(1, generator=g)) * 40 + 20)
                        for _ in range(E)]
         made = [bundle(fmt, H, I, g, self.inputs[e]) for e in range(E)]
@@ -150,6 +158,8 @@ class Experts:
         self.layout = layout(fmt, H, I)
         if activation != "silu":   # a layout's 13th integer, after the int4_zp group (0 for none)
             self.layout += [0] * (12 - len(self.layout)) + [gx.ACTIVATIONS[activation]]
+        if caps is not None:       # its 14th and 15th: the caps
+            self.layout += gx.caps_layout(caps)
 
     def reference(self, x, ids, weights, slots=None):
         x = x.bfloat16().double().cpu()
@@ -161,9 +171,15 @@ class Experts:
                     continue
                 xin = quantize(x[t:t + 1].float(), self.inputs[e][0])[0] if self.a4 else x[t]
                 gu = self.gate_up[e] @ xin
-                gate = (torch.nn.functional.silu(gu[:self.I]) if self.activation == "silu"
-                        else torch.nn.functional.gelu(gu[:self.I], approximate="tanh"))
-                h = gate * gu[self.I:]
+                up = gu[self.I:]
+                if self.activation == "softcapped_silu":
+                    cg, cu = self.caps
+                    gate = cg * torch.tanh(gu[:self.I] / cg) * torch.sigmoid(gu[:self.I])
+                    up = cu * torch.tanh(up / cu)
+                else:
+                    gate = (torch.nn.functional.silu(gu[:self.I]) if self.activation == "silu"
+                            else torch.nn.functional.gelu(gu[:self.I], approximate="tanh"))
+                h = gate * up
                 h = quantize(h[None].float(), self.inputs[e][1])[0] if self.a4 else h.float().bfloat16().double()
                 out[t] += float(weights[t, j]) * (self.down[e] @ h)
         return out
@@ -186,7 +202,7 @@ def routes(T, top, E, g, holes=True):
 
 
 CASES = [("bf16", False), ("fp8:channel", False), ("fp8:block", False), ("nvfp4", False), ("nvfp4", True),
-         ("int4", False), ("mxfp4", False), ("int4_zp", False)]
+         ("int4", False), ("mxfp4", False), ("int4_zp", False), ("mxfp8", False)]
 
 
 @pytest.mark.kernels_ci
@@ -228,8 +244,34 @@ def test_a_block_gated_by_gelu_matches_the_fp64_reference_and_keeps_a_routes_bit
 
 
 @pytest.mark.kernels_ci
+@pytest.mark.parametrize("fmt,a4", [("bf16", False), ("nvfp4", False), ("nvfp4", True), ("int4_zp", False),
+                                    ("mxfp8", False)])
+def test_a_block_gated_by_a_capped_swiglu_matches_the_fp64_reference_and_keeps_a_routes_bits(fmt, a4):
+    # softcapped_silu: cap_g tanh(gate / cap_g) sigmoid(gate) * cap_u tanh(up / cap_u), the caps small enough here that
+    # they bend most rows; another gate than SwiGLU's, a route's bits its own in either item width, refused with
+    # caps it does not take.
+    caps = (0.5, 2.0)
+    experts, swiglu = Experts(fmt, a4=a4, activation="softcapped_silu", caps=caps), Experts(fmt, a4=a4)
+    g = torch.Generator().manual_seed(4)
+    x = (torch.randn(40, experts.H, generator=g) * 4).bfloat16().to(dev)
+    ids, w = routes(40, 3, experts.E, g)
+    out = experts.forward(x, ids, w).double().cpu()
+    ref = experts.reference(x, ids.cpu(), w.cpu())
+    scale = ref.abs().max()
+    assert (out - ref).abs().max() <= (3e-2 if a4 else 5e-3) * scale, (fmt, a4, float((out - ref).abs().max() / scale))
+    assert (out - swiglu.forward(x, ids, w).double().cpu()).abs().max() > 0.05 * scale
+    full, valid = experts.rows(x, ids), (ids.reshape(-1) >= 0).cpu()
+    for width in (8, 32):
+        part = experts.rows(x[11:19].clone(), ids[11:19].clone(), width=width)
+        assert torch.equal(part[valid[33:57]], full[33:57][valid[33:57]]), (fmt, width)
+    ws = gx.Workspace(40, 3, experts.E, experts.H, experts.I, dev)
+    with pytest.raises(RuntimeError, match="two positive caps"):
+        gx.route_outputs(x, ids, experts.store, None, experts.layout[:13], ws, a4)
+
+
+@pytest.mark.kernels_ci
 @pytest.mark.parametrize("fmt,a4", [("bf16", False), ("nvfp4", True), ("fp8:block", False), ("mxfp4", False),
-                                    ("int4_zp", False)])
+                                    ("int4_zp", False), ("mxfp8", False)])
 def test_a_route_keeps_its_bits_whatever_shares_its_call(fmt, a4):
     experts = Experts(fmt, E=16, a4=a4, seed=1)
     g = torch.Generator().manual_seed(5)

@@ -65,7 +65,22 @@ the top-p boundary and the draw (weights) are all the same search: walk the key'
 the cumulative crosses the target, then resolve the final key's ties in id order with a
 block-wide scan. Each sum is per-thread FP32 over a fixed stride, then FP64 over threads
 in a fixed order, so a row's result never depends on timing or on the other rows of the
-launch; `top_k = 0` is the whole vocabulary, as in Core.
+launch; `top_k = 0` is the whole vocabulary, as in Core. The tie scan visits only the
+1,024-id tiles that hold a token with the boundary key: a tile without one adds exact zeros
+and holds no hit, so skipping it keeps every sum and the pick.
+
+**The spread form.** The 1,024 threads of a row's law are virtual threads over 32 blocks of
+one warp each, launched cooperatively, so a row's passes run on 32 multiprocessors
+instead of one. A virtual thread reads the ids the one-block law's thread reads, in the
+same order, and its warp is that thread's warp, so every per-thread sum and shuffle tree is
+the same; only the cross-warp step moves: each warp writes its value to the row's slots in
+scratch (double-buffered), the row's blocks meet at a barrier (an arrival counter), and
+each block's first thread reduces the 32 values in the one-block law's order. Both forms
+give the same bits. `enqueue_sample` and `enqueue_verify` take the spread form where the
+device runs cooperative launches and the occupancy API says every block of the grid fits at
+once (a cooperative launch also refuses a grid that does not, rather than deadlocking);
+otherwise, when the launch fails, or with `CRIT_SAMPLING_ONE_BLOCK=1`, one block a row.
+`enqueue_select` keeps one block a row.
 
 **Speculative verification.** `enqueue_verify` computes the law of all `K + 1` verify
 columns in parallel (one block per column and request) and writes predictions for the
@@ -172,8 +187,8 @@ its length and its address modulo 16 bytes, the same for every row of a vocabula
 over a token tree (`view.tree_depths`, draft-trees) predicts each node's own draw at
 `out_count + depth` through `Rows::tree`. A second `reserve` keeps the rules staged before, and the plugin's facts
 name the kernel the rounds run (`round_sampling`: `native` or `torch`). The launches are
-`sampling.cu`'s through [sampling_torch.cpp](code/sampling_torch.cpp), built at load through torch's extension builder
-(a name hashed from the sources); where it does not build, with the `rounds` option `torch`, and on the CPU the same
+crit's kernel [token-sampling](../../kernels/techniques/sampling/token-sampling/README.md) (`sampling.cu` and its torch ops, built for the device by crit's kernel
+build with the engine's tuning or its default knobs, declared in plugin.json's `kernels`); where it does not build, with the `rounds` option `torch`, and on the CPU the same
 rules run in torch over sorted rows in FP64 with dense laws (slower, exact up to cumulative sums in a parallel order).
 The tokens equal the host form's `predictions` for the same rows, drafts and laws wherever the fast path settles the
 row (greedy, `top_k <= 64`, or a kept set closing within the top 64); full-law rows keep their FP32 boundary caveat.
@@ -183,7 +198,8 @@ than the rejection rule.
 
 ## What the code supplies
 
-[sampling.h](code/sampling.h) / [sampling.cu](code/sampling.cu), linking `crit::core`:
+[sampling.h](../../kernels/techniques/sampling/token-sampling/sampling_cuda/sampling.h) / [sampling.cu](../../kernels/techniques/sampling/token-sampling/sampling_cuda/sampling.cu) (crit's kernel
+token-sampling), linking `crit::core`:
 
 | Interface | Supplies |
 | --- | --- |
@@ -196,7 +212,7 @@ than the rejection rule.
 | `enqueue_ranked_logprobs` | The same over rows that are log-probabilities already (a torch engine's `log_softmax`): the chosen tokens' values and the ranked alternatives as given (the rounds:sampler extension's) |
 | `enqueue_commit` | Counts and positions after publication, from a device-held emitted count |
 
-[sampling_torch.cpp](code/sampling_torch.cpp) binds the launches for torch tensors (host code), and
+The kernel's [torch ops](../../kernels/techniques/sampling/token-sampling/torch-ext/torch_binding.cpp) bind the launches for torch tensors (host code), and
 [device_rounds.py](code/device_rounds.py) is the rounds:sampler extension over them, with the torch law as its
 fallback.
 

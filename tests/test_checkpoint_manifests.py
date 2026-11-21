@@ -133,6 +133,26 @@ class ManifestPlanTests(unittest.TestCase):
         if uncovered:
             print("checkpoints no model-template layout covers: " + ", ".join(uncovered))
 
+    def test_a_draft_layers_link_reserve_counts_every_plan_of_a_captured_round(self):
+        # FP4-Local Flash-Next stores its draft layer's experts W4A16 beside the decoder's W4A4: beside the CPU tier
+        # that layer's misses go over the link, from a reserve of the slots one decode round routes in it. A captured
+        # round lists its victims once, and the draft layer runs each request's catch-up (width + 1 columns) and then
+        # its chain's width - 1 steps in it: 4 requests at width 3 and top 10 route 4 x 6 x 10 = 240, not the catch-up's
+        # 160 alone, so the reserve is 240 and a prompt takes 512 + 240 + 1 = 753 of the cache's slots.
+        found = manifests.available()
+        name = "nvidia-Qwen3.8-Flash-Next-FP4-Local"
+        if name not in found:
+            self.skipTest(f"no {name} manifest")
+        report = dry_plan.plan(manifests.load(found[name]), "tables-on")
+        self.assertIsNone(report["error"], report["error"])
+        begun = report["experts"]
+        draft = begun["layers"] - 1
+        self.assertEqual((begun["a4"][draft], {begun["a4"][layer] for layer in range(draft)}), (False, {True}))
+        concurrency, width = 4, 3   # model-template's defaults
+        self.assertEqual((begun["decode_rows"], begun["top"]), (concurrency * (width + 1 + width - 1), 10))
+        reserve = min(begun["experts"], begun["decode_rows"] * begun["top"])
+        self.assertEqual((reserve, begun["experts"] + reserve + 1), (240, 753))
+
 
 if __name__ == "__main__":
     unittest.main()

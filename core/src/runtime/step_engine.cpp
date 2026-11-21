@@ -102,6 +102,9 @@ Settings settings(std::string_view configuration) {
     p.prefill_chunk = i.prefill_chunk;
     p.max_concurrency = i.max_concurrency;
     p.max_pending = count(e, "max_pending", i.max_concurrency);
+    // How long a request may wait for a lane before it fails ("pending request deadline expired"): the caller's, Core's
+    // StepEngine passes its own (crit_core.native: none unless a server bounds its queue).
+    p.pending_timeout_ms = count(e, "pending_timeout_ms", p.pending_timeout_ms);
     p.max_batch_tokens = count(e, "max_batch_tokens", i.prefill_chunk + i.max_concurrency * s.row_tokens);
     i.mixed_batches = p.max_batch_tokens > 0;
     if(const auto* policy = e.find("batch_policy"); policy && !policy->is_null()) {
@@ -179,6 +182,7 @@ std::string options_json(const RequestView& view, const ModelInfo& info) {
         key("plain");
         out += "true";
     }
+    if(o.decode_via_prompt) { key("decode_via_prompt"); out += "true"; }
     return out + "}";
 }
 
@@ -258,14 +262,15 @@ class StepModel final : public Model {
         StepModel* model;
         std::uint64_t handle;
         std::optional<std::uint32_t> logprobs;
-        bool constrained = false;   // Core's host side masks its tokens: never in a native round
+        bool constrained = false;   // Core's host side masks its tokens: in a native round only where the rounds mask
         bool replay = false;        // a replay continuation: its native rounds run the log-probability form
+        bool via_prompt = false;    // decode rows through the model's prompt arithmetic: never in a native round
         RoundFacts rounds;
         std::vector<Token> tokens;
         std::vector<float> token_logprobs;
         std::vector<TokenLogprob> top;
-        Row(StepModel* m, std::uint64_t h, std::optional<std::uint32_t> n, bool c, bool r)
-            : model(m), handle(h), logprobs(n), constrained(c), replay(r) {}
+        Row(StepModel* m, std::uint64_t h, std::optional<std::uint32_t> n, bool c, bool r, bool p)
+            : model(m), handle(h), logprobs(n), constrained(c), replay(r), via_prompt(p) {}
         ~Row() override { model->release(handle); }
     };
 
@@ -285,12 +290,14 @@ class StepModel final : public Model {
     std::vector<char> opened_;           // per row count: 1 when open gave it a width (it may run natively)
     bool native_last_ = false;
     bool logprobs_round_ = false;        // the native round native() chose runs its log-probability form
+    bool constrained_round_ = false;     // ... and holds a constrained row, whose next mask the engine stages in commit
 
     // A native round serves these items when every one is a decode row of a session in slots 0 .. n - 1 (each slot
-    // once), the engine gives n rows a width, every row's grant holds the round's columns, no request is constrained,
-    // and a request asking for log-probabilities asks for no more alternatives than the rounds rank (StepRounds'
-    // logprobs and top). slot_of_[i] is item i's slot. The round runs its log-probability form when a row's request
-    // asks for log-probabilities or replays a continuation (logprobs_round_), else its plain form.
+    // once), the engine gives n rows a width, every row's grant holds the round's columns, no request decodes through
+    // the prompt path (decode_via_prompt), a constrained request only in rounds that mask (StepRounds' masks), and a
+    // request asking for log-probabilities asks for no more alternatives than the rounds rank (StepRounds' logprobs
+    // and top). slot_of_[i] is item i's slot. The round runs its log-probability form when a row's request asks for
+    // log-probabilities or replays a continuation (logprobs_round_), else its plain form.
     bool native(std::span<const WorkItem> items, bool mixed) {
         const auto* r = rounds_;
         if(!r || !r->launch || !r->wait || !r->block || !r->slot_session || !r->widths) return false;
@@ -302,14 +309,15 @@ class StepModel final : public Model {
                                      std::to_string(r->widest) + ")");
         const auto columns = std::uint32_t(r->widths[n - 1]) + 1;
         slot_of_.assign(n, 0);
-        logprobs_round_ = false;
+        logprobs_round_ = constrained_round_ = false;
         std::vector<char> taken(n, 0);
         for(std::size_t i = 0; i < n; ++i) {
             const auto& session = *static_cast<Row*>(items[i].session);
-            if(!items[i].budget.prefill_complete || session.constrained) return false;
+            if(!items[i].budget.prefill_complete || (session.constrained && !r->masks) || session.via_prompt) return false;
             if(session.logprobs && !(r->logprobs && settings_.info.token_logprobs && *session.logprobs <= r->top))
                 return false;
             logprobs_round_ = logprobs_round_ || session.logprobs || session.replay;
+            constrained_round_ = constrained_round_ || session.constrained;
             if(mixed && items[i].budget.token_work < columns) return false;   // step() decodes within a short grant
             std::size_t s = 0;
             while(s < n && r->slot_session[s] != session.handle) ++s;
@@ -530,7 +538,8 @@ public:
             const auto* context = view.options->context.get();
             const auto* attachment = dynamic_cast<const HostAttachment*>(context);
             return std::make_unique<Row>(this, handle, view.options->logprobs, attachment && attachment->constrained,
-                                             dynamic_cast<const ReplayContinuation*>(context) != nullptr);
+                                             dynamic_cast<const ReplayContinuation*>(context) != nullptr,
+                                             view.options->decode_via_prompt);
         } catch(...) {
             release(handle);
             throw;
@@ -542,8 +551,10 @@ public:
     void commit(std::span<const CommitDecision> decisions) override {
         ordinary();
         if(!cb_.commit) return;
-        // After a native round the engine hears only of rows Core trimmed, ended or cancelled.
-        if(native_last_ && std::all_of(decisions.begin(), decisions.end(), [](const CommitDecision& d) {
+        // After a native round the engine hears only of rows Core trimmed, ended or cancelled, and of every row of a
+        // round that ran a constrained row: its token goes to the request's matcher, and the slot's next mask is
+        // staged before the next round.
+        if(native_last_ && !constrained_round_ && std::all_of(decisions.begin(), decisions.end(), [](const CommitDecision& d) {
                return !d.terminal && !d.cancelled &&
                       d.accepted == static_cast<const Row*>(d.session)->tokens.size();
            }))

@@ -155,6 +155,25 @@ __device__ __forceinline__ void mma_nvf4_m16n8k64(float* c, uint32_t a0, uint32_
 #endif
 }
 
+// d = A B as mma_nvf4_m16n8k64 with a zero accumulator (a register holding +0, not d's values): a chain's first MMA,
+// which needs no zeroed accumulator before it.
+__device__ __forceinline__ void mma_nvf4_m16n8k64_zero(float* d, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                                       uint32_t b0, uint32_t b1, uint32_t sfa, uint32_t sfb) {
+#if CRIT_KCORE_HAS_BLOCK_SCALED_MMA
+    const float zero = 0.f;
+    asm volatile(
+        "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%16,%16,%16,%16}, {%10}, {%11,%12}, {%13}, {%14,%15};\n"
+        : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(sfa), "h"((uint16_t)0), "h"((uint16_t)0), "r"(sfb),
+          "h"((uint16_t)0), "h"((uint16_t)0), "f"(zero));
+#else
+    (void)a0, (void)a1, (void)a2, (void)a3, (void)b0, (void)b1, (void)sfa, (void)sfb;
+    d[0] = d[1] = d[2] = d[3] = 0.0f;
+    __trap();
+#endif
+}
+
 // c += A (16 x 64 E2M1) B (64 x 8 E2M1) with a UE8M0 scale per 32 values of K on both (MXFP4; scale_vec::2X: two
 // scale bytes, the low two of the word), FP32 accumulation.
 __device__ __forceinline__ void mma_mxf4_m16n8k64(float* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,

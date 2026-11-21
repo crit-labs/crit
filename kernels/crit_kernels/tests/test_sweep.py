@@ -222,8 +222,8 @@ def test_a_stop_during_the_builds_ends_them_and_writes_the_defaults_table(tmp_pa
     monkeypatch.setattr(sweep, "_Stop", Stop)
     monkeypatch.setattr(sweep, "_build_one", build_one)
     monkeypatch.setattr(sweep, "ProcessPoolExecutor",
-                        lambda max_workers, initializer: ThreadPoolExecutor(max_workers=1))
-    monkeypatch.setattr(sweep, "_measure_all", lambda *a, **k: (_ for _ in ()).throw(AssertionError("measured")))
+                        lambda max_workers, initializer, mp_context=None: ThreadPoolExecutor(max_workers=1))
+    monkeypatch.setattr(sweep, "_measure_build", lambda *a, **k: (_ for _ in ()).throw(AssertionError("measured")))
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda *a: "test device")
     monkeypatch.setattr(kbuild, "device_arch", lambda: ("sm_120", "12.0"))
     shapes = {"gemm": [{"N": 4096, "K": 4096, "format": "Q4_K"}]}
@@ -231,5 +231,148 @@ def test_a_stop_during_the_builds_ends_them_and_writes_the_defaults_table(tmp_pa
     assert len(calls) == 1   # one build ran, the rest were cancelled
     assert tuning["structures"]["gemm"] == {"configs": [kbuild.defaults(kbuild.find("gguf-rows")[1], "gemm")], "table": []}
     reasons = set(report["dropped"].values())
-    assert len(reasons) == 1 and "stopped during its builds (1 of" in reasons.pop()
+    assert len(reasons) == 1 and "the sweep was stopped (1 of" in reasons.pop()
     assert json.loads((tmp_path / "gguf-rows.json").read_text())["structures"]["gemm"]["table"] == []
+
+
+def _pipeline(monkeypatch, stop_after=None):
+    """_measure_all over three builds a thread pool finishes one at a time (each waits for its gate), with fakes for
+    the GPU: what was timed, in what order, and whether the GPU lock was held then."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    events, lock_held = [], []
+    gates = [threading.Event() for _ in range(3)]
+    plan = [("s", [], [(0, {"K": 0})]), ("s", [{"K": 1}], [(1, {"K": 1})]), ("s", [{"K": 2}], [(1, {"K": 2})])]
+
+    class Handle:
+        def __init__(self):
+            lock_held.append(True)
+
+        def close(self):
+            lock_held.append(False)
+
+    def build(i):
+        gates[i].wait(10)
+        events.append(("built", i))
+        return {"s": plan[i][1]}, ("does not compile" if i == 2 else None)
+
+    def measure(kernel_id, root, manifest, item, benches, shape_sets, results, dropped, where, timer, torch):
+        i = plan.index(item)
+        events.append(("timed", i, lock_held[-1]))
+        if all(("s", json.dumps(c, sort_keys=True)) in dropped for _, c in item[2]):
+            return
+        results[("s", (1,), 1, json.dumps(item[2][0][1], sort_keys=True))] = 1.0
+        if i + 1 < len(gates):
+            gates[i + 1].set()   # the next build finishes only once this one was timed: timing does not wait on all
+
+    stopped = sweep._Stop()
+    if stop_after is not None:
+        def measure_then_stop(*args):
+            measure(*args)
+            if len([e for e in events if e[0] == "timed"]) == stop_after:
+                stopped._stop()
+        monkeypatch.setattr(sweep, "_measure_build", measure_then_stop)
+    else:
+        monkeypatch.setattr(sweep, "_measure_build", measure)
+    monkeypatch.setattr(kbuild, "load", lambda *a, **k: "module")
+    monkeypatch.setattr(sweep, "_lock", lambda path: Handle())
+    monkeypatch.setattr(sweep, "Timer", lambda *a: "timer")
+    monkeypatch.setattr(sweep, "choose", lambda *a: ({}, {}))
+    monkeypatch.setattr(sweep, "_confirm", lambda *a: events.append(("confirmed", lock_held[-1])))
+    monkeypatch.setattr(sweep, "_yardsticks", lambda *a: {})
+    results, dropped = {}, {}
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {pool.submit(build, i): i for i in range(3)}
+
+        def built(future, result):
+            if result[1]:
+                for _, c in plan[futures[future]][2]:
+                    dropped[("s", json.dumps(c, sort_keys=True))] = result[1]
+        gates[0].set()
+        found = sweep._measure_all("toy", None, "lock", None, 3, 25, {}, plan, ["s"], {"s": []}, {}, results, dropped,
+                                   {}, stopped, lambda *_: None, pool, futures, None, built)
+        for gate in gates:
+            gate.set()
+    return found, events, results, dropped
+
+
+def test_each_build_is_timed_as_it_finishes_under_the_lock(monkeypatch):
+    """The sweep times a build's configurations as soon as that build finishes, not after every build: build 1 only
+    finishes once build 0 was timed. Timing and the confirmation hold the GPU lock; a build that failed is not timed."""
+    (builds, finished), events, results, dropped = _pipeline(monkeypatch)
+    assert (builds, finished) == (3, 3)
+    assert events[:4] == [("built", 0), ("timed", 0, True), ("built", 1), ("timed", 1, True)]
+    assert ("timed", 2, True) in events and events[-1] == ("confirmed", True)
+    assert len(results) == 2 and set(dropped.values()) == {"does not compile"}
+
+
+def test_a_stop_while_builds_run_keeps_what_was_timed(monkeypatch):
+    """A stop after the first build was timed ends the builds; the table is chosen from that build's timings and the
+    rest is recorded as not measured, saying how many builds were done."""
+    (builds, finished), events, results, dropped = _pipeline(monkeypatch, stop_after=1)
+    assert len(results) == 1 and ("confirmed", True) not in events
+    assert finished <= 2 and builds == 3
+    assert all("the sweep was stopped" in why and "builds built" in why for why in dropped.values())
+    assert len(dropped) == 2
+
+
+class _Valid:
+    """A bench whose STAGES 3 does not run 256-wide heads and whose CONVERT runs only over 8-bit pages; variants by
+    page kind."""
+
+    def valid_for(self, knobs, shape):
+        return not (knobs["STAGES"] == 3 and shape["D"] == 256) and not (knobs["CONVERT"] and shape["kind"] == "bf16")
+
+    def variants(self, shape):
+        return [{"KIND": {"bf16": 0, "fp8": 1}[shape["kind"]]}]
+
+
+VALID = {"id": "toy2", "structures": {"s": {"key": ["D"], "knobs": {
+    "STAGES": {"values": [0, 3], "default": 0}, "CONVERT": {"values": [0, 1], "default": 0}}}}}
+
+
+def test_configurations_that_run_no_shape_are_not_built():
+    shapes = [{"D": 256, "kind": "bf16"}, {"D": 256, "kind": "fp8"}]
+    found = sweep.configurations(VALID, "s")
+    kept, left = sweep.runnable(VALID, "s", found, _Valid(), shapes)
+    assert left == 2 and kept == [{"STAGES": 0, "CONVERT": 0}, {"STAGES": 0, "CONVERT": 1}]
+    # the defaults are built even where they run nothing (index 0 of every build), a bench without valid_for keeps all
+    kept, _ = sweep.runnable(VALID, "s", found, _Valid(), [{"D": 256, "kind": "bf16"}][:0])
+    assert kept == [{"STAGES": 0, "CONVERT": 0}]
+    assert sweep.runnable(VALID, "s", found, object(), shapes) == (found, 0)
+
+
+def test_a_mixed_kernels_builds_compile_only_the_variants_their_configurations_run():
+    shapes = [{"D": 128, "kind": "bf16"}, {"D": 128, "kind": "fp8"}]
+    bench = _Valid()
+    variants = sweep._variants(bench, shapes)
+    assert variants == [{"KIND": 0}, {"KIND": 1}]
+    found = sweep.configurations(VALID, "s")
+    needs = {json.dumps(c, sort_keys=True): sweep._needs(bench, c, shapes, variants) for c in found}
+    assert needs[json.dumps({"STAGES": 3, "CONVERT": 1}, sort_keys=True)] == (1,)       # fp8 pages only
+    assert needs[json.dumps({"STAGES": 3, "CONVERT": 0}, sort_keys=True)] == (0, 1)
+    chunks = sweep._chunks(VALID, "s", found, 8, lambda c: needs[json.dumps(c, sort_keys=True)])
+    # the defaults first, with those that run both kinds; the CONVERT ones (fp8 only) share a build of their own
+    assert [[c for _, c in indices] for _, indices in chunks] == [
+        [{"STAGES": 0, "CONVERT": 0}, {"STAGES": 3, "CONVERT": 0}],
+        [{"STAGES": 0, "CONVERT": 1}, {"STAGES": 3, "CONVERT": 1}]]
+    assert [i for i, _ in chunks[1][1]] == [1, 2]          # their indices in their build (0 is the defaults)
+    # without groups: one build in kernel.json's order, as before
+    assert [[c for _, c in indices] for _, indices in sweep._chunks(VALID, "s", found, 8)] == [found]
+
+
+def test_configurations_that_compile_alike_are_next_to_each_other():
+    manifest = {"id": "toy3", "structures": {"s": {"knobs": {
+        "CHUNK": {"values": [0, 128, 256], "default": 0},
+        "WARPS": {"values": [4, 8], "default": 4},
+        "RAMP": {"values": [0, 1], "default": 0}}}}}
+
+    class Bench:
+        runtime = ("CHUNK", "RAMP")
+    found = sweep.configurations(manifest, "s", Bench())
+    assert len(found) == 12
+    # the compiled knob (WARPS) varies slowest: a build of six holds one compiled tile
+    assert [c["WARPS"] for c in found] == [4] * 6 + [8] * 6
+    assert [(c["CHUNK"], c["RAMP"]) for c in found[:6]] == [(0, 0), (0, 1), (128, 0), (128, 1), (256, 0), (256, 1)]
+    # a bench that names none: kernel.json's product order, as before
+    assert [c["WARPS"] for c in sweep.configurations(manifest, "s")[:4]] == [4, 4, 8, 8]

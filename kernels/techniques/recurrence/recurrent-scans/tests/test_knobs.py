@@ -81,6 +81,31 @@ def test_tensor_core_prefill_configurations_give_the_default_bits(T, dv):
     kbuild.select(kn, "delta-prefill-tc", -1)
 
 
+@pytest.mark.kernels_ci
+def test_chunk_rows_configurations_give_the_default_bits():
+    """delta-chunk-rows runs on delta-prefill-tc's knobs: every configuration gives the default build's bits for rows
+    of 1 to 130 tokens from their own states, with the boundary states written."""
+    x = prefill_inputs(260, 2, 6, 128, seed=3)
+    q, k, v, logd, beta, s0 = x
+    lengths = (1, 63, 64, 130, 2)
+    firsts = [sum(lengths[:i]) for i in range(len(lengths))]
+    meta = torch.tensor([[f, n, i, i] for i, (f, n) in enumerate(zip(firsts, lengths))], dtype=torch.int32, device=dev)
+    states = torch.stack([s0 * (1 + 0.1 * i) for i in range(len(lengths))])
+
+    def run(module):
+        out_states = torch.zeros_like(states)
+        out = module.gated_delta_chunk_rows(q[:sum(lengths)], k[:sum(lengths)], v[:sum(lengths)], logd[:sum(lengths)],
+                                            beta[:sum(lengths)], meta, states, out_states, scale=128 ** -0.5,
+                                            widest=max(lengths))
+        return out, out_states
+    base = run(rs)
+    for i in range(0, len(TC) + 1):
+        kbuild.select(kn, "delta-prefill-tc", i)
+        found = run(kn)
+        assert torch.equal(found[0], base[0]) and torch.equal(found[1], base[1]), i
+    kbuild.select(kn, "delta-prefill-tc", -1)
+
+
 def pool_inputs(T, kh, vh, dk, dv, seed):
     g = torch.Generator(device="cpu").manual_seed(seed)
     q, k = (torch.randn(T, kh, dk, generator=g).bfloat16() for _ in range(2))

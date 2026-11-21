@@ -44,7 +44,7 @@ from crit.plugins import ENGINE_SERVICES, SOURCES, add, library, main, status, u
 
 INFERENCE = ROOT / "inference"
 ENTRIES = sorted(p.parent.name for p in INFERENCE.glob("*/entry.json"))
-BASE = ["chain-verifier", "device-placement", "eager-graphs", "expert-tensors", "experts-reference", "greedy-head-drafter",
+BASE = ["chain-verifier", "device-placement", "expert-tensors", "experts-reference", "greedy-head-drafter",
         "memory-table-rows", "projections-dense", "sequential-recurrence", "softmax-attention", "topk-router",
         "torch-norms"]
 
@@ -84,8 +84,15 @@ class LibraryTests(unittest.TestCase):
         cls.registry = library()
 
     def test_every_library_plugin_passes_its_own_tests(self):
+        # Where Core's runtime is not built (a checkout before `crit core build`), a plugin whose tests skip only for
+        # it fails crit plugins test but not this suite, which has its own tests gate on the runtime; CI builds it, so
+        # there every unchecked skip fails here too.
+        from crit_core.native import step_library
+        from crit_plugins.testing import NO_CORE_RUNTIME
+        built = step_library() is not None
         items = run_tests(self.registry, log=lambda line: None)
-        failed = {i["name"]: i["detail"] for i in items if i["state"] != "passed"}
+        failed = {i["name"]: i["detail"] for i in items if i["state"] != "passed"
+                  and (built or not i.get("unchecked") or any(s["reason"] != NO_CORE_RUNTIME for s in i["unchecked"]))}
         self.assertEqual(failed, {})
         self.assertEqual(len(items), len(self.registry))
 
@@ -187,7 +194,7 @@ class LibraryTests(unittest.TestCase):
         self.assertEqual(set(ENGINE_SERVICES) & (techniques | sourced), set())
         self.assertEqual(sorted(techniques | sourced | set(ENGINE_SERVICES)), ENTRIES)
         self.assertEqual(sorted(sourced - techniques), ["async-expert-contributions", "expert-streamed-prefill"])
-        self.assertEqual((len(techniques), len(ENTRIES)), (24, 34))
+        self.assertEqual((len(techniques), len(ENTRIES)), (23, 29))
         self.assertEqual(list(INFERENCE.glob("*/plugins/*/plugin.json")), [])
 
 

@@ -3,18 +3,7 @@ also provides: the package's experts-reference in every respect, its device form
 alone, SwiGLU in FP32 over the expert's matrices, the weighted outputs summed in route order) with the expert of each
 route gathered on the device by its id instead of read back to the host, so it runs inside a captured round. A
 token's bits do not depend on the tokens beside it."""
-from pathlib import Path
-
-from crit_plugins import Registry
-from crit_plugins.assemble import load_module
-from crit_plugins.manifest import options_for
-
-
-def library_plugin(context, plugin_id, parts, options=None):
-    """The package's plugin `plugin_id` (copied in beside this stand-in), created as Core's loader creates a plugin."""
-    manifest = Registry.discover(Path(context.package) / "plugins")[plugin_id]
-    factory = getattr(load_module(manifest), manifest["entry"][1])
-    return factory(context, options_for(manifest, options or {}, f"plugins.options.{plugin_id}"), parts)
+from crit_plugins.compose import package_plugin
 
 
 class RoundExperts:
@@ -63,4 +52,4 @@ class RoundExperts:
 
 
 def create(context, options, parts):
-    return RoundExperts(library_plugin(context, options["inner"], parts))
+    return RoundExperts(package_plugin(context, options["inner"], parts))

@@ -5,7 +5,9 @@
   "title": "Top-k expert routing of router logits in one kernel, a warp per token row: softmax or sigmoid scores, correction bias, renormalization, NaN-safe ties to the lower id",
   "package": "topk_routing",
   "language": "cuda",
-  "operations": [],
+  "operations": [
+    "expert-routing"
+  ],
   "sources": [
     "topk_routing_cuda/binding.cu",
     "topk_routing_cuda/topk_routing.cu",

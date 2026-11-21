@@ -31,6 +31,16 @@
       },
       "verify": "on the target, score a prompt chunk's and a decode row's tokens over a real layer's compressed keys with the kernel and with sparse_scores: scores within FP32 accumulation of the 16-bit products; the picked positions those of sparse_index, or where they differ, scores within that error of the k-th best",
       "invariance": "a token's scores and picks independent of the tokens beside it (a decode token's picks the same token's in a prompt chunk); the same bits on a repeat"
+    },
+    {
+      "id": "kv-page-write",
+      "what": "keys and values of new positions into their page slots in the pool's page kind: 16-bit values as they are, FP8 codes at the layer's multipliers, fp8:row and int8 codes with an FP32 scale a position and KV head (max |x| / 448 or / 127, at least 1e-30, codes the nearest, ties to even); a negative slot written nowhere",
+      "reference": {
+        "path": "inference/attention-state/code/pages.py",
+        "symbol": "write"
+      },
+      "verify": "on the target, write the same rows with the kernel and with the pool's torch write: the codes and scales bit for bit, every slot outside the written ones untouched",
+      "invariance": "a position's codes and scale depend on its own row only; the same bits on a repeat"
     }
   ]
 }

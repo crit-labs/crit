@@ -18,6 +18,7 @@
 #include "crit_tuning.h"
 #include "crit_kcore/device.cuh"
 #include "crit_kcore/load.cuh"
+#include "crit_kcore/radix.cuh"   // the keys and the digit search
 
 namespace {
 
@@ -39,12 +40,6 @@ struct Select {
     int n, k, slice;
     long long stride_s, stride_o;
 };
-
-// FP32 scores as uint32 keys of the same order, a NaN as 0 (below every number, -inf included): _kernels._order_key.
-__device__ __forceinline__ uint32_t order_key(uint32_t bits) {
-    const uint32_t key = (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
-    return (bits & 0x7fffffffu) > 0x7f800000u ? 0u : key;
-}
 
 // CTA (token t, slice p): the k best of the token's valid scores in positions p x slice .. (p + 1) x slice - 1, at
 // out[t][p x k ..].
@@ -97,7 +92,7 @@ __global__ void __launch_bounds__(kThreads) select_kernel(Select a) {
     if(last > first) kc::mbarrier_wait(&landed, 0u);
 #endif
     __syncthreads();
-    for(int j = tid; j < count; j += kThreads) keys[j] = order_key(keys[j]);
+    for(int j = tid; j < count; j += kThreads) keys[j] = kc::radix_key_bits(keys[j]);   // radix.radix_key in the Triton kernels
 #pragma unroll
     for(int d = 0; d < 4; ++d)
         for(int b = tid; b < kBins; b += kThreads) hist[d][b] = 0;
@@ -105,9 +100,8 @@ __global__ void __launch_bounds__(kThreads) select_kernel(Select a) {
     auto valid = [&](int j) { return !prow || where[j] >= 0; };
 
     // Four 8-bit passes, the highest digit first: the k-th largest key's digit among the keys matching the prefix.
-    // A pass costs one barrier (after its histogram): every warp then reads the 256 bins itself (a lane 8 of them),
-    // so each finds the digit without a word from the others. A lane's suffix sum over the warp's 8-bin groups
-    // locates the group that holds the k-th key, that group's lane finds the bin, and a shuffle tells the warp.
+    // A pass costs one barrier (after its histogram): every warp then reads the 256 bins itself (the core's
+    // warp_digit_256, a lane 8 of them), so each finds the digit without a word from the others.
     int need = a.k;
     uint32_t prefix = 0u;
 #pragma unroll
@@ -120,34 +114,7 @@ __global__ void __launch_bounds__(kThreads) select_kernel(Select a) {
             atomicAdd(&bins[counts ? (key >> shift) & 0xFFu : 256u], 1);
         }
         __syncthreads();
-        int group[8], ge = 0;   // the lane's bins 8 lane .. 8 lane + 7, and the keys of those digits or above
-#pragma unroll
-        for(int i = 0; i < 8; ++i) {
-            group[i] = bins[8 * lane + i];
-            ge += group[i];
-        }
-#pragma unroll
-        for(int off = 1; off < 32; off <<= 1) {
-            const int v = __shfl_down_sync(0xffffffffu, ge, off);
-            if(lane + off < 32) ge += v;
-        }
-        if(d == 0) need = min(need, __shfl_sync(0xffffffffu, ge, 0));   // every valid key where there are k or fewer
-        // The highest group with `need` keys at or above it (the last one where need is 0), then its highest such bin
-        // and what is still needed among that bin's keys.
-        const int holder = 31 - __clz(__ballot_sync(0xffffffffu, ge >= need) | 1u);
-        int above = ge, digit = 8 * lane, left = need;
-#pragma unroll
-        for(int i = 0; i < 8; ++i) above -= group[i];   // the keys above the lane's group
-#pragma unroll
-        for(int i = 7; i >= 0; --i) {
-            if(above + group[i] >= left && digit == 8 * lane) {   // (the first bin from the top that reaches it)
-                digit = 8 * lane + i + 256;
-                left -= above;
-            }
-            above += group[i];
-        }
-        digit = __shfl_sync(0xffffffffu, digit, holder) & 0xFF;
-        need = __shfl_sync(0xffffffffu, left, holder);
+        const int digit = kc::warp_digit_256(bins, need, d == 0);   // d == 0: every valid key where there are k or fewer
         prefix |= static_cast<uint32_t>(digit) << shift;
     }
 
@@ -213,10 +180,7 @@ __global__ void __launch_bounds__(kThreads) select_kernel(Select a) {
             allowed -= tie;
             const int j = j0 + 32 * c + i;
             orow[at] = prow ? where[j] : lo + j;
-            if(srow) {   // the score back from its key (a NaN stays a NaN: the candidates' pass keys it as 0 again)
-                const uint32_t key = keys[j];
-                reinterpret_cast<uint32_t*>(srow)[at] = (key & 0x80000000u) ? key & 0x7fffffffu : ~key;
-            }
+            if(srow) srow[at] = kc::radix_float(keys[j]);   // a NaN stays a NaN: the candidates' pass keys it as 0 again
             ++at;
         }
     }

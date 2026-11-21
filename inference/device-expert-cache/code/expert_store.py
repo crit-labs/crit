@@ -252,7 +252,7 @@ def csf_layout(layout, scales):
     {"bundle_bytes": the store bundle's bytes, "slot_bytes", "components": {name: (offset, nbytes)} of the store
     bundle, "program": [[op, src, dst, a, b, c, d, 0]]}: op COPY (src offset, dst offset, bytes) for every other
     component, op CSF (fixed offset, dst offset, rows, groups, exceptions offset, capacity) for each compressed one.
-    The device expert cache runs the program in its fill (directory_ops.cu fill_program, or the torch ops)."""
+    The device expert cache runs the program in its fill (crit's kernel expert-directory's fill_program, or the torch ops)."""
     parts = sorted(layout["components"].items(), key=lambda item: item[1][0])
     unknown = set(scales) - {name for name, _ in parts}
     if unknown:
@@ -398,6 +398,7 @@ class BundleStore:
     """
 
     mapped = True    # region() and address() are device-readable (a file tier's are not)
+    kept = False     # kept for the next engine by its keeper (expert-tensors' open_store(kept=)), who closes it
 
     def __init__(self, layout, layers, experts, device, path=None, identity=None):
         """identity: the checkpoint's identity (a fingerprint: shard names, sizes, header digests) a store file is
@@ -549,6 +550,12 @@ class BundleStore:
         self._host = memory.host_tensor(self._mapping.address, self.size)
         self._device = memory.device_tensor(address, self.size, self.device) if cuda else None
 
+    @property
+    def sealed(self):
+        """Registered for the device: its bundles are all there and put() is refused (a kept store an earlier engine
+        sealed, say)."""
+        return self._registered is not None
+
     def region(self):
         """(host tensor, device tensor) over the whole store; the device tensor is None on a host without CUDA."""
         self._seal()
@@ -634,3 +641,36 @@ def _jsonable(value):
 def open_bundles(layout, layers, experts, device, path=None, identity=None):
     """A BundleStore (the "experts:store" extension's open_store)."""
     return BundleStore(layout, layers, experts, device, path, identity)
+
+
+def row_slot_bytes(row_bytes):
+    """The slot bytes a row of `row_bytes` takes in a cache: the row, padded to a multiple of 16 (the cache copies
+    16-byte words)."""
+    if int(row_bytes) < 1:
+        raise ValueError("a row holds one byte or more")
+    return _round_up(int(row_bytes), ALIGNMENT)
+
+
+def open_rows(groups, keys, row_bytes, device, rows, path=None, identity=None):
+    """A BundleStore of opaque rows in the caller's own layout (the "experts:rows" extension's row_store): `groups` x
+    `keys` rows of `row_bytes` bytes each (any count, padded to row_slot_bytes in the store), key = group * keys + key,
+    from `rows` ([groups * keys][row_bytes] uint8, a tensor or a sequence of bytes-like rows, in key order). The store
+    knows nothing of what a row holds: an expert in a format of the model's own, a table row, any bytes the caller reads
+    back from a cache slot (ExpertCache.rows()). Its row_bytes is the rows' own size."""
+    slot = row_slot_bytes(row_bytes)
+    store = BundleStore({"bundle_bytes": slot, "row_bytes": int(row_bytes)}, groups, keys, device, path, identity)
+    store.row_bytes = int(row_bytes)
+    if store.complete:
+        return store
+    if len(rows) != store.keys:
+        store.close()
+        raise ValueError(f"the store holds {store.keys} rows, not {len(rows)}")
+    pad = bytes(slot - int(row_bytes))
+    for key in range(store.keys):
+        row = rows[key]
+        data = row.detach().contiguous().cpu().numpy().tobytes() if hasattr(row, "numpy") else bytes(row)
+        if len(data) != int(row_bytes):
+            store.close()
+            raise ValueError(f"row {key} is {len(data)} bytes, not {int(row_bytes)}")
+        store.put(key // store.experts, key % store.experts, data + pad)
+    return store

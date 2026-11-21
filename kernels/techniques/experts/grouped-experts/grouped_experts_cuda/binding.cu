@@ -5,6 +5,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/torch.h>
 
+#include <cstring>
 #include <optional>
 
 #include "grouped_experts.h"
@@ -21,8 +22,9 @@ void typed(const torch::Tensor& t, const char* name, torch::ScalarType type) {
     TORCH_CHECK(t.scalar_type() == type, name, " has dtype ", t.scalar_type(), ", not ", type);
 }
 gx::Layout layout_of(c10::ArrayRef<int64_t> v) {
-    TORCH_CHECK(v.size() >= 11 && v.size() <= 13,
-                "a layout is 11 integers (12: an int4_zp group after them, 0 for none; 13: the activation last)");
+    TORCH_CHECK(v.size() >= 11 && v.size() <= 15 && v.size() != 14,
+                "a layout is 11 integers (12: an int4_zp group after them, 0 for none; 13: the activation; 15: the "
+                "activation's two caps after it, each an FP32's bits)");
     gx::Layout L;
     L.format = static_cast<gx::Format>(v[0]);
     L.bytes = v[1];
@@ -30,9 +32,17 @@ gx::Layout layout_of(c10::ArrayRef<int64_t> v) {
     L.down = v[5], L.down_scale = v[6], L.down_inverse = v[7], L.input = v[8];
     L.hidden = static_cast<int>(v[9]), L.inter = static_cast<int>(v[10]);
     L.group = v.size() >= 12 ? static_cast<int>(v[11]) : 0;
-    L.activation = v.size() == 13 ? static_cast<int>(v[12]) : 0;
-    TORCH_CHECK(v[0] >= 0 && v[0] <= 6, "unknown format ", v[0]);
-    TORCH_CHECK(L.activation == 0 || L.activation == 1, "unknown activation ", L.activation, " (0 silu, 1 gelu_tanh)");
+    L.activation = v.size() >= 13 ? static_cast<int>(v[12]) : 0;
+    if(v.size() == 15) {   // the caps, an FP32's bits each
+        const int32_t gate_bits = static_cast<int32_t>(v[13]), up_bits = static_cast<int32_t>(v[14]);
+        std::memcpy(&L.gate_cap, &gate_bits, sizeof(float));
+        std::memcpy(&L.up_cap, &up_bits, sizeof(float));
+    }
+    TORCH_CHECK(v[0] >= 0 && v[0] <= 7, "unknown format ", v[0]);
+    TORCH_CHECK(L.activation == 0 || L.activation == 1 || L.activation == 2, "unknown activation ", L.activation,
+                " (0 silu, 1 gelu_tanh, 2 softcapped_silu)");
+    TORCH_CHECK((L.activation == 2) == (v.size() == 15) && (L.activation != 2 || (L.gate_cap > 0 && L.up_cap > 0)),
+                "softcapped_silu, and only it, takes two positive caps after the activation");
     return L;
 }
 gx::Items items_of(const torch::Tensor& slot, const torch::Tensor& routes, const torch::Tensor& count) {
@@ -237,4 +247,129 @@ void declared_intermediate(const torch::Tensor& gate_up, const torch::Tensor& st
                                          items_of(item_slot, item_routes, item_count), values.data_ptr<int8_t>(),
                                          scales.data_ptr<float>(), at::cuda::getCurrentCUDAStream()),
        "declared_intermediate");
+}
+
+bool fp4_available() {
+    return gx::fp4_available(at::cuda::getCurrentCUDAStream());
+}
+
+void fp4_inputs(const torch::Tensor& x, int64_t top, const torch::Tensor& store, c10::ArrayRef<int64_t> layout,
+                const torch::Tensor& item_slot, const torch::Tensor& item_routes, const torch::Tensor& item_count,
+                torch::Tensor& codes, torch::Tensor& scales) {
+    const c10::cuda::CUDAGuard guard(x.device());
+    const gx::Layout L = layout_of(layout);
+    typed(x, "x", torch::kBFloat16);
+    typed(codes, "codes", torch::kUInt8);
+    typed(scales, "scales", torch::kUInt8);
+    store_of(store, L);
+    TORCH_CHECK(x.dim() == 2 && x.size(1) == L.hidden, "x is [tokens][hidden]");
+    TORCH_CHECK(codes.dim() == 2 && codes.size(1) == L.hidden / 2 && codes.size(0) >= x.size(0) * top &&
+                    scales.dim() == 2 && scales.size(1) == L.hidden / 16 && scales.size(0) >= x.size(0) * top,
+                "codes is [routes][hidden / 2], scales [routes][hidden / 16]");
+    ok(gx::enqueue_fp4_inputs(reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), static_cast<int>(top),
+                              store.data_ptr<uint8_t>(), L, items_of(item_slot, item_routes, item_count),
+                              codes.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(), at::cuda::getCurrentCUDAStream()),
+       "fp4_inputs");
+}
+
+void fp4_gate_up(const torch::Tensor& codes, const torch::Tensor& scales, const torch::Tensor& store,
+                 c10::ArrayRef<int64_t> layout, const torch::Tensor& item_slot, const torch::Tensor& item_routes,
+                 const torch::Tensor& item_count, torch::Tensor& h_codes, torch::Tensor& h_scales, int64_t tokens) {
+    const c10::cuda::CUDAGuard guard(codes.device());
+    const gx::Layout L = layout_of(layout);
+    typed(codes, "codes", torch::kUInt8);
+    typed(scales, "scales", torch::kUInt8);
+    typed(h_codes, "h_codes", torch::kUInt8);
+    typed(h_scales, "h_scales", torch::kUInt8);
+    store_of(store, L);
+    TORCH_CHECK(codes.dim() == 2 && codes.size(1) == L.hidden / 2 && scales.dim() == 2 &&
+                    scales.size(1) == L.hidden / 16 && scales.size(0) == codes.size(0),
+                "codes is [routes][hidden / 2], scales [routes][hidden / 16]");
+    TORCH_CHECK(h_codes.dim() == 2 && h_codes.size(1) == L.inter / 2 && h_codes.size(0) == codes.size(0) &&
+                    h_scales.dim() == 2 && h_scales.size(1) == L.inter / 16 && h_scales.size(0) == codes.size(0),
+                "h_codes is [routes][inter / 2], h_scales [routes][inter / 16]");
+    ok(gx::enqueue_fp4_gate_up(codes.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(), store.data_ptr<uint8_t>(), L,
+                               items_of(item_slot, item_routes, item_count), h_codes.data_ptr<uint8_t>(),
+                               h_scales.data_ptr<uint8_t>(), at::cuda::getCurrentCUDAStream(),
+                               static_cast<int>(tokens)),
+       "fp4_gate_up");
+}
+
+void fp4_down(const torch::Tensor& h_codes, const torch::Tensor& h_scales, const torch::Tensor& store,
+              c10::ArrayRef<int64_t> layout, const torch::Tensor& item_slot, const torch::Tensor& item_routes,
+              const torch::Tensor& item_count, torch::Tensor& y, int64_t tokens) {
+    const c10::cuda::CUDAGuard guard(h_codes.device());
+    const gx::Layout L = layout_of(layout);
+    typed(h_codes, "h_codes", torch::kUInt8);
+    typed(h_scales, "h_scales", torch::kUInt8);
+    typed(y, "y", torch::kFloat32);
+    store_of(store, L);
+    TORCH_CHECK(h_codes.dim() == 2 && h_codes.size(1) == L.inter / 2 && h_scales.dim() == 2 &&
+                    h_scales.size(1) == L.inter / 16 && h_scales.size(0) == h_codes.size(0),
+                "h_codes is [routes][inter / 2], h_scales [routes][inter / 16]");
+    TORCH_CHECK(y.dim() == 2 && y.size(1) == L.hidden && y.size(0) == h_codes.size(0), "y is [routes][hidden]");
+    ok(gx::enqueue_fp4_down(h_codes.data_ptr<uint8_t>(), h_scales.data_ptr<uint8_t>(), store.data_ptr<uint8_t>(), L,
+                            items_of(item_slot, item_routes, item_count), y.data_ptr<float>(),
+                            at::cuda::getCurrentCUDAStream(), static_cast<int>(tokens)),
+       "fp4_down");
+}
+
+bool fp8_available() {
+    return gx::fp8_available(at::cuda::getCurrentCUDAStream());
+}
+
+void fp8_inputs(const torch::Tensor& rows, int64_t div, const torch::Tensor& item_slot, const torch::Tensor& item_routes,
+                const torch::Tensor& item_count, torch::Tensor& codes, torch::Tensor& scales) {
+    const c10::cuda::CUDAGuard guard(rows.device());
+    typed(rows, "rows", torch::kBFloat16);
+    typed(codes, "codes", torch::kUInt8);
+    typed(scales, "scales", torch::kFloat32);
+    TORCH_CHECK(rows.dim() == 2 && rows.size(1) % 128 == 0, "rows are [..][K], K a multiple of 128");
+    const int64_t K = rows.size(1);
+    TORCH_CHECK(codes.dim() == 2 && codes.size(1) == K && scales.dim() == 2 && scales.size(1) == K / 128 &&
+                    scales.size(0) == codes.size(0) && codes.size(0) >= rows.size(0) * div,
+                "codes are [routes][K], scales [routes][K / 128]");
+    ok(gx::enqueue_fp8_inputs(reinterpret_cast<const __nv_bfloat16*>(rows.data_ptr()), static_cast<int>(div),
+                              static_cast<int>(K), items_of(item_slot, item_routes, item_count), codes.data_ptr<uint8_t>(),
+                              scales.data_ptr<float>(), at::cuda::getCurrentCUDAStream()),
+       "fp8_inputs");
+}
+
+void fp8_gate_up(const torch::Tensor& codes, const torch::Tensor& scales, const torch::Tensor& store,
+                 c10::ArrayRef<int64_t> layout, const torch::Tensor& item_slot, const torch::Tensor& item_routes,
+                 const torch::Tensor& item_count, torch::Tensor& h, int64_t tokens) {
+    const c10::cuda::CUDAGuard guard(codes.device());
+    const gx::Layout L = layout_of(layout);
+    typed(codes, "codes", torch::kUInt8);
+    typed(scales, "scales", torch::kFloat32);
+    typed(h, "h", torch::kBFloat16);
+    store_of(store, L);
+    TORCH_CHECK(codes.dim() == 2 && codes.size(1) == L.hidden && scales.dim() == 2 &&
+                    scales.size(1) == L.hidden / 128 && scales.size(0) == codes.size(0),
+                "codes are [routes][hidden], scales [routes][hidden / 128]");
+    TORCH_CHECK(h.dim() == 2 && h.size(1) == L.inter && h.size(0) >= codes.size(0), "h is [routes][inter]");
+    ok(gx::enqueue_fp8_gate_up(codes.data_ptr<uint8_t>(), scales.data_ptr<float>(), store.data_ptr<uint8_t>(), L,
+                               items_of(item_slot, item_routes, item_count),
+                               reinterpret_cast<__nv_bfloat16*>(h.data_ptr()), at::cuda::getCurrentCUDAStream(),
+                               static_cast<int>(tokens)),
+       "fp8_gate_up");
+}
+
+void fp8_down(const torch::Tensor& h_codes, const torch::Tensor& h_scales, const torch::Tensor& store,
+              c10::ArrayRef<int64_t> layout, const torch::Tensor& item_slot, const torch::Tensor& item_routes,
+              const torch::Tensor& item_count, torch::Tensor& y, int64_t tokens) {
+    const c10::cuda::CUDAGuard guard(h_codes.device());
+    const gx::Layout L = layout_of(layout);
+    typed(h_codes, "h_codes", torch::kUInt8);
+    typed(h_scales, "h_scales", torch::kFloat32);
+    typed(y, "y", torch::kFloat32);
+    store_of(store, L);
+    TORCH_CHECK(h_codes.dim() == 2 && h_codes.size(1) == L.inter && h_scales.dim() == 2 &&
+                    h_scales.size(1) == L.inter / 128 && h_scales.size(0) == h_codes.size(0),
+                "h_codes are [routes][inter], h_scales [routes][inter / 128]");
+    TORCH_CHECK(y.dim() == 2 && y.size(1) == L.hidden && y.size(0) == h_codes.size(0), "y is [routes][hidden]");
+    ok(gx::enqueue_fp8_down(h_codes.data_ptr<uint8_t>(), h_scales.data_ptr<float>(), store.data_ptr<uint8_t>(), L,
+                            items_of(item_slot, item_routes, item_count), y.data_ptr<float>(),
+                            at::cuda::getCurrentCUDAStream(), static_cast<int>(tokens)),
+       "fp8_down");
 }

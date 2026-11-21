@@ -27,11 +27,11 @@ cache.telemetry()                                      # slots, resident, lent, 
   `spare` bytes for the own slots: one allocation, so a lent slot is a row of the same tensor).
 - **One plan per routed layer.** `plan(layer, ids)` takes a step's routes as the router gives them (`[tokens][top]`,
   duplicates and -1 allowed) and writes the layer's slot table (`[experts]`: a slot, -1 not routed, -2 the CPU tier)
-  in one launch of [directory_ops.cu](code/directory_ops.cu) (one block: distinct experts in the order first
+  in one launch of crit's kernel [expert-directory](../../kernels/techniques/experts/expert-directory) (one block: distinct experts in the order first
   routed, hits pinned, misses decided in that order, clock victims by a warp, several per 32-slot window, the same as
   `LayerDirectory`'s one-slot scan), then one fill launch that copies the admitted bundles with SM loads from the
   store's device address (registered host memory read over the link) by a fixed grid (`fill_blocks`, `fill_vector`).
-  No host synchronization, no allocation: a captured round replays it. Where directory_ops.cu does not build (or
+  No host synchronization, no allocation: a captured round replays it. Where the kernel does not build (or
   `native: false`), [device_directory.py](code/device_directory.py)'s torch ops plan by the same rule (the clock's
   victims from cumulative sums over the slots in scan order) and fill with copies; `facts()` says which ran.
 - **Prompts never admit.** A chunk of at least `stage_routes` routes (the layer's expert count by default: such a
@@ -81,6 +81,15 @@ cache.telemetry()                                      # slots, resident, lent, 
   the CPU tier's until a later round misses them again. The copies never stall a layer: the CPU tier computes the
   miss now, the link carries it for later. [recent_residency.py](code/recent_residency.py)'s `RecentResidency` is the
   rule on the host, and the device gives its hits, copies and slots plan for plan.
+- **Link layers** (`link_layers`, `link_slots`, recent residency): layers whose experts the CPU tier does not
+  compute (a W4A16 draft layer beside W4A4 ones). The round lists `link_slots` more victims, the list's last, as
+  their reserve; a link layer's plan admits every miss at once from the list's end down, maps it, stamps it with the
+  round and copies it before the layer reads it, as a clock plan does. The CPU tier's copies never take the reserve.
+  Where the round's other plans stamped reserve slots (a step plans the decoder's layers before the draft layer),
+  the link plan goes on below the reserve, down to the CPU tier's next victim, so a route is lost (failure bit 2)
+  only when the whole list is spent. `link_slots` is what one round routes in those layers: every plan of a
+  captured round counts, its victims listed once at its start. A prompt ring then takes a layer's experts beside
+  `link_slots`, not beside a layer's experts held whole.
 - **A pinned core** (`pin(keys)`, recent residency): these experts' bundles in slots of their own for good. No
   plan lists such a slot as a victim, no shrink gives it back (an elastic cache never shrinks below its core, and
   compaction leaves it where it is) and no preload or prompt ring takes it, so an expert of the core never misses
@@ -125,13 +134,31 @@ cache.telemetry()                                      # slots, resident, lent, 
   slot-layout bundle: the store encodes those components from the bundle's scale bytes, or takes the checkpoint's CSF
   scales (`put(layer, expert, bundle, compressed={component: (fixed, exceptions)})`, a list of parts for gate and up
   scales stacked by rows); `store.compressed` names them and `store.layout` is the store's own (`csf_layout`: its
-  bundle layout and a fill program). The cache rebuilds every slot in the slot layout as it fills it (directory_ops.cu's program fill: components copied, scales decoded a
+  bundle layout and a fill program). The cache rebuilds every slot in the slot layout as it fills it (the kernel's program fill: components copied, scales decoded a
   slab of 16 rows per block, then the exception words; the torch ops otherwise). Host memory and link bytes per miss
   shrink by the scales' half. Prompt staging over such a store copies chunks of 32 store bundles by the copy engine
   into a device buffer and rebuilds them into the ring slots by the program fill, on the copy stream. `csf_decode`
   decodes CSF on the host or the device alone.
 
-directory_ops.cu is CUDA C++ only: torch's extension builder hipifies it on ROCm, untested there.
+- **Opaque rows.** The cache never reads what a slot holds, so a model whose experts (or any rows it keeps off the
+  device: table rows, a layer group's weights) sit in a layout of its own uses it unchanged through the `experts:rows`
+  extension, with no experts plugin's bundle layout:
+
+  ```text
+  store = residency.row_store(groups, keys, row_bytes, device, rows)    # rows: [groups * keys][row_bytes] uint8
+  cache = residency.row_cache(groups, keys, row_bytes, slots, device, store, lend=None)
+  slots = cache.plan(group, ids)                                         # as cache()'s plan, capture-safe
+  mine = decode_my_layout(cache.rows()[slots[ids]])                      # [S][row_bytes]: the slots' rows
+  ```
+
+  A row is any number of bytes: each slot holds one padded to a multiple of 16 (`row_slot_bytes`), and `rows()` is
+  the store without the padding. `row_store()` builds a `BundleStore` of the rows (host memory regions: Linux), and
+  `row_cache()` takes any other source with `keys`, `bundle_bytes` (the padded row), `layout`, `mapped` and
+  `read(keys, into)`, a mapped one `region()` too. Plans, fills, prompts, policies, lending and telemetry are the
+  bundles' ([test_rows.py](tests/test_rows.py): a toy experts block of 27-byte int8 rows reads its experts back from
+  the cache byte for byte and computes what it computes over the host rows).
+
+The kernel expert-directory is CUDA C++ only (crit's kernel build, sm_80 and newer); elsewhere the torch ops serve.
 
 ## When to use it
 
@@ -331,13 +358,15 @@ unused prefetch bytes).
 - [corpus.json](code/corpus.json) / [corpus.py](code/corpus.py): the profile corpus,
   `load_manifest`, `fetch` and `describe`.
 - [expert_store.py](code/expert_store.py): `Component`,
-  `layout`, `build_store` and `open_store` (`Store` with `bundle`, `component`, `register`).
+  `layout`, `build_store` and `open_store` (`Store` with `bundle`, `component`, `register`); `open_rows` and
+  `row_slot_bytes` for opaque rows.
 - [replay.py](code/replay.py): `Bundle`, the event types, `replay` and
   `compare_policies`. It does not reproduce the CUDA prefetch pool.
 - The device form: [expert_cache.py](code/expert_cache.py) (`ExpertCache`),
   [device_directory.py](code/device_directory.py) (`DeviceDirectory`: the directory tensors, plans, fills and
-  host-driven changes, torch ops as the fallback), [directory_ops.cu](code/directory_ops.cu) with
-  [native.py](code/native.py) (its plan and fill, built at load), [host_memory.py](code/host_memory.py) and
+  host-driven changes, torch ops as the fallback), crit's kernel
+  [expert-directory](../../kernels/techniques/experts/expert-directory) loaded by [native.py](code/native.py) (its
+  plan and fill, built for the device), [host_memory.py](code/host_memory.py) and
   `BundleStore` in expert_store.py; `LayerDirectory` in device_cache.py is their host twin.
 
 ## What the engine supplies

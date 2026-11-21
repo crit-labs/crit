@@ -349,10 +349,10 @@ def tail(path, size=2000):
 def serving(store, run_id, candidate_id, attempt, kv_tokens, log, name, timeout=600, address=("127.0.0.1", 0),
             environment=None):
     """The candidate served under `attempt` (attempt.Attempt): through crit serve for a plugin package, from its launch
-    command for an external candidate."""
+    command for an external candidate. `environment`: crit's own variables for the engine's processes."""
     folder = safe_path(store.directory(run_id), f"candidates/{candidate_id}")
     if candidate_spec(folder) is None:
-        return Served(store, run_id, candidate_id, attempt.id, kv_tokens, log, name, timeout, address)
+        return Served(store, run_id, candidate_id, attempt.id, kv_tokens, log, name, timeout, address, environment)
     served = External(store, run_id, candidate_id, attempt, kv_tokens, log, name, timeout, address, environment)
     served.deadline_at = attempt.deadline_at
     return served
@@ -431,16 +431,17 @@ def kernels(store, run_id, candidate_id, seconds=None, nvcc=None):
             **({"reason": found["reason"]} if not found["available"] else {})}
 
 
-def _tracer_clock(library):
-    """(now(), name): the tracer library's CUPTI clock when it exports crit_ktrace_timestamp, else the host's realtime
-    clock, which read_traces converts kernel times to through the trace's clock pairs."""
+def _tracer_clock(library, clock="cupti"):
+    """(now(), name): the tracer library's own clock (`clock`, CUPTI's or rocprofiler's) when it exports
+    crit_ktrace_timestamp, else the host's realtime clock, which read_traces converts kernel times to through the
+    trace's clock pairs."""
     import ctypes
     try:
         now = ctypes.CDLL(str(library)).crit_ktrace_timestamp
     except (OSError, AttributeError):
         return time.time_ns, "realtime"
     now.restype, now.argtypes = ctypes.c_ulonglong, []
-    return now, "cupti"
+    return now, clock
 
 
 def _toolkit(nvcc=None):

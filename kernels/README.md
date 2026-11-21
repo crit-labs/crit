@@ -67,14 +67,15 @@ CRIT_KERNEL_TUNING=TUNING crit serve ...                 # or, for a try, a fold
 ```
 
 `crit kernels sweep` builds every knob configuration of each structure a kernel declares (many configurations a
-build, picked at run time), checks each against the operation's reference and, for a structure that is
+build, picked at run time, the builds in a pool of CPU workers), and as each build finishes checks each against the operation's reference and, for a structure that is
 [row-exact or higher](#exactness), against crit's row-invariance contract
 (a row's bits never depend on the rows beside it), times it on the checkpoint's own shapes (and the stacked matrices engines load, such as q, k and v together) with a cold L2 (`--matrices` with a candidate's serve --check report: exactly the shapes its engine loaded,
 from quantized-projections' `matrices` fact), and writes
 `TUNING/<ID>.json` (the table per shape and row count) and a report against the default knobs. A knob that changes
 the summation order keeps one value a shape for every row count. A sweep stopped part way (SIGTERM or Ctrl+C)
-writes its table from what it measured, every structure's defaults first, and its report names what it did not measure;
-stopped during its builds, it ends them and writes the table of every structure's defaults, saying how many builds were done. A library plugin loads a kernel by id
+writes its table from what it measured, every structure's defaults first, and its report names what it did not measure
+and how many builds were done; the builds still running are ended. The GPU lock is held while a finished build is timed
+and given back while the sweep waits on the next build. A library plugin loads a kernel by id
 (`crit_plugins.kernels.load_kernel`), built with the engine's tuning or with the default knobs, which reproduce the
 kernel as it was hand-tuned, and falls back to its torch path when the kernel cannot be built here (no CUDA toolkit,
 an architecture it does not cover). Builds need torch with CUDA, the CUDA toolkit (nvcc) and ninja; they are cached
@@ -110,13 +111,14 @@ A level keeps what the levels below it keep, and no structure is below `repeatab
 declared, 12 exact, 43 row-exact and 13 repeatable; `crit kernels list` shows each one's level (`exactness`, and
 `bits_of` for the exact ones). An engine asks for a level per phase, `decode` (its decode and verify rows) and
 `prompt` (its prompt rows), and where it asks for none the run's quality mode gives it: both `preserve` and `speed`
-ask `exact` (`crit_kernels.exactness`: `setting()`, `for_quality_mode()`, and `choices()` for the structures of a
-kernel a phase may then run), so the modes differ in the precision of what is summed and a lower level is a lever an
+ask `exact` (Core's `crit_plugins.exactness`: the levels, `setting()` and `for_quality_mode()`; `crit_kernels.exactness`
+reads a kernel.json against them, `choices()` giving the structures of a kernel a phase may then run), so the modes differ in the precision of what is summed and a lower level is a lever an
 engine pulls itself. For the decode rows `exact` and `row-exact` are one level, the bits a
 prompt row is compared with. An engine package states its levels in its configuration (`"exactness"`), Core tells
 them to the plugins before any is made, the engine's facts say what was asked and what each plugin keeps, and an
-engine that keeps less than it asks is refused ([plugins and exactness](../docs/PLUGINS.md#exactness)); `crit run`
-writes the quality mode's level into every candidate's configuration for a phase it states none for. A plugin that
+engine that keeps less than it asks is refused ([plugins and exactness](../docs/PLUGINS.md#exactness)); a phase the
+configuration states none for takes its quality mode's level, which `crit run` writes into every candidate and Core's
+loader asks wherever a package loads. A plugin that
 can run a phase's rows through more than one structure chooses by the level where its option is left `auto`
 (quantized-projections' and host-expert-arithmetic's `prompt_gemm`, the attention plugins' `prompt_reader`,
 gguf-projections' `prompt`, the expert plugins' `prompt_arithmetic`, the recurrences' `prompt_rows`), and every
@@ -124,6 +126,22 @@ plugin states the level its loaded rows keep ([the table](../docs/PLUGINS.md#exa
 
 The level is about the order of the sums, not the precision of the operands: W4A4 or W8A8 activations, 8-bit KV pages
 and FP16 operands are a structure's arithmetic, which its `what` and its operation state.
+
+**Choosing by what was measured** (`crit_kernels/select.py`). A plugin that picks among structures by speed asks the
+selector instead of keeping measurements in code: `fitting(operation, asked, rows)` gives the structures kernel.json
+says compute the operation, keep the level and take the row count; `times(report, structure, key)` the times a sweep
+measured at a shape (the `<id>.report.json` `crit kernels sweep` writes beside its tuning: each row's `tuned_us`, and
+its yardstick's `library_us`); `fastest(options, rows, default)` the fastest of them at a row count or over every
+count they share, ties to the earlier, and `default`, the plugin's own rule, where the reports do not cover the
+shape. quantized-projections' `prompt_gemm auto` (crit's native GEMM or the provider's) and its `gemv crossover`
+take it. The selector never measures: without a report on this device a plugin keeps its rule.
+
+**Floors** (`crit_kernels/floors.py`). `crit kernels report` states each speed row's share of the device's limit
+(`of_floor`: the floor's time over the call's): the floor is the call's bytes (the bench's `bytes()`) at the memory
+bandwidth or its multiply-adds (the bench's `flops()`, with its arithmetic) at that format's tensor rate, whichever is
+longer, the ceilings from a `crit eval probe` result (`--probe`) or measured at the report's start (a 1 GiB copy,
+cuBLAS GEMMs). A yardstick says how a structure compares with a library at its arithmetic; the floor says how far it
+is from what the GPU can do at all.
 
 <a id="one-gpu"></a>
 
@@ -187,7 +205,10 @@ kernels are timed against:
 
 Start from the technique: its `operations.json` ([Inference](../inference/README.md#read-and-adapt-an-entry)) says
 what each device operation computes, the CPU reference to check a kernel against and how (tolerance, invariance).
-Take crit's kernel for the operation where one exists and sweep it for the model; else a library's; else write the
+The same contract is executable in `crit_kernels/contracts.py`: each operation's FP64 reference and its tolerance
+(`contracts.reference(op)`, `contracts.check(op, got, want)`), the one definition the kernels' benches, the sweep's
+gates and their tests call; CI checks that every operation has one and that every structure of every kernel maps to
+operations a technique defines (`contracts.problems()`). Take crit's kernel for the operation where one exists and sweep it for the model; else a library's; else write the
 kernel in the workbench, with the library as its yardstick. Three checks catch most mismatches:
 
 - **The actual device.** A datacenter build can lack the instructions for the target (for example consumer

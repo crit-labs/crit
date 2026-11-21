@@ -1,6 +1,7 @@
 """The exactness a kernel structure keeps: what the bits of a row may depend on.
 
-Each structure in kernel.json declares its level ("exactness"), from the most exact:
+Each structure in kernel.json declares its level ("exactness"), on Core's scale (crit_plugins.exactness, from the most
+exact):
 
     declared    the kernel's declared order: the bits every implementation of that order gives (the CPU tier's rows,
                 the decode rows and a prompt GEMM in the same order)
@@ -11,34 +12,16 @@ Each structure in kernel.json declares its level ("exactness"), from the most ex
     repeatable  the same call gives the same bits again; a row's bits may follow the row count, the chunk's length or
                 the tile
 
-A level keeps what every level below it keeps, and none is below repeatable. The faster structures are usually the
-lower ones (a split of K that follows the row count, the tensor cores' own order, a reduction over a whole chunk), so
-the level is the trade an engine makes between exactness and speed: it asks for one per phase ("decode": its decode
-and verify rows; "prompt": its prompt rows), and without one the run's quality mode gives it (for_quality_mode:
-both modes ask exact). For the decode rows exact and row-exact are one level: they are the bits a prompt row is
-compared with.
-
-The level is about the order of the sums, not the operands' precision: activations quantized to 4 or 8 bits, 8-bit KV
-pages or FP16 operands are a structure's arithmetic, which its "what" and its operation say.
+The faster structures are usually the lower ones (a split of K that follows the row count, the tensor cores' own
+order, a reduction over a whole chunk), so the level is the trade an engine makes between exactness and speed: it asks
+for one per phase, and without one the run's quality mode gives it. The levels, the phases, the quality modes and an
+engine's setting are Core's (crit_plugins.exactness, imported here as they were defined here before); this module
+reads a kernel.json against them: a structure's level, whether it keeps a level, whose bits it has and the structures
+a phase may run.
 """
+from crit_plugins.exactness import LEVELS, MODE_LEVELS, PHASES, for_quality_mode, rank, setting
 
-LEVELS = ("repeatable", "row-exact", "exact", "declared")   # from the least exact
-PHASES = ("decode", "prompt")
-# The level each of a run's quality modes asks where an engine states none: exact in both. A prompt row then has the
-# bits of the same token decoded, which is what the serving checks hold an engine to (crit smoke: a prefix against
-# its prompt, decoding against prefilling), and what they can only judge without a tolerance: an engine whose rows
-# multiply quantized activations turns an order's last bit into tenths of a nat (a 4-bit rounding that falls the
-# other way), so at a lower level its sound rows and a broken path's read alike. The modes differ in the precision
-# of what is summed, not in the order. A lower level is a lever an engine pulls itself, with its speed measured and
-# its checks passed.
-QUALITY_MODES = {"preserve": "exact", "speed": "exact"}
-
-
-def rank(level):
-    """The level's place in LEVELS (a higher rank keeps more); ValueError for another name."""
-    if level not in LEVELS:
-        raise ValueError(f"exactness {level!r} is not one of {', '.join(reversed(LEVELS))}")
-    return LEVELS.index(level)
+QUALITY_MODES = MODE_LEVELS   # the mode -> level table, under the name it had here
 
 
 def level(spec):
@@ -93,38 +76,6 @@ def choices(manifest, asked, decode=None):
     return out
 
 
-def for_quality_mode(mode):
-    """The level each phase gets from a run's quality mode when the engine asks for none: exact in both modes
-    (QUALITY_MODES)."""
-    if mode not in QUALITY_MODES:
-        raise ValueError(f"quality mode {mode!r} is not one of {', '.join(QUALITY_MODES)}")
-    return {phase: QUALITY_MODES[mode] for phase in PHASES}
-
-
-def setting(value=None, quality_mode=None):
-    """An engine's exactness setting as {"decode": level, "prompt": level}. value: one level for both phases, or a
-    level per phase; a phase it leaves out takes the quality mode's (for_quality_mode), which must then be given.
-    The decode rows' exact is written row-exact, the one level it is there."""
-    if isinstance(value, str):
-        value = {phase: value for phase in PHASES}
-    value = dict(value or {})
-    unknown = set(value) - set(PHASES)
-    if unknown:
-        raise ValueError(f"exactness is set per phase ({', '.join(PHASES)}), not {', '.join(sorted(unknown))}")
-    out = {}
-    for phase in PHASES:
-        if value.get(phase) is None:
-            if quality_mode is None:
-                raise ValueError(f"no exactness for the {phase} phase and no quality mode to take it from")
-            out[phase] = for_quality_mode(quality_mode)[phase]
-        else:
-            rank(value[phase])
-            out[phase] = value[phase]
-    if out["decode"] == "exact":
-        out["decode"] = "row-exact"
-    return out
-
-
 def problems(manifest, explicit=False):
     """What is wrong with a kernel.json's levels, as a list of sentences (empty: nothing). explicit: every structure
     must say its level itself (crit's own kernels), with no "row_invariant" left."""
@@ -173,5 +124,5 @@ def check(manifest, explicit=False):
     return manifest
 
 
-__all__ = ["LEVELS", "PHASES", "QUALITY_MODES", "check", "choices", "for_quality_mode", "keeps", "level", "problems",
-           "rank", "reference", "same_bits", "setting"]
+__all__ = ["LEVELS", "MODE_LEVELS", "PHASES", "QUALITY_MODES", "check", "choices", "for_quality_mode", "keeps", "level",
+           "problems", "rank", "reference", "same_bits", "setting"]

@@ -60,6 +60,7 @@ class LedgerTests(unittest.TestCase):
     def setUp(self):
         self.readings = Readings(1000)
         self.memory = memory.DeviceMemory("fake:0", self.readings)
+        self.memory.headroom = 0   # the ledger alone: a device of 10,000 bytes keeps no headroom
 
     def test_nothing_is_taken_while_the_device_has_room(self):
         cache = Giver(self.readings, 5000, 100)
@@ -214,7 +215,9 @@ class LedgerTests(unittest.TestCase):
 
     def test_the_report_is_the_whole_device(self):
         self.readings.unused = 300
-        self.assertEqual(self.memory.report(), {
+        found = self.memory.report()
+        self.assertEqual(found.pop("steps")["arena"], 0)   # the steps' memory: Core's allocator, the arena, the counts
+        self.assertEqual(found, {
             "device": "fake:0", "total": 10_000, "free": 1000, "elastic": {},
             "torch": {"allocated": 2000, "reserved": 2300, "unused": 300}, "other": 6700})
 
@@ -226,8 +229,291 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual((cpu.need(1 << 40), cpu.serve(), cpu.release(), cpu.elastic_ranges), (0, 0, None, False))
 
 
+MIB = 1 << 20
+
+
+class StepReadings:
+    """A device of `free` MiB whose torch allocator reserves blocks as a step's tensors come (take) and keeps them
+    unused when they go (drop), with its peak since the last mark."""
+    total = 32 << 30
+
+    def __init__(self, free):
+        self.bytes, self.reserved, self.unused = free * MIB, 2048 * MIB, 0
+        self.top = self.reserved
+
+    def free(self):
+        return self.bytes
+
+    def torch(self):
+        return {"allocated": self.reserved - self.unused, "reserved": self.reserved, "unused": self.unused}
+
+    def release(self):
+        self.bytes, self.reserved, self.unused = self.bytes + self.unused, self.reserved - self.unused, 0
+
+    def mark(self):
+        self.top = self.reserved
+
+    def peak(self):
+        return self.top
+
+    def take(self, mib):   # a tensor of the step: from the unused blocks first, else a new block from the device
+        nbytes = mib * MIB
+        reused = min(self.unused, nbytes)
+        self.unused -= reused
+        self.reserved += nbytes - reused
+        self.bytes -= nbytes - reused
+        self.top = max(self.top, self.reserved)
+
+    def drop(self, mib):   # it goes: the allocator keeps its block
+        self.unused += mib * MIB
+
+    def segments(self):
+        return []
+
+
+class RangeGiver(Giver):
+    """An elastic expert cache: its slots are an elastic range of the device (the ledger's ranges hold what it backs),
+    so what it gives and takes is never a step's."""
+
+    @property
+    def mapped(self):
+        return self.held
+
+
+def cache_on(device, unit=4 * MIB):
+    cache = RangeGiver(device.readings, 0, unit)
+    device.ranges["cache/slots"] = cache
+    device.give("cache", cache.release, cache.regrow)
+    return cache
+
+
+class StepMemoryTests(unittest.TestCase):
+    """Every byte a step takes is admitted by the device's ledger before it exists (Core's allocator calls _admit): the
+    givers keep the headroom and the step arena free, a step's segments come out of the arena, and what passes it or
+    the headroom is counted. Nothing is forecast and nothing is looked at during a step."""
+
+    def setUp(self):
+        self.readings = StepReadings(free=24 * 1024)
+        self.memory = memory.DeviceMemory("fake:0", self.readings)
+        self.memory.headroom = 256 * MIB
+        self.cache = cache_on(self.memory)   # an elastic expert cache: it releases and regrows, no keep of its own
+        self.memory.load()
+
+    def segment(self, mib):
+        """Core's allocator hands the step pool a segment: the ledger admits it, the driver makes it."""
+        ok = self.memory._admit(mib * MIB)
+        if ok:
+            self.readings.bytes -= mib * MIB
+        return ok
+
+    def free_segment(self, mib):
+        self.readings.bytes += mib * MIB
+        self.memory._freed(mib * MIB)
+
+    def test_the_arena_is_what_the_load_s_steps_took_or_the_model_s_word_whichever_is_more(self):
+        self.memory.begin_step(37)
+        self.segment(40)
+        self.memory.end_step(False)
+        self.memory.begin_step(0, score=True)
+        self.segment(100)
+        self.memory.end_step(False)
+        self.assertEqual(self.memory.most, {"prompt": 40 * MIB, "score": 100 * MIB})
+        self.assertEqual(self.memory.size_arena(), int(100 * MIB * memory.ARENA_SLACK))
+        self.assertEqual(self.memory.size_arena(declared=400 * MIB), int(400 * MIB * memory.ARENA_SLACK))
+
+    def test_the_givers_keep_the_headroom_and_the_arena_free_and_a_step_takes_it_without_asking(self):
+        self.memory.arena = 512 * MIB
+        self.memory.serve()                     # the cache took every free byte but the headroom and the arena
+        self.assertEqual(self.readings.bytes, (256 + 512) * MIB)
+        held = self.cache.held
+        self.memory.begin_step(512)
+        for _ in range(4):
+            self.assertTrue(self.segment(100))   # within the arena: no giver is asked, the headroom stays free
+        self.assertEqual(self.cache.held, held)
+        self.assertGreaterEqual(self.readings.bytes, 256 * MIB)
+        self.memory.end_step(False)             # no prompt in flight: the pool retires, its segments go back
+        for _ in range(4):
+            self.free_segment(100)
+        self.memory.settle(None)
+        self.assertEqual(self.cache.held, held)   # the arena is free again, kept for the next step
+        steps = self.memory.steps()
+        self.assertEqual((steps["overflows"], steps["breaches"], steps["refused"]), (0, 0, 0))
+        self.assertEqual((steps["most"]["prompt"], steps["granted"]), (400 * MIB, 0))
+
+    def test_what_passes_the_arena_or_the_headroom_is_counted_and_what_the_device_lacks_is_refused(self):
+        self.memory.arena = 128 * MIB
+        self.memory.serve()
+        self.memory.begin_step(512)
+        self.assertTrue(self.segment(100))
+        self.assertTrue(self.segment(100))       # past the arena: lent from free memory, counted, and under the
+        self.assertTrue(self.segment(100))       # headroom: counted too
+        steps = self.memory.steps()
+        self.assertEqual((steps["overflows"], steps["breaches"]), (2, 2))
+        self.assertLess(steps["least_free"], 256 * MIB)
+        self.assertFalse(self.memory._admit(self.readings.bytes + MIB))   # more than the device has: refused
+        self.assertEqual(self.memory.steps()["refused"], 1)
+        self.memory.end_step(False)
+
+    def test_each_serving_segment_is_kept_with_the_memory_outside_the_engine(self):
+        # Core's segment readings for the check: the free bytes a segment left and what others held on the card then,
+        # with what they held as serving began, so the check judges the engine's own use (crit.run.checks).
+        self.memory.arena = 128 * MIB
+        self.memory.serve()
+        at_serve = self.memory.steps()["outside_at_serve"]
+        self.assertIsNotNone(at_serve)
+        self.memory.begin_step(512)
+        self.assertTrue(self.segment(100))
+        self.readings.reserved += 100 * MIB       # torch holds the segment it was given
+        self.readings.bytes -= 50 * MIB           # another program takes 50 MiB of the card
+        self.assertTrue(self.segment(20))
+        self.memory.end_step(False)
+        steps = self.memory.steps()
+        (first_left, first_other), (second_left, second_other) = steps["segment_memory"]
+        self.assertEqual(second_other - first_other, 50 * MIB)
+        self.assertEqual(first_left - second_left, 70 * MIB)    # the 20 MiB segment and the other program's 50
+        self.assertEqual(first_other, at_serve)
+
+    def test_a_segment_a_kept_tensor_holds_is_the_engine_s_past_its_pool(self):
+        self.memory.arena = 256 * MIB
+        self.memory.serve()
+        self.memory.begin_step(64)
+        self.segment(64)                         # a workspace a plugin makes at its first call and keeps
+        self.segment(32)
+        self.memory.end_step(False)              # the pool retires; torch frees what nothing holds
+        self.free_segment(32)
+        steps = self.memory.steps()
+        self.assertEqual((steps["granted"], steps["retired"]), (64 * MIB, 64 * MIB))
+        self.assertEqual(self.memory.kept(), 256 * MIB + 256 * MIB)   # the next pool starts with the whole arena
+        self.free_segment(64)                    # the workspace goes too
+        self.assertEqual((self.memory.steps()["granted"], self.memory.steps()["retired"]), (0, 0))
+
+    def test_a_long_prompt_keeps_its_pool_while_another_chunk_fits_the_arena(self):
+        # torch reuses the pool's cached blocks for a like chunk and a deeper chunk adds segments of its own: the pool
+        # retires once the next chunk's most would pass the arena, and when the prompt ends in any case.
+        self.memory.arena = 512 * MIB
+        self.memory.serve()
+        self.memory.begin_step(512)
+        self.segment(200)
+        self.memory.end_step(True)               # 200 and another 200 fit 512: kept
+        self.assertEqual(self.memory.steps()["retired"], 0)
+        self.memory.begin_step(512)
+        self.segment(150)                        # a deeper chunk's larger blocks
+        self.memory.end_step(True)               # 350 and another 200 pass 512: retired
+        self.assertEqual(self.memory.steps()["retired"], 350 * MIB)
+        self.free_segment(200)
+        self.free_segment(150)
+        self.memory.begin_step(512)
+        self.segment(100)
+        self.memory.end_step(False)              # the prompt ended: retired whatever it holds
+        self.assertEqual(self.memory.steps()["retired"], 100 * MIB)
+        self.assertEqual(self.memory.steps()["overflows"], 0)
+
+    def test_a_measured_step_that_runs_out_has_the_givers_make_room_and_runs_again(self):
+        # While the engine loads the givers keep only the headroom free (an expert cache opened before a model's
+        # calibration takes the rest); the allocator cannot ask them for a segment, so a calibration chunk whose
+        # segment it refused (torch's out-of-memory error) has them release room, and the chunk runs again.
+        self.cache.regrow(self.readings.bytes - 256 * MIB)   # the cache took every byte past the headroom
+        runs = []
+
+        def chunk():
+            runs.append(len(runs))
+            if not self.segment(300):
+                raise RuntimeError("CUDA out of memory. Tried to allocate 300.00 MiB")
+        held = self.cache.held
+        step = self.memory.measure(chunk)
+        self.assertEqual((len(runs), step.took), (2, 300 * MIB))
+        self.assertEqual(held - self.cache.held, 600 * MIB)   # twice the refused segment, given back
+        self.assertEqual(self.memory.most["prompt"], 300 * MIB)
+        self.free_segment(300)
+        with self.assertRaisesRegex(ValueError, "not memory"):   # any other failure is the step's own
+            self.memory.measure(lambda: (_ for _ in ()).throw(ValueError("not memory")))
+        self.cache.regrow(self.readings.bytes - 256 * MIB)
+        self.cache.held = 0          # a giver with nothing left to give: the refusal is raised
+        with self.assertRaisesRegex(RuntimeError, "out of memory"):
+            self.memory.measure(chunk)
+
+    def test_a_device_without_core_s_allocator_runs_its_steps_on_torch_s_and_says_so(self):
+        bare = memory.DeviceMemory("fake:1", StepReadings(free=1024))
+        with bare.step_pool():   # fake readings: no CUDA, no pool
+            pass
+        self.assertIsNone(bare._pool)
+
+
 @unittest.skipIf(torch is None or not torch.cuda.is_available(), "no CUDA device")
 class DeviceTests(unittest.TestCase):
+    def test_a_step_s_tensors_come_from_core_s_allocator_and_go_back_with_its_pool(self):
+        # Core's step engine runs each step in the device's step pool: its segments are admitted before they exist,
+        # counted as the step's, and handed back to the driver when the pool retires (no prompt in flight).
+        import gc
+        device = memory.of("cuda")
+        before = device.steps()["granted"]
+        device.begin_step(16)
+        with device.step_pool():
+            made = torch.empty(64 << 20, dtype=torch.uint8, device="cuda")
+            made.fill_(1)
+        if device.steps().get("unaccounted"):
+            self.skipTest(device.steps()["unaccounted"])
+        self.assertGreaterEqual(device.steps()["granted"] - before, 64 << 20)
+        del made
+        device.end_step(False)
+        self.assertGreaterEqual(device.most.get("prompt", 0), 64 << 20)   # what the step took, kept by its kind
+        gc.collect()
+        torch.cuda.synchronize()
+        self.assertEqual(device.steps()["granted"], before)
+
+    def test_a_step_a_plugin_measures_at_load_is_counted_as_a_step_of_its_kind(self):
+        # A calibration's prompt chunk at the deepest position: no warm request reaches it, so the plugin runs it as
+        # Core's measured step and the arena holds what it took from Core's allocator.
+        device = memory.of("cuda")
+        with device.measured("prompt") as step:
+            made = torch.empty(48 << 20, dtype=torch.uint8, device="cuda")
+            made.fill_(1)
+            del made
+        if device.steps().get("unaccounted"):
+            self.skipTest(device.steps()["unaccounted"])
+        self.assertGreaterEqual(step.took, 48 << 20)
+        self.assertGreaterEqual(device.most["prompt"], step.took)
+        device.begin_step(16)
+        try:
+            with self.assertRaises(RuntimeError):   # never inside another step
+                with device.measured():
+                    pass
+        finally:
+            device.end_step(False)
+
+    def test_a_thread_reading_torch_s_allocator_never_waits_on_a_step_s_new_segments(self):
+        # Core's allocator runs inside torch's allocation, under torch's allocator lock, on a step thread that let the
+        # GIL go: it calls no Python, so a thread holding the GIL and reading torch's allocator (memory_stats, as a
+        # telemetry read does) while the step makes segments is never stuck behind it.
+        import threading
+        device = memory.of("cuda")
+        stop, done = threading.Event(), []
+
+        def steps():
+            for i in range(64):
+                device.begin_step(16)
+                with device.step_pool():
+                    made = torch.empty((1 + i % 5) << 22, dtype=torch.uint8, device="cuda")   # a new segment
+                    made.fill_(1)
+                    del made
+                device.end_step(False)   # the pool retires: the next step's segments are new
+            done.append(True)
+
+        def read():
+            while not stop.is_set():
+                torch.cuda.memory_stats()
+
+        reader, stepper = threading.Thread(target=read, daemon=True), threading.Thread(target=steps, daemon=True)
+        reader.start()
+        stepper.start()
+        stepper.join(120)
+        stop.set()
+        reader.join(10)
+        if device.steps().get("unaccounted"):
+            self.skipTest(device.steps()["unaccounted"])
+        self.assertEqual(done, [True], "a step making segments and a thread reading torch's allocator deadlocked")
+        self.assertFalse(reader.is_alive())
+
     def test_the_card_counts_at_least_what_this_process_holds(self):
         held = torch.zeros(8 << 20, dtype=torch.uint8, device="cuda")
         left = memory.card_free(0)
@@ -473,8 +759,47 @@ class DeviceTests(unittest.TestCase):
         report = self.memory.report()
         self.assertEqual(report["plugins"], found["plugins"])
         self.assertEqual(report["elastic"]["test/census"]["backed"], self.gran)
-        self.assertEqual(report["total"], report["free"] + report["torch"]["reserved"] + self.gran + report["other"])
+        backed = sum(e["backed"] for e in report["elastic"].values())   # this range, and any an earlier test left open
+        self.assertEqual(report["total"], report["free"] + report["torch"]["reserved"] + backed + report["other"])
         del stray
+
+
+
+class KvFitTests(unittest.TestCase):
+    """memory.kv_fit, the one arithmetic of the KV cache that fits the device (crit Eval's max context calls it)."""
+
+    def test_the_budget_is_free_memory_less_headroom_reserve_and_what_stays_in_order(self):
+        found = memory.kv_fit(10_000, 7, headroom=1_000, reserve=500, held=(2_000, 0.5, 100), granularity=16)
+        self.assertEqual(found["budget"], 10_000 - 1_000 - 500 - 2_000 - 0.5 - 100)
+        self.assertEqual(found["tokens"], (10_000 - 1_000 - 500 - 2_000 - 0.5 - 100) // 7 // 16 * 16)
+        self.assertEqual(memory.kv_fit(10_000, 0)["tokens"], None)   # nothing grows with the context
+        self.assertEqual(memory.kv_fit(100, 1, headroom=200), {"budget": -100, "tokens": 0})
+        self.assertEqual(memory.kv_fit(memory.HEADROOM + 4096, 2)["tokens"], 2048)   # Core's headroom by default
+
+
+class StepPoolNameTests(unittest.TestCase):
+    def test_step_pools_are_named_and_the_names_of_those_holding_nothing_go(self):
+        # Core's step pools are listed as core/steps among the device's pools, as a graph's pool is listed by its
+        # driver, so the memory audit names their segments. Every STEP_POOLS_NAMED new pools the names of those the
+        # allocator holds no segment of go: a pool that still holds one (the first step's, which keeps a workspace)
+        # and the newest stay named.
+        class Held(Readings):
+            def __init__(self):
+                super().__init__(free=1000)
+                self.held = set()
+
+            def segments(self):   # (first, end, allocated, private, pool) as _Torch.segments() gives them
+                return [(0, 1, 1, True, pool) for pool in sorted(self.held)]
+        readings = Held()
+        device = memory.DeviceMemory("fake:0", readings)
+        first, newest = (0, 1), (0, memory.STEP_POOLS_NAMED + 1)
+        readings.held.add(first)
+        for n in range(1, memory.STEP_POOLS_NAMED + 1):
+            device._name_step_pool((0, n))
+        self.assertEqual(len(device.pools), memory.STEP_POOLS_NAMED)   # none gone yet
+        self.assertEqual(device.pools[(0, 2)], "core/steps")
+        device._name_step_pool(newest)
+        self.assertEqual(device.pools, {first: "core/steps", newest: "core/steps"})
 
 
 if __name__ == "__main__":

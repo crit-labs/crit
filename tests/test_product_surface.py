@@ -180,7 +180,7 @@ class ProductTests(unittest.TestCase):
     def test_real_inference_entries_are_generic_local_implementations(self):
         self.assertEqual(store.check(), [])
         entries = store.load()["entries"]
-        self.assertEqual(len(entries), 34)
+        self.assertEqual(len(entries), 29)
         for entry in entries:
             self.assertNotIn("donors", entry)
             self.assertNotIn("code_locations", entry)
@@ -263,7 +263,7 @@ class ProductTests(unittest.TestCase):
         self.assertEqual({p.name for p in (ROOT / "kernels").iterdir() if p.is_dir()},
                          {"crit_kernels", "core", "techniques", "starters"})
         self.assertEqual({p.name for p in (ROOT / "kernels/techniques").iterdir() if p.is_dir()},
-                         {"attention", "experts", "norms", "projections", "recurrence"})
+                         {"attention", "experts", "norms", "projections", "recurrence", "sampling"})
         self.assertEqual({p.name for p in (ROOT / "models").iterdir() if p.is_dir()}, {"crit_models"})
         self.assertEqual({p.name for p in (ROOT / "smoke").iterdir() if p.is_dir()}, {"crit_smoke"})
         self.assertEqual({p.name for p in (ROOT / "core/python").iterdir()

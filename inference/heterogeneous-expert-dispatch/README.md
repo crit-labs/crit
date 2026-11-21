@@ -59,8 +59,7 @@ activation quantizations.
 | [`implementation.py`](code/implementation.py) | `ResidencyGroup`, `ResidencyPlan`, `prefix_residency_plans`; `Route`, `partition`, `combine`; `ReadySlot`, `MixedRoute`, `MixedSourcePlan`, `mixed_source_plan`; `execute_mixed`, which calls `quantize(activations)` once then `project(encoded, plan)` once |
 | [`measured_dispatch.py`](code/measured_dispatch.py) | `CalibrationKey`, `TimingCurve`, `DispatchCalibration`, `plan_dispatch` returning a `DispatchDecision` of every `DispatchCandidate`; optional `HostMemoryCosts`, `admit_host` and `revalidate_memory` |
 | [`routing.py`](code/routing.py) | `Routing`, one description of top-k routing; `route`, its host reference for one token; `routing_from_config`, which maps the config.json fields Core parses |
-| [`cpu_routes.cu`](code/cpu_routes.cu) | The post and scatter kernels of a layer's CPU routes over the slots of one of the host's handoffs (Core's `crit_plugins.host`), and their torch binding (built at load) |
-| [`device_dispatch.py`](code/device_dispatch.py) | `DeviceDispatch` (post, forward, calibrate, status), `KernelRoutes` (the grouped-experts kernel device part, `kernel_part` checks the bundle layouts), `DeclaredRoutes` (the torch fallback), the extension's build |
+| [`device_dispatch.py`](code/device_dispatch.py) | `DeviceDispatch` (post, forward, calibrate, status), `KernelRoutes` (the grouped-experts kernel device part, `kernel_part` checks the bundle layouts), `DeclaredRoutes` (the torch fallback), the load of crit's kernel [cpu-routes](../../kernels/techniques/experts/cpu-routes) (the post and scatter kernels of a layer's CPU routes over the slots of one of the host's handoffs) |
 
 `decision.best` is `None` when no feasible measured split exists; the engine then
 uses its ordinary exact path. Rejected splits keep their bytes and reasons. The
@@ -108,9 +107,9 @@ as `renormalize_floor`.
 
 The experts slot's device form splits a layer between the device and
 [host-expert-tier](../host-expert-tier/README.md)'s CPU tier by the slot table an expert cache's plan writes
-([experts:bundles](../../docs/PLUGINS.md#device-extensions)): a slot >= 0 is the device part's, -2 the CPU's. One post kernel (`cpu_routes.cu`) lists the layer's -2
+([experts:bundles](../../docs/PLUGINS.md#device-extensions)): a slot >= 0 is the device part's, -2 the CPU's. One post kernel (crit's kernel `cpu-routes`) lists the layer's -2
 routes in route order, writes their expert keys, tokens and the tokens' FP32 rows into a
-slot of a handoff (Core's `crit_plugins.host`, the [host-work-mailbox](../host-work-mailbox/README.md) technique)
+slot of a handoff (Core's `crit_plugins.host`, [the handoffs' protocol](../../core/python/crit_plugins/host/README.md))
 and posts it (or answers it itself when the layer has none); the host's service thread runs the tier's C handler
 (`crit_tier_serve`) on the host's worker pool; the stream joins (the capturable join the host measured cheaper on
 the device) and a scatter kernel copies the CPU's rows into the device
@@ -161,15 +160,14 @@ representation, workload, implementation and hardware topology, including shapes
 route multiplicity, residency, concurrency, CPU threads and transfer settings).
 Selection rejects a different key; invalidate samples when inputs change or
 timings drift. Measure warmed lanes under representative simultaneous traffic,
-with upload samples covering the real copy grouping, not only total bytes. Use
-[recorded selection](../recorded-selection/README.md) when a lane-cost model does
-not fit.
+with upload samples covering the real copy grouping, not only total bytes. Where a lane-cost model does not fit, record the measured choice once
+(`crit_plugins.decisions.settle`) so every load of the package replays it.
 
 `HostMemoryCosts` takes explicit peak-byte tables (CPU scratch by occurrence
 count, pinned staging by upload bytes, per-expert and per-upload loader bytes and
 file pages, common overhead) bound to the same identity. Missing estimates fail
 closed; use explicit zeros for resident sources. Compose `admit_host` with
-`admit_working_set` from [host-memory-admission](../host-memory-admission/README.md)
+Core's `admit_working_set` (`crit_plugins.host.memory`, the host memory admission)
 and call `revalidate_memory(candidate, callback)` with a fresh observation just
 before allocating; on denial, replan or use the exact fallback. No planner result
 reserves memory or proves device readiness.
@@ -235,10 +233,7 @@ tight = plan_dispatch(work, {0}, {1: 7, 2: 7, 3: 7}, calibration,
 assert tuple(r.expert for r in tight.best.host) == (1, 2)
 
 # Compose OS admission with exact measured dispatch, using synthetic observations.
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path.cwd().parents[1] / "host-memory-admission" / "code"))
-from memory import Observation, admit_working_set
+from crit_plugins.host.memory import Observation, admit_working_set
 from measured_dispatch import HostMemoryCosts, revalidate_memory
 
 costs = HostMemoryCosts(identity,
@@ -308,8 +303,8 @@ resident. Measure such a split against the exact one: it pays when the host's fa
 or the saved copies outweigh the drift, which the run's quality budget judges.
 
 **Host work inside a captured decode.** To run the host share mid-graph, post it
-through one of the host's handoffs (Core's `crit_plugins.host`; the
-[host-work mailbox](../host-work-mailbox/README.md) technique), which supplies the
+through one of the host's handoffs (Core's `crit_plugins.host`;
+[the handoffs' protocol](../../core/python/crit_plugins/host/README.md)), which supply the
 doorbell protocol, measured join choice, release and failure answering.
 
 ## Costs and validation

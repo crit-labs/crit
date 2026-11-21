@@ -78,8 +78,7 @@
     "Reader"
   ],
   "interactions": [
-    "ssd-expert-materialization",
-    "host-memory-admission"
+    "ssd-expert-materialization"
   ],
   "techniques": [
     "lookup-table-rows",

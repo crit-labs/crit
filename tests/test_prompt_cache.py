@@ -60,6 +60,97 @@ class Pool:
         self.lengths[sequence] = length
 
 
+class ElasticPool(Pool):
+    """A pool whose pages are an elastic range of a device (crit_plugins.memory): every position a sequence holds
+    backs `per` bytes, given back to the device as the sequence closes."""
+
+    def __init__(self, readings, memory, per=100):
+        super().__init__()
+        self.per, self.readings = per, readings
+        self.elastic = self   # the pool's range: its memory and its backed bytes
+        self.memory = memory
+
+    @property
+    def bytes(self):
+        return self.per * sum(self.lengths.values())
+
+    def close(self, sequence):
+        self.readings.bytes += self.per * self.lengths[sequence]
+        super().close(sequence)
+
+    def grow(self, sequence, length):
+        self.readings.bytes -= self.per * (length - self.lengths[sequence])
+        super().grow(sequence, length)
+
+
+class DeviceGiverTests(unittest.TestCase):
+    """A prompt cache over elastic pools is two givers of the device's memory: kept sequences no prompt reused for
+    IDLE_S seconds give first (before an expert cache), and also to a giver that grows back; the others give last."""
+
+    def setUp(self):
+        from crit_plugins import memory
+        from test_memory import Giver, Readings
+        self.memory_module = memory
+        self.readings = Readings(1000)
+        self.readings.total = 100_000
+        self.device = memory.DeviceMemory("fake:0", self.readings)
+        self.device.headroom = 0
+        self.pool = ElasticPool(self.readings, self.device)
+        self.cache = PromptCache([self.pool], entries=8)
+        self.addCleanup(self.cache.close)
+        self.now = [0.0]
+        self.cache.clock = lambda: self.now[0]
+        self.experts = Giver(self.readings, 5000, 100)   # an expert cache: copies, rank COPIES, that would grow
+        self.device.give("experts", self.experts.release, self.experts.regrow, hungry=lambda: self.hungry)
+        self.hungry = True
+
+    def keep(self, sequence, length):
+        self.cache.open(sequence, list(range(sequence * 1000, sequence * 1000 + length)))
+        self.pool.grow(sequence, length)
+        self.cache.retire(sequence, list(range(sequence * 1000, sequence * 1000 + length)))
+
+    def test_an_idle_kept_prompt_gives_before_the_expert_cache_and_a_recent_one_after_it(self):
+        from crit_plugins.prompt_cache import IDLE_S
+        self.keep(1, 20)                        # 2,000 bytes
+        self.now[0] = IDLE_S + 1                # idle now
+        self.keep(2, 10)                        # 1,000 bytes, just kept
+        self.readings.bytes = 0                 # the device is full
+        self.assertEqual(self.device.need(1500), 2000)   # the idle prompt first: whole, 2,000 bytes
+        self.assertEqual((list(self.cache.kept), self.experts.held), ([2], 5000))
+        self.readings.bytes = 0
+        self.assertEqual(self.device.need(500), 500)      # then the expert cache, before a prompt kept for reuse
+        self.assertEqual((list(self.cache.kept), self.experts.held), ([2], 4500))
+        self.readings.bytes, self.experts.held = 0, 0     # an expert cache with nothing left
+        self.assertEqual(self.device.need(800), 1000)     # the recent prompt last
+        self.assertEqual(list(self.cache.kept), [])
+        givers = self.device.givings()
+        self.assertEqual({name.split(":")[-1]: g["released"] for name, g in givers.items()},
+                         {"idle": 2000, "experts": 500, str(id(self.cache)): 1000})
+
+    def test_an_expert_cache_that_would_grow_takes_back_what_an_idle_prompt_holds(self):
+        from crit_plugins.prompt_cache import IDLE_S
+        self.device.serve()                     # the cache took the free bytes
+        self.keep(1, 30)
+        self.readings.bytes = 0                 # nothing free: the cache would take more
+        self.device.settle(None)
+        self.assertEqual(list(self.cache.kept), [1])   # not idle: it stays
+        self.now[0] = IDLE_S + 1
+        self.hungry = False
+        self.device.settle(None)
+        self.assertEqual(list(self.cache.kept), [1])   # idle, but no giver would take its memory: it stays
+        self.hungry = True
+        self.device.settle(None)                # the cache is hungry, the prompt idle: it gives, the cache grows
+        self.assertEqual(list(self.cache.kept), [])
+        self.assertTrue(self.device.owed)
+        held = self.experts.held
+        self.device.settle(None)
+        self.assertEqual(self.experts.held, held + 3000)
+
+    def test_a_closed_cache_leaves_the_device(self):
+        self.cache.close()
+        self.assertEqual([n for n in self.device.givers if n.startswith("prompt-cache")], [])
+
+
 class LedgerTests(unittest.TestCase):
     def serve(self, cache, pools, sequence, prompt, output=(), allow=True, marks=()):
         reused = cache.open(sequence, prompt, allow)

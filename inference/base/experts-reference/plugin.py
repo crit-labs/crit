@@ -47,14 +47,18 @@ class Matrices:
 class ReferenceExperts:
     def __init__(self, source):
         self.source, self.loaded, self.stacked, self.captured = source, {}, {}, set()
-        self.activation = "silu"
+        self.activation, self.caps = "silu", None
 
-    def activate(self, name):
-        """The gate of the blocks' product, act(gate) * up: silu (SwiGLU, the default) or gelu_tanh
+    def activate(self, name, caps=None):
+        """The gate of the blocks' product, act(gate) * up: silu (SwiGLU, the default), gelu_tanh, or softcapped_silu
+        with caps (gate, up): cap_g * tanh(gate / cap_g) * sigmoid(gate) * cap_u * tanh(up / cap_u)
         (experts:activations)."""
         if name not in reference.ACTIVATIONS:
             raise ValueError(f"experts-reference gates a block by {' or '.join(reference.ACTIVATIONS)}, not {name!r}")
-        self.activation = name
+        if (name == "softcapped_silu") != (caps is not None) or (caps is not None and (len(caps) != 2
+                                                                                         or min(caps) <= 0)):
+            raise ValueError("softcapped_silu, and only it, takes two positive caps: (gate, up)")
+        self.activation, self.caps = name, None if caps is None else (float(caps[0]), float(caps[1]))
 
     def run(self, layer, x, ids, weights):
         check_routes(x, ids, weights)
@@ -63,7 +67,7 @@ class ReferenceExperts:
             return [[0.0] * len(row) for row in x]
         matrices = Matrices(self.source, layer)
         return reference.moe_block(x, ids, weights, matrices.gate_up, matrices.down, matrices.inter(used[0]),
-                                   activation=self.activation)
+                                   activation=self.activation, caps=self.caps)
 
     def load(self, layer, expert, gate_up, down, format="bf16"):
         """The device form: an expert's dense matrices, kept as given (on the device, any float dtype). The reference
@@ -130,9 +134,14 @@ class ReferenceExperts:
         for c0 in range(0, padded, chunk):
             e, t = expert[c0:c0 + chunk], token[c0:c0 + chunk]
             both = torch.bmm(gate_up.index_select(0, e).double(), xd.index_select(0, t)[:, :, None])[..., 0]
-            gate = (torch.nn.functional.silu(both[:, :inter]) if self.activation == "silu"
-                    else torch.nn.functional.gelu(both[:, :inter], approximate="tanh"))
-            h = gate * both[:, inter:]
+            g, u = both[:, :inter], both[:, inter:]
+            if self.activation == "softcapped_silu":
+                gate = self.caps[0] * torch.tanh(g / self.caps[0]) * torch.sigmoid(g)
+                u = self.caps[1] * torch.tanh(u / self.caps[1])
+            else:
+                gate = (torch.nn.functional.silu(g) if self.activation == "silu"
+                        else torch.nn.functional.gelu(g, approximate="tanh"))
+            h = gate * u
             rows[c0:c0 + chunk] = torch.bmm(down.index_select(0, e).double(), h[:, :, None])[..., 0].float()
         w = weights.reshape(-1).float()
         contributions = torch.where(valid[:, None], rows[:n] * w[:, None], torch.zeros_like(rows[:n]))   # a skipped route

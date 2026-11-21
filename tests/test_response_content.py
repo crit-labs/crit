@@ -102,6 +102,23 @@ class ResponseContentTests(unittest.TestCase):
             reply(response | {"tool_calls": [CALL]},
                   self.request | {"messages": [{"role": "assistant", "tool_calls": [CALL]}]})
 
+    def test_a_blank_reply_at_its_output_cap_is_the_reply(self):
+        """A model may spend every token it was given on whitespace (a JSON-mode reply before its object, measured on
+        a cut checkpoint whose every reply was whitespace): at the cap that is the reply, and below it a fault."""
+        at_cap = {"prompt_tokens": 2, "output_tokens": 8, "prefill_tokens": 2, "prefill_ms": 1, "decode_tokens": 7,
+                  "decode_ms": 1, "ttft_ms": 1, "missing": {}}
+        for text in ("", " \n\t\n"):
+            with self.subTest(text=text):
+                capped = self.response | {"assistant": text, "telemetry": at_cap, "finish": "length"}
+                assistant, _ = reply(capped, self.request)
+                self.assertEqual(assistant, text)
+                writer = self.writer()
+                if text:
+                    writer.emit(text)
+                writer.finish(capped)
+                with self.assertRaisesRegex(ValueError, "requires assistant text"):
+                    reply(self.response | {"assistant": text}, self.request)
+
     def test_final_stream_content_matches_reply_with_and_without_tool_deltas(self):
         cases = [
             ({"assistant": "Answer"}, True),

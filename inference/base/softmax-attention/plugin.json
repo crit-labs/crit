@@ -20,6 +20,7 @@
     "attention:sinks",
     "attention:sliding",
     "attention:latent",
+    "attention:distance-bias",
     "prompts:attention"
   ],
   "devices": [
@@ -62,13 +63,14 @@
     },
     "reader": {
       "type": "choice",
-      "default": "split",
+      "default": "auto",
       "choices": [
+        "auto",
         "split",
         "flash",
         "cuda"
       ],
-      "description": "which of crit's paged-kv-attention structures read the pages where the kernel loads: split: the split-KV launch (piece i of a row's positions to KV partition i mod P, partials merged in partition order) for window rows and crit's prompt reader for prompt chunks; flash: the flash structures (flash-window, flash-fused: a row's positions in contiguous splits of one chunk per pool, its columns times a KV head's query heads packed into tensor-core tiles, the splits merged in split order; a column's bits the same alone, in any window, in a step and in a captured round, another reduction than split's) and the flash prompt chunk (flash-prefill: a prompt token's bits follow its chunk's length); partitions and piece do not apply, block lists stay on the split launch; cuda: the same launches through the CUDA flash tile (cuda-window, cuda-fused, cuda-prefill: queries in shared memory, 16 rows a warp, each warp's online softmax in registers, one chunk and block per pool; a column's bits the same alone, in any window, in a step and in a round, another reduction than split's and flash's; its prompt chunk follows the chunk's length), compiled with nvcc for the GPU on first use"
+      "description": "auto (the default): window rows through crit's CUDA flash tile for each pool it takes, the split-KV reader for the others, prompt chunks through reader split's prompt reader (partitioned-attention's reader option has the numbers); otherwise which of crit's paged-kv-attention structures read the pages where the kernel loads: split: the split-KV launch (piece i of a row's positions to KV partition i mod P, partials merged in partition order) for window rows and crit's prompt reader for prompt chunks; flash: the flash structures (flash-window, flash-fused: a row's positions in contiguous splits of one chunk per pool, its columns times a KV head's query heads packed into tensor-core tiles, the splits merged in split order; a column's bits the same alone, in any window, in a step and in a captured round, another reduction than split's) and the flash prompt chunk (flash-prefill: a prompt token's bits follow its chunk's length); partitions and piece do not apply, block lists stay on the split launch; cuda: the same launches through the CUDA flash tile (cuda-window, cuda-fused, cuda-prefill: queries in shared memory, 16 rows a warp, each warp's online softmax in registers, one chunk and block per pool; a column's bits the same alone, in any window, in a step and in a round, another reduction than split's and flash's; its prompt chunk follows the chunk's length), compiled with nvcc for the GPU on first use"
     },
     "partitions": {
       "type": "int",

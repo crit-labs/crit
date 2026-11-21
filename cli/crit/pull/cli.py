@@ -107,7 +107,7 @@ def context_tokens(card, model, device, requested=None):
 
 def device_probe(project, store, given=None):
     """A crit eval probe result: --device, else settings.toml's device, else one this command runs into the store."""
-    from crit.run.cli import load_settings
+    from crit.settings import load as load_settings
     path = given
     if path is None and "device" in load_settings(project):
         path = Path(load_settings(project)["device"]).expanduser()
@@ -393,12 +393,11 @@ def pull(engine, store, project=ROOT, hub=None, index=None, checkout=None, model
         for download, missed in toolchain:
             log(f"crit pull: the prebuilt {download['repository']} does not match this machine ("
                 + "; ".join(machine.unmet(missed)) + "); building from source")
-    from crit.run.cli import load_settings
-    from crit_eval import VRAM_HEADROOM_GIB
+    from crit.settings import load as load_settings, ram_headroom_bytes, vram_headroom_bytes
     settings = load_settings(project)
     limits = {"kv_tokens": context_tokens(card, model_id, probe, context),
-              "vram_headroom_bytes": round(settings.get("vram_headroom_gib", VRAM_HEADROOM_GIB) * GIB),
-              "ram_headroom_bytes": round(settings.get("ram_headroom_gib", 2) * GIB)}
+              "vram_headroom_bytes": vram_headroom_bytes(settings),
+              "ram_headroom_bytes": ram_headroom_bytes(settings)}
     staging = Path(tempfile.mkdtemp(dir=store.root, prefix=".pull-"))
     try:
         folder = staging / "engine"

@@ -11,7 +11,7 @@
       "The host's pool (Core's): one worker per physical core minus the caller's, pinned, flat batches claimed with one compare-and-swap of an epoch-tagged word, spin then yield then sleep; a task's exception is rethrown after the batch drains (PoolRef)",
       "HostExpertTier::compute: a layer's CPU routes, each expert's rows read once for all of its tokens (up to 8 a chunk), rows split over the pool, bitwise equal to a serial computation for any pool size, ISA or store layout",
       "The expert composition declared end to end: host_int's integer rows, swiglu_declared and the intermediate's declared quantizer (E2M1 x 2 or INT8), so the device's kernels give the same bits",
-      "A host-work-mailbox payload of FP32 token rows (route keys and tokens, the rows, room for the outputs: input_layout) and crit_tier_serve, the mailbox handler that serves it",
+      "A handoff payload (Core's crit_plugins.host) of FP32 token rows (route keys and tokens, the rows, room for the outputs: input_layout) and crit_tier_serve, the mailbox handler that serves it",
       "interleave_matrix for the CPU's store layout, and telemetry: routes, expert chunks, ms per phase, expert bytes read"
     ],
     "engine_supplies": [
@@ -83,7 +83,6 @@
   ],
   "interactions": [
     "host-expert-arithmetic",
-    "host-work-mailbox",
     "device-expert-cache",
     "async-expert-contributions",
     "heterogeneous-expert-dispatch"

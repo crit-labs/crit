@@ -42,8 +42,8 @@ Outputs are per route and unweighted: the device multiplies by the routing weigh
 ([async-expert-contributions](../async-expert-contributions/README.md)), so the order of a token's sum never depends
 on the split. Any pool size, ISA or store layout gives the same bits.
 
-**The handoff.** The device posts a layer's CPU routes into a slot of one of the host's handoffs (Core's, the
-[host-work-mailbox](../host-work-mailbox/README.md) technique) laid out as `input_layout(hidden, routes, tokens)`: a
+**The handoff.** The device posts a layer's CPU routes into a slot of one of the host's handoffs (Core's,
+[the handoffs' protocol](../../core/python/crit_plugins/host/README.md)) laid out as `input_layout(hidden, routes, tokens)`: a
 header {count, tokens, route capacity, token capacity}, each route's expert key and token, the tokens' FP32 rows,
 room for the output rows; the handoff's handler is
 `crit_tier_serve` (tier_capi.cpp), which calls `serve_inputs` ([heterogeneous-expert-dispatch](../heterogeneous-expert-dispatch/README.md)'s

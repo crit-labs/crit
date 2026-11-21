@@ -4,6 +4,7 @@ report says which plugin pays and which one slows the engine. The package is a w
 plugins, inference/examples/plugin-engine/plugins, with the attention and drafter plugins below in their slots); its resident host runs
 the scripted ENGINE over the assembled plugins (support/serve.py's scripted serving)."""
 import json
+import os
 from pathlib import Path
 import sys
 import unittest
@@ -16,6 +17,7 @@ from support.serve import RECIPE, scripted_package, scripted_serving
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "core" / "python"))
+from crit_plugins.ablation import describe as ablation_describe  # noqa: E402
 from crit_plugins.testing import run_tests  # noqa: E402
 
 # The toy engine: the plugin in its attention slot adds seconds per token, the one in its drafter slot makes a decode
@@ -29,6 +31,29 @@ from pathlib import Path
 from crit_plugins import Registry, assemble
 
 ROUND = 0.006
+# The prefill: long against the serving jitter of a loaded machine. crit serve's request path took up to 30 ms more
+# while other suites ran beside it, which at a 0.1 s prefill moved a variant's unchanged first token by 12-14% and its
+# verdict from pays to trades; at PREFILL it stays near 6%, inside the tests' noise.
+PREFILL = 0.5
+SPIN = False   # wait by spinning, not sleeping: a sub-millisecond schedule
+
+
+class Clock:
+    """The toy's time: a request's phases on one absolute schedule from its start, so a wake that comes late (a
+    sleep on a loaded Windows host overshoots by tens of milliseconds) delays no phase after it, and a request takes
+    the time its phases add up to instead of that plus every overshoot."""
+
+    def __init__(self):
+        self.at = time.perf_counter()
+
+    def wait(self, seconds):
+        self.at += seconds
+        while True:
+            left = self.at - time.perf_counter()
+            if left <= 0:
+                return
+            if not SPIN:
+                time.sleep(min(left, 0.002))
 
 
 class Engine:
@@ -45,13 +70,14 @@ class Engine:
         n = request['limits']['max_output_tokens']
         drafter, attention = self.parts.get('drafter'), self.parts['attention']
         per_round = drafter.tokens_per_round if drafter is not None else 1
-        time.sleep(0.1 + attention.seconds_per_token * 4)   # the prefill, long enough that serving jitter stays under 3%
+        clock = Clock()
+        clock.wait(PREFILL + attention.seconds_per_token * 4)   # the prefill
         emit('x')
         done, rounds = 1, 0
         while done < n:
             cancellation.check()
             k = min(per_round, n - done)
-            time.sleep(ROUND + attention.seconds_per_token * k)
+            clock.wait(ROUND + attention.seconds_per_token * k)
             for _ in range(k):
                 emit('x')
             done, rounds = done + k, rounds + 1
@@ -242,13 +268,62 @@ class AblateTests(run_measure.MeasureFixture, unittest.TestCase):
         with self.assertRaisesRegex(Exception, "exactness is one of declared, exact, row-exact, repeatable"):
             ablate(self.store, self.run_id, candidate, smoke=False, sets=["exactness=bitwise"])
 
+    @unittest.skipIf(os.environ.get("GITHUB_ACTIONS") == "true",
+                     "resolves a 1% change in wall time: a shared runner's jitter between rounds (up to 12% on "
+                     "Windows, a steady 2-3% prefill skew on Linux) is larger than the change")
+    def test_alternating_rounds_resolve_a_one_percent_change(self):
+        # The engine's decode rounds take 1% longer with attn-spin.extra=0.01, a change well inside the 3% a single
+        # pass is judged against. Served in four alternating rounds and compared round by round, it slows the engine
+        # in every round, while the same options served again (extra=0, the engine as built) change nothing every
+        # round agrees on.
+        engine = ENGINE.replace("ROUND = 0.006\n", "ROUND = 0.008\n").replace("SPIN = False", "SPIN = True")
+        engine = engine.replace("clock.wait(PREFILL + attention.seconds_per_token * 4)", "clock.wait(0.05)")
+        engine = engine.replace("clock.wait(ROUND + attention.seconds_per_token * k)",
+                                "clock.wait(ROUND * (1 + attention.extra))")
+        self.assertEqual((engine.count("SPIN = True"), engine.count("clock.wait(0.05)"),
+                          engine.count("clock.wait(ROUND * (1 + attention.extra))")), (1, 1, 1))
+
+        def write_plugins(package):
+            AblateTests.write_plugins(package)
+            folder = package / "plugins" / "attn-spin"
+            (folder / "tests").mkdir(parents=True, exist_ok=True)
+            (folder / "plugin.json").write_text(json.dumps({
+                "schema": "crit-plugin-v1", "id": "attn-spin", "title": "attn-spin", "fills": ["attention"],
+                "entry": "plugin.py:create", "needs": [], "devices": ["cpu"],
+                "options": {"extra": {"type": "float", "default": 0.0, "min": 0.0, "max": 1.0}}}), encoding="utf-8")
+            (folder / "plugin.py").write_text(PLUGIN.format(seconds=0.0).replace(
+                '        self.tokens_per_round = options.get("width", 1)\n',
+                '        self.tokens_per_round = 1\n        self.extra = options["extra"]\n'), encoding="utf-8")
+            (folder / "tests" / "test_plugin.py").write_text(TEST, encoding="utf-8")
+        self.write_plugins = write_plugins
+        selection = {"use": {**USE, "attention": "attn-spin", "drafter": None},
+                     "base": {"attention": "attn-plain", "drafter": None}}
+        candidate = self.plugin_package(engine=engine, selection=selection)
+        result = ablate(self.store, self.run_id, candidate, repetitions=3, smoke=False, rounds=4,
+                        sets=["attn-spin.extra=0.01", "attn-spin.extra=0"])
+        report = read_json(self.directory / result["report"])
+        self.assertEqual((report["rounds"], report["noise"]), (4, 0.005))
+        self.assertEqual([len(row["rounds"]) for row in report["variants"]], [4, 4, 4])
+        self.assertEqual({row["state"] for row in report["variants"]}, {"measured"}, report["variants"])
+        log = (self.directory / result["attempt"]["logs"][0]["path"]).read_text(encoding="utf-8")
+        self.assertIn("round 2 of 4: set:attn-spin.extra=0, set:attn-spin.extra=0.01, full", log)
+        rows = {row["plugin"]: row for row in report["blame"]}
+        slower, same = rows["set:attn-spin.extra=0.01"], rows["set:attn-spin.extra=0"]
+        changes = slower["paired"]["in_engine"]["decode_tps"]
+        self.assertEqual(len(changes), 4)
+        self.assertTrue(all(-0.03 < change < 0 for change in changes), changes)
+        self.assertAlmostEqual(slower["in_engine"]["decode_tps"], -0.01, delta=0.005)
+        self.assertEqual(slower["verdict"], "slows", slower)
+        self.assertEqual(same["verdict"], "neutral", same)
+        self.assertIn("(rounds ", ablation_describe(slower))
+
     def test_a_variant_is_warmed_until_its_decode_rounds_take_a_steady_time(self):
         # A rebuilt engine whose first three requests run cold, each less than the one before, as a real engine's
         # lazy captures do: one warmup would leave the bench's repetitions cold.
         cold = ENGINE.replace("        self.facts = self.parts.facts()\n",
                               "        self.facts = self.parts.facts()\n        self.cold = 3\n")
-        cold = cold.replace("            time.sleep(ROUND + attention.seconds_per_token * k)\n",
-                            "            time.sleep(ROUND + attention.seconds_per_token * k + 0.01 * self.cold)\n")
+        cold = cold.replace("            clock.wait(ROUND + attention.seconds_per_token * k)\n",
+                            "            clock.wait(ROUND + attention.seconds_per_token * k + 0.01 * self.cold)\n")
         cold = cold.replace("        prompt = sum(", "        self.cold = max(0, self.cold - 1)\n        prompt = sum(")
         self.assertEqual(cold.count("self.cold"), 4)
         candidate = self.plugin_package(engine=cold)
@@ -257,6 +332,31 @@ class AblateTests(run_measure.MeasureFixture, unittest.TestCase):
         case = full["cases"]["case-0001"]
         # Three cold requests, then two that agree; a round costs 18 ms warm and 28 to 48 ms cold.
         self.assertGreaterEqual(case["warmups"], 5, case)
+        self.assertGreater(case["decode_tps"], 3 / 0.024, case)
+
+    def test_evals_cases_are_warmed_before_their_seeds_are_measured(self):
+        # An engine whose first three requests of each prompt run cold, as an expert cache's residency follows the
+        # content: an Eval case measured unwarmed decodes its first seeds slow, and later variants faster.
+        import tempfile
+        cold = ENGINE.replace("        self.facts = self.parts.facts()\n",
+                              "        self.facts = self.parts.facts()\n        self.cold = {}\n")
+        cold = cold.replace("        per_round = drafter", "        text = str(request['messages'])\n"
+                            "        self.cold[text] = self.cold.get(text, 4) - 1\n        per_round = drafter")
+        cold = cold.replace("            clock.wait(ROUND + attention.seconds_per_token * k)\n",
+                            "            clock.wait(ROUND + attention.seconds_per_token * k + 0.01 * max(0, self.cold[text]))\n")
+        self.assertEqual(cold.count("self.cold"), 4)
+        candidate = self.plugin_package(engine=cold)
+        with tempfile.TemporaryDirectory() as data:
+            (Path(data) / "prepared.json").write_text(json.dumps({
+                "sampling": {"temperature": 0},
+                "speed": [{"id": "chat", "messages": [{"role": "user", "content": "rivers"}], "output_tokens": 24}]}),
+                encoding="utf-8")
+            result = ablate(self.store, self.run_id, candidate, names=["full"], repetitions=2, smoke=False, data=data,
+                            seeds=2)
+        (full,) = read_json(self.directory / result["report"])["variants"]
+        case = full["cases"]["eval:chat"]
+        # Three cold requests, then two that agree; a round costs 18 ms warm and 28 to 48 ms cold.
+        self.assertGreaterEqual(case["warmups"], 4, case)
         self.assertGreater(case["decode_tps"], 3 / 0.024, case)
 
     def test_an_engine_that_does_not_report_its_plugins_fails_every_variant(self):

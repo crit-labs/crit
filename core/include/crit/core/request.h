@@ -49,6 +49,12 @@ struct RequestOptions {
     // log-probability plus its n most likely alternatives. Requires
     // ModelInfo::token_logprobs and n <= ModelInfo::max_top_logprobs.
     std::optional<std::uint32_t> logprobs = {};
+    // A debug request's decode rows run through the model's prompt arithmetic (a one-token prompt chunk each) and
+    // never in a native round, so a gap between decoding and prefilling that vanishes is rounding, not a fault.
+    bool decode_via_prompt = false;
+    // The order a waiting generation is admitted in: a lower value first, the oldest first among equal values. A
+    // score stays an exclusive barrier that no request overtakes; scoring takes no priority.
+    std::int32_t priority = 0;
 };
 // A token and its natural-log probability under the raw logits of the pass that
 // produced or scored the position: before temperature, penalties, bias and filters,

@@ -1,81 +1,9 @@
 """Portable metadata, state coordination, replay policy and real host tier copies."""
 from concurrent.futures import Future
-from dataclasses import replace
 import random
 import unittest
 
 from test_techniques import load
-
-
-class MetadataTests(unittest.TestCase):
-    def test_incremental_gather_rebind_and_retained_snapshots(self):
-        m = load("concurrent-request-execution", "metadata.py")
-        table = m.MetadataTable(1000000, 32)
-        replica = m.MetadataReplica(table.empty)
-        table.set((1, 1), b"abc")
-        table.set((2, 1), b"de")
-        first = table.snapshot()
-        self.assertEqual(first.diff(replica.snapshot).payload_bytes, 5)
-        replica.apply(first.diff(replica.snapshot))
-        held = replica.snapshot
-        table.set((1, 1), b"abcd")
-        second = table.snapshot(((2, 1), (1, 1)))
-        delta = second.diff(replica.snapshot)
-        self.assertEqual(delta.payload_bytes, 4)
-        self.assertEqual(replica.apply(delta), second)
-        self.assertEqual(held.rows[0].payload, b"abc")
-        with self.assertRaises(ValueError):
-            replica.apply(delta)
-        table.release((1, 1))
-        self.assertEqual(table.set((3, 2), b"new"), 0)
-        third = table.snapshot()
-        self.assertEqual(replica.apply(third.diff(replica.snapshot)), third)
-        self.assertEqual(held.rows[0].key, (1, 1))
-        same = table.snapshot()
-        self.assertEqual(same.diff(replica.snapshot).payload_bytes, 0)
-        replica.apply(same.diff(replica.snapshot))
-
-    def test_random_patches_match_full_rebuild(self):
-        m, rng = load("concurrent-request-execution", "metadata.py"), random.Random(144)
-        table = m.MetadataTable(12, 20)
-        replica = m.MetadataReplica(table.empty)
-        expected = {}
-        for _ in range(500):
-            key = (rng.randrange(1, 13), 1)
-            if key in expected and rng.randrange(4) == 0:
-                table.release(key)
-                del expected[key]
-            else:
-                value = rng.randbytes(rng.randrange(20))
-                table.set(key, value)
-                expected[key] = value
-            keys = list(expected)
-            rng.shuffle(keys)
-            wanted = table.snapshot(keys)
-            actual = replica.apply(wanted.diff(replica.snapshot))
-            self.assertEqual([(r.key, r.payload) for r in actual.rows], [(k, expected[k]) for k in keys])
-
-    def test_invalid_patches_are_atomic(self):
-        m = load("concurrent-request-execution", "metadata.py")
-        table = m.MetadataTable(1, 3)
-        replica = m.MetadataReplica(table.empty)
-        table.set((1, 1), b"one")
-        delta = table.snapshot().diff(replica.snapshot)
-        for bad in (replace(delta, order=(0, 0)), replace(delta, changed=(replace(delta.changed[0], payload=b"long"),)),
-                    replace(delta, changed=(replace(delta.changed[0], slot=9),))):
-            with self.assertRaises(ValueError):
-                replica.apply(bad)
-            self.assertIs(replica.snapshot, table.empty)
-        with self.assertRaises(ValueError):
-            table.set((2, 1), b"two")
-        replica.apply(delta)
-        bad = m.MetadataDelta(replica.snapshot, 99, (0,),
-                              (replace(replica.snapshot.rows[0], version=1),), (0,))
-        with self.assertRaises(ValueError):
-            replica.apply(bad)
-        foreign = m.MetadataTable(1, 3)
-        with self.assertRaises(ValueError):
-            foreign.snapshot().diff(replica.snapshot)
 
 
 class CoordinationTests(unittest.TestCase):
@@ -118,31 +46,6 @@ class CoordinationTests(unittest.TestCase):
                 components.append(m.PrefixFrontier(str(i), "x", maximum, quantum, checkpoints))
                 allowed &= values
             self.assertEqual(m.common_prefix(components, limit, identity="x"), max(v for v in allowed if v <= limit))
-
-
-class ReplayTests(unittest.TestCase):
-    def test_amortization_memory_padding_and_generation(self):
-        m = load("recorded-selection", "replay.py")
-        shape = m.ExecutionShape("decode", 3, 2, ("repr", "backend", 7, (1, 2)))
-        eager = m.ReplayOffer("eager", "eager", shape, 100, workspace_bytes=2)
-        full = m.ReplayOffer("full", "full", replace(shape, tokens=4), 20,
-                             workspace_bytes=4, resident_bytes=8, setup_ns=500, setup_peak_bytes=20)
-        partial = m.ReplayOffer("partial", "partial", shape, 50, workspace_bytes=4, ready=True)
-        def select(offers, **kw):
-            return m.select_replay(shape, offers, modes={"eager", "full", "partial"}, **kw)
-        self.assertEqual(select((eager, full), free_bytes=20, allow_padding=True).offer, eager)
-        self.assertEqual(select((eager, full), free_bytes=20, expected_uses=10, allow_padding=True).offer, full)
-        self.assertEqual(select((eager, full, partial), free_bytes=4, expected_uses=10, allow_padding=True).offer, partial)
-        self.assertEqual(select((eager, full), free_bytes=20, expected_uses=10).offer, eager)
-        stale = replace(partial, shape=replace(shape, identity=("repr", "backend", 8, (1, 2))))
-        choice = select((eager, stale), free_bytes=100)
-        self.assertEqual(choice.offer, eager)
-        self.assertIn("identity", choice.rejected[0][1])
-        self.assertEqual(select((replace(full, ready=True),), free_bytes=4, allow_padding=True).offer.mode, "full")
-        with self.assertRaises(ValueError):
-            select((eager,), free_bytes=1)
-        with self.assertRaises(ValueError):
-            m.ExecutionShape("decode", 1, 1, (object(),))
 
 
 class TierTests(unittest.TestCase):

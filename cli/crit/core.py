@@ -1,6 +1,6 @@
 """crit core: build Core's native runtime, the crit_core_steps library every engine runs on (crit_core.native), where
 Core's loader finds it without CRIT_CORE_STEP_LIBRARY (crit_core.native.step_library): in a crit checkout its
-build/core-steps; for a crit installed from its wheel, which carries no C++, Core's source at the installed release's
+build/core-steps/<sys.platform>; for a crit installed from its wheel, which carries no C++, Core's source at the installed release's
 tag (crit X.Y.Z is published from vX.Y.Z), fetched once into Core's cache and built there."""
 import argparse
 from pathlib import Path
@@ -9,16 +9,14 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
-BUILD = "build/core-steps"
 
 
 def library(folder):
-    """The crit_core_steps file a build folder holds, or None."""
-    from crit_core.native import STEP_LIBRARY_FILES
+    """The crit_core_steps file of this OS a build folder holds, or None."""
+    from crit_core.native import STEP_LIBRARY_FILE
     for sub in (folder, folder / "Release"):
-        for name in STEP_LIBRARY_FILES:
-            if (sub / name).is_file():
-                return sub / name
+        if (sub / STEP_LIBRARY_FILE).is_file():
+            return sub / STEP_LIBRARY_FILE
     return None
 
 
@@ -26,7 +24,8 @@ def source():
     """(Core's source folder, the build folder): this checkout's, else the installed release's in Core's cache,
     fetched with git at the release's tag when it is not there yet."""
     if (ROOT / "core" / "CMakeLists.txt").is_file():
-        return ROOT / "core", ROOT / BUILD
+        from crit_core.native import STEP_BUILD
+        return ROOT / "core", ROOT / STEP_BUILD
     from crit_core.native import step_cache
     from . import __version__
     from .cli import REPOSITORY
@@ -66,7 +65,7 @@ def build(build_type="Release", jobs=None):
 def parser():
     result = argparse.ArgumentParser(prog="crit core", description=__doc__)
     subs = result.add_subparsers(dest="command", required=True)
-    sub = subs.add_parser("build", help="Build crit_core_steps where Core's loader finds it (a checkout's build/core-steps, else Core's cache)")
+    sub = subs.add_parser("build", help="Build crit_core_steps where Core's loader finds it (a checkout's build/core-steps/<platform>, else Core's cache)")
     sub.add_argument("--build-type", default="Release", help="CMake build type (default Release)")
     sub.add_argument("--jobs", type=int, help="Parallel build jobs (default: CMake's)")
     subs.add_parser("where", help="Print the crit_core_steps library Core's loader would load, or exit 1")

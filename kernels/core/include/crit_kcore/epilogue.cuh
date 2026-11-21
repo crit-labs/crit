@@ -45,6 +45,15 @@ __device__ __forceinline__ float gelu_tanh_mul(float gate, float up) {
     return __fmul_rn(__fmul_rn(__fmul_rn(0.5f, gate), __fadd_rn(1.0f, tanhf(inner))), up);
 }
 
+// SwiGLU whose linear gate factor and up projection are each capped by a tanh: cap_g tanh(gate / cap_g) sigmoid(gate)
+// times cap_u tanh(up / cap_u), the sigmoid of the raw gate. The CUDA math library's tanhf and expf (within their ulp
+// bounds), every other operation rounded, so a row's bits are its own whatever shares its launch.
+__device__ __forceinline__ float softcapped_swiglu(float gate, float up, float gate_cap, float up_cap) {
+    const float capped = __fmul_rn(gate_cap, tanhf(__fdiv_rn(gate, gate_cap)));
+    const float sig = __fdiv_rn(1.0f, __fadd_rn(1.0f, expf(-gate)));
+    return __fmul_rn(__fmul_rn(capped, sig), __fmul_rn(up_cap, tanhf(__fdiv_rn(up, up_cap))));
+}
+
 // ------------------------------------------------------------------------------------------- activations
 // The CUDA math library's functions (expf: within its ulp bound, not declared bits).
 

@@ -16,7 +16,9 @@ with:
     def bytes(self, shape, rows): optional, bytes the call must move (for the GB/s column)
     def valid(self, knobs): optional, False for knob combinations that cannot build or run
     def valid_for(self, knobs, shape): optional, False where a configuration cannot run this shape (a split that does
-        not divide K): the shape is not timed with it
+        not divide K): the shape is not timed with it, and a configuration that runs none of the shapes is not built
+    runtime: optional, the knobs the kernel reads at run time only (a split's size, not a template argument):
+        configurations that differ only in them compile to the same code, so the sweep builds them together
     def variants(self, shape): optional, for a kernel with CUDA sources beside its Triton modules (kernel.json "cuda"):
         the CUDA variants (dicts of its "variant" fields) a call on this shape uses, compiled before the GPU is held
     default: set by the sweep before timing, the kernel's untuned build (its default knobs), for benches that compare
@@ -30,7 +32,10 @@ A knob with "order": true changes the kernel's summation order. A row's bits mus
 (the operations' invariance contract), so one shape keeps one value of every order knob for all its row counts; the
 others (speed only) may differ per row count. Configurations whose result is wrong, or whose row 0 differs from row 0
 computed alone (for a structure whose kernel.json "exactness" is row-exact or higher: crit_kernels.exactness), are
-dropped.
+dropped. A configuration the bench says runs none of the model's shapes (valid_for) is not built at all (the defaults
+always are), a kernel with CUDA sources beside its Triton modules groups a structure's configurations into builds by
+the CUDA variants they run, each build compiling only those, and configurations that differ only in the bench's runtime
+knobs are built together.
 
 A structure may declare "lengths": {"field": "N", "values": [...]} (a shape field the bench reads: the positions a
 row holds, for attention): every shape is swept at each of those lengths (a shape that gives the field keeps its own),
@@ -68,6 +73,9 @@ def _bench_class(folder, ref):
 
 
 def configurations(manifest, structure, bench=None):
+    """Every knob combination the bench calls valid, those that differ only in the knobs its `runtime` names (read
+    at run time: the same compiled code) next to each other, so a build of consecutive ones compiles their code
+    once instead of once a configuration."""
     knobs = manifest["structures"][structure].get("knobs", {})
     names = list(knobs)
     out = []
@@ -75,6 +83,10 @@ def configurations(manifest, structure, bench=None):
         config = dict(zip(names, values))
         if bench is None or not hasattr(bench, "valid") or bench.valid(config):
             out.append(config)
+    runtime = set(getattr(bench, "runtime", ()) or ())
+    compiled = [n for n in names if n not in runtime]
+    if len(compiled) < len(names):
+        out.sort(key=lambda c: tuple(knobs[n]["values"].index(c[n]) for n in compiled))   # stable: the rest in order
     return out
 
 
@@ -203,12 +215,45 @@ def _lock(path):
     return handle
 
 
-def _chunks(manifest, structure, configs, size):
+def _runs(bench, knobs, shape):
+    """Whether the bench says the knobs can run the shape (valid_for; a bench without one, or one that cannot tell,
+    runs it)."""
+    if not hasattr(bench, "valid_for"):
+        return True
+    try:
+        return bool(bench.valid_for(knobs, shape))
+    except Exception:  # noqa: BLE001 - a bench that cannot tell: the configuration is built and _measure decides
+        return True
+
+
+def runnable(manifest, structure, configs, bench, shapes):
+    """The configurations that run at least one of the shapes (bench.valid_for), the defaults always: one that runs
+    none is never timed, so it is not built either. Returns (kept, how many were left out)."""
+    base = kbuild.defaults(manifest, structure)
+    kept = [c for c in configs if c == base or any(_runs(bench, c, shape) for shape in shapes)]
+    return kept, len(configs) - len(kept)
+
+
+def _needs(bench, knobs, shapes, variants):
+    """The indices of the CUDA variants (variants: the structure's, _variants()) a configuration is timed on: those
+    of the shapes it runs (bench.variants(shape))."""
+    found = set()
+    for shape in shapes:
+        if _runs(bench, knobs, shape):
+            found.update(variants.index(dict(v)) for v in bench.variants(shape) if dict(v) in variants)
+    return tuple(sorted(found))
+
+
+def _chunks(manifest, structure, configs, size, group_of=None):
     """The structure's configurations in builds of `size`: each build holds the defaults (index 0) and its share of the
-    rest in order, so a configuration's index in its build is known (select())."""
+    rest in order, so a configuration's index in its build is known (select()). group_of(config): configurations of
+    one value share builds (a mixed kernel's: the CUDA variants they run, so a build compiles only those)."""
     base = kbuild.defaults(manifest, structure)
     rest = [c for c in configs if c != base]
-    groups = [rest[i:i + size] for i in range(0, len(rest), size)] or [[]]
+    parts = {group_of(base): []} if group_of and base in configs else {}   # the defaults' group first: the first
+    for c in rest:                                                            # build holds them
+        parts.setdefault(group_of(c) if group_of else None, []).append(c)
+    groups = [part[i:i + size] for part in parts.values() if part for i in range(0, len(part), size)] or [[]]
     out = []
     for group in groups:
         indices = [(0, base)] if base in configs and group is groups[0] else []
@@ -250,37 +295,6 @@ def _worker_signals():
         signal.signal(sig, signal.SIG_DFL)
 
 
-def _collect(pool, futures, stopped, on_done):
-    """The builds as they finish (on_done(future, its result)); a stop cancels the builds not started and ends the
-    running ones. Returns how many builds finished."""
-    pending, finished = set(futures), 0
-
-    def take(done):
-        nonlocal finished
-        for future in done:
-            try:
-                result = future.result()
-            except Exception:  # noqa: BLE001 - a worker ended by the stop's signal breaks the pool
-                if stopped.now:
-                    continue
-                raise
-            finished += 1
-            on_done(future, result)
-    while pending and not stopped.now:
-        done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
-        take(done)
-    if pending:
-        # the builds that finished as the stop came still count
-        take({f for f in pending if f.done() and not f.cancelled()})
-        pending = {f for f in pending if not f.done()}
-        for future in pending:
-            future.cancel()
-        for process in list((getattr(pool, "_processes", None) or {}).values()):
-            process.terminate()
-        pool.shutdown(wait=False, cancel_futures=True)
-    return finished
-
-
 def sweep(kernel_id, *, model=None, shapes=None, structures=None, out=None, jobs=None, root=None, lock=None,
           warmup=3, repeat=25, chunk=24, matrices=None, log=print):
     """Tune kernel_id. model: a checkpoint folder (its shapes come from each bench's shapes()); shapes: {structure:
@@ -320,14 +334,32 @@ def sweep(kernel_id, *, model=None, shapes=None, structures=None, out=None, jobs
     # of the binding and the knob-independent sources a build), each picked at run time (select()).
     plan = []   # (structure, configurations the build holds, [(index in the build, configuration)])
     total = 0
+    mixed_cuda = set(manifest["cuda"].get("structures", [])) if kbuild._mixed(manifest) else set()
+    variants = {s: _variants(benches[s], shape_sets[s]) for s in chosen if s in mixed_cuda}
+    needs = {}     # (structure, config json) -> the indices of its structure's variants it is timed on
     for s in chosen:
         if not shape_sets[s]:
             log(f"{kernel_id}/{s}: no shapes, not swept")
             continue
-        found = configurations(manifest, s, benches[s])
+        found, left = runnable(manifest, s, configurations(manifest, s, benches[s]), benches[s], shape_sets[s])
+        if left:
+            log(f"{kernel_id}/{s}: {left} configurations run none of its shapes (valid_for): not built")
         total += len(found)
-        for group, indices in _chunks(manifest, s, found, chunk):
+        group_of = None
+        if variants.get(s):
+            for c in found:
+                needs[(s, json.dumps(c, sort_keys=True))] = _needs(benches[s], c, shape_sets[s], variants[s])
+            group_of = lambda c, s=s: needs[(s, json.dumps(c, sort_keys=True))]
+        for group, indices in _chunks(manifest, s, found, chunk, group_of):
             plan.append((s, group, indices))
+
+    def build_variants(item):
+        """The CUDA variants a build compiles before the GPU is held: those its configurations are timed on."""
+        s, _, indices = item
+        wanted = set()
+        for _, c in indices:
+            wanted.update(needs.get((s, json.dumps(c, sort_keys=True)), ()))
+        return [v for i, v in enumerate(variants[s]) if i in wanted]
     # Every structure's defaults first (the first build of each holds them), so a sweep stopped part way has them all.
     firsts = {}
     for item in plan:
@@ -337,58 +369,47 @@ def sweep(kernel_id, *, model=None, shapes=None, structures=None, out=None, jobs
     t0 = time.time()
     failed = {}
     jobs = jobs or max(1, (os.cpu_count() or 2) - 2)
-    # A stop (SIGTERM, Ctrl+C) during the builds ends them and writes the defaults' table; while measuring it ends the
-    # measuring and writes the table from what was measured.
+    # The builds run in the pool while the configurations of each finished one are timed on the GPU (under the lock,
+    # held only while there is a build to time). A stop (SIGTERM, Ctrl+C) ends the builds and the timing: the table is
+    # chosen from what was measured (every structure's defaults first: their builds come first).
     stopped = _Stop()
-    builds, built = 0, 0
-    if manifest["language"] == "cuda":
-        with ProcessPoolExecutor(max_workers=jobs, initializer=_worker_signals) as pool:
-            futures = {pool.submit(_build_one, (kernel_id, {s: group}, root)): (s, indices)
-                       for s, group, indices in plan}
-
-            def built_cuda(future, result):
-                s, indices = futures[future]
-                if result[1]:
-                    for _, c in indices:
-                        failed[(s, json.dumps(c, sort_keys=True))] = result[1]
-            builds, built = len(futures), _collect(pool, futures, stopped, built_cuda)
-    elif kbuild._mixed(manifest):
-        # A Triton kernel with CUDA sources: the builds of its CUDA structures compile the variants their benches call
-        # (bench.variants(shape)), and the untuned build all of them, before the GPU is held; the Triton structures'
-        # builds need no compile step.
-        cuda = set(manifest["cuda"].get("structures", []))
-        variants = {s: _variants(benches[s], shape_sets[s]) for s in chosen if s in cuda}
-        every = [v for s in sorted(variants) for v in variants[s]]
-        with ProcessPoolExecutor(max_workers=jobs, initializer=_worker_signals) as pool:
-            futures = {pool.submit(_build_one, (kernel_id, {s: group}, root, variants[s])): (s, indices)
-                       for s, group, indices in plan if s in cuda and variants[s]}
-            if every:
-                futures[pool.submit(_build_one, (kernel_id, None, root, every))] = (None, [])
-
-            def built_mixed(future, result):
-                s, indices = futures[future]
-                error = result[1]
-                if error and s is None:
-                    log(f"{kernel_id}: the untuned build's CUDA variants did not compile: {error}")
-                for _, c in indices if error else []:
-                    failed[(s, json.dumps(c, sort_keys=True))] = error
-            builds, built = len(futures), _collect(pool, futures, stopped, built_mixed)
     results = {}   # (structure, shape key, rows, config json) -> us
-    dropped = dict(failed)
+    dropped = {}   # (structure, config json) or (structure, config @ shape) -> why it was not measured
     library = {}
     swept = [s for s in chosen if shape_sets[s]]
-    if stopped.now:
-        stopped.restore()
-        for s, _, indices in plan:
-            for _, c in indices:
-                dropped.setdefault((s, json.dumps(c, sort_keys=True)),
-                                   f"not measured: the sweep was stopped during its builds ({built} of {builds} built)")
-        log(f"{kernel_id}: stopped during the builds after {time.time() - t0:.0f} s, {built} of {builds} builds done: "
-            "nothing measured, the table holds every structure's defaults")
-    else:
-        log(f"{kernel_id}: built in {time.time() - t0:.0f} s, {len(failed)} configurations failed to build")
-        _measure_all(kernel_id, root, lock, torch, warmup, repeat, manifest, plan, swept, shape_sets, benches,
-                     results, dropped, library, stopped, log)
+    # Spawned, not forked: this process has CUDA initialized by now (the benches' valid_for() reads the device), which a
+    # forked worker cannot use again, and a mixed kernel's builds read the device's fields.
+    import multiprocessing
+    with ProcessPoolExecutor(max_workers=jobs, initializer=_worker_signals,
+                             mp_context=multiprocessing.get_context("spawn")) as pool:
+        futures, untuned = {}, None   # future -> index of its plan item (None: the untuned build)
+        if manifest["language"] == "cuda":
+            futures = {pool.submit(_build_one, (kernel_id, {s: group}, root)): i
+                       for i, (s, group, _) in enumerate(plan)}
+        elif kbuild._mixed(manifest):
+            # A Triton kernel with CUDA sources: the builds of its CUDA structures compile the variants their benches
+            # call (bench.variants(shape)), and the untuned build all of them; the Triton structures' builds need no
+            # compile step, so they are timed first.
+            # A build compiles only the variants its configurations are timed on (build_variants): its configurations
+            # share the variants they run (_chunks' group_of).
+            every = [v for s in sorted(variants) for v in variants[s]]
+            futures = {pool.submit(_build_one, (kernel_id, {s: group}, root, build_variants(plan[i]))): i
+                       for i, (s, group, _) in enumerate(plan) if s in mixed_cuda and variants[s]}
+            if every:
+                untuned = pool.submit(_build_one, (kernel_id, None, root, every))
+                futures[untuned] = None
+
+        def built(future, result):
+            error, i = result[1], futures[future]
+            if error and i is None:
+                log(f"{kernel_id}: the untuned build's CUDA variants did not compile: {error}")
+            for _, c in plan[i][2] if error and i is not None else ():
+                failed[(plan[i][0], json.dumps(c, sort_keys=True))] = error
+                dropped[(plan[i][0], json.dumps(c, sort_keys=True))] = error
+        builds, done = _measure_all(kernel_id, root, lock, torch, warmup, repeat, manifest, plan, swept, shape_sets,
+                                    benches, results, dropped, library, stopped, log, pool, futures, untuned, built)
+    log(f"{kernel_id}: {done} of {builds} builds done, each timed as it finished, in {time.time() - t0:.0f} s; "
+        f"{len(failed)} configurations failed to build")
     tuning, report = choose(manifest, swept, shape_sets, results, dropped, benches)
     _add_yardsticks(manifest, report, library)
     tuning["source"] = kbuild.source_digest(kernel_id, root)
@@ -402,43 +423,95 @@ def sweep(kernel_id, *, model=None, shapes=None, structures=None, out=None, jobs
     return tuning, report
 
 
+def _cancel(pool, pending):
+    """A stop: the builds not started are cancelled and the running ones ended."""
+    for future in pending:
+        future.cancel()
+    for process in list((getattr(pool, "_processes", None) or {}).values()):
+        process.terminate()
+    pool.shutdown(wait=False, cancel_futures=True)
+
+
 def _measure_all(kernel_id, root, lock, torch, warmup, repeat, manifest, plan, swept, shape_sets, benches,
-                 results, dropped, library, stopped, log):
-    """Every build's configurations timed on the GPU (under the lock), then the picks confirmed and the yardsticks
-    timed; a stop while measuring ends the measuring after the build in hand (results and dropped say what was)."""
-    # The untuned build, before the GPU is held: benches may compare bits with it or plan calls with it.
-    default_module = kbuild.load(kernel_id, root=root)
-    for bench in benches.values():
-        bench.default = default_module
-    handle = _lock(lock)
-    try:
-        timer = Timer(torch, warmup, repeat)
-        where = {}     # (structure, config json) -> (module, index in its build)
-        t0 = time.time()
-        for s, group, indices in plan:
-            if stopped.now:
-                for _, c in indices:
-                    dropped.setdefault((s, json.dumps(c, sort_keys=True)), "not measured: the sweep was stopped")
-                continue
+                 results, dropped, library, stopped, log, pool=None, futures=None, untuned=None, built=None):
+    """Every build's configurations timed on the GPU as its build finishes, then the picks confirmed and the
+    yardsticks timed. futures: {future of a build in `pool`: the index of its plan item (None: the untuned build)};
+    a plan item without one needs no build. Each finished build's result goes to built(future, result). The GPU lock
+    is held while a finished build is timed and given back while the next is still building. A stop ends the builds
+    and the timing after the build in hand (results and dropped say what was measured). Returns (builds, finished)."""
+    import heapq
+    futures = futures or {}
+    waiting = {i for i in futures.values() if i is not None}
+    ready = [i for i in range(len(plan)) if i not in waiting]   # plan items to time, the earliest first
+    heapq.heapify(ready)
+    pending, finished = set(futures), 0
+    default_module, handle, timer = None, None, None
+    where = {}     # (structure, config json) -> (module, index in its build)
+    timed = set()  # the plan items timed
+    t0 = time.time()
+
+    def take(done):
+        nonlocal finished
+        for future in done:
             try:
-                module = kbuild.load(kernel_id, configs={s: group}, sweep=True, root=root)
-            except Exception as error:  # noqa: BLE001
-                for _, c in indices:
-                    dropped.setdefault((s, json.dumps(c, sort_keys=True)), f"load: {error}")
+                result = future.result()
+            except Exception:  # noqa: BLE001 - a worker ended by the stop's signal breaks the pool
+                if stopped.now:
+                    continue
+                raise
+            finished += 1
+            if built is not None:
+                built(future, result)
+            if futures[future] is not None:
+                heapq.heappush(ready, futures[future])
+    try:
+        while not stopped.now:
+            if pending:
+                done, pending = wait(pending, timeout=0 if ready else 0.5, return_when=FIRST_COMPLETED)
+                take(done)
+                if stopped.now:
+                    break
+            if default_module is None and (untuned is None or untuned.done()):
+                # The untuned build: benches may compare bits with it or plan calls with it.
+                default_module = kbuild.load(kernel_id, root=root)
+                for bench in benches.values():
+                    bench.default = default_module
+            if ready and default_module is not None:
+                if handle is None:
+                    handle = _lock(lock)
+                if timer is None:
+                    timer = Timer(torch, warmup, repeat)
+                i = heapq.heappop(ready)
+                _measure_build(kernel_id, root, manifest, plan[i], benches, shape_sets, results, dropped, where, timer,
+                               torch)
+                timed.add(i)
+                log(f"{kernel_id}: build {len(timed)} of {len(plan)} timed ({plan[i][0]}, {len(plan[i][2])} "
+                    f"configurations) at {time.time() - t0:.0f} s, {finished} of {len(futures)} builds done")
                 continue
-            for index, config in indices:
-                cj = json.dumps(config, sort_keys=True)
-                if (s, cj) not in dropped:
-                    kbuild.select(module, s, index)
-                    _measure(s, cj, module, manifest, benches, shape_sets, results, dropped, timer, torch)
-                    where[(s, cj)] = (module, index)
-            kbuild.select(module, s, -1)
+            if not pending:
+                break
+            if handle is not None:   # nothing built to time: the GPU is the machine's while the builds go on
+                handle.close()
+                handle = None
+        if pending:
+            take({f for f in pending if f.done() and not f.cancelled()})   # those that finished as the stop came
+            pending = {f for f in pending if not f.done()}
+            if pool is not None:
+                _cancel(pool, pending)
         stopped.restore()
+        if stopped.now:
+            for s, _, indices in (item for i, item in enumerate(plan) if i not in timed):
+                for _, c in indices:
+                    dropped.setdefault((s, json.dumps(c, sort_keys=True)),
+                                       f"not measured: the sweep was stopped ({finished} of {len(futures)} builds "
+                                       "built)")
         log(f"{kernel_id}: measured in {time.time() - t0:.0f} s, {len(dropped)} configurations dropped"
             + ("; stopped part way: the table is chosen from what was measured" if stopped.now else ""))
         # A median can still catch other work on the GPU: re-time the defaults and every pick once more and keep the
         # lower of the two medians, then choose again with them (a stopped sweep writes its table without them).
-        if not stopped.now:
+        if not stopped.now and timer is not None:
+            if handle is None:
+                handle = _lock(lock)
             tuning, report = choose(manifest, swept, shape_sets, results, dropped, benches)
             _confirm(tuning, manifest, swept, shape_sets, results, dropped, where, benches, timer)
             tuning, report = choose(manifest, swept, shape_sets, results, dropped, benches)
@@ -446,6 +519,27 @@ def _measure_all(kernel_id, root, lock, torch, warmup, repeat, manifest, plan, s
     finally:
         if handle:
             handle.close()
+    return len(futures), finished
+
+
+def _measure_build(kernel_id, root, manifest, item, benches, shape_sets, results, dropped, where, timer, torch):
+    """One build's configurations, each checked and timed on every shape (the GPU lock held)."""
+    s, group, indices = item
+    if indices and all((s, json.dumps(c, sort_keys=True)) in dropped for _, c in indices):
+        return   # its build failed: nothing to time
+    try:
+        module = kbuild.load(kernel_id, configs={s: group}, sweep=True, root=root)
+    except Exception as error:  # noqa: BLE001
+        for _, c in indices:
+            dropped.setdefault((s, json.dumps(c, sort_keys=True)), f"load: {error}")
+        return
+    for index, config in indices:
+        cj = json.dumps(config, sort_keys=True)
+        if (s, cj) not in dropped:
+            kbuild.select(module, s, index)
+            _measure(s, cj, module, manifest, benches, shape_sets, results, dropped, timer, torch)
+            where[(s, cj)] = (module, index)
+    kbuild.select(module, s, -1)
 
 
 def _yardsticks(manifest, swept, shape_sets, benches, timer, report=None, where=None, results=None):

@@ -1,5 +1,6 @@
 """Model recon: facts gathered from tiny fixture model folders and frozen into candidates; no network, no GPU."""
 import json
+import math
 from pathlib import Path
 import sys
 import tempfile
@@ -193,6 +194,56 @@ class ReconTests(unittest.TestCase):
         (self.directory / recon.RECON_MD).write_text(notes, encoding="utf-8")
         self.assertNotIn(recon.PLACEMENT_PLAN, recon.unfinished(self.directory))
 
+    def test_recon_records_smokes_reference_from_evals_reference_scores(self):
+        """recon --data copies a few conversations and the reference's log-probability of each answer token from crit
+        Eval's prepared data into recon.json, which crit smoke's fluent judges against; on an existing recon.json it
+        records only that, and gathering again keeps it for the same checkpoint."""
+        from crit_eval import EVAL_DIR, load_json
+        from crit_eval.quality import fixed
+        from crit_eval.quality.prepare import PREPARED, model_identity
+        from crit_eval.quality.reference import REFERENCE_VERSION
+        sys.path.insert(0, str(ROOT / "smoke"))
+        from crit_smoke.reference import load, validate
+        data = self.root / "data"
+        data.mkdir()
+        identity = model_identity(self.model)
+        quality = [{"id": f"c{i}", "set": "conversations", "prompt_ids": [1, 5 + i, 6], "continuation_ids": [7, 8, 9]}
+                   for i in range(6)]
+        quality.insert(1, {"id": "long", "set": "long-1024", "prompt_ids": [1] * 2000, "continuation_ids": [7]})
+        prepared = {"model": identity, "quality": quality, "valid_vocab": 420}
+        (data / PREPARED).write_text(json.dumps(prepared), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "holds no reference scores"):
+            self.store.recon(self.run_id, data=data)
+        self.assertFalse((self.directory / recon.RECON_JSON).exists())
+        top_k = load_json(EVAL_DIR / "protocol.json")["quality"]["top_k"]
+        scores = {}
+        for row in quality:   # position p predicts token p + 1; the answer's tokens read at -1, -2, -3
+            n = len(row["prompt_ids"]) + len(row["continuation_ids"])
+            target = [-9.0] * (len(row["prompt_ids"]) - 1) + [-1.0 - j for j in range(len(row["continuation_ids"]))]
+            scores[row["id"]] = (target, [[7] * top_k] * (n - 1), [[-0.5] * top_k] * (n - 1))
+        fixed.write(data, {"model_sha256": identity["sha256"], "reference": REFERENCE_VERSION,
+                           **fixed.identity(fixed.texts(prepared), top_k, 420)}, scores)
+        self.store.recon(self.run_id)
+        notes = self.directory / recon.RECON_MD
+        notes.write_text("my findings", encoding="utf-8")
+        value = self.store.recon(self.run_id, data=data)   # an existing recon.json: only the reference
+        block = validate(value["gathered"]["smoke_reference"])
+        self.assertEqual([t["id"] for t in block["texts"]], ["c0", "c1", "c2", "c3"])   # conversations only, 4
+        self.assertEqual(block["texts"][0], {"id": "c0", "set": "conversations", "prompt_tokens": 3,
+                                             "ids": [1, 5, 6, 7, 8, 9], "target": [-1.0, -2.0, -3.0]})
+        self.assertAlmostEqual(block["perplexity"], math.exp(2.0), 3)
+        self.assertEqual(block["source"]["model_sha256"], identity["sha256"])
+        path = self.directory / recon.RECON_JSON
+        self.assertEqual(load(path), block)
+        self.assertEqual(recon.smoke_reference_of(self.directory), block)
+        self.assertEqual(notes.read_text(encoding="utf-8"), "my findings")
+        self.store.recon(self.run_id, force=True)   # gathered again: the same checkpoint keeps its reference
+        self.assertEqual(read_json(path)["gathered"]["smoke_reference"], block)
+        prepared["model"] = {**identity, "sha256": "0" * 64}
+        (data / PREPARED).write_text(json.dumps(prepared), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "prepared from another model"):
+            self.store.recon(self.run_id, data=data)
+
     def test_candidates_freeze_the_recon_block(self):
         self.store.recon(self.run_id)
         path = self.directory / recon.RECON_JSON
@@ -286,14 +337,17 @@ class ReconTests(unittest.TestCase):
         single.write_bytes(b"not a model folder")
         with self.assertRaisesRegex(ValueError, "description files; .* has none"):
             recon.gather(single)
-        # A single-file model needs no recon; its candidates are unchanged.
+        # A single-file model needs no recon; its candidates are unchanged but for what crit completes (the plan's
+        # prompt activations and the run's VRAM headroom among it).
         store = RunStore(self.root / "single-runs")
         run_id = store.create({"model_path": str(single), "correctness_criteria": "Fixture gates",
                                "budget_minutes": 1, "kv_tokens": 8192})["run"]["run_id"]
         self.store, self.run_id, self.directory = store, run_id, store.directory(run_id)
         self.assertEqual(self.candidate({"batch": 1})["configuration"],
                          {"batch": 1, "plugins": selection(), "exactness": {"decode": "row-exact", "prompt": "exact"},
-                          "quality_mode": "speed"})
+                          "quality_mode": "speed", "prompt_activations": "stored",
+                          "vram_headroom_bytes": store.get(run_id)["run"]["spec"]["hardware_constraints"][
+                              "vram_headroom_bytes"]})
 
 
 if __name__ == "__main__":

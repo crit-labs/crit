@@ -7,26 +7,25 @@
 #include <cstdint>
 #include <type_traits>
 
+#include "crit_kcore/arch.cuh"
 #include "crit_kcore/device.cuh"
+#include "crit_kcore/formats.cuh"
 #include "crit_kcore/load.cuh"
+#include "crit_kcore/mma.cuh"
 #include "crit_kcore/tile.cuh"
 
-// The block-scaled FP4 mma.sync (kind::mxf4nvf4, m16n8k64) exists on the sm_120 family's specific targets.
-#if defined(__CUDA_ARCH_SPECIFIC__) && (__CUDA_ARCH_SPECIFIC__ == 1200 || __CUDA_ARCH_SPECIFIC__ == 1210)
-#define CRIT_FP4_MMA 1
-#else
-#define CRIT_FP4_MMA 0
-#endif
+// The block-scaled FP4 mma.sync (kind::mxf4nvf4, m16n8k64) exists on the sm_120 family's specific targets
+// (arch.cuh's CRIT_KCORE_HAS_BLOCK_SCALED_MMA); its wrappers, the quad's word transpose and cuBLASLt's blocked scale
+// offsets are the kernel core's (mma.cuh, formats.cuh).
+#define CRIT_FP4_MMA CRIT_KCORE_HAS_BLOCK_SCALED_MMA
 
 namespace crit::kernels::mma_rows {
 namespace {
 
 namespace kc = crit::kcore;
+using kc::quad_transpose;
 
-__device__ __forceinline__ size_t blocked_offset(int n, int j, int ct) {
-  const int r = n & 127;
-  return ((size_t)(n >> 7) * ct + (j >> 2)) * 512 + (size_t)(r & 31) * 16 + (r >> 5) * 4 + (j & 3);
-}
+__device__ __forceinline__ size_t blocked_offset(int n, int j, int ct) { return kc::blocked_scale_offset(n, j, ct); }
 
 __device__ __forceinline__ void wait_prior() {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
@@ -81,49 +80,12 @@ __device__ __forceinline__ uint16_t out_bits16(const Problem& p, float v) {
 // K order (the step's two, steps in order, `splits` contiguous parts added in part order), whatever M is.
 __device__ __forceinline__ void mma_fp4(float (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
                                         uint32_t b1, uint32_t sfa, uint32_t sfb) {
-#if CRIT_FP4_MMA
-  asm volatile(
-      "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
-      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%13}, {%14,%15};\n"
-      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(sfa), "h"((uint16_t)0), "h"((uint16_t)0), "r"(sfb),
-        "h"((uint16_t)0), "h"((uint16_t)0));
-#endif
+  kc::mma_nvf4_m16n8k64(c, a0, a1, a2, a3, b0, b1, sfa, sfb);
 }
-
 // The same MMA into c from zero: a chain's first (c need not hold zeros before it).
 __device__ __forceinline__ void mma_fp4_first(float (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                                               uint32_t b0, uint32_t b1, uint32_t sfa, uint32_t sfb) {
-#if CRIT_FP4_MMA
-  const float zero = 0.f;
-  asm volatile(
-      "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
-      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%16,%16,%16,%16}, {%10}, {%11,%12}, {%13}, {%14,%15};\n"
-      : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(sfa), "h"((uint16_t)0), "h"((uint16_t)0), "r"(sfb),
-        "h"((uint16_t)0), "h"((uint16_t)0), "f"(zero));
-#else
-  c[0] = c[1] = c[2] = c[3] = 0.f;
-#endif
-}
-
-__device__ __forceinline__ uint32_t word_of(const uint4& v, int i) {
-  return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w;
-}
-
-// The quad's 4 x 4 word transpose: lane t gets word t of quad lane s as y[s].
-__device__ __forceinline__ void quad_transpose(const uint4& v, int t, int lane, uint32_t (&y)[4]) {
-  const uint32_t own = word_of(v, t);
-  y[0] = y[1] = y[2] = y[3] = own;
-#pragma unroll
-  for (int r = 1; r < 4; ++r) {
-    const uint32_t got = __shfl_sync(0xffffffffu, word_of(v, (t + r) & 3), (lane & ~3) | ((t - r) & 3));
-    const int s = (t - r) & 3;
-    y[0] = s == 0 ? got : y[0];
-    y[1] = s == 1 ? got : y[1];
-    y[2] = s == 2 ? got : y[2];
-    y[3] = s == 3 ? got : y[3];
-  }
+  kc::mma_nvf4_m16n8k64_zero(c, a0, a1, a2, a3, b0, b1, sfa, sfb);
 }
 
 // U: steps of weights a warp loads together (kernel.json, structure fp4-tile, knob HOIST; kFp4Hoist untuned). It

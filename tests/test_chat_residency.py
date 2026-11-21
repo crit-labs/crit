@@ -501,6 +501,30 @@ class ModelPoolTests(unittest.TestCase):
         self.events.append('allocate')
         return DeviceAllocation(object(), 4, lambda: self.events.append('wait'), lambda: self.events.append('free'))
 
+    def test_a_plugins_host_store_stays_in_the_pool_until_the_model_unloads(self):
+        # An ablation's two variants of one candidate, built one after the other in the host: the second engine's
+        # plugin gets the store the first one built (crit_core.engine.LoadContext.keep under crit serve).
+        builds, closed, stores = [], [], []
+        for _ in range(2):
+            context = ModelContext(self.pool, {})
+            stores.append(context.keep("expert-tensors:store", ["checkpoint", "layout"],
+                                       lambda: builds.append(1) or object(), closed.append, 4))
+            with self.assertRaisesRegex(ValueError, "held by an engine under another key"):
+                context.keep("expert-tensors:store", ["checkpoint", "other layout"], object, closed.append)
+            context.close()
+        self.assertIs(stores[0], stores[1])
+        self.assertEqual((len(builds), closed), (1, []))
+        self.assertEqual(self.pool.kept.report()["expert-tensors:store"], {"nbytes": 4, "users": 0, "reused": 1})
+        held = ModelContext(self.pool, {})
+        held.keep("expert-tensors:store", ["checkpoint", "layout"], object, closed.append)
+        with self.assertRaisesRegex(ValueError, "while engines hold its kept stores"):
+            self.pool.close()
+        held.close()
+        self.pool.close()
+        self.assertEqual(closed, [stores[0]])
+        with self.assertRaisesRegex(ValueError, "Load a healthy model"):
+            ModelContext(self.pool, {}).keep("expert-tensors:store", [], object)
+
     def test_native_file_lease_avoids_copy_and_holds_source_until_close(self):
         pool = ModelPool(self.root / 'native', 4, 8)
         pool.load(self.source, self.manifest, native_files=True)

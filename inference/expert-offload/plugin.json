@@ -37,12 +37,20 @@
   },
   "kernels": [
     {
+      "name": "cpu-routes",
+      "fallback": "heterogeneous-expert-dispatch's host path: the CPU tier served outside the stream (not capture-safe)"
+    },
+    {
       "name": "grouped-experts",
       "fallback": "none: the plugin refuses to load without crit's grouped-experts kernel"
     },
     {
       "name": "gguf-rows",
       "fallback": "none: GGUF experts are refused without crit's gguf-rows kernel"
+    },
+    {
+      "name": "expert-directory",
+      "fallback": "the device cache's torch ops (device-expert-cache's device_directory.py): the same rule, slower"
     }
   ],
   "entry": "plugin.py:create",
@@ -81,7 +89,13 @@
       "type": "int",
       "default": 0,
       "min": 0,
-      "description": "0: every route. N: each token keeps the router's first N routes and the rest are left out (not renormalized), in every tier and for decode rows and prompt chunks alike. An approximation of the model that trades quality for fewer expert rows and fewer misses; it is the same for a row whatever the cache holds, so replies stay repeatable and independent of the requests beside them. For quality mode speed, where the run's drift budget judges it; never in preserve"
+      "description": "0: every route. N: each token keeps the router's first N routes and the rest are left out (not renormalized), in every tier and for decode rows and prompt chunks alike. An approximation of the model that trades quality for fewer expert rows and fewer misses; it is the same for a row whatever the cache holds, so replies stay repeatable and independent of the requests beside them. For quality mode speed, where the run's drift budget judges it; never in preserve",
+      "approximates": {
+        "exact": [
+          0
+        ],
+        "what": "each token keeps the router's first N routes and drops the rest (not renormalized): every layer's expert output changes, decode and prompt rows alike"
+      }
     },
     "swaps": {
       "type": "int",
@@ -122,16 +136,10 @@
       "min": 0,
       "description": "device memory open() leaves free past the model's pools: a fixed cache's whole reserve for the model's prompt temporaries, graphs and workspaces; an elastic cache's until the engine's warm requests ran"
     },
-    "margin_mib": {
-      "type": "int",
-      "default": 256,
-      "min": 0,
-      "description": "device memory an elastic cache leaves free at every moment: the run's VRAM headroom (crit plugins offload writes it). After the warm requests the cache takes every other free byte but a short prompt's room; a prompt step gets the room a chunk of its size was measured to take, from the blocks torch's allocator kept of earlier prompts and, for what they lack, from the cache's coldest slots, and while it runs the cache looks at it before every routed layer and keeps a reserve free beyond the margin (what such steps took between two looks), so a step that outgrows its room is given more before it takes it; the cache grows back when no prompt is in flight"
-    },
     "elastic": {
       "type": "bool",
       "default": true,
-      "description": "the cache's slots in an elastic range (crit_plugins.memory, the driver's virtual memory API): address space for every expert, backed for what open() finds free less reserve_mib, then for every free byte but margin_mib and a short prompt's room, with every slot's address fixed; prompt steps get their room from it through Core's step frames. Off, or where the API is not reachable, the cache keeps its size from open()"
+      "description": "the cache's slots in an elastic range (crit_plugins.memory, the driver's virtual memory API): address space for every expert, backed for what open() finds free less reserve_mib, then for every free byte the device does not keep (the run's VRAM headroom and a short prompt's room: crit_plugins.memory's headroom, which Core's loader sets), with every slot's address fixed; prompt steps get their room from it through the device's step frames. Off, or where the API is not reachable, the cache keeps its size from open()"
     },
     "ram_headroom_mib": {
       "type": "int",

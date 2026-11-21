@@ -18,7 +18,7 @@
     "engine_supplies": [
       "The selection: a plugin in every slot the layout calls and its options (the router's rule, the experts plugin's)",
       "For an architecture no layout covers: a layout file, and a block class for a layer part no block computes",
-      "The options a run sets: context, concurrency, prefill_chunk, span_seconds, pass_mib, headroom_mib, drafting width"
+      "The options a run sets: context, concurrency, prefill_chunk, span_seconds, pass_mib, drafting width"
     ],
     "preserve": [
       "Every matmul through ctx.mm (RowGroups) and every norm, rotary position and gated product through the norms slot",
@@ -29,7 +29,7 @@
     "adapt": [
       "A block subclass for a layer part with other arithmetic (an attention variant, another FFN), passed to compose()",
       "A layout of the engine's own for another family's tensor names and layer kinds",
-      "Span budget and room (span_seconds, headroom_mib) for the run's cancel grace and VRAM headroom"
+      "Span budget (span_seconds) for the run's cancel grace; the room is the device's free memory less the run's VRAM headroom (Core's)"
     ]
   },
   "path": "inference/model-template/README.md",
@@ -54,6 +54,10 @@
     {
       "path": "inference/model-template/code/compose.py",
       "purpose": "compose(), the layouts' schema check, the library's layouts by model type, the options every composed model reads with their defaults, the kernel tuning folder"
+    },
+    {
+      "path": "inference/model-template/code/shape.py",
+      "purpose": "Shape, the model before its weights: layer kinds and mixers, the residual, the draft layer, the decoder's prefix and the KV pools (layers, heads, widths, positions, page type), which a load makes and the plugin's resolve() prices before any load"
     },
     {
       "path": "inference/model-template/code/passes.py",
@@ -101,6 +105,7 @@
     "NgramRows",
     "PreNorm",
     "RowGroups",
+    "Shape",
     "Spans",
     "Streams",
     "SwiGLU",

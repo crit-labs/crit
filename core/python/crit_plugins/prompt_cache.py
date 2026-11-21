@@ -60,8 +60,20 @@ the first output token. Kept sequences leave least recently used first, past `en
 and on evict(), which a model calls when its admission runs short of pages and which a pool that offers
 on_exhausted(callback) calls itself before it refuses a page; a kept sequence that a newer one extends leaves too.
 Every method runs on Core's one engine worker, as the model's do, so it needs no lock.
+
+The memory a kept sequence holds is the device's to reclaim (crit_plugins.memory's one eviction order), not only the
+model's admission's: where its pools are elastic (their pages backed as they come, a range of the device's memory),
+the cache is two givers of the device. Kept sequences no prompt reused for IDLE_S seconds give first (rank IDLE),
+before an expert cache's slots, and also to a giver that grows back once the device is quiet (an expert cache that
+would take more): a long prompt kept past its use no longer holds gigabytes an expert cache's decode is short of. The
+others give last (rank WORK), after the expert cache, when the device is short of memory a request needs. Each gives
+whole sequences, least recently used first, until the pools' backed bytes fell by what was asked. close() leaves the
+device's givers (a model calls it as it closes).
 """
 from collections import OrderedDict
+import time
+
+IDLE_S = 60.0   # a kept sequence no prompt reused for this long is idle: it gives its memory first
 
 SHARED = 2   # the shared marks a kept sequence holds, the longest
 
@@ -77,12 +89,12 @@ class _Mark:
 
 
 class _Entry:
-    __slots__ = ("sequence", "tokens", "marks", "end")
+    __slots__ = ("sequence", "tokens", "marks", "end", "used")
 
-    def __init__(self, sequence, tokens, marks, end):
+    def __init__(self, sequence, tokens, marks, end, used=0.0):
         # marks: {position: _Mark}; end: (payload,) where the states stand at the sequence's end, None where they do
-        # not (the state pools then hold nothing of the sequence itself).
-        self.sequence, self.tokens, self.marks, self.end = sequence, tokens, marks, end
+        # not (the state pools then hold nothing of the sequence itself); used: when it was kept or last reused.
+        self.sequence, self.tokens, self.marks, self.end, self.used = sequence, tokens, marks, end, used
 
 
 def shared(a, b):
@@ -127,7 +139,19 @@ class PromptCache:
         for pool in self.pools + self.states:
             if callable(getattr(pool, "on_exhausted", None)):
                 pool.on_exhausted(self.evict)   # a kept sequence goes before a request is refused a page
-        self.counted = {"hits": 0, "misses": 0, "reused_tokens": 0, "kept": 0, "evicted": 0, "shared_marks": 0}
+        self.counted = {"hits": 0, "misses": 0, "reused_tokens": 0, "kept": 0, "evicted": 0, "shared_marks": 0,
+                        "given": 0}
+        self.clock = time.monotonic
+        # The device's memory, where the pools' pages are an elastic range of it: the kept sequences are its givers.
+        self._ranges = [r for r in (getattr(pool, "elastic", None) for pool in self.pools + self.states)
+                        if r is not None and getattr(r, "memory", None) is not None]
+        self.memory = self._ranges[0].memory if self._ranges else None
+        self._names = ()
+        if self.memory is not None:
+            from .memory import IDLE, WORK
+            self._names = (f"prompt-cache:{id(self)}:idle", f"prompt-cache:{id(self)}")
+            self.memory.give(self._names[0], lambda n: self._give(n, idle=True), rank=IDLE)
+            self.memory.give(self._names[1], lambda n: self._give(n, idle=False), rank=WORK)
 
     # -- a request's sequence --------------------------------------------------------------------------------------------
     def open(self, sequence, prompt, allow=True):
@@ -153,6 +177,7 @@ class PromptCache:
         for pool in self.states:
             pool.fork(source, sequence)
         self.kept.move_to_end(entry.sequence)
+        entry.used = self.clock()
         self.live[sequence], self.lengths[sequence] = {}, len(prompt)
         if mark is not None and self.marks:   # the place it resumed from stays one of its own
             mark.holders += 1
@@ -277,7 +302,7 @@ class PromptCache:
                 return False
             for pool in self.states:          # its own state stands nowhere a prompt resumes
                 pool.close(sequence)
-        self.kept[sequence] = _Entry(sequence, tokens, marks, (payload,) if stands else None)
+        self.kept[sequence] = _Entry(sequence, tokens, marks, (payload,) if stands else None, self.clock())
         self.counted["kept"] += 1
         while len(self.kept) > self.entries or (self.tokens is not None and self.held() > self.tokens
                                                  and len(self.kept) > 1):
@@ -314,6 +339,30 @@ class PromptCache:
     def clear(self):
         while self.evict():
             pass
+
+    def close(self):
+        """The cache leaves the device's givers (its model closes): what it keeps is its pools' to close."""
+        if self.memory is not None:
+            for name in self._names:
+                self.memory.ungive(name)
+            self.memory = None
+
+    def _give(self, nbytes, idle):
+        """A giver's release (crit_plugins.memory): kept sequences close, least recently used first (those no prompt
+        reused for IDLE_S seconds alone where `idle`), until the pools' backed bytes fell by `nbytes` or none is left.
+        Returns the bytes the pools gave back."""
+        before = sum(r.bytes for r in self._ranges)
+        now = self.clock()
+        while self.kept:
+            entry = next(iter(self.kept.values()))
+            if idle and now - entry.used < IDLE_S:
+                break
+            self._close(entry)
+            self.counted["evicted"] += 1
+            self.counted["given"] += 1
+            if before - sum(r.bytes for r in self._ranges) >= nbytes:
+                break
+        return max(0, before - sum(r.bytes for r in self._ranges))
 
     def telemetry(self):
         return {"prompt_cache": {**self.counted, "entries": len(self.kept), "tokens": self.held()}}

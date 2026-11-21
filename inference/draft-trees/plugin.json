@@ -2,7 +2,7 @@
   "schema": "crit-plugin-v1",
   "id": "draft-trees",
   "title": "EAGLE-2 draft trees from the engine's draft head, verified by an accept walk",
-  "description": "draft-trees' dynamic tree and its accept, fused: they only work together, since a tree needs a verifier that walks it. The drafter takes the root's best `branch` tokens, then the `beam` best candidates of each newer depth by path log-probability, keeping the width best nodes in topological order; the engine verifies every node in one pass under the ancestor masks of the proposal's parents. The verifier walks from the root to the child holding each node's prediction and emits it, until no child matches; that prediction is the correction. With one branch and one beam it is greedy-head-drafter with chain-verifier. Inside captured decode rounds the tree, its expansion and the walk run on the device (draft:device and verify:device, code/device_tree.py); the verify pass needs the attention slot's ancestor masks there (attention:tree, checked when rounds draft trees).",
+  "description": "draft-trees' dynamic tree and its accept, fused: they only work together, since a tree needs a verifier that walks it. The drafter takes the root's best `branch` tokens, then the `beam` best candidates of each newer depth by path log-probability, keeping the width best nodes in topological order; the engine verifies every node in one pass under the ancestor masks of the proposal's parents. The verifier walks from the root to the child holding each node's prediction and emits it, until no child matches; that prediction is the correction. With one branch and one beam it is greedy-head-drafter with chain-verifier. Inside captured decode rounds the tree, its expansion and the walk run on the device (draft:device and verify:device, code/device_tree.py); the verify pass needs the attention slot's ancestor masks there (attention:tree, checked when rounds draft trees), and the model's device draft head must draft a frontier of several entries a depth along their parents (draft:head-tree; a chain-only head such as model-template's MTP head keeps one feature a row and is refused at resolve).",
   "fills": [
     "drafter",
     "verifier"
@@ -13,7 +13,8 @@
   ],
   "needs": [
     "draft:head",
-    "draft:head-device"
+    "draft:head-device",
+    "draft:head-tree"
   ],
   "provides": [
     "draft:tree",

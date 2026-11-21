@@ -74,3 +74,52 @@ class DeviceTableTests(PluginTestCase):
                 packed = plugin.store(codes.to(device), "nvfp4", scales.to(device), 0.5)
                 self.assertTrue(torch.equal(packed.lookup(ids).cpu(), reference.lookup(ids).cpu()))
                 self.assertEqual(packed.lookup(ids).dtype, torch.bfloat16)
+
+    def test_a_table_off_the_device_is_read_from_its_files_into_host_memory(self):
+        # embeddings:host: model-template opens a table its plan put off the device where the checkpoint stores it
+        # ({paths, offsets, rows}); this plugin reads those rows once into registered host memory, so a lookup gives
+        # the rows lookup-table-rows' file reader gives, and captures in a CUDA graph.
+        if os.name == "nt":
+            self.skipTest(NO_HOST_MEMORY)
+        import tempfile
+        torch = __import__("torch")
+        from crit_plugins.assemble import assemble
+        device = self.device()
+        g = torch.Generator().manual_seed(3)
+        rows = torch.randn(13, 8, generator=g).to(torch.bfloat16)
+        codes = torch.randint(0, 256, (13, 16), dtype=torch.uint8, generator=g)
+        scales = torch.randint(0, 0x7F, (13, 2), dtype=torch.uint8, generator=g)
+        folder = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, folder, True)
+
+        def files(tensor, name):   # the rows split over two files, each after a header of 24 bytes
+            data = tensor.contiguous().view(torch.uint8).numpy().tobytes()
+            cut = 5 * (len(data) // tensor.shape[0])
+            paths = []
+            for n, part in enumerate((data[:cut], data[cut:])):
+                paths.append(os.path.join(folder, f"{name}{n}.bin"))
+                with open(paths[-1], "wb") as handle:
+                    handle.write(b"h" * 24 + part)
+            return {"paths": paths, "offsets": [24, 24], "rows": [5, 8]}
+        other = assemble({"use": {"embeddings": "lookup-table-rows"}, "options": {}}, self.registry())
+        self.addCleanup(other.close)
+        plugin = self.assemble()["embeddings"]
+        self.assertIn("embeddings:host", self.registry()["memory-table-rows"]["provides"])
+        ids = torch.tensor([12, 0, 5, 4, 12], device=device)
+        plain = plugin.open(files(rows, "bf16"), 8, torch.bfloat16, device)
+        self.assertTrue(torch.equal(plain.lookup(ids).cpu(), rows[ids.cpu()]))
+        self.assertEqual(plugin.facts()["embeddings"]["table"], "host")
+        packed = plugin.open(files(codes, "codes"), 32, torch.bfloat16, device, format="nvfp4",
+                             scales=files(scales, "scales"), scale=0.5)
+        reference = other["embeddings"].open(files(codes, "rcodes"), 32, torch.bfloat16, device, format="nvfp4",
+                                             scales=files(scales, "rscales"), scale=0.5)
+        self.assertTrue(torch.equal(packed.lookup(ids).cpu(), reference.lookup(ids).cpu()))
+        plugin.prefetch([1, 2])   # nothing to read ahead, and no error
+        if device == "cuda":
+            plain.lookup(ids)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                out = plain.lookup(ids)
+            ids.copy_(torch.tensor([1, 2, 3, 6, 7]))
+            graph.replay()
+            self.assertTrue(torch.equal(out.cpu(), rows[[1, 2, 3, 6, 7]]))

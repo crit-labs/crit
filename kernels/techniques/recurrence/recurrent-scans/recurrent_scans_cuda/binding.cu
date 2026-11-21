@@ -1,5 +1,6 @@
 // Torch entry points over the recurrent kernels: shape checks, strides from the tensors, scratch from the caching
 // allocator, the current stream.
+#include <initializer_list>
 #include <optional>
 
 #include <ATen/cuda/CUDAContext.h>
@@ -125,6 +126,36 @@ void gated_delta_prefill_tc(torch::Tensor& out, torch::Tensor& state, const torc
     auto scratch = torch::empty({static_cast<int64_t>(rk::delta_tc_scratch_bytes(d, rows))}, q.options().dtype(torch::kUInt8));
     check_ok(rk::enqueue_delta_prefill_tc(d, in, rows, state.data_ptr<float>(), scratch.data_ptr(), out.data_ptr<float>(),
                                           out.stride(0), at::cuda::getCurrentCUDAStream()), "gated_delta_prefill (tensor cores)");
+}
+
+void gated_delta_chunk_rows_tc(torch::Tensor& out, torch::Tensor& states_out, const torch::Tensor& states_in,
+                               const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
+                               const torch::Tensor& log_decay, const torch::Tensor& beta, const torch::Tensor& meta,
+                               int64_t widest, double scale) {
+    const c10::cuda::CUDAGuard guard(q.device());
+    const rk::DeltaInputs in = delta_inputs(q, k, v, log_decay, beta, scale);
+    const rk::DeltaShape d = delta_shape(q, v);
+    const int64_t total = q.size(0);
+    check_f32(out, "out", 3);
+    TORCH_CHECK(out.size(0) == total && out.size(1) == d.v_heads && out.size(2) == d.dv && out.stride(1) == d.dv,
+                "out must be [T, v_heads, dv]");
+    for(const torch::Tensor* s : std::initializer_list<const torch::Tensor*>{&states_in, &states_out}) {
+        check_f32(*s, "states", 4);
+        TORCH_CHECK(s->is_contiguous() && s->size(1) == d.v_heads && s->size(2) == d.dk && s->size(3) == d.dv,
+                    "states must be contiguous [slots, v_heads, dk, dv]");
+    }
+    TORCH_CHECK(meta.is_cuda() && meta.scalar_type() == torch::kInt32 && meta.dim() == 2 && meta.size(1) == 4 &&
+                    meta.is_contiguous(), "meta must be contiguous int32 [rows, 4] (first, tokens, slot_in, slot_out)");
+    TORCH_CHECK(rk::delta_tc_supported(d), "chunk rows on tensor cores take dk 64 or 128 and dv a multiple of 16");
+    TORCH_CHECK(widest >= 1 && widest <= total, "widest is the longest row's tokens, 1 .. T");
+    const int count = static_cast<int>(meta.size(0));
+    if(!count) return;
+    auto scratch = torch::empty({static_cast<int64_t>(rk::delta_tc_rows_scratch_bytes(d, count, static_cast<int>(widest)))},
+                                q.options().dtype(torch::kUInt8));
+    check_ok(rk::enqueue_delta_chunk_rows_tc(d, in, meta.data_ptr<int>(), count, static_cast<int>(widest),
+                                             states_in.data_ptr<float>(), states_out.data_ptr<float>(), scratch.data_ptr(),
+                                             out.data_ptr<float>(), out.stride(0), at::cuda::getCurrentCUDAStream()),
+             "gated_delta_chunk_rows (tensor cores)");
 }
 
 void gated_delta_scan(torch::Tensor& out, torch::Tensor& state, const torch::Tensor& q, const torch::Tensor& k,

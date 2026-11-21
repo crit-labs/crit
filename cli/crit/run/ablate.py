@@ -3,12 +3,16 @@ again in the same resident host with each variant of its plugins: as built, at i
 and with each alone (crit_plugins.ablation.variants). Every variant serves the run's cases for a short bench (crit run
 measure's requests, warmed until the engine runs steady) and runs crit smoke, and the report says what each plugin
 adds, costs or breaks before Eval spends a round on the engine. With crit-eval's prepared data (--data) each variant
-also decodes Eval's speed cases and held-out prompts at the model's sampling, one request per seed: a plugin whose
+also decodes Eval's speed cases and held-out prompts at the model's sampling, each warmed as the run's cases are, then
+one request per seed: a plugin whose
 effect depends on the text (drafts, copies, draft widths) is measured on the text Eval scores, not on the run's cases
 alone. Option variants (--set PLUGIN.OPTION=VALUE) serve the full selection with options changed: an in-process A/B on
 the same cases; exactness=LEVEL (or exactness.prompt=LEVEL, exactness.decode=LEVEL) among them serves the engine
-asking that level of its rows, so the report says what a level costs or gains. Development evidence under a check
-attempt: it records no check and no benchmark.
+asking that level of its rows, so the report says what a level costs or gains. With --rounds N every variant is
+served N times, in alternating order (as listed, then reversed), and each comparison is the median of its rounds'
+paired changes, as crit eval ab pairs two engines: the device's drift between variants served far apart cancels, so a
+change of 1% is told from noise where every round shows it (crit_plugins.ablation.PAIRED_NOISE). Development evidence
+under a check attempt: it records no check and no benchmark.
 
 An external candidate (crit.run.external) has no plugins to switch: it is ablated only on the options its
 configuration declares (configuration.engine.options), each a flag of its launch command. --set NAME=VALUE serves it
@@ -62,8 +66,11 @@ def eval_cases(data, seeds=None):
             if not row.get("messages"):
                 continue
             request = {"messages": row["messages"], **({"tools": row["tools"]} if row.get("tools") else {}), **sampling}
+            # Warmed as the run's cases are (_warm): an engine's first requests of a prompt it has not served run
+            # cold (expert residency follows the content), so unwarmed, the first seed of every case measured slow (in
+            # a Flash-Next build's ablations rep 1 decoded at 0.87 of its case's median, rep 3 at 1.11).
             out.append({"case_id": prefix + row["id"], "request": request, "prompt_tokens": None,
-                        "output_tokens": int(row["output_tokens"]), "concurrency": 1, "warm": False,
+                        "output_tokens": int(row["output_tokens"]), "concurrency": 1, "warm": True,
                         "warmup_runs": 0, "repetitions": seeds, "seeds": list(range(1, seeds + 1))})
     if not out:
         raise ValueError(f"{data}: prepared.json holds no speed case or held-out prompt with messages")
@@ -71,15 +78,16 @@ def eval_cases(data, seeds=None):
 
 
 def ablate(store, run_id, candidate_id, seconds=None, names=None, repetitions=REPETITIONS, smoke=True,
-           smoke_tests=None, noise=None, data=None, seeds=None, sets=None):
+           smoke_tests=None, noise=None, data=None, seeds=None, sets=None, rounds=1):
     """Serve each variant of the candidate's plugins and measure it; keep the report as
     candidates/ID/logs/ablation-ATTEMPT.json and return {attempt, report, variants, blame}. data: crit-eval's
     prepared data, whose speed cases and held-out prompts each variant also decodes (eval_cases, `seeds` seeds each).
     sets: option variants (crit_plugins.ablation.option_variants), served with the full selection and, unless `names`
-    asks for others, instead of the plugin variants."""
+    asks for others, instead of the plugin variants. rounds: every variant served this many times in alternating
+    order (_rounds), crit smoke in the first round alone; noise defaults to ablation.PAIRED_NOISE then."""
     ablation = _import("crit_plugins.ablation")
     assemble = _import("crit_plugins.assemble")
-    noise = ablation.NOISE if noise is None else noise
+    rounds = _check_rounds(rounds)
     root = store.directory(run_id)
     run = load_run(root)
     folder = unsealed(root, candidate_id, "The candidate is sealed and takes no attempt: ablate a candidate before "
@@ -91,7 +99,7 @@ def ablate(store, run_id, candidate_id, seconds=None, names=None, repetitions=RE
     spec = candidate_spec(folder)
     if spec is not None:
         return _external(store, run_id, candidate_id, spec, seconds, names, repetitions, smoke, smoke_tests, noise,
-                         data, seeds, sets)
+                         data, seeds, sets, rounds)
     configuration = read_json(folder / "candidate.json")["configuration"]
     selection = configuration.get("plugins")
     if selection is None:
@@ -105,7 +113,7 @@ def ablate(store, run_id, candidate_id, seconds=None, names=None, repetitions=RE
         # A variant that sets the engine's exactness is served asking those levels over the candidate's own (which a
         # candidate recorded before crit stated them takes from the run's quality mode).
         if any(variant.get("exactness") for variant in found):
-            from crit_kernels.exactness import setting
+            from crit_plugins.exactness import setting
             from .records import quality_mode
             own = setting(configuration.get("exactness"), quality_mode(run["spec"]["correctness"]))
             for variant in found:
@@ -116,22 +124,26 @@ def ablate(store, run_id, candidate_id, seconds=None, names=None, repetitions=RE
     cases = _cases(root, run, repetitions, data, seeds)
     kv_tokens = run["spec"]["hardware_constraints"]["kv_tokens"]
     attempt = Attempt(store, run_id, candidate_id, "check", seconds, "ablate", "crit run ablate", "The ablation")
-    rows = []
+    measured = {}
     with attempt.running() as log:
-        log(f"crit run ablate: {len(found)} variants of {', '.join(ablation.toggles(selection)) or 'no plugin'}")
+        log(f"crit run ablate: {len(found)} variants of {', '.join(ablation.toggles(selection)) or 'no plugin'}"
+            + (f", {rounds} rounds in alternating order" if rounds > 1 else ""))
         from crit_core.machine import engine_lock
         served = Served(store, run_id, candidate_id, attempt.id, kv_tokens, log, "The ablation",
                         timeout=min(86400, max(1.0, remaining(attempt.deadline_at))))
         with engine_lock(f"crit run ablate {run_id} {candidate_id}",
                          deadline=time.monotonic() + remaining(attempt.deadline_at)):
             with served.until(attempt.deadline_at):
-                for variant in found:
-                    rows.append(_variant(store, run_id, served, variant, cases, smoke, smoke_tests, log))
+                _rounds(found, rounds, measured, log, lambda variant, first: _variant(
+                    store, run_id, served, variant, cases, smoke and first, smoke_tests, log))
+    rows = [ablation.combine(measured[variant["name"]]) for variant in found if variant["name"] in measured]
+    noise = _noise(ablation, measured, noise)
     # Option variants alone (--set without --variant) serve no plugin variant, so no plugin is blamed.
     plugins_blamed = ablation.blame(rows, selection, noise) if rows and (names or not sets) else []
     blamed = plugins_blamed + (ablation.settings(rows, noise) if rows else [])
     report = folder / "logs" / f"ablation-{attempt.id}.json"
     write_json(report, {"attempt_id": attempt.id, "plugins": selection, "repetitions": repetitions, "noise": noise,
+                        "rounds": rounds,
                         **({"eval_data": str(data), "seeds": seeds or SEEDS} if data is not None else {}),
                         "variants": rows, "blame": blamed}, immutable=True)
     for row in blamed:
@@ -141,6 +153,37 @@ def ablate(store, run_id, candidate_id, seconds=None, names=None, repetitions=RE
     return {"attempt": result, "report": report.relative_to(root).as_posix(),
             "variants": [{k: row.get(k) for k in ("name", "state", "kpis", "detail")} for row in rows],
             "blame": blamed}
+
+
+def _check_rounds(rounds):
+    rounds = int(rounds)
+    if rounds < 1:
+        raise ValueError("--rounds is at least 1")
+    return rounds
+
+
+def _noise(ablation, measured, noise):
+    """The noise the verdicts read unless given: PAIRED_NOISE where variants were compared over two rounds or more,
+    else NOISE (also for an attempt with --rounds that ran out of time in its first round)."""
+    if noise is not None:
+        return noise
+    return ablation.PAIRED_NOISE if any(len(rows) > 1 for rows in measured.values()) else ablation.NOISE
+
+
+def _rounds(found, rounds, measured, log, serve):
+    """Serve every variant `rounds` times, as crit eval ab alternates two engines: in the listed order, then reversed,
+    and so on, so no variant always follows the same one. Each served row goes to measured[name] as it is made (an
+    attempt that runs out of time keeps the rounds it served); serve(variant, first) serves one, `first` in the first
+    round alone. A variant refused or failed in a round is not served again: its row says why."""
+    for index in range(rounds):
+        order = found if index % 2 == 0 else found[::-1]
+        if rounds > 1:
+            log(f"crit run ablate: round {index + 1} of {rounds}: " + ", ".join(variant["name"] for variant in order))
+        for variant in order:
+            rows = measured.setdefault(variant["name"], [])
+            if rows and rows[-1].get("state") != "measured":
+                continue
+            rows.append(serve(variant, index == 0))
 
 
 def _cases(root, run, repetitions, data, seeds):
@@ -183,19 +226,20 @@ def option_sets(spec, sets):
 
 
 def _external(store, run_id, candidate_id, spec, seconds, names, repetitions, smoke, smoke_tests, noise, data, seeds,
-              sets):
+              sets, rounds=1):
     """crit run ablate on an external candidate: its declared options served A/B (option_sets), or, when it declares
     none, a report that it has no ablation."""
     ablation = _import("crit_plugins.ablation")
-    noise = ablation.NOISE if noise is None else noise
+    rounds = _check_rounds(rounds)
     root = store.directory(run_id)
     run = load_run(root)
     folder = root / "candidates" / candidate_id
     attempt = Attempt(store, run_id, candidate_id, "check", seconds, "ablate", "crit run ablate", "The ablation")
     report = folder / "logs" / f"ablation-{attempt.id}.json"
     head = {"attempt_id": attempt.id, "engine": "external", "options": spec["options"], "repetitions": repetitions,
-            "noise": noise, **({"eval_data": str(data), "seeds": seeds or SEEDS} if data is not None else {})}
-    rows, blamed = [], []
+            "noise": noise, "rounds": rounds,
+            **({"eval_data": str(data), "seeds": seeds or SEEDS} if data is not None else {})}
+    measured, found, blamed = {}, [], []
     with attempt.running() as log:
         if not spec["options"]:
             reason = ("the external engine declares no option (configuration.engine.options), so crit cannot switch "
@@ -206,7 +250,8 @@ def _external(store, run_id, candidate_id, spec, seconds, names, repetitions, sm
             found = option_sets(spec, sets)
             if names:
                 found = [variant for variant in found if variant["name"] in set(names)]
-            log(f"crit run ablate: {len(found)} variants of the options {', '.join(spec['options'])}")
+            log(f"crit run ablate: {len(found)} variants of the options {', '.join(spec['options'])}"
+                + (f", {rounds} rounds in alternating order" if rounds > 1 else ""))
             cases = _cases(root, run, repetitions, data, seeds)
             from crit_core.machine import engine_lock
             from .external import serving
@@ -215,10 +260,13 @@ def _external(store, run_id, candidate_id, spec, seconds, names, repetitions, sm
             with engine_lock(f"crit run ablate {run_id} {candidate_id}",
                              deadline=time.monotonic() + remaining(attempt.deadline_at)):
                 with served.until(attempt.deadline_at):
-                    for variant in found:
-                        rows.append(_external_variant(store, run_id, served, variant, cases, smoke, smoke_tests, log))
-            blamed = ablation.settings(rows, noise) if rows else []
-    write_json(report, {**head, "variants": rows, "blame": blamed}, immutable=True)
+                    _rounds(found, rounds, measured, log, lambda variant, first: _external_variant(
+                        store, run_id, served, variant, cases, smoke and first, smoke_tests, log))
+    rows = [ablation.combine(measured[variant["name"]]) for variant in found if variant["name"] in measured]
+    noise = _noise(ablation, measured, noise)
+    if rows:
+        blamed = ablation.settings(rows, noise)
+    write_json(report, {**head, "noise": noise, "variants": rows, "blame": blamed}, immutable=True)
     for row in blamed:
         print("crit run ablate: " + ablation.describe(row), file=sys.stderr)
     result = attempt.settle(evidence=(report,))
@@ -300,7 +348,12 @@ def _served_sampling(cases, supported):
 def _variant(store, run_id, served, variant, cases, smoke, smoke_tests, log):
     """One variant served, checked to run the plugins it names, benched and smoke-tested."""
     use = variant["plugins"]["use"]
-    row = {"name": variant["name"], "use": use, **({"also": variant["also"]} if variant.get("also") else {})}
+    row = {"name": variant["name"], "use": use, **({"also": variant["also"]} if variant.get("also") else {}),
+           **({"approximates": variant["approximates"]} if variant.get("approximates") else {})}
+    for found in variant.get("approximates") or ():
+        log(f"crit run ablate: {variant['name']} sets {found['plugin']}.{found['option']}={found['value']!r}, which "
+            f"approximates the model ({found['what']}): its speed here does not judge it; its drift against the "
+            "reference scores does (Eval's quality, the pre-check's drift item)")
     shown = ", ".join(f"{slot}={plugin_id or '-'}" for slot, plugin_id in use.items())
     if "error" in variant:
         log(f"crit run ablate: {variant['name']} ({shown}) is refused by its plugins: {variant['error']}")
@@ -308,7 +361,9 @@ def _variant(store, run_id, served, variant, cases, smoke, smoke_tests, log):
     log(f"crit run ablate: {variant['name']}: {shown}")
     try:
         started = time.perf_counter()
-        engine, _, port = served.open(configuration={"plugins": variant["plugins"], **(
+        # A variant is asked no prompt activations: it measures what other plugins or options serve (its facts say
+        # which), where the candidate's configuration asks its plan's.
+        engine, _, port = served.open(configuration={"plugins": variant["plugins"], "prompt_activations": None, **(
             {"exactness": variant["exactness"]} if variant.get("exactness") else {})})
         load_ms = (time.perf_counter() - started) * 1000
         smoke_module = _import("crit_smoke")
@@ -353,7 +408,9 @@ def _bench(store, run_id, served, engine, port, load_ms, cases, smoke, smoke_tes
     kpis = _import("crit_plugins.ablation").summary(per_case)
     row.update(state="measured", load_ms=round(load_ms, 1), cases=per_case, kpis=kpis)
     if smoke:
-        items = smoke_module.run(client, set(smoke_tests or ()), log=lambda line: log("crit smoke: " + line.strip()))
+        from .recon import smoke_reference_of
+        items = smoke_module.run(client, set(smoke_tests or ()), log=lambda line: log("crit smoke: " + line.strip()),
+                                 reference=smoke_reference_of(store.directory(run_id)))
         row["smoke"] = {"passed": sum(i["state"] == "passed" for i in items),
                         "failed": [i["name"] for i in items if i["state"] == "failed"],
                         "skipped": sum(i["state"] == "skipped" for i in items),

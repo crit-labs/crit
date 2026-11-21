@@ -44,6 +44,16 @@ def stored(fmt, rows, cols, g, inputs=None):
     return found
 
 
+def quantize_fp8(v):
+    """crit's declared FP8 group quantizer as values: each 128 values of a row in E4M3 at amax / 448."""
+    import torch
+    rows, cols = v.shape
+    g = v.float().reshape(rows, cols // 128, 128)
+    scale = g.abs().amax(-1, keepdim=True) / 448.0
+    codes = torch.where(scale > 0, g / torch.where(scale > 0, scale, torch.ones_like(scale)), torch.zeros_like(g))
+    return (codes.clamp(-448, 448).to(torch.float8_e4m3fn).double() * scale.double()).reshape(rows, cols)
+
+
 def quantize_int8(v, block=32):
     """crit's declared INT8 quantizer (host_int quantize_int8) as values: per `block` values d = amax / 127, each value
     rint(v / d) clamped to 127, times d."""
@@ -92,7 +102,7 @@ class DeviceExpertsTests(PluginTestCase):
         device = self.device()
         return x.to(device), ids.to(device), torch.rand(T, top, generator=g).to(device)
 
-    def reference(self, experts, fmt, x, ids, w, a4, int8=False, layer=3):
+    def reference(self, experts, fmt, x, ids, w, a4, int8=False, layer=3, fp8=False):
         """The FP64 block over the bundles' decoded weights, x in BF16 and h rounded as the plugin rounds them."""
         torch = self.torch
         module = sys.modules[type(experts).__module__]
@@ -111,11 +121,12 @@ class DeviceExpertsTests(PluginTestCase):
             g_in, g_dn = self.inputs[e]
             rows = xs[t]
             xin = (fallback.quantize(rows.float(), torch.full((len(t),), float(g_in))).double() / g_in if a4
-                   else quantize_int8(rows.float()).double() if int8 else rows)
+                   else quantize_int8(rows.float()).double() if int8 else quantize_fp8(rows) if fp8 else rows)
             gu = xin @ gate_up[e].T
             h = torch.nn.functional.silu(gu[:, :I]) * gu[:, I:]
             h = (fallback.quantize(h.float(), torch.full((len(t),), float(g_dn))).double() / g_dn if a4
-                 else quantize_int8(h.float()).double() if int8 else h.float().bfloat16().double())
+                 else quantize_int8(h.float()).double() if int8
+                 else quantize_fp8(h.float().bfloat16().double()) if fp8 else h.float().bfloat16().double())
             out.index_add_(0, t, w[t, j][:, None] * (h @ down[e].T))
         return out
 
@@ -155,6 +166,67 @@ class DeviceExpertsTests(PluginTestCase):
                 self.assertTrue(torch.equal(alone[0], out[4]))
                 self.assertEqual(experts.facts()["experts"]["arithmetic"], "declared")
                 self.assertEqual(experts.exactness(), {"decode": "declared", "prompt": "declared"})
+
+    def test_the_fp4_arithmetic_matches_the_fp64_reference_and_keeps_its_bits_in_prompt_calls(self):
+        # NVFP4 W4A4 on the FP4 tensor cores: within the W4A4 tolerance of the FP64 block, a route's bits the same
+        # alone, batched and in a prompt-sized call (prompt items), and the facts and level say so.
+        torch = self.torch
+        self.with_kernel()
+        if not self.assemble(USE)["experts"].kernel.fp4_available():
+            self.skipTest("no block-scaled FP4 tensor cores here")
+        experts = self.experts("nvfp4", "nvfp4", True, E=8, seed=16, arithmetic="fp4")
+        x, ids, w = self.routes(300, 4, 8, 17)
+        out = experts.forward(3, x, ids, w)
+        ref = self.reference(experts, "nvfp4", x[:12], ids[:12], w[:12], True)
+        self.assertLess(float((out[:12].double().cpu() - ref).abs().max() / ref.abs().max()), 3e-2)
+        for first, count in ((4, 1), (40, 9)):
+            part = experts.forward(3, x[first:first + count].clone(), ids[first:first + count].clone(),
+                                   w[first:first + count].clone())
+            self.assertTrue(torch.equal(part, out[first:first + count]), (first, count))
+        self.assertEqual(experts.facts()["experts"]["arithmetic"], "fp4")
+        self.assertEqual(experts.exactness(), {"decode": "row-exact", "prompt": "exact"})
+
+    def test_the_fp8_arithmetic_keeps_a_routes_bits_in_prompt_calls_and_refuses_other_formats(self):
+        # FP8 W8A8 on the E4M3 tensor cores: within FP32 sums of the FP64 block over the same quantized operands
+        # (crit's declared group quantizer), a route's bits the same alone, batched and in a prompt-sized call; other
+        # formats refused.
+        torch = self.torch
+        self.with_kernel()
+        if not self.assemble(USE)["experts"].kernel.fp8_available():
+            self.skipTest("no E4M3 tensor cores here")
+        for fmt in ("fp8:channel", "fp8:block"):
+            with self.subTest(fmt=fmt):
+                experts = self.experts(fmt, "bf16", True, E=8, seed=19, arithmetic="fp8")
+                x, ids, w = self.routes(300, 4, 8, 20)
+                out = experts.forward(3, x, ids, w)
+                ref = self.reference(experts, fmt, x[:12], ids[:12], w[:12], False, fp8=True)
+                self.assertLess(float((out[:12].double().cpu() - ref).abs().max() / ref.abs().max()), 1e-2)
+                for first, count in ((4, 1), (40, 9)):
+                    part = experts.forward(3, x[first:first + count].clone(), ids[first:first + count].clone(),
+                                           w[first:first + count].clone())
+                    self.assertTrue(torch.equal(part, out[first:first + count]), (fmt, first, count))
+                self.assertEqual(experts.exactness(), {"decode": "row-exact", "prompt": "exact"})
+        g = torch.Generator().manual_seed(21)
+        other = self.assemble(USE, {"arithmetic": "fp8"})["experts"]
+        with self.assertRaisesRegex(ValueError, "fp8 runs FP8 experts W8A8"):
+            other.load(0, 0, on(stored("bf16", 2 * I, H, g), self.device()), on(stored("bf16", H, I, g), self.device()),
+                       "bf16")
+
+    def test_the_fp4_arithmetic_refuses_what_it_does_not_compute(self):
+        self.with_kernel()
+        if not self.assemble(USE)["experts"].kernel.fp4_available():
+            self.skipTest("no block-scaled FP4 tensor cores here")
+        torch = self.torch
+        g = torch.Generator().manual_seed(18)
+        experts = self.assemble(USE, {"arithmetic": "fp4", "activations": "nvfp4"})["experts"]
+        with self.assertRaisesRegex(ValueError, "fp4 runs NVFP4 experts W4A4"):
+            experts.load(0, 0, on(stored("bf16", 2 * I, H, g), self.device()), on(stored("bf16", H, I, g), self.device()),
+                         "bf16")
+        with self.assertRaisesRegex(ValueError, "needs each matrix's input_scale"):
+            experts.load(0, 0, on(stored("nvfp4", 2 * I, H, g), self.device()),
+                         on(stored("nvfp4", H, I, g), self.device()), "nvfp4")
+        with self.assertRaisesRegex(ValueError, "fp4 runs only on crit's kernel"):
+            self.assemble(USE, {"arithmetic": "fp4", "activations": "nvfp4", "kernel": False})
 
     def test_the_declared_arithmetic_is_refused_without_the_kernel(self):
         with self.assertRaisesRegex(ValueError, f"declared runs only on crit's kernel {KERNEL}.*kernel is false"):

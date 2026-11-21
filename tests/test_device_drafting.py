@@ -21,6 +21,7 @@ except ImportError:   # the device forms are torch's
 DEVICE = "cuda" if torch is not None and torch.cuda.is_available() else "cpu"
 LIBRARY = ROOT / "inference"
 HEAD = ["draft:head", "draft:head-device"]
+TREE_HEAD = [*HEAD, "draft:head-tree"]   # a device head that drafts a tree's frontier along its parents
 GRAPHS = (False, True) if DEVICE == "cuda" else (False,)
 
 
@@ -668,7 +669,7 @@ class DeviceTreeTests(unittest.TestCase):
 
     def trees(self, options=None, rows=3, width=9, vocab=30):
         trees = plugins({"drafter": "draft-trees", "verifier": "draft-trees"}, {"draft-trees": options or self.OPTIONS},
-                        HEAD)["drafter"]
+                        TREE_HEAD)["drafter"]
         trees.reserve(rows, width, vocab, DEVICE)
         return trees
 
@@ -741,7 +742,7 @@ class DeviceTreeTests(unittest.TestCase):
         prompts, count = [[1, 2, 3], [4, 5, 6, 7, 8]], 30
         for graphs in GRAPHS:
             trees = plugins({"drafter": "draft-trees", "verifier": "draft-trees", "sampler": "token-sampling"},
-                            {"draft-trees": {"depth": 3, "branch": 2, "beam": 2}}, HEAD)
+                            {"draft-trees": {"depth": 3, "branch": 2, "beam": 2}}, TREE_HEAD)
             target = MaskedTarget(vocab, 4, rows=len(prompts))
             truth = [target.plain(p, count) for p in prompts]
             rounds = Rounds(target, trees["sampler"], rows=len(prompts), widest=width, device=DEVICE,

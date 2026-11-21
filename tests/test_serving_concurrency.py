@@ -56,7 +56,11 @@ class Request(ResidentChat):
         if self.gate:
             self.gate.with_suffix(".closed").touch()
 
-Engine.max_concurrent_requests = 2
+def capacity(self):
+    """Two requests at once, under crit serve's cap where the host loads with one: Core's runtime applies it."""
+    cap = (getattr(self.context, "limits", None) or {}).get("max_concurrent_requests")
+    return 2 if cap is None else min(2, cap)
+Engine.max_concurrent_requests = property(capacity)
 def create_request(self, request):
     if request["messages"][-1]["content"] == "badfactory":
         return self
@@ -280,7 +284,8 @@ class ConcurrentTests(ShutdownFixture, unittest.TestCase):
         self.assertFalse(second[2][1].wait(.15))
         self.assertFalse(second[0].with_suffix(".started").exists(), "the cap holds the second request back")
         self.assertEqual(engine.status()["active_requests"], 1)
-        self.assertEqual(engine.status()["max_concurrent_requests"], 2, "the engine still declares its own capacity")
+        # The host loads the engine with the cap, and the engine (Core's runtime) holds no more than it.
+        self.assertEqual(engine.status()["max_concurrent_requests"], 1, "the engine applies crit serve's cap")
         self.release(first)
         self.started(second)
         self.release(second)

@@ -18,7 +18,7 @@ import triton.language as tl
 WORD = 0xFFFFFFFF
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["n"])
 def _uniform_kernel(key_ptr, counter_ptr, out_ptr, n):
     """Core's uniform(seed, position, stream) per row: key = seed (lo, hi), counter = (position lo, hi, stream, 0)."""
     r = tl.program_id(0)

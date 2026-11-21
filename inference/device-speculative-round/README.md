@@ -327,7 +327,7 @@ A model that reads per-token rows from a table on disk (hashed n-gram or embeddi
 after drafting, they leave the GPU idle for a whole round of disk reads. Start each draft token's rows the moment the
 token exists instead, with `RowPrefetch.start` under the next draft step. A host drafter (prompt lookup, copied
 drafts, n-gram tables) knows its tokens at once. A device drafter writes each step's token to mapped pinned memory
-that a host thread polls (the [host-work-mailbox](../host-work-mailbox/README.md) pattern), or the engine drafts a
+that a host thread polls (the pattern of [the host's handoffs](../../core/python/crit_plugins/host/README.md)), or the engine drafts a
 step ahead. Before the step that reads the rows, `wait` on that round's tickets copies only what is still in flight,
 and a rejected draft's rows stay in the hot-row cache. Put the wait time in the round account: `RowPrefetch.stats()`
 says how much of it the table still costs.

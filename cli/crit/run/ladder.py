@@ -14,6 +14,11 @@ full Eval, once it is sealed built or completed with a passed crit run ... serve
 draft, fixed as a new candidate from the same plan at no cost and with its number. A run started from a crit-hub engine
 (create --from-engine) gives its first candidate, the engine as imported, a small Eval, so the run has a measured
 baseline before any change.
+
+A run whose Eval cannot measure its model (crit-eval's reference refuses it) records the rung unreachable
+(rung_unreachable.json, set by crit run ... eval from Eval's refusal): from then on a candidate on the full rung stands
+on the ladder once sealed built with a passed serve check, as one below it does, each plan starts from the newest
+candidate on the ladder, and no candidate is certified.
 """
 from .records import evaluated_candidates, ident, read_json, safe_path
 
@@ -34,6 +39,8 @@ STAGES = {"small": 1, "medium": 2}
 # The lifecycles a candidate below the full Eval is sealed with to stand on the ladder without an Eval.
 SEALED = ("built", "completed")
 SERVE_CHECK = "crit run serve --check"
+# The run's record that Eval refused to measure its model, so no rung's Eval can be reached.
+UNREACHABLE = "rung_unreachable.json"
 
 
 def scope(number, last=False, origin=False):
@@ -96,16 +103,50 @@ def sealed_lifecycle(root, candidate_id):
     return read_json(folder / "outcome.json").get("lifecycle")
 
 
+def eval_refusal(model_path):
+    """Why crit-eval's reference cannot score the run's model (crit_eval.quality.checkpoints.scoring_refusal: no
+    layout for its GGUF architecture, no modeling code in the installed transformers, ...), or None, also when the
+    installed crit-eval has no such check."""
+    try:
+        from crit_eval.quality.checkpoints import scoring_refusal
+    except ImportError:
+        return None
+    return scoring_refusal(model_path)
+
+
+def unreachable(root):
+    """The run's rung-unreachable record ({candidate_id, scope, segment_id, reason, recorded_at}), or None while Eval
+    can measure the run's model."""
+    path = safe_path(root, UNREACHABLE)
+    return read_json(path) if path.is_file() else None
+
+
+def state_text(found):
+    """The rung-unreachable state as crit prints it."""
+    return f"rung unreachable: {found['reason']}"
+
+
+def uncertified(root):
+    """What the run's summary says of certification when the rung is unreachable (None otherwise): no candidate is
+    certified, and why."""
+    found = unreachable(root)
+    if found is None:
+        return None
+    return (f"No candidate is certified: {state_text(found)} (Eval refused {found['candidate_id']}'s "
+            f"{found['scope'] or 'requested'} Eval at {found['recorded_at']})")
+
+
 def counted(root):
     """candidate_id -> the segment it counts in, for every candidate on the ladder: those an Eval attempt was reserved
     for (the segment of the first), and those below the full Eval sealed built or completed with a passed serve
-    check (the segment that created them)."""
+    check (the segment that created them); with the rung unreachable, those on the full rung too."""
     found = dict(evaluated_candidates(root))
+    reach = unreachable(root) is None
     for folder in sorted(safe_path(root, "candidates").glob("candidate-*")):
         name = folder.name
         if name in found or sealed_lifecycle(root, name) not in SEALED or not served_check(root, name):
             continue
-        if scope_of(root, name, found) != "full":
+        if not reach or scope_of(root, name, found) != "full":
             found[name] = _candidate(root, name).get("segment_id")
     return dict(sorted(found.items()))
 

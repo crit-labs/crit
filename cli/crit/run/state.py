@@ -14,12 +14,20 @@ Candidate states, in the order a candidate moves through them (docs/RUN_RECORDS.
 | check_failed | its newest serve --check failed | seal check_failed, fix as a new candidate from the same plan |
 | serve_checked | serve --check passed | its rung: seal built (rung 1), eval (or seal built, rungs 2 to 4), eval (full) |
 | eval_stopped | its newest Eval attempt stopped before the end | eval --resume |
-| evaluated | a completed Eval | check --from-eval, measure, seal completed |
+| evaluated | a completed Eval | check --from-eval, measure, seal completed; seal built where its checks keep its benchmarks exploratory (measure refuses it) |
 | running | an attempt is running | wait for it (or settle it when its process is gone) |
 | sealed | closed with a lifecycle | nothing: the run plans from it |
 
+With the run's rung unreachable (crit.run.ladder.unreachable: Eval refused the run's model), a serve_checked candidate
+on any rung is sealed built, and the hand-off says that no candidate is certified and why.
+
 A sealed candidate is a draft when it is not on the candidate ladder (crit.run.ladder.counted); its plan builds the
 fix.
+
+A step named here is one its command takes: where a command judges a candidate by a rule of its own (measure's
+qualification, seal's measured cases), the step reads that rule (measure.unqualified), so no state is left without
+a legal action. A build's c2 was told to measure, which refused (its checks keep its benchmarks exploratory), and
+seal completed refused without a measurement.
 """
 from . import ladder, plans, recon
 from .records import load_run, read_json, safe_path, segment, timestamp
@@ -111,13 +119,19 @@ def next_step(store, run_id):
         return {"step": name, "command": command and f"{base} {command}", "why": why, "candidate": candidate,
                 "state": {"segment": bounds["segment_id"], "candidates": rows}}
 
+    uncertified = ladder.uncertified(root)
     if state["stopping_reason"] is not None:
         if not (root / "summary.md").is_file():
+            late = plans.retroactive(root, run)
             return step("hand_off", None, f"The run stopped ({state['stopping_reason']}). Write summary.md, record the "
                         "cost (crit run ... cost --transcript ...), run crit serve --write-launchers for the selected "
-                        "candidate and hand off (AGENTS.md section 5)")
+                        "candidate and hand off (AGENTS.md section 5)"
+                        + (f". Retroactive plans, recorded after their change was measured: {', '.join(late)}; "
+                           "summary.md names them" if late else "")
+                        + (f". {uncertified}: summary.md says so" if uncertified else ""))
         return step("done", None, f"The run stopped ({state['stopping_reason']}) and summary.md is written. Resume "
-                    "with crit run ... resume --candidates N only when the user asks for more")
+                    "with crit run ... resume --candidates N only when the user asks for more"
+                    + (f". {uncertified}" if uncertified else ""))
     if utc_now() >= timestamp(bounds["deadline_at"], "deadline"):
         return step("resume", "resume --candidates N --external-agent-stopped",
                     "The segment's safety window has passed: only the user authorizes a new segment")
@@ -163,6 +177,11 @@ def _candidate_step(step, root, run, row):
         return step("eval_resume", f"eval --candidate {cid} --data EVAL_DATA --resume",
                     f"Its Eval stopped ({row['detail']}): go on from its journal, never from the start", cid)
     if name == "serve_checked":
+        blocked = ladder.unreachable(root)
+        if blocked is not None and row["scope"] != "none":
+            return step("seal", f"seal --candidate {cid} --lifecycle built",
+                        f"The run records {ladder.state_text(blocked)}: seal it built, and the next plan starts from "
+                        f"it. {SWEEP_FIRST.format(cid=cid)}", cid)
         if row["scope"] == "none":
             return step("seal", f"seal --candidate {cid} --lifecycle built",
                         "Rung 1 takes no Eval: seal it built, and the next plan starts from it", cid)
@@ -177,6 +196,17 @@ def _candidate_step(step, root, run, row):
         return step("record_checks", f"check --candidate {cid} --from-eval",
                     "Read crit eval status (with --kernels) for the next plan, and record the run's checks from the "
                     "Eval result", cid)
+    from .measure import unqualified
+    found = unqualified(root, run, cid)
+    if found["lasting"] or found["missing"]:
+        # measure refuses it (its benchmarks would stay exploratory) and a completed seal needs its benchmarks: built
+        # is the seal it takes, and the next plan repairs what keeps it from qualifying.
+        repairs = ("; the next plan repairs it with a requirement lever serving "
+                   + ", ".join(f"check:{gate}" for gate in sorted(found["failed"])) if found["failed"] else "")
+        return step("seal", f"seal --candidate {cid} --lifecycle built",
+                    "Its benchmarks cannot qualify (" + "; ".join(found["lasting"] + found["missing"]) + "): crit run "
+                    "measure refuses it and a completed seal needs every case's benchmark. Seal it built" + repairs
+                    + f". {SWEEP_FIRST.format(cid=cid)}", cid)
     missing = _measured(folder, run)
     if missing:
         return step("measure", f"measure --candidate {cid}", f"Benchmark the run's cases ({', '.join(missing)})", cid)
@@ -192,9 +222,13 @@ def _plan_step(step, root, run, bounds):
     summaries = [s for s in plans.summaries(root, run)
                  if s["segment_id"] == bounds["segment_id"] and s["superseded_by"] is None]
     parent = max(counted) if counted else None
+    # With the rung unreachable no candidate qualifies, so the stop selects none.
+    uncertified = ladder.uncertified(root)
+    select = (f"{uncertified}, so select none" if uncertified
+              else "select the best eligible candidate (crit run ... select)")
     if summaries and summaries[-1]["decision"] == "stop":
-        return step("stop", "stop --record stop.json", "The newest plan is a stop plan: select the best eligible "
-                    "candidate (crit run ... select), then stop with search_exhausted")
+        return step("stop", "stop --record stop.json", f"The newest plan is a stop plan: {select}, then stop with "
+                    "search_exhausted")
     ready = [s for s in summaries if s["decision"] == "build" and (s["candidate_id"] is None
                                                                    or s["candidate_id"] not in counted)]
     if ready:
@@ -204,7 +238,7 @@ def _plan_step(step, root, run, bounds):
                     f"{ready[-1]['parent_candidate_id']}) and every lever's fate in the proposal")
     if budget is not None and used >= budget:
         return step("stop", "stop --record stop.json", f"The segment's {budget} budgeted candidates are on the ladder: "
-                    "select the best eligible candidate (crit run ... select), then stop with budget_exhausted")
+                    f"{select}, then stop with budget_exhausted")
     target = f"from {parent}" if parent else "for the first candidate"
     return step("plan", "plan --draft --record plan.json",
                 f"Plan the next candidate {target} before any code: plan --draft writes the plan's skeleton with "

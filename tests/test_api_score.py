@@ -14,7 +14,7 @@ from crit_api.server import Api, Server
 from crit_core.serving import ResidentChat, ScoreRows, capabilities, logprob_row, packed_scores
 
 # Every row ranks the scored token first at -0.25, then token 1 at -2.0; a prompt starting with 999 makes the engine
-# name another token than the one it scores.
+# name another token than the one it scores; a request asking decode_via_prompt reports a decode_ms of 9.
 SCORE_ADAPTER = r'''
 Engine.scores = True
 
@@ -29,7 +29,7 @@ def _score(self, request, cancellation):
     return {'schema_version': 1, 'record_kind': 'score_response', 'request_id': request['request_id'],
             'candidate_id': request['candidate_id'], 'package_sha256': request['package_sha256'],
             'prompt': rows, 'continuation': [row(t) for t in continuation],
-            'telemetry': {'prefill_ms': 1.5, 'decode_ms': 2.0}}
+            'telemetry': {'prefill_ms': 1.5, 'decode_ms': 9.0 if request.get('decode_via_prompt') else 2.0}}
 
 Engine.score = _score
 '''
@@ -80,11 +80,20 @@ class ScoreApiTests(ServeFixture, unittest.TestCase):
         for body, param in (({"prompt_ids": []}, "prompt_ids"), ({"prompt_ids": [1, -2]}, "prompt_ids"),
                             ({"prompt_ids": [1], "top_logprobs": 21}, "top_logprobs"),
                             ({"prompt_ids": [1], "continuation_ids": "x"}, "continuation_ids"),
+                            ({"prompt_ids": [1], "decode_via_prompt": 1}, "decode_via_prompt"),
                             ({"prompt_ids": [1], "messages": []}, "messages")):
             with self.subTest(body=body):
                 response, value = self.post(body)
                 self.assertEqual(response.status, 400, value)
                 self.assertEqual(value["error"]["param"], param)
+
+    def test_decode_via_prompt_reaches_the_engine_only_when_asked(self):
+        body = {"prompt_ids": [5, 6, 7], "continuation_ids": [8, 9], "top_logprobs": 1}
+        for asked, decode_ms in ((None, 2.0), (False, 2.0), (True, 9.0)):
+            with self.subTest(asked=asked):
+                response, value = self.post(body if asked is None else dict(body, decode_via_prompt=asked))
+                self.assertEqual(response.status, 200, value)
+                self.assertEqual(value["crit_telemetry"]["decode_ms"], decode_ms)
 
     def test_a_full_queue_refuses_a_score_with_retry_after(self):
         engine = self.server.api.engine
@@ -199,6 +208,28 @@ class ScoreRecordTests(unittest.TestCase):
             engine.score(short, cancellation)
         alone = engine.score(dict(self.request, prompt_rows=False), cancellation)
         self.assertEqual((alone["prompt"], len(alone["continuation"])), ([], 1))
+
+    def test_resident_chat_passes_decode_via_prompt_only_to_an_engine_that_takes_it(self):
+        seen = []
+
+        class Engine(ResidentChat):
+            scores = True
+
+            def score_tokens(self, ids, continuation, top_k, cancelled, prompt_rows, **options):
+                seen.append(options)
+                return [(-0.5, [(t, -0.5), (0, -1.0)][:top_k]) for t in ids[1:]], \
+                    [(-0.25, [(t, -0.25), (0, -2.0)][:top_k]) for t in continuation], \
+                    {"prefill_ms": 1.0, "decode_ms": 1.0}
+        engine = object.__new__(Engine)
+        cancellation = SimpleNamespace(is_set=lambda: False, check=lambda: None)
+        asked = dict(self.request, decode_via_prompt=True)
+        with self.assertRaisesRegex(ValueError, "decode_via_prompt"):
+            engine.score(asked, cancellation)
+        engine.decode_via_prompt = True
+        engine.score(self.request, cancellation)
+        engine.score(dict(self.request, decode_via_prompt=False), cancellation)
+        engine.score(asked, cancellation)
+        self.assertEqual(seen, [{}, {}, {"decode_via_prompt": True}])
 
     def test_packed_records_hold_the_json_rows(self):
         class Engine(ResidentChat):

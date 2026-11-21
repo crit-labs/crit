@@ -33,15 +33,9 @@ ENGINE_SERVICES = {
     "artifact-loading": "reads the checkpoint's tensors for the model plugin, before it hands them to the slots",
     "model-import-audit": "checks a checkpoint's headers and tensor roles before the model plugin loads it",
     "checkpoint-storage": "where the checkpoint and its prefetch live, which the model plugin reads from",
-    "host-memory-admission": "admits the host memory the plugins' budget is checked against",
     "device-speculative-round": "the technique of a speculative round on the device (accept, frontier advance, one "
                                 "readback a round) and python_round's rejection and copy-draft helpers, which Core's "
                                 "round driver (crit_plugins.rounds) runs for a model plugin's captured rounds",
-    "session-scheduling": "prefill chunks and physical batches: Core's concurrent runtime schedules every engine's steps",
-    "host-work-mailbox": "host work a device's stream posts and joins, captured graphs included: Core's handoffs "
-                         "(crit_plugins.host) run it for every plugin",
-    "concurrent-request-execution": "requests in flight at once, admission and compact ready rows: Core's concurrent "
-                                    "runtime",
 }
 
 
@@ -56,7 +50,8 @@ def library(inference=INFERENCE):
 
 
 def closure(registry, ids):
-    """[(id, why)]: the plugins `ids`, then transitively their references and the plugins their tests use."""
+    """[(id, why)]: the plugins `ids`, then transitively their references, the plugins their tests use and the plugins
+    they extend."""
     out, seen, queue = [], set(), [(plugin_id, "named") for plugin_id in ids]
     while queue:
         plugin_id, why = queue.pop(0)
@@ -67,6 +62,8 @@ def closure(registry, ids):
         out.append((plugin_id, why))
         queue += [(other, f"the reference of {plugin_id}") for other in manifest["reference"] or []]
         queue += [(other, f"the tests of {plugin_id} use it") for other in manifest["test_with"]]
+        if manifest.get("extends"):
+            queue.append((manifest["extends"]["id"], f"{plugin_id} extends it"))
     return out
 
 
@@ -414,6 +411,8 @@ def main(argv=None):
     tested.add_argument("folder", type=Path, nargs="?")
     tested.add_argument("--only", action="append", help="Test only this plugin (repeatable)")
     tested.add_argument("--timeout", type=float, default=600, help="Seconds per plugin (default %(default)s)")
+    tested.add_argument("--jobs", type=int, help="Plugins tested at once, a process each (default: "
+                        "CRIT_PLUGIN_TEST_JOBS, else half the cores up to 4)")
     tested.add_argument("--no-cache", action="store_true", help="Run every plugin's tests, also those that passed "
                         "before with the same files and environment (by default they are reported as cached)")
     shown = subs.add_parser("variants", help="Show the variants crit run ... ablate serves for a selection")
@@ -443,14 +442,16 @@ def main(argv=None):
     updated.add_argument("--inference", type=Path, default=INFERENCE,
                          help="The Inference folder the copies came from (default: crit's)")
     updated.add_argument("--dry-run", action="store_true", help="Say what would be replaced, and write nothing")
-    from . import audit, decisions, offload
+    from . import audit, decisions, offload, resolve
     offload.add_parser(subs)
     audit.add_parser(subs)
     decisions.add_parser(subs)
+    resolve.add_parser(subs)
     args = parser.parse_args(argv)
-    if args.action in ("offload", "memory", "decisions"):
+    if args.action in ("offload", "memory", "decisions", "resolve"):
         try:
-            return {"offload": offload, "memory": audit, "decisions": decisions}[args.action].main(args)
+            return {"offload": offload, "memory": audit, "decisions": decisions,
+                    "resolve": resolve}[args.action].main(args)
         except (OSError, ValueError, ImportError, PluginError) as error:
             print(f"crit plugins {args.action}: {error}", file=sys.stderr)
             return 1
@@ -514,13 +515,14 @@ def main(argv=None):
                     print(f"  {slot:<16} {plugin_id or '-'}")
             return 0
         if args.action == "test":
-            items = run_tests(registry, set(args.only or ()), args.timeout, cache=not args.no_cache)
+            items = run_tests(registry, set(args.only or ()), args.timeout, cache=not args.no_cache, jobs=args.jobs)
             failed = sum(i["state"] == "failed" for i in items)
             skipped = [(i["name"], skip) for i in items for skip in i.get("skipped") or ()]
             print(f"{len(items) - failed} passed, {failed} failed"
                   + (f"; {len(skipped)} tests skipped, which these passes do not cover:" if skipped else ""))
             for name, skip in skipped:
-                print(f"  {name}: {skip['test']}: {skip['reason']}")
+                print(f"  {name}: {skip['test']}: {skip['reason']}"
+                      + (" (unchecked: fails the plugin)" if skip.get("unchecked") else ""))
             return 1 if failed else 0
         for variant in variants(_selection(args.selection), registry, args.fact or None):
             switched = ", ".join(f"{slot}={pid or '-'}" for slot, pid in variant["plugins"]["use"].items())

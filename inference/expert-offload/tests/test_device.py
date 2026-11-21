@@ -39,6 +39,15 @@ def bits(t):
 
 @unittest.skipIf(torch is None or not torch.cuda.is_available(), "the device form runs on CUDA")
 class OffloadDeviceTests(PluginTestCase):
+    def setUp(self):
+        super().setUp()
+        # The device keeps no headroom here (crit_plugins.memory's, which Core's loader sets from the run): the cache
+        # takes every free byte, so the tests count its slots and set a headroom where one is what they check.
+        from crit_plugins import memory
+        device = memory.of("cuda")
+        self.addCleanup(setattr, device, "headroom", device.headroom)
+        device.headroom = 0
+
     def offload(self, count=EXPERTS, **options):
         use, context = dict(options.pop("use_options", {})), options.pop("context", None)
         experts = self.assemble(USE, {"workers": 3, "pin": False, "max_tokens": 16, **options}, use_options=use,
@@ -85,7 +94,7 @@ class OffloadDeviceTests(PluginTestCase):
     def test_keep_routes_leaves_each_tokens_last_routes_out_in_every_tier(self):
         whole = self.offload()
         cut = self.offload(keep_routes=2)                                     # every expert on the device
-        offloaded = self.offload(tier="ram", misses="link", margin_mib=0, keep_routes=2)
+        offloaded = self.offload(tier="ram", misses="link", keep_routes=2)
         offloaded.open()
         rng = random.Random(12)
         for tokens in (3, 24):                                                # decode rows, then a prompt chunk
@@ -99,7 +108,7 @@ class OffloadDeviceTests(PluginTestCase):
         self.assertNotIn("keep_routes", whole.facts()["expert_offload"])
 
     def test_misses_over_the_link_give_the_all_device_bits(self):
-        fits, offloaded = self.offload(), self.offload(tier="ram", misses="link", margin_mib=0)
+        fits, offloaded = self.offload(), self.offload(tier="ram", misses="link")
         offloaded.open()
         self.assertEqual(offloaded.misses, "link")
         rng = random.Random(2)
@@ -118,7 +127,7 @@ class OffloadDeviceTests(PluginTestCase):
         self.assertEqual(fits.exactness(), {"decode": "row-exact", "prompt": "exact"})
 
     def test_misses_on_the_cpu_give_the_declared_all_device_bits(self):
-        offloaded = self.offload(tier="ram", misses="cpu", margin_mib=0)
+        offloaded = self.offload(tier="ram", misses="cpu")
         offloaded.open()
         if offloaded.misses != "cpu":
             self.skipTest(f"no CPU tier here: {offloaded.reasons.get('misses')}")
@@ -143,7 +152,7 @@ class OffloadDeviceTests(PluginTestCase):
         with tempfile.TemporaryDirectory() as folder:
             settings = Path(folder) / "offload.json"
             settings.write_text(json.dumps({"options": {"expert-offload": {"slots": 12}}}), encoding="utf-8")
-            auto = self.offload(tier="ram", misses="auto", settings=str(settings), reserve_mib=0, margin_mib=0,
+            auto = self.offload(tier="ram", misses="auto", settings=str(settings), reserve_mib=0,
                                 elastic=False)
             try:
                 auto.open()
@@ -158,7 +167,7 @@ class OffloadDeviceTests(PluginTestCase):
             want = self.all_device(auto, 0, x, ids, weights, "declared")
             self.assertTrue(torch.equal(bits(auto.forward(0, x, ids, weights)), bits(want)))
             auto.end_step()
-            link = self.offload(tier="ram", misses="link", settings=str(settings), reserve_mib=0, margin_mib=0,
+            link = self.offload(tier="ram", misses="link", settings=str(settings), reserve_mib=0,
                                 elastic=False)
             with self.assertRaisesRegex(ValueError, "holds no prompt ring.*prompts take 16 slots"):
                 link.open()
@@ -168,7 +177,7 @@ class OffloadDeviceTests(PluginTestCase):
         # than a layer has experts sends its missed routes to the CPU tier when they cost less there than their
         # experts over the link, by the times open() measured (also with the misses pinned to the CPU tier): the
         # bits are the same either way, nothing is admitted, and the CPU's way borrows no ring.
-        offloaded = self.offload(tier="ram", misses="cpu", margin_mib=0)
+        offloaded = self.offload(tier="ram", misses="cpu")
         offloaded.open()
         if offloaded.misses != "cpu":
             self.skipTest(f"no CPU tier here: {offloaded.reasons.get('misses')}")
@@ -200,7 +209,7 @@ class OffloadDeviceTests(PluginTestCase):
         for asked, arithmetic, level in ((None, "declared", "declared"), ("repeatable", "tensor", "row-exact"),
                                          ("row-exact", "tensor", "row-exact"), ("exact", "declared", "declared")):
             kernels.use_exactness(asked and {"decode": "row-exact", "prompt": asked})
-            offloaded = self.offload(tier="ram", misses="cpu", margin_mib=0)
+            offloaded = self.offload(tier="ram", misses="cpu")
             offloaded.open()
             if offloaded.misses != "cpu":
                 self.skipTest(f"no CPU tier here: {offloaded.reasons.get('misses')}")
@@ -211,7 +220,7 @@ class OffloadDeviceTests(PluginTestCase):
             self.assertTrue(torch.equal(bits(offloaded.forward(0, x, ids, weights)), bits(want)), asked)
             offloaded.end_step()
         kernels.use_exactness("exact")   # an option set to one arithmetic is that arithmetic, whatever is asked
-        pinned = self.offload(tier="ram", misses="cpu", margin_mib=0, prompt_arithmetic="tensor")
+        pinned = self.offload(tier="ram", misses="cpu", prompt_arithmetic="tensor")
         pinned.open()
         self.assertEqual(pinned.facts()["expert_offload"]["prompt_arithmetic"], "tensor")
         self.assertEqual(pinned.exactness(), {"decode": "declared", "prompt": "row-exact"})
@@ -223,7 +232,7 @@ class OffloadDeviceTests(PluginTestCase):
             profile.write_text(json.dumps({"kind": "expert-offload-routing", "layers": LAYERS, "experts": EXPERTS,
                                            "routes": 1, "keys": [9, 2, 14, 5, 0, 11]}), encoding="utf-8")
             options = dict(tier="ram", misses="cpu", policy="recent", store_dir=folder, settings=str(settings),
-                           profile=str(profile), reserve_mib=0, margin_mib=0, elastic=False)
+                           profile=str(profile), reserve_mib=0, elastic=False)
             plain = self.offload(**options)       # the same cache without a core, from the same store file
             plain.open()
             if plain.misses != "cpu":
@@ -271,7 +280,7 @@ class OffloadDeviceTests(PluginTestCase):
         with tempfile.TemporaryDirectory() as folder:
             settings = Path(folder) / "offload.json"   # fewer slots than experts, so the cache has room to grow into
             settings.write_text(json.dumps({"options": {"expert-offload": {"slots": 12}}}), encoding="utf-8")
-            offloaded = self.offload(tier="ram", misses="cpu", settings=str(settings), reserve_mib=0, margin_mib=0)
+            offloaded = self.offload(tier="ram", misses="cpu", settings=str(settings), reserve_mib=0)
             offloaded.open()
             if offloaded.misses != "cpu":
                 self.skipTest(f"no CPU tier here: {offloaded.reasons.get('misses')}")
@@ -289,36 +298,31 @@ class OffloadDeviceTests(PluginTestCase):
             device.serve()   # Core's call after the warm requests: the load is over, the givers take what is left
             self.assertEqual(offloaded.cache.backed_slots(), LAYERS * EXPERTS)   # the free memory holds every expert
             decode(3)
-            # A prompt step whose chunk was measured to take more than the device has free: the cache gives slots back
-            # before it, serves the chunk through its ring, and grows back after the prompt's last step.
-            offloaded._peaks = {24: device.free() + (64 << 20)}
-            offloaded.begin_step(24)
-            self.assertLess(offloaded.cache.backed_slots(), LAYERS * EXPERTS)
-            self.assertGreaterEqual(offloaded.shrinks, 1)
-            x, ids, weights = self.routes(rng, tokens=24)
-            for layer in range(LAYERS):
-                want = self.all_device(offloaded, layer, x, ids, weights, "declared")
-                self.assertTrue(torch.equal(bits(offloaded.forward(layer, x, ids, weights)), bits(want)))
-            offloaded._peaks = {}                                   # what the step took is measured at its end
-            offloaded.end_step(False)
-            self.assertEqual(list(offloaded._peaks), [24])
-            self.assertEqual(offloaded.cache.backed_slots(), LAYERS * EXPERTS)
-            decode(3)                                               # the experts lost come back as they are missed
-            # A prompt step of a size seen finds its measured room free: the cache gives nothing back for it, nor
-            # for a step without prompt tokens.
-            shrinks = offloaded.shrinks
+            # A step's temporaries come from Core's allocator, inside the arena the device keeps free beside the
+            # headroom: the cache gives nothing back for them, and grows back nothing it did not give.
+            device.arena = 64 << 20
+            device.need(0)   # what the arena asks of the cache, where the device lacks it: once, before any step
+            held = offloaded.cache.backed_slots()
             for tokens in (24, 0):
-                offloaded.begin_step(tokens)
-                if tokens:
-                    x, ids, weights = self.routes(rng, tokens=tokens)
-                    for layer in range(LAYERS):
-                        want = self.all_device(offloaded, layer, x, ids, weights, "declared")
-                        self.assertTrue(torch.equal(bits(offloaded.forward(layer, x, ids, weights)), bits(want)))
+                device.begin_step(tokens)
+                with device.step_pool():
+                    scratch = torch.empty(32 << 20, dtype=torch.uint8, device="cuda")   # a step's temporaries
+                    if tokens:
+                        x, ids, weights = self.routes(rng, tokens=tokens)
+                        for layer in range(LAYERS):
+                            want = self.all_device(offloaded, layer, x, ids, weights, "declared")
+                            self.assertTrue(torch.equal(bits(offloaded.forward(layer, x, ids, weights)), bits(want)))
+                    del scratch
                 offloaded.end_step(False)
-                self.assertEqual((offloaded.shrinks, offloaded.cache.backed_slots()), (shrinks, LAYERS * EXPERTS))
+                device.end_step(False)
+                self.assertEqual(offloaded.cache.backed_slots(), held)
+            steps = device.steps()
+            self.assertEqual((steps["overflows"], steps["breaches"], steps["refused"]), (0, 0, 0))
+            self.assertGreaterEqual(steps["most"]["prompt"], 32 << 20)
             decode(2)
             seen = offloaded.telemetry()["expert_offload"]["elastic"]
-            self.assertEqual((seen["slots"], list(seen["prompt_bytes"])), (LAYERS * EXPERTS, [24]))
+            self.assertEqual((seen["slots"], seen["arena_bytes"]), (held, 64 << 20))
+            device.arena = 0
 
     def test_a_kv_pool_takes_its_pages_from_an_elastic_cache_on_a_full_device(self):
         # While the engine serves, an elastic cache holds every byte the device has free but what it keeps. A KV pool
@@ -335,8 +339,7 @@ class OffloadDeviceTests(PluginTestCase):
             # a decode-only cache (ring_slots 0): two layers over the link hold a prompt ring only with every expert
             settings.write_text(json.dumps({"options": {"expert-offload": {"slots": 3 * count // 2, "ring_slots": 0}}}),
                                 encoding="utf-8")
-            offloaded = self.offload(count, tier="ram", misses="link", settings=str(settings), reserve_mib=0,
-                                     margin_mib=0)
+            offloaded = self.offload(count, tier="ram", misses="link", settings=str(settings), reserve_mib=0)
             offloaded.open()
         self.assertTrue(offloaded.facts()["expert_offload"]["elastic"])
         device.serve()
@@ -345,7 +348,7 @@ class OffloadDeviceTests(PluginTestCase):
         before, held = offloaded.cache.backed_slots(), offloaded.cache.elastic.mapped
         # The device counts as full: the cache keeps free exactly what is free now, so every byte the pool backs
         # is one the cache gives back.
-        offloaded.options["margin_mib"] = device.free() >> 20
+        device.headroom = device.free()
         pool.open("a")
         slots = pool.reserve(StepBatch.build([("a", 0, 32768)], "cuda"))
         self.assertEqual(int(slots.numel()), 32768)
@@ -365,13 +368,12 @@ class OffloadDeviceTests(PluginTestCase):
         want = offloaded.part.combine(offloaded.part.route_outputs(1, x, ids, store, table, "tensor"), ids, weights)
         self.assertTrue(torch.equal(bits(offloaded.forward(1, x, ids, weights)), bits(want)))
         pool.close("a")
-        offloaded.options["margin_mib"] = 0
+        device.headroom = 0
 
-    def test_a_prompt_step_that_cannot_reuse_torchs_kept_blocks_keeps_the_margin(self):
-        # Blocks torch's allocator keeps from a prompt's earlier steps are room only where a step reuses them: a
-        # tensor larger than any kept block (attention's grow with the context) takes new device memory beside them.
-        # The cache gives a step the device bytes such steps took, so the margin holds at the step's peak; counting
-        # the kept blocks as room in use left 24 MiB less than the margin free here.
+    def test_a_step_past_its_arena_is_counted_and_the_headroom_at_its_peak_is_kept_or_counted(self):
+        # Every byte a step takes comes from Core's allocator: the device knows it before the step has it. A step
+        # within the arena leaves the headroom free; one past it is lent free memory and counted (overflows), and one
+        # that leaves less than the headroom free is counted too (breaches): nothing passes the arena unseen.
         from crit_plugins import memory
         device = memory.of("cuda")
         if not device.elastic_ranges:
@@ -382,71 +384,29 @@ class OffloadDeviceTests(PluginTestCase):
             settings = Path(folder) / "offload.json"   # fewer slots than experts at open(): the cache is elastic
             settings.write_text(json.dumps({"options": {"expert-offload": {"slots": 3 * count // 2, "ring_slots": 0}}}),
                                 encoding="utf-8")
-            offloaded = self.offload(count, tier="ram", misses="link", settings=str(settings), reserve_mib=0,
-                                     margin_mib=0)
+            offloaded = self.offload(count, tier="ram", misses="link", settings=str(settings), reserve_mib=0)
             offloaded.open()
         device.serve()
         try:
-            offloaded.options["margin_mib"] = device.free(release=True) >> 20   # the device counts as full
-            margin = offloaded._margin()
-            offloaded.begin_step(24)            # a prompt's first step: 32 MiB of temporaries
-            offloaded._prompt_forward(24)
-            first = torch.empty(32 * mib, dtype=torch.uint8, device="cuda")
-            del first
-            offloaded.end_step(True)            # the prompt goes on: torch keeps the block
-            self.assertGreaterEqual(device.torch()["unused"], 32 * mib)
-            offloaded.begin_step(24)            # its next step: a larger tensor, which the kept block cannot hold
-            offloaded._prompt_forward(24)
-            larger = torch.empty(56 * mib, dtype=torch.uint8, device="cuda")
-            self.assertGreaterEqual(device.free(), margin)
-            del larger
-            offloaded.end_step(False)
-        finally:
-            offloaded.options["margin_mib"] = 0
-            offloaded.close()
-
-    def test_a_prompt_step_that_outgrows_its_room_keeps_the_margin_at_every_look(self):
-        # A step's room is a forecast from the steps before it. A step that takes more (deeper in the context than
-        # any before, a plugin's temporaries outside the ledger) is looked at before each routed layer: the cache
-        # keeps a reserve free beyond the margin and gives the step's next stride before the step takes it. With the
-        # room alone the fifth of these allocations left 10 MiB less than the margin free.
-        from crit_plugins import memory
-        device = memory.of("cuda")
-        if not device.elastic_ranges:
-            self.skipTest("the driver's virtual memory API is not reachable here")
-        device.load()
-        count, mib = 3072, 1 << 20
-        with tempfile.TemporaryDirectory() as folder:
-            settings = Path(folder) / "offload.json"   # fewer slots than experts at open(): the cache is elastic
-            settings.write_text(json.dumps({"options": {"expert-offload": {"slots": 3 * count // 2, "ring_slots": 0}}}),
-                                encoding="utf-8")
-            offloaded = self.offload(count, tier="ram", misses="link", settings=str(settings), reserve_mib=0,
-                                     margin_mib=0)
-            offloaded.open()
-        device.serve()
-        try:
-            offloaded.options["margin_mib"] = device.free(release=True) >> 20   # the device counts as full
-            margin = offloaded._margin()
-            offloaded.begin_step(24)            # a prompt step of this size takes 16 MiB: its room from now on
-            offloaded._prompt_forward(24)
-            first = torch.empty(16 * mib, dtype=torch.uint8, device="cuda")
-            del first
-            offloaded.end_step(False)
-            offloaded.begin_step(24)            # the next takes six times that, 12 MiB a layer
-            offloaded._prompt_forward(24)
-            held = []
-            for layer in range(8):
-                held.append(torch.empty(12 * mib, dtype=torch.uint8, device="cuda"))
-                self.assertGreaterEqual(device.free(), margin, layer)
-                offloaded._prompt_forward(24)   # the next routed layer: a look
-            self.assertGreaterEqual(offloaded.extends, 3)
-            found = offloaded.telemetry()["expert_offload"]["elastic"]
-            self.assertEqual((found["looks"], found["extends"]), (offloaded.looks, offloaded.extends))
-            self.assertGreaterEqual(found["reserve_bytes"], 64 * mib)
+            device.headroom, device.arena = 128 * mib, 64 * mib
+            device.need(0)
+            free = device.free(release=True)
+            self.assertGreaterEqual(free, device.headroom + device.arena - 2 * mib)
+            device.begin_step(24)
+            with device.step_pool():
+                held = [torch.empty(16 * mib, dtype=torch.uint8, device="cuda") for _ in range(3)]
+                self.assertGreaterEqual(device.free(), device.headroom)   # within the arena
+                self.assertEqual(device.steps()["overflows"], 0)
+                held.append(torch.empty(48 * mib, dtype=torch.uint8, device="cuda"))   # past it
             del held
             offloaded.end_step(False)
+            device.end_step(False)
+            steps = device.steps()
+            self.assertGreaterEqual(steps["overflows"], 1)
+            self.assertGreaterEqual(steps["most"]["prompt"], 96 * mib)
+            self.assertEqual(steps["granted"] - steps["retired"], 0)   # the step pool retired: its segments went back
         finally:
-            offloaded.options["margin_mib"] = 0
+            device.headroom, device.arena = 0, 0
             offloaded.close()
 
     def test_a_cache_that_keeps_its_size_leaves_elastic_pools_their_room(self):
@@ -459,12 +419,12 @@ class OffloadDeviceTests(PluginTestCase):
         pool = self.kv_pool(1 << 22)
         reserved = pool.elastic.range.size - pool.elastic.range.mapped
         self.assertGreater(reserved, 1 << 30)
-        fixed = self.offload(tier="ram", misses="link", elastic=False, margin_mib=0)
+        fixed = self.offload(tier="ram", misses="link", elastic=False)
         self.assertEqual(fixed._pools_unbacked(), reserved)
         fixed.open()
         self.assertFalse(fixed.facts()["expert_offload"]["elastic"])
         self.assertIn("left free for the model's pools", fixed.facts()["expert_offload"]["reasons"]["pools"])
-        whole = self.offload(tier="ram", misses="link", margin_mib=0)
+        whole = self.offload(tier="ram", misses="link")
         whole.open()
         self.assertFalse(whole.facts()["expert_offload"]["elastic"])
         self.assertIn("left free for the model's pools", whole.facts()["expert_offload"]["reasons"]["pools"])
@@ -473,7 +433,7 @@ class OffloadDeviceTests(PluginTestCase):
             settings.write_text(json.dumps({"options": {"expert-offload": {"slots": 3 * EXPERTS // 2,
                                                                            "ring_slots": 0}}}),   # decode only
                                 encoding="utf-8")
-            elastic = self.offload(tier="ram", misses="link", settings=str(settings), margin_mib=0)
+            elastic = self.offload(tier="ram", misses="link", settings=str(settings))
             elastic.open()
         self.assertTrue(elastic.facts()["expert_offload"]["elastic"])
         self.assertNotIn("pools", elastic.facts()["expert_offload"]["reasons"])
@@ -543,11 +503,11 @@ class OffloadDeviceTests(PluginTestCase):
     def mixed(self, **options):
         """Layers 0 and 1 W4A4, layer 2 W4A16 (weight-only: its experts carry no input scales), as a checkpoint whose
         draft layer's experts are stored otherwise than its decoder's."""
-        use = dict(options.pop("use_options", {}))
+        use, begun = dict(options.pop("use_options", {})), dict(options.pop("begin", {}))
         experts = self.assemble(USE, {"workers": 3, "pin": False, "max_tokens": 16, **options},
                                 use_options=use)["experts"]
         self.addCleanup(experts.close)
-        experts.begin(LAYERS + 1, EXPERTS, "nvfp4", HIDDEN, INTER)
+        experts.begin(LAYERS + 1, EXPERTS, "nvfp4", HIDDEN, INTER, **begun)
         generator = torch.Generator().manual_seed(4)
         for layer in range(LAYERS + 1):
             for e in range(EXPERTS):
@@ -558,9 +518,9 @@ class OffloadDeviceTests(PluginTestCase):
     def test_a_weight_only_layer_beside_w4a4_layers_loads_in_every_tier(self):
         # The CPU tier computes W4A4 experts only. With the experts in host memory and no store file to leave the
         # weight-only layer out of, open() added that layer's experts to the tier, which refused them: the engine did
-        # not load. In a file tier the same checkpoint was refused outright. The layer stays whole on the device
-        # where the CPU tier may serve misses (it is left out of the store before the timing that picks who does:
-        # with misses auto it stays there whoever is picked) and is cached as the others where only the link can.
+        # not load. In a file tier the same checkpoint was refused outright. Where the CPU tier serves misses the
+        # layer is the cache's link layer (its misses over the link, never the tier's), and it is cached as the
+        # others where only the link serves them.
         fits = self.mixed()
         rng = random.Random(9)
         calls = [(layer, *self.routes(rng)) for layer in (2, 0, 2, 1, 2)]
@@ -568,13 +528,13 @@ class OffloadDeviceTests(PluginTestCase):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
             for options in (dict(tier="ram", misses="cpu"), dict(tier="ram", misses="auto"),
                             dict(tier="ram", misses="link"), dict(tier="disk", misses="auto", store_dir=folder)):
-                offloaded = self.mixed(margin_mib=0, **options)
+                offloaded = self.mixed(**options)
                 offloaded.open()
                 served = "cpu" if options["misses"] == "cpu" else offloaded.misses
                 if options["misses"] == "cpu" and offloaded.misses != "cpu":
                     self.skipTest(f"no CPU tier here: {offloaded.reasons.get('misses')}")
-                whole = options["tier"] == "ram" and options["misses"] != "link" and offloaded._cpu_possible("nvfp4")
-                self.assertEqual(sorted(offloaded.resident), [2] if whole else [], options)
+                self.assertEqual((offloaded.resident, offloaded.link_layers), ({}, [2] if served == "cpu" else []),
+                                 options)
                 for (layer, x, ids, weights), expected in zip(calls, want):
                     found = bits(offloaded.forward(layer, x, ids, weights))
                     if layer == 2 or served != "cpu":   # the kernel's tensor arithmetic: the device tier's bits
@@ -587,24 +547,101 @@ class OffloadDeviceTests(PluginTestCase):
                     self.assertTrue(all(key // EXPERTS != 2 for key in offloaded.dispatch.tier.entries))
                 offloaded.close()
 
+    def test_a_weight_only_layer_goes_through_the_cache_over_the_link_beside_the_cpu_tiers_layers(self):
+        # Under recent residency the weight-only layer is no longer held whole on the device: it is in the cache with
+        # the W4A4 layers, each miss admitted in its own plan and copied over the link before the layer reads it,
+        # while the CPU tier computes the W4A4 layers' misses. A cache of 20 slots for 24 experts evicts it over and
+        # over; its rows are the kernel's tensor arithmetic, decode rows and prompt chunks alike: the device tier's
+        # bits, as when it was held whole (the ranked policy still holds it so).
+        fits = self.mixed()
+        with tempfile.TemporaryDirectory() as folder:
+            settings = Path(folder) / "offload.json"
+            settings.write_text(json.dumps({"options": {"expert-offload": {"slots": 20}}}), encoding="utf-8")
+            whole = self.mixed(tier="ram", misses="cpu", policy="ranked", settings=str(settings), reserve_mib=0,
+                               elastic=False)
+            whole.open()
+            if whole.misses != "cpu":
+                self.skipTest(f"no CPU tier here: {whole.reasons.get('misses')}")
+            link = self.mixed(tier="ram", misses="cpu", settings=str(settings), reserve_mib=0, elastic=False)
+            link.open()
+        self.assertEqual((sorted(whole.resident), whole.link_layers), ([2], []))
+        self.assertEqual((link.resident, link.link_layers, sorted(link.cache.link_layers)), ({}, [2], [2]))
+        self.assertEqual((link.slots, link.cache.link_slots), (20, EXPERTS))   # no decode_rows: a layer's experts
+        self.assertIn("W4A16", link.reasons["link_layers"])
+        rng = random.Random(14)
+        fills = 0
+        for r in range(24):   # rounds of every layer, the decoder's first and the draft layer last, as a model's
+            for layer in (0, 1, 2):
+                x, ids, weights = self.routes(rng)
+                before = link.cache.telemetry(sync=True)["fills"]
+                found = bits(link.forward(layer, x, ids, weights))
+                if layer == 2:
+                    fills += link.cache.telemetry(sync=True)["fills"] - before
+                    self.assertTrue(torch.equal(found, bits(fits.forward(2, x, ids, weights))), r)
+                    self.assertTrue(torch.equal(found, bits(whole.forward(2, x, ids, weights))), r)
+                else:
+                    want = self.all_device(link, layer, x, ids, weights, "declared")
+                    self.assertTrue(torch.equal(found, bits(want)), (r, layer))
+        self.assertGreater(fills, 0)                                  # its misses came over the link
+        seen = link.cache.telemetry(sync=True)
+        self.assertGreater(seen["cpu"], 0)                            # the W4A4 layers' went to the CPU tier
+        self.assertEqual(seen["failure"], 0)
+        self.assertNotIn(2, link.dispatch.layers)
+        x, ids, weights = self.routes(rng, tokens=37)                 # a prompt chunk: staged through the ring
+        self.assertTrue(torch.equal(bits(link.forward(2, x, ids, weights)), bits(fits.forward(2, x, ids, weights))))
+        link.end_step()
+
+    def test_a_link_layers_reserve_is_what_a_decode_round_routes_so_a_tight_cache_still_stages_prompts(self):
+        # 14 slots for layers of 8 experts. Held whole the weight-only layer took 8 of them and the bundle the
+        # cache's end keeps: 5 were left and no prompt ring of 8 fit, so the load was refused (as FP4-Local Flash-Next
+        # was under extreme memory pressure: 507 slots left, 513 needed). As a link layer it takes a reserve of what
+        # one decode round routes in it, here one row of 4 routes, beside the ring's 8: 12 of the 14. Without
+        # decode_rows the reserve is a layer's 8 experts, and a ring beside them takes 16.
+        with tempfile.TemporaryDirectory() as folder:
+            settings = Path(folder) / "offload.json"
+            settings.write_text(json.dumps({"options": {"expert-offload": {"slots": 14}}}), encoding="utf-8")
+            options = dict(tier="ram", misses="cpu", settings=str(settings), reserve_mib=0, elastic=False)
+            capped = self.mixed(begin={"decode_rows": 1, "top": 4}, **options)
+            capped.open()
+            if capped.misses != "cpu":
+                self.skipTest(f"no CPU tier here: {capped.reasons.get('misses')}")
+            uncapped = self.mixed(**options)
+            with self.assertRaisesRegex(ValueError, "holds no prompt ring.*link layers' misses.*prompts take 16 slots"):
+                uncapped.open()
+        self.assertEqual((capped.slots, capped.link_reserve(), capped.cache.link_slots), (14, 4, 4))
+        self.assertEqual(len(capped.cache.ring_slots), EXPERTS)
+        self.assertIn("reserve of 4 slots a round (the 4 routes one decode round makes", capped.reasons["link_layers"])
+        fits = self.mixed()
+        rng = random.Random(15)
+        for r in range(16):   # one decode row a round: what the reserve was sized for, never a route lost
+            for layer in (0, 1, 2):
+                x, ids, weights = self.routes(rng, tokens=1)
+                found = bits(capped.forward(layer, x, ids, weights))
+                if layer == 2:
+                    self.assertTrue(torch.equal(found, bits(fits.forward(2, x, ids, weights))), r)
+        self.assertEqual(capped.cache.telemetry(sync=True)["failure"], 0)
+        x, ids, weights = self.routes(rng, tokens=37)
+        self.assertTrue(torch.equal(bits(capped.forward(2, x, ids, weights)), bits(fits.forward(2, x, ids, weights))))
+        capped.end_step()
+
     def test_a_store_with_compressed_scales_sends_its_misses_over_the_link(self):
         # The CPU tier reads bundles in place in the slot layout; a store that keeps scale components compressed
         # (the expert source's csf_scales) has another. On auto the misses go over the link, with the reason; asked
         # for the CPU by name, the engine is refused before the tier reads a byte of the wrong layout.
         csf = {"use_options": {"expert-tensors": {"csf_scales": "gate_up_scale:4096,down_scale:2048"}}}
         fits = self.offload()
-        offloaded = self.offload(tier="ram", misses="auto", margin_mib=0, **csf)
+        offloaded = self.offload(tier="ram", misses="auto", **csf)
         offloaded.open()
         self.assertEqual(offloaded.misses, "link")
         self.assertIn("compressed", offloaded.reasons["misses"])
         x, ids, weights = self.routes(random.Random(11))
         self.assertTrue(torch.equal(bits(offloaded.forward(1, x, ids, weights)), bits(fits.forward(1, x, ids, weights))))
-        refused = self.offload(tier="ram", misses="cpu", margin_mib=0, **csf)
+        refused = self.offload(tier="ram", misses="cpu", **csf)
         with self.assertRaisesRegex(ValueError, "csf_scales"):
             refused.open()
 
     def test_recorded_routes_are_the_decode_routes(self):
-        offloaded = self.offload(tier="ram", misses="link", margin_mib=0, record_routes=16)
+        offloaded = self.offload(tier="ram", misses="link", record_routes=16)
         x, ids, weights = self.routes(random.Random(6), tokens=2)
         offloaded.forward(1, x, ids, weights)
         want = [(1, [e for e in row if e >= 0]) for row in ids.tolist()]
@@ -635,6 +672,15 @@ class GgufOffloadTests(PluginTestCase):
     """Experts as a GGUF checkpoint stores them (format gguf: each layer's formats): every tier gives the bits of every
     expert on the device, prompt chunks the bits of the same routes decoded, all of it the blocks of the stored values
     (Core's decoders) within the int8 activations' rounding."""
+
+    def setUp(self):
+        super().setUp()
+        # The device keeps no headroom here (crit_plugins.memory's, which Core's loader sets from the run): the cache
+        # takes every free byte, so the tests count its slots and set a headroom where one is what they check.
+        from crit_plugins import memory
+        device = memory.of("cuda")
+        self.addCleanup(setattr, device, "headroom", device.headroom)
+        device.headroom = 0
 
     def offload(self, formats=GGUF_FORMATS, **options):
         experts = self.assemble(USE, {"workers": 3, "pin": False, "max_tokens": 16, **options})["experts"]
@@ -674,7 +720,7 @@ class GgufOffloadTests(PluginTestCase):
 
     def test_every_tier_gives_the_device_tiers_bits_and_the_stored_values_block(self):
         fits = self.offload()
-        offloaded = self.offload(tier="ram", misses="link", margin_mib=0)
+        offloaded = self.offload(tier="ram", misses="link")
         offloaded.open()
         self.assertEqual((fits.tier, offloaded.tier, offloaded.misses), ("device", "ram", "link"))
         rng = random.Random(5)
@@ -704,7 +750,7 @@ class GgufOffloadTests(PluginTestCase):
         formats = {layer: ("IQ2_XXS", "Q2_0") for layer in range(19)}
         formats[19] = ("IQ2_S", "Q2_0")
         fits = self.offload(formats)
-        offloaded = self.offload(formats, tier="ram", misses="link", margin_mib=0)
+        offloaded = self.offload(formats, tier="ram", misses="link")
         offloaded.open()
         found = offloaded.bundle_layout
         self.assertEqual(found["bundle_bytes"], found["sizes"][0])
@@ -727,7 +773,7 @@ class GgufOffloadTests(PluginTestCase):
         # kernel's splits): a decode row served from it has the bits of every expert on the device, and a cache too
         # small for a prompt ring beside a layer's experts still serves prompts with every miss on the CPU tier.
         fits = self.offload().open()
-        offloaded = self.offload(tier="ram", misses="cpu", margin_mib=0, settings="")
+        offloaded = self.offload(tier="ram", misses="cpu", settings="")
         offloaded.open()
         self.assertEqual((offloaded.misses, offloaded.dispatch.in_stream), ("cpu", False))
         self.assertEqual(type(offloaded.dispatch.tier).__name__, "GgufCpuTier")

@@ -33,7 +33,7 @@ def content_size(assistant, tool_characters=0, reasoning=""):
     return size
 
 
-def response_content(value, tool_characters=0, *, final=True, continued=False, blank=False):
+def response_content(value, tool_characters=0, *, final=True, continued=False, blank=False, truncated=False):
     """Validate content channels; callers validate complete or partial tool-call semantics.
 
     A completed plain-text reply must contain nonblank text. Reasoning or tools
@@ -41,11 +41,13 @@ def response_content(value, tool_characters=0, *, final=True, continued=False, b
     their eventual completed response still goes through the final check. A reply
     that `continued` the conversation's final message may be empty: that message
     may already have been complete. A raw prompt's continuation (blank,
-    completion-v1) may be empty or whitespace.
+    completion-v1) may be empty or whitespace. So may a reply that ended at its output cap (`truncated`): a
+    model may spend every token it was given on whitespace, as a JSON-mode reply may before its object, and that is
+    the reply, not a fault of the engine.
     """
     assistant = content_text(value["assistant"], "Reply assistant", allow_empty=True)
     reasoning = content_text(value["reasoning"], "Reply reasoning") if "reasoning" in value else ""
     content_size(assistant, tool_characters, reasoning)
-    if not (continued or blank or tool_characters or reasoning or (assistant.strip() if final else assistant)):
+    if not (continued or blank or truncated or tool_characters or reasoning or (assistant.strip() if final else assistant)):
         raise ValueError("Reply requires assistant text, reasoning or tool calls")
     return assistant, reasoning

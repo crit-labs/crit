@@ -317,6 +317,20 @@ class DeviceRecurrenceTests(PluginTestCase):
         both(lambda plugin, pool: pool.close("d"))
         self.assertEqual(backed.backed, 1)
 
+    def test_closing_the_plugin_gives_every_pools_range_back_to_the_device(self):
+        # The Flash-Next build's leak: the device's registry of ranges kept a closed engine's state pools.
+        from crit_plugins import memory
+        if self.device() != "cuda" or not memory.of("cuda").elastic_ranges:
+            self.skipTest("an elastic range is the CUDA driver's")
+        elastic = self.assemble(options={"exact_rows": 64, "elastic": True})["recurrence"]
+        rig = Rig(self.torch, "cuda", *self.shapes()[-1], channels=16, tokens=30, seed=11)
+        ranges = [rig.pool(elastic, widest=2).elastic.range for _ in range(2)]
+        device = memory.of("cuda")
+        self.assertEqual(sum(made in ranges for made in device.ranges.values()), 2)
+        elastic.close()
+        self.assertFalse([key for key, made in device.ranges.items() if made in ranges])
+        self.assertTrue(all(not made.base for made in ranges))
+
     def test_a_prompt_row_through_the_scan_has_the_bits_of_the_serial_decode(self):
         torch = self.torch
         for name, plugin in self.plugins(exact_rows=64):

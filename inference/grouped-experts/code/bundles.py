@@ -18,6 +18,8 @@ is [2 * inter][hidden] with the gate rows first, down is [hidden][inter]. Compon
     int4         as nvfp4, the codes INT4 two's complement nibbles; *_inverse 1 unless a global scale is given
     mxfp4        gate_up uint8 [2I][H / 2] (E2M1); gate_up_scale uint8 [2I][H / 32] (E8M0: 2^(byte - 127), byte 255
                  NaN); down, down_scale
+    mxfp8        gate_up float8_e4m3fn [2I][H]; gate_up_scale uint8 [2I][H / 32] (E8M0, as mxfp4's); down, down_scale
+                 (the grouped experts kernel's format 7)
     int4_zp:G    INT4 with a zero point a group of G inputs (AWQ and GPTQ in crit's rows, the grouped experts kernel's
                  format 6): gate_up uint8 [2I][H / 2] (unsigned codes, element 2k in the low nibble of byte k);
                  gate_up_scale float16 [2I][H / G]; gate_up_inverse uint8 [2I][H / G] (the zero points, 0 to 16);
@@ -35,8 +37,9 @@ int8) or in its own dtype (float8_e4m3fn, float4_e2m1fn_x2, float8_e8m0fnu).
 """
 import math
 
-FORMATS = ("bf16", "fp8:channel", "fp8:block", "nvfp4", "int4", "mxfp4", "int4_zp")   # int4_zp as int4_zp:<group>
-KERNEL_FORMATS = {"bf16": 0, "fp8:channel": 1, "fp8:block": 2, "nvfp4": 3, "int4": 4, "mxfp4": 5, "int4_zp": 6}
+FORMATS = ("bf16", "fp8:channel", "fp8:block", "nvfp4", "int4", "mxfp4", "int4_zp", "mxfp8")   # int4_zp:<group>
+KERNEL_FORMATS = {"bf16": 0, "fp8:channel": 1, "fp8:block": 2, "nvfp4": 3, "int4": 4, "mxfp4": 5, "int4_zp": 6,
+                  "mxfp8": 7}
 STORED_INT4 = ("awq", "gptq")   # checkpoint formats pack() repacks into int4_zp:<group> bundles
 ALIGN = 16
 BLOCK = 128   # fp8:block's scale block
@@ -79,6 +82,9 @@ def _components(format, hidden, inter):
     H, I = hidden, inter
     if format == "bf16":
         return [("gate_up", "bfloat16", (2 * I, H)), ("down", "bfloat16", (H, I))]
+    if format == "mxfp8":
+        return [("gate_up", "float8_e4m3fn", (2 * I, H)), ("gate_up_scale", "uint8", (2 * I, H // 32)),
+                ("down", "float8_e4m3fn", (H, I)), ("down_scale", "uint8", (H, I // 32))]
     if format.startswith("fp8"):
         if format == "fp8:channel":
             gs, ds = (2 * I,), (H,)
@@ -106,7 +112,7 @@ _BYTE_DTYPES = {("fp8", "gate_up"): "float8_e4m3fn", ("fp8", "down"): "float8_e4
                 ("e4m3", "gate_up_scale"): "float8_e4m3fn", ("e4m3", "down_scale"): "float8_e4m3fn",
                 ("e8m0", "gate_up_scale"): "float8_e8m0fnu", ("e8m0", "down_scale"): "float8_e8m0fnu"}
 _KINDS = {"fp8:channel": ("fp8",), "fp8:block": ("fp8",), "nvfp4": ("e2m1", "e4m3"), "int4": ("e4m3",),
-          "mxfp4": ("e2m1", "e8m0")}
+          "mxfp4": ("e2m1", "e8m0"), "mxfp8": ("fp8", "e8m0")}
 _LAYOUTS = {}
 _INTERS = {}
 
@@ -127,18 +133,23 @@ def layout(format, hidden, inter):
     return {**found, "components": dict(found["components"])}
 
 
-ACTIVATIONS = {"silu": 0, "gelu_tanh": 1}   # a block's gate, as the kernel numbers it
+ACTIVATIONS = {"silu": 0, "gelu_tanh": 1, "softcapped_silu": 2}   # a block's gate, as the kernel numbers it
 
 
-def kernel_layout(found, activation="silu"):
+def kernel_layout(found, activation="silu", caps=None):
     """The layout as the grouped experts kernel takes it: [format, bytes, offsets of _KEYS (-1 absent), hidden, inter],
-    an int4_zp group after them, and for a block not gated by SiLU the group (0 for none) and then the activation."""
+    an int4_zp group after them, and for a block not gated by SiLU the group (0 for none) and then the activation;
+    softcapped_silu's two caps after it, each an FP32's bits."""
     components = found["components"]
     base, group = parse_format(found["format"])
     plain = ([KERNEL_FORMATS[base], found["bundle_bytes"]]
              + [components[k][0] if k in components else -1 for k in _KEYS] + [found["hidden"], found["inter"]])
     if activation != "silu":
-        return plain + [group or 0, ACTIVATIONS[activation]]
+        found = plain + [group or 0, ACTIVATIONS[activation]]
+        if activation == "softcapped_silu":
+            import struct
+            found += [struct.unpack("<i", struct.pack("<f", float(cap)))[0] for cap in caps]
+        return found
     return plain + ([group] if group is not None else [])
 
 
@@ -337,6 +348,8 @@ def pack(gate_up, down, format, device=None):
         elif base == "int4_zp":
             put(prefix + "_scale", stored["scale"])
             put(prefix + "_inverse", stored["zeros"])
+        elif format == "mxfp8":
+            put(prefix + "_scale", stored["scale"])
         elif format in ("nvfp4", "int4", "mxfp4"):
             put(prefix + "_scale", stored["scale"])
             if format != "mxfp4":
@@ -427,6 +440,9 @@ def operands(bundles, found):
             q = torch.stack([(w & 15).float(), (w >> 4).float()], -1).reshape(w.shape[0], w.shape[1], -1)
             z = _view(bundles, found, prefix + "_inverse").float().repeat_interleave(group, 2)
             values = (q - z) * _view(bundles, found, prefix + "_scale").float().repeat_interleave(group, 2)
+        elif fmt == "mxfp8":   # E4M3 codes times their exponent a 32: exact in BF16
+            s = _view(bundles, found, prefix + "_scale")
+            values = w.float() * _table(w.device, "e8m0")[s.long()].repeat_interleave(32, 2)
         elif fmt.startswith("fp8"):
             values = w.float()
             s = _view(bundles, found, prefix + "_scale")

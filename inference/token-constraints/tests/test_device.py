@@ -114,10 +114,15 @@ class ConstrainedRoundTests(PluginTestCase):
             rng = random.Random(5)
             g = torch.Generator().manual_seed(5)
 
-            def stage():
-                allowed = sorted(rng.sample(range(VOCABULARY), rng.choice([1, 3, 12])))
-                rules = [{"temperature": rng.choice([0.0, 0.9]), "seed": rng.randrange(1 << 30),
-                          "allowed": Allowed.of(allowed, VOCABULARY)},
+            def stage(rules=None):
+                # Every other trial keeps slot 0's rules and stages only its next mask (stage_mask), as Core does
+                # between two rounds of a constrained request.
+                allowed = Allowed.of(sorted(rng.sample(range(VOCABULARY), rng.choice([1, 3, 12]))), VOCABULARY)
+                if rules is not None:
+                    rules[0] = dict(rules[0], allowed=allowed)
+                    sampler.stage_mask(0, allowed)
+                    return rules
+                rules = [{"temperature": rng.choice([0.0, 0.9]), "seed": rng.randrange(1 << 30), "allowed": allowed},
                          {"temperature": rng.choice([0.0, 1.1]), "seed": rng.randrange(1 << 30)}]
                 for slot, p in enumerate(rules):
                     sampler.stage(slot, p)
@@ -137,7 +142,7 @@ class ConstrainedRoundTests(PluginTestCase):
                 with torch.cuda.graph(graph):
                     out = run()
                 for trial in range(6):
-                    rules = stage()                       # new rules and masks, outside the graph
+                    rules = stage(rules if trial % 2 else None)   # new rules and masks, outside the graph
                     rows = (torch.randn(2, width + 1, VOCABULARY, generator=g) * 2).round(decimals=1)
                     logits.copy_(rows.cuda())
                     view.out_count[:2] = torch.tensor([trial, 3 * trial])

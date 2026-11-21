@@ -32,7 +32,9 @@
 
 namespace crit::techniques::grouped_experts {
 
-enum class Format : int { bf16 = 0, fp8_channel = 1, fp8_block = 2, nvfp4 = 3, int4 = 4, mxfp4 = 5, int4_zp = 6 };
+enum class Format : int { bf16 = 0, fp8_channel = 1, fp8_block = 2, nvfp4 = 3, int4 = 4, mxfp4 = 5, int4_zp = 6,
+                          mxfp8 = 7 };
+// mxfp8: E4M3 codes [rows][K] with one E8M0 exponent byte a 32 of each row, *_scale uint8 [rows][K / 32].
 
 // Byte offsets of a bundle's components (crit's experts:bundles layout); -1 for a component the format lacks. int4_zp
 // (INT4 with a zero point a group: AWQ, GPTQ in crit's rows, decode-gemv's repack_awq / repack_gptq): codes [rows][K /
@@ -47,8 +49,10 @@ struct Layout {
     Format format = Format::bf16;
     int group = 0;                                         // int4_zp: inputs a scale and zero point cover
     // The block's gated product: 0 silu(gate) * up (SwiGLU, crit's declared one), 1 gelu(gate) * up with GELU's tanh
-    // form (the tensor arithmetic only: the declared order's host twin computes SwiGLU).
+    // form, 2 SwiGLU with its linear gate factor and its up capped by a tanh each (gate_cap, up_cap) (1 and 2: the
+    // tensor arithmetic only: the declared order's host twin computes SwiGLU).
     int activation = 0;
+    float gate_cap = 0.0f, up_cap = 0.0f;
 };
 
 // The items of a call: item u is the slot of one expert and `width` of its routes (route = token * top + j, in
@@ -107,5 +111,34 @@ cudaError_t enqueue_declared_intermediate(const float* gate_up, const std::uint8
 // (2 * e2m1) and scales FP32 [rows][cols / 16] (decoded / global).
 cudaError_t enqueue_quantize_e2m1x2(const float* x, int rows, int cols, float global, std::int8_t* values,
                                     float* scales, cudaStream_t stream);
+
+// The FP4 tensor-core arithmetic (mma_experts.cu; nvfp4 bundles, hidden and inter multiples of 128): every route's
+// gate/up inputs quantized once by crit's declared NVFP4 quantizer at its expert's input scale, as E2M1 codes
+// [routes][hidden / 2] (two a byte, low nibble first) and UE4M3 block scales [routes][hidden / 16]; the gate/up and
+// down rows on mma.sync kind::mxf4nvf4 with the weights' own codes and scales, one MMA chain an output over K in
+// order, so decode items and prompt items give a route the same bits; the intermediate quantized the same way at the
+// down's input scale (h codes [routes][inter / 2], scales [routes][inter / 16]). fp4_available: whether this build's
+// code for the current device has the MMA (the sm_120 family's specific targets).
+bool fp4_available(cudaStream_t stream);
+cudaError_t enqueue_fp4_inputs(const __nv_bfloat16* x, int top, const std::uint8_t* store, const Layout& layout,
+                               const Items& items, std::uint8_t* codes, std::uint8_t* scales, cudaStream_t stream);
+cudaError_t enqueue_fp4_gate_up(const std::uint8_t* codes, const std::uint8_t* scales, const std::uint8_t* store,
+                                const Layout& layout, const Items& items, std::uint8_t* h_codes,
+                                std::uint8_t* h_scales, cudaStream_t stream, int tokens = 0);
+cudaError_t enqueue_fp4_down(const std::uint8_t* h_codes, const std::uint8_t* h_scales, const std::uint8_t* store,
+                             const Layout& layout, const Items& items, float* y, cudaStream_t stream, int tokens = 0);
+// The FP8 tensor-core arithmetic (mma_experts.cu; fp8:channel and fp8:block bundles, hidden and inter multiples of
+// 128, sm_89 on), W8A8: rows of K values BF16 (route r reads row r / div) quantized by crit's declared group
+// quantizer, each 128 values in E4M3 at amax / 448: codes [routes][K], FP32 scales [routes][K / 128]; the gate/up and
+// down rows on the E4M3 MMA, one block sum a 128-k block folded with fmaf by the two scales in block order, so decode
+// and prompt items give a route the same bits; h [routes][inter] BF16 between the passes (quantized like the inputs).
+bool fp8_available(cudaStream_t stream);
+cudaError_t enqueue_fp8_inputs(const __nv_bfloat16* rows, int div, int K, const Items& items, std::uint8_t* codes,
+                               float* scales, cudaStream_t stream);
+cudaError_t enqueue_fp8_gate_up(const std::uint8_t* codes, const float* scales, const std::uint8_t* store,
+                                const Layout& layout, const Items& items, __nv_bfloat16* h, cudaStream_t stream,
+                                int tokens = 0);
+cudaError_t enqueue_fp8_down(const std::uint8_t* h_codes, const float* h_scales, const std::uint8_t* store,
+                             const Layout& layout, const Items& items, float* y, cudaStream_t stream, int tokens = 0);
 
 }  // namespace crit::techniques::grouped_experts

@@ -61,6 +61,17 @@ and which matrices to stack are the model plugin's: this plugin multiplies rows 
   thousands (gguf-rows' README gives the numbers).
 - **Fallback**: where gguf-rows cannot be built, and on a CPU device, the stored values decoded on the host at load
   (Core's exact decoders) run as a BF16 matrix through torch (FP32 sums), one row a call for decode rows.
+- **Dense matrices** (the file's F32, F16 and BF16 matrices loaded as `bf16`: routers, small gates, indexers, n-gram
+  maps; and the fallback's decoded ones) follow `prompt` too. With `dequantize`, decode rows one row a call through
+  torch (`row-exact`) and prompt rows cuBLAS's GEMM (`repeatable`). With `exact`, every row has its decode row's bits
+  (`exact`, what preserve mode asks): on crit's kernel
+  [mma-rows](../../kernels/techniques/projections/mma-rows/README.md) where it builds and K is a multiple of 32, decode
+  rows on its BF16 decode tile and prompt rows on its prompt tile with the decode tile's bits (the pair
+  quantized-projections' `prompt_gemm` tile runs for a safetensors checkpoint's BF16 matrices), both at the K splits
+  mma-rows' plan gives the matrix (cut where a decode call's partial sums would pass 16 MiB); else, and on a CPU
+  device, prompt rows one row a call like decode rows (slower). The facts' `dense_paths` say which: `tile`, `rows` or
+  `torch`. On an RTX 5090 a decode row of the Flash-Next GGUF's dense shapes takes 2.8-10.8 us on the tile at the
+  plan's splits, against 3.4-21.1 us through torch; one split of K ran a 4 x 10240 row in 25.5 us.
 
 ## Host form
 
@@ -72,4 +83,10 @@ and which matrices to stack are the model plugin's: this plugin multiplies rows 
 `tests/test_plugin.py` on an RTX 5090: every format loaded from seeded stored rows; decode rows equal gguf-rows'
 gemv bit for bit and a row alone equals it among others; dequantize-path prompt rows equal cuBLAS on the stored values
 in BF16; exact prompt rows have the decode rows' bits; an expert stack's rows equal the plain call on their expert;
-the fallback runs the host-decoded values; dense tensors and refusals.
+the fallback runs the host-decoded values; dense tensors and refusals. On the CPU (`DenseRowTests`): a GGUF file's
+F32, F16 and BF16 matrices loaded under preserve mode's exactness keep every row's bits in prompt chunks of any
+length, decode calls of one or three rows and `prompt=True` calls, the plugin states `exact` prompt rows (Core's
+loader takes it; with `dequantize` it states `repeatable` and is refused), and the tile path's calls reach mma-rows'
+`mm_rows` and `mm_prompt` at the plan's K splits (fewer where the partial sums would pass 16 MiB). model-template's
+`GgufDenseDecoderTests` loads a GGUF engine with F32 matrices in preserve mode. On CUDA (RTX 5090) the same tests run
+the tile path: every row's bits the same in prompt chunks and decode calls.

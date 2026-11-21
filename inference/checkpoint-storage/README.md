@@ -224,8 +224,8 @@ A device retained-state tier is additional engine work: keep a chosen source
 leased through restore, charge shared storage once per physical owner, and compare
 restore and spill costs with avoided computation and with the best cheaper-tier
 prefix rather than taking the longest prefix. [Attention state](../attention-state/README.md)
-supplies a logical commit boundary and [session scheduling](../session-scheduling/README.md)
-the matching input cursor; a checkpoint must describe the same committed prefix in both.
+supplies a logical commit boundary and Core's [runtime](../../core/src/runtime/README.md) the matching prompt
+progress; a checkpoint must describe the same committed prefix in both.
 
 ## Costs and validation
 

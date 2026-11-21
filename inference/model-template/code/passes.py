@@ -104,7 +104,8 @@ class States:
             self.kept[chunk] = tuple(state)
             return
         first, size = self.bases[chunk]
-        region, at, found = self.paged.tensor[first:first + size], 0, []
+        region, at, found, moves = self.paged.tensor[first:first + size], 0, [], []
+        low, high = region.data_ptr(), region.data_ptr() + size
         for tensor in state:
             if tensor is None:
                 found.append(None)
@@ -115,9 +116,14 @@ class States:
                 return
             view = region[at:at + nbytes].view(tensor.dtype).view(tensor.shape)
             if tensor.data_ptr() != view.data_ptr():
-                view.copy_(tensor)
+                # A tensor already in the range elsewhere (the state's tensors moved: one grew, or the residual
+                # keeps a tensor of an earlier layer's state) is read before any is written: no write overlaps it.
+                inside = low <= tensor.data_ptr() < high
+                moves.append((view, tensor.clone() if inside else tensor))
             found.append(view)
             at = -(-(at + nbytes) // ALIGN) * ALIGN
+        for view, tensor in moves:
+            view.copy_(tensor)
         self.kept[chunk] = tuple(found)
 
     def get(self, chunk):

@@ -1,0 +1,26 @@
+{
+  "kind": "crit-technique-operations",
+  "technique": "heterogeneous-expert-dispatch",
+  "operations": [
+    {
+      "id": "expert-routing",
+      "what": "top-k expert selection of a mixture-of-experts router's logits: softmax or sigmoid scores before or after the selection, a per-expert correction bias that changes the selection only, ties to the larger value then the lower expert id (a NaN below every number), the picked weights renormalized (divided by max(sum + epsilon, floor)) and scaled",
+      "reference": {
+        "path": "inference/heterogeneous-expert-dispatch/code/routing.py",
+        "symbol": "Routing, route"
+      },
+      "verify": "on the target, route the same rows with the kernel and with route: the ids equal (selection order), the weights within FP32 rounding of route's (2e-6)",
+      "invariance": "a row's picks and weights independent of the other rows; the same bits on a repeat"
+    },
+    {
+      "id": "cpu-route-handoff",
+      "what": "a routed layer's CPU share inside a CUDA stream: the routes the slot table sends to the CPU tier (slot -2) listed in route order with their expert keys, their tokens in first-use order and those tokens' rows (BF16-rounded FP32) written into a handoff slot's payload and posted (or the slot answered itself when there is none); after the join the CPU's rows copied into the device part's route rows, NaN rows where the CPU failed",
+      "reference": {
+        "path": "inference/heterogeneous-expert-dispatch/code/device_dispatch.py",
+        "symbol": "DeviceDispatch (the host path: ext None)"
+      },
+      "verify": "on the target, run the same layers with the in-stream kernels and with the host path: the same CPU routes, payloads and combined rows bit for bit, eager and in captured rounds, and NaN rows with the failed status where the CPU fails (tests/test_device.py)",
+      "invariance": "a route's listing and its row depend on the step's routes in route order only, not on the launch"
+    }
+  ]
+}

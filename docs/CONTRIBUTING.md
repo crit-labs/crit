@@ -59,7 +59,8 @@ python -B -m unittest discover -s tests -v
 
 `-e core/python` matters: crit's version pin on `crit-core` is met by the release on PyPI too, and a checkout's CLI
 on a released Core fails in confusing ways, so crit refuses to run that way. `crit core build` builds Core's runtime,
-`crit_core_steps`, into `build/core-steps`, where Core's loader finds it (`CRIT_CORE_STEP_LIBRARY` names another).
+`crit_core_steps`, into `build/core-steps/<sys.platform>` (`win32`, `linux`, ...), where Core's loader finds it
+(`CRIT_CORE_STEP_LIBRARY` names another).
 `python -B tests/run_parallel.py` runs the same tests as CI does, several processes at once: one a module, or one
 a test class where [tests/durations.json](../tests/durations.json) splits a module. `--shard I/N` runs one of CI's
 shards, filled by those recorded times.
@@ -108,7 +109,7 @@ and installs the wheel from a clean snapshot:
 mkdir -p build/package-source
 git archive HEAD | tar -x -C build/package-source
 python -B -c "import os; from setuptools.build_meta import build_sdist, build_wheel; os.chdir('build/package-source'); build_sdist('../dist'); build_wheel('../dist')"
-python -m pip install build/dist/crit-0.21.0-py3-none-any.whl
+python -m pip install build/dist/crit-0.22.0-py3-none-any.whl
 ```
 
 The `crit` wheel holds `crit`, `crit_api`, `crit_kernels`, `crit_mcp`, `crit_models` and `crit_smoke`, and

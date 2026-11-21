@@ -1,6 +1,6 @@
 """Core's captured prompt chunks (crit_plugins.prompt_graphs): a sequence's prompt chunk runs in the smallest captured
 bucket that holds it, padded, and gives exactly the eager prompt path's output and leaves exactly its state (the
-padding changes none); the graphs slot's plugin chooses between the eager path and the buckets; a selection whose
+padding changes none), the bucket chosen by the chunk's length alone; a selection whose
 plugins lack prompts:<slot>, or give a reason of their own, runs every chunk eagerly; the captures' memory is planned
 through the placement plugin."""
 from pathlib import Path
@@ -106,7 +106,7 @@ class Parts:
         return self.objects.get(slot, default)
 
 
-USE = {"model": "toy-model", "placement": "toy-placement", "graphs": "toy-graphs", "sampler": "toy-sampler",
+USE = {"model": "toy-model", "placement": "toy-placement", "sampler": "toy-sampler",
        "kv_cache": "toy-kv", "attention": "toy-attention", "projections": "toy-projections"}
 FACTS = {"toy-kv": ["prompts:kv_cache"], "toy-attention": ["prompts:attention"],
          "toy-projections": ["prompts:projections"]}
@@ -196,9 +196,6 @@ class PromptGraphTests(unittest.TestCase):
         self.assertEqual((counts["graph_chunks"], counts["eager_chunks"], counts["tokens"]), (6, 1, 5 + 23 + 58 + 64))
         self.assertEqual(sum(p["prompts:captures"] for p in plans), prompts.captured_bytes)
         self.assertGreater(prompts.captured_bytes, 0)
-        for bucket in (16, 64):
-            self.assertGreater(prompts.costs[bucket]["eager_ns"], 0)
-            self.assertGreater(prompts.costs[bucket]["graph_ns"], 0)
 
     @unittest.skipIf(not CUDA, "no CUDA device")
     def test_buckets_capture_into_the_engines_pool_where_their_parts_carry_one(self):
@@ -218,60 +215,12 @@ class PromptGraphTests(unittest.TestCase):
         self.assertNotIn(tuple(engine.graphs), pools)
 
     @unittest.skipIf(not CUDA, "no CUDA device")
-    def test_the_offers_carry_the_buckets_steady_replay_times(self):
-        import statistics
-        import time
+    def test_a_chunk_runs_in_the_smallest_captured_bucket_that_holds_it(self):
         prompts = self.build("cuda", buckets=(16, 64))
         prompts.prepare()
-        for bucket in (16, 64):
-            graph, _ = prompts.graphs[bucket]
-            for _ in range(20):
-                graph.replay()
-            torch.cuda.synchronize()
-            steady = []
-            for _ in range(60):
-                started = time.perf_counter_ns()
-                graph.replay()
-                torch.cuda.synchronize()
-                steady.append(time.perf_counter_ns() - started)
-            steady = statistics.median(steady)
-            offered = prompts.costs[bucket]["graph_ns"]
-            self.assertTrue(steady / 2.5 <= offered <= steady * 2.5, (bucket, offered, steady))
-
-    @unittest.skipIf(not CUDA, "no CUDA device")
-    def test_the_graphs_plugin_chooses_between_the_eager_path_and_a_padded_bucket(self):
-        seen = []
-
-        class Eager:   # eager-graphs: the eager offer of the exact shape
-            def choose(self, shape, offers, free_bytes, uses=1):
-                seen.append((shape, [o["name"] for o in offers]))
-                return next(o["name"] for o in offers if o["mode"] == "eager")
-
-        class Fastest:   # padding allowed: the least measured run time
-            def choose(self, shape, offers, free_bytes, uses=1):
-                return min(offers, key=lambda o: o["run_ns"])["name"]
-        prompts = self.build("cuda", buckets=(16, 64), parts=Parts(USE, FACTS, {"graphs": Eager()}))
-        prompts.prepare()
-        self.assertIsNone(prompts.run(0, 0, [1] * 10))
-        shape, names = seen[0]
-        self.assertEqual(shape, {"phase": "prefill", "tokens": 10, "rows": 1, "identity": ("prompt-graphs",)})
-        self.assertEqual(names, ["eager", "graph:16", "graph:64"])
-        self.assertEqual([o["shape"]["tokens"] for o in prompts.offers(20)[1]], [20, 64])
-        self.assertEqual([o["bits"] for o in prompts.offers(16)[1]], ["eager", "padded:16", "padded:64"])
-        prompts = self.build("cuda", buckets=(16, 64), parts=Parts(USE, FACTS, {"graphs": Fastest()}))
-        prompts.capture(64)
-        self.assertIsNotNone(prompts.run(0, 0, [1] * 10), "a replay beats the toy's eager loop")
-        # The choice is asked once per chunk size while the offers stay as they are, and again after a capture.
-        asked = []
-        prompts._chooser = type("Counting", (), {"choose": lambda self, *a, **k: asked.append(a[0]["tokens"]) or
-                                                 Fastest().choose(*a, **k)})()
-        prompts._chosen.clear()
-        for frontier in (10, 20):
-            prompts.run(0, frontier, [1] * 10)
-        self.assertEqual(asked, [10])
-        prompts.capture(16)
-        self.assertEqual(prompts.choose(10), 16)
-        self.assertEqual(asked, [10, 10])
+        self.assertEqual([prompts.choose(n) for n in (1, 10, 16, 17, 64, 65)], [16, 16, 16, 64, 64, None])
+        self.assertIsNotNone(prompts.run(0, 0, [1] * 10))
+        self.assertIsNone(prompts.run(1, 0, [1] * 70))   # past every bucket: the eager path
 
 
 if __name__ == "__main__":

@@ -551,7 +551,12 @@ def summaries(root, run):
     linked = links(root)
     return [{"plan_id": plan["plan_id"], "segment_id": plan["segment_id"], "parent_candidate_id": plan["parent_candidate_id"],
              "decision": plan["decision"], "supersedes": plan.get("supersedes"), "superseded_by": replaced.get(plan["plan_id"]),
-             "candidate_id": linked.get(plan["plan_id"])} for plan in plans]
+             "candidate_id": linked.get(plan["plan_id"]), "retroactive": plan.get("retroactive", False)} for plan in plans]
+
+
+def retroactive(root, run):
+    """The run's retroactive plans' ids: recorded after the change they plan was measured in the work tree."""
+    return [summary["plan_id"] for summary in summaries(root, run) if summary["retroactive"]]
 
 
 FIELDS = {"parent_candidate_id", "decision", "needed", "gaps", "strategy", "levers", "rejected", "forecast", "gates"}
@@ -559,7 +564,7 @@ CRIT_FIELDS = {"plan_id", "segment_id", "created_at", "request_sha256", "inputs"
 
 
 OPTIONAL = {"supersedes", "estimated_limits", "forecast_justification", "weakest", "review", "prompt_activations",
-            "round", "engine"}
+            "round", "engine", "kv_bytes_per_token", "retroactive"}
 # A plan for an external engine (crit.run.external) says so: its candidate declares configuration.engine, and its rungs
 # name levers by technique or kernel taken into the engine's own code, not by plugin.
 EXTERNAL = "external"
@@ -665,6 +670,14 @@ def objective(number, last=False, origin=False, external=False):
 def _fields(data):
     """Fields, types and text limits; unknown keys are refused."""
     keys(data, FIELDS, OPTIONAL)
+    if "retroactive" in data:
+        # A plan recorded after its change was measured in the work tree says so; one recorded first leaves it out.
+        if data["retroactive"] is not True:
+            raise ValueError("retroactive is true for a plan recorded after its change was measured in the work tree; "
+                             "a plan recorded before any code leaves it out")
+        if data["decision"] == "stop":
+            raise ValueError("retroactive marks a build plan recorded after its change was measured; a stop plan "
+                             "plans no change, so it leaves it out")
     if "engine" in data and data["engine"] != EXTERNAL:
         raise ValueError(f'engine is "{EXTERNAL}" for an external engine started from its launch command; a plan for a '
                          "plugin package leaves it out")
@@ -674,6 +687,12 @@ def _fields(data):
             raise ValueError("prompt_activations is what the planned engine declares to Eval: one of bf16, fp16_acc, fp8 "
                              "or stored for every quantized format, or per stored format (fp8, nvfp4) one of them or "
                              "{activation: share}")
+    if "kv_bytes_per_token" in data:
+        value = data["kv_bytes_per_token"]
+        if type(value) is not int or value <= 0:
+            raise ValueError("kv_bytes_per_token is the device bytes one more token of context takes in the planned "
+                             "engine's KV pools, as its plugins resolve them before a load (crit plugins resolve; the "
+                             "engine facts' kv_bytes_per_token once it loads): a positive integer")
     if "forecast_justification" in data:
         text(data["forecast_justification"], "forecast_justification", 8000)
     if "review" in data:
@@ -1069,8 +1088,15 @@ def build(root, run, bounds, data, status_for=None):
             raise ValueError(f"{parent} is not on the candidate ladder yet: run its Eval (crit run ... eval), or, "
                              "below the full Eval, seal it built (crit run ... seal --lifecycle built) once crit run "
                              "... serve --check passes, before planning from it (crit run ... next says which)")
+        # With the rung unreachable no candidate gets an Eval, so the lineage follows the builds: the newest
+        # candidate on the ladder is the parent, and it freezes no Eval.
+        blocked = ladder.unreachable(root)
+        if blocked is not None and parent != max(counted):
+            raise ValueError(f"The run records {ladder.state_text(blocked)}: a plan starts from the newest candidate on "
+                             f"the ladder, {max(counted)}, not {parent}")
         found = completed_evals(root, parent)
-        if not found and (parent in evaluated_candidates(root) or ladder.scope_of(root, parent) == "full"):
+        if not found and blocked is None and (parent in evaluated_candidates(root)
+                                              or ladder.scope_of(root, parent) == "full"):
             raise ValueError(f"{parent} has no completed Eval attempt: run crit run ... eval --candidate {parent} "
                              "(--resume goes on from a stopped one) before planning from it")
         # The newest attempt that measured decode and prefill, so a partial rerun (quality alone) leaves the attempt
@@ -1543,10 +1569,10 @@ def _bf16_formats(declared):
 def activations_served(planned, served):
     """Whether an engine that declares prompt activations `served` (its facts' prompt_activations, per stored
     format) serves what a plan declared (`planned`, its prompt_activations: one activation for every quantized
-    format, or one per format)."""
-    if isinstance(planned, str) and isinstance(served, dict):
-        planned = {name: planned for name in served}
-    return served == planned
+    format, or one per format): Core's comparison (crit_core.serving.activations_served, which its loader holds an
+    engine to), with an engine that declares none not serving a plan that declared some."""
+    from crit_core.serving import activations_served as as_asked
+    return served is not None and as_asked(planned, served)
 
 
 def _check_activations(plan):
@@ -1966,6 +1992,38 @@ def check_engine(plan, configuration):
                          'package: record a plan with engine "external"')
 
 
+KV_TOLERANCE = 0.01   # a plan's kv_bytes_per_token against the engine's, as serve --check's plan_kv holds it
+
+
+def check_kv(plan, package, model, configuration, context_tokens=None, device_file=None):
+    """The KV a plan budgets the device by (its kv_bytes_per_token) against what the candidate's engine will take,
+    answered before any load by its plugins (their resolve(): crit plugins resolve), at the context its serve checks
+    load it at: a plan whose figure is not its engine's (by more than KV_TOLERANCE) is refused as the candidate is
+    created, before an engine is built on it. Returns the engine's figure, or None where the plan states none or no
+    plugin resolves it (then the first serve check holds the engine to the plan: plan_kv)."""
+    from .external import spec_of
+    planned = plan.get("kv_bytes_per_token")
+    if planned is None or spec_of(configuration) is not None:   # an external engine has no plugins to ask
+        return None
+    from crit_core.engine import resolve_package
+    probe = read_json(Path(device_file)) if device_file and Path(device_file).is_file() else None
+    try:
+        found = resolve_package(package, model, configuration, context_tokens=context_tokens, probe=probe)
+    except Exception as error:   # noqa: BLE001 - a plugin's own refusal (an option the checkpoint cannot serve), said
+        raise ValueError(f"{plan['plan_id']} budgets {planned:,} KV bytes a token, and the candidate's plugins do not "
+                         f"say what their engine takes before a load: {type(error).__name__}: {error} (crit plugins "
+                         "resolve shows their answer)") from error
+    resolved = found["facts"].get("kv_bytes_per_token")
+    if resolved is None:
+        return None
+    if abs(int(resolved) - int(planned)) > KV_TOLERANCE * int(resolved):
+        raise ValueError(f"{plan['plan_id']} budgets {planned:,} KV bytes a token, and the candidate's engine takes "
+                         f"{int(resolved):,} ({found['by']['kv_bytes_per_token']}'s answer before a load, at "
+                         f"{context_tokens or 'its own'} tokens of context: crit plugins resolve). Record a plan "
+                         "budgeted from that figure, or set the KV options that take what the plan budgets")
+    return int(resolved)
+
+
 def check_link(root, run, plan_id, parent):
     """A proposal's plan: it exists, is the newest of its chain, builds, is unlinked and starts from the same parent.
     A plan whose candidate never reached the candidate ladder (a draft, sealed with what stopped it) links again: the
@@ -2078,7 +2136,9 @@ def outcome(run, plan, candidate_id, attempt_id, eval_ref, status, fates=None):
                "fate": (fates or {}).get(lever["id"])} for lever in plan["levers"]]
     return record("plan_outcome", run["run_id"], plan_id=plan["plan_id"], candidate_id=candidate_id, attempt_id=attempt_id,
                   recorded_at=now(), plan_sha256=digest(plan), eval=eval_ref, kpis=kpis, estimates=estimates, flags=flags,
-                  requirements=requirements, levers=levers, forecast_on_p2=priority_flag(plan), alternative=alternative)
+                  requirements=requirements, levers=levers, forecast_on_p2=priority_flag(plan), alternative=alternative,
+                  # A retroactive plan forecast a change already measured: its errors say nothing of the planning.
+                  retroactive=plan.get("retroactive", False))
 
 
 TODO = "TODO"

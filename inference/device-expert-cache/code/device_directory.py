@@ -2,15 +2,20 @@
 admitting misses), the plan of a prompt chunk (misses into ring slots, never admitting), the fill of a plan's copies,
 and the host-driven changes (slots made unavailable or available again, preload, background swaps).
 
-The rule is device_cache.LayerDirectory's, bit for bit. Plans and fills run directory_ops.cu (built at load,
-native.py) and otherwise the torch ops below: fixed shapes, no host synchronization in plan and prompt plans
+The rule is device_cache.LayerDirectory's, bit for bit. Plans and fills run crit's kernel expert-directory (built for
+the device, native.py) and otherwise the torch ops below: fixed shapes, no host synchronization in plan and prompt plans
 (capture-safe), the clock's victims by cumulative sums over the slots in scan order. A torch fill under capture copies
 the plan's most possible copies (the rest into the scratch slot); outside capture it reads the copy count and copies
 only those. The host-driven changes are torch ops either way.
 
 Recent residency (plan(recent=...), expert_cache._Recent): a plan sends every miss to the CPU tier and gives it the
 next slot of the round's victim list that is still open and was not routed this round; the slot and the key are
-reserved (-2) until the round after maps the copy, the (key, slot) copies appended to the round's pending list.
+reserved (-2) until the round after maps the copy, the (key, slot) copies appended to the round's pending list. A
+link layer's plan (plan(link=True): experts the CPU tier does not compute) admits every miss now: the round's
+victims from the list's end down (state [4]), mapped at once, stamped with the round and copied by the plan's copies
+before the layer reads them. Its reserve (state [5], the list's last victims) is the link layers' alone: the CPU
+tier's copies take the victims below it, and a link plan goes below it only where the round's other plans stamped
+reserve slots, down to the CPU tier's next victim; a miss without one is lost (failure bit 2).
 
 Tensors (int32 unless said): key_slot [keys + 1] (slot, -1 none, -2 its copy under way; the last entry a dummy),
 slot_key [slots + 1] (key, -1 empty, -2 reserved by a swap or a copy under way, -3 unavailable), slot_ref uint8
@@ -122,18 +127,22 @@ class DeviceDirectory:
         self.kernel = _kernel(self.device) if kernel and self.device.type == "cuda" else None
 
     # -- the plans ---------------------------------------------------------------------------------------------------
-    def plan(self, layer, ids, top, rows=None, row_counters=None, ring=None, recent=None):
+    def plan(self, layer, ids, top, rows=None, row_counters=None, ring=None, recent=None, link=False):
         """Plans layer `layer` over ids ([tokens][top] or flat, int64 or int32, on the device): the slot table goes to
         tables[layer], the copies to copies[layer] and their count to copy_count[layer]. ring (an int32 device tensor
         of ring slots) makes it a prompt plan. rows ([tokens] int64) and row_counters ([rows][2] int64) add each row's
         reads and hits. recent ((victims, state, pending, range) int32 device tensors: expert_cache._Recent) plans by
-        recent residency: the plan's copies go to pending and their range of it to range ([2]: first, count)."""
+        recent residency: the plan's copies go to pending and their range of it to range ([2]: first, count); with link
+        (a layer whose experts the CPU tier does not compute) its misses are admitted now from the round's reserve and
+        their copies go to copies[layer] as a clock plan's."""
         if not 0 <= layer < self.layers:
             raise ValueError(f"layer {layer} outside the directory's {self.layers}")
         flat = ids.reshape(-1)
         quota = self.quota_for(flat.numel() // int(top))
         if ring is not None:
-            recent = None
+            recent, link = None, False
+        if link and recent is None:
+            raise ValueError("a link layer's plan is a recent residency's (recent=)")
         if self.kernel is not None:
             none = self._empty_i32
             victims, state, pending, span = recent if recent is not None else (none, none, none, none)
@@ -144,10 +153,13 @@ class DeviceDirectory:
                              self._empty_i64 if row_counters is None else row_counters,
                              self._empty_i32 if ring is None else ring,
                              self.tables[layer], self.copies[layer], self.copy_count[layer:layer + 1],
-                             self.slot_last if recent is not None else none, victims, state, pending, span)
+                             self.slot_last if recent is not None else none, victims, state, pending, span,
+                             bool(link))
             return
         if ring is not None:
             self._prompt_torch(layer, flat.long(), ring)
+        elif recent is not None and link:
+            self._link_torch(layer, flat.long(), int(top), rows, row_counters, *recent)
         elif recent is not None:
             self._recent_torch(layer, flat.long(), int(top), rows, row_counters, *recent)
         else:
@@ -255,7 +267,8 @@ class DeviceDirectory:
         rank[order] = torch.cumsum(new[order].long(), 0) - 1
         R = victims.numel() - 1
         v = victims[:R].long()
-        usable = (torch.arange(R, device=self.device) < state[2]) & (self.slot_key[v] >= EMPTY) & \
+        floor = state[2] - torch.minimum(state[5], state[2])   # the victims from here on are the link layers'
+        usable = (torch.arange(R, device=self.device) < floor) & (self.slot_key[v] >= EMPTY) & \
             (self.slot_last[v] != now)
         ranked = torch.full((R + 1,), S, dtype=torch.int64, device=self.device)
         ranked.scatter_(0, torch.where(usable, torch.cumsum(usable.long(), 0) - 1, R), v)
@@ -275,6 +288,58 @@ class DeviceDirectory:
         self.tables[layer].copy_(torch.where(hit, slot_of, torch.where(miss, CPU, NOT_ROUTED)))
         self.copy_count[layer:layer + 1].zero_()
         self.counters[0:4].add_(torch.stack([routed.sum(), hit.sum(), got, miss.sum()]))
+        if rows is not None and row_counters is not None:
+            self._row_counts(flat, valid, hit, top, rows, row_counters)
+
+    def _link_torch(self, layer, flat, top, rows, row_counters, victims, state, pending, span):
+        """A link layer's recent plan in torch ops (the kernel's rule): its misses, in route order, take the round's
+        victims still open and not routed this round from the list's end (state [4]) down to the CPU tier's next
+        victim (state [1]; the reserve above the floor is theirs alone), mapped and stamped now; their copies go to
+        copies[layer]."""
+        torch = self.torch
+        E, S, K, n = self.experts, self.slots, self.keys, flat.numel()
+        first, valid = self._first(flat)
+        routed = first < n
+        keys = layer * E + self._ar_e
+        slot_of = self.key_slot[keys].long()
+        hit = routed & (slot_of >= 0)
+        miss = routed & ~hit
+        now = state[0]
+        self.slot_last.index_copy_(0, torch.where(hit, slot_of, S), now.expand(E).contiguous())
+        self.slot_last[S:].fill_(NEVER)
+        if self.route_counts.numel():
+            self.route_counts.index_add_(0, torch.where(routed, keys, K), routed.long())
+        order = torch.argsort(torch.where(miss, first, n), stable=True)
+        rank = torch.empty_like(order)
+        rank[order] = torch.cumsum(miss[order].long(), 0) - 1
+        R = victims.numel() - 1
+        at = torch.arange(R, device=self.device)
+        v = victims[:R].long()
+        usable = (at >= state[1]) & (at < state[4]) & (self.slot_key[v] >= EMPTY) & (self.slot_last[v] != now)
+        # the usable victims' positions from the list's end down, highest first
+        place = (-torch.sort(torch.where(usable, -at, 1), stable=True).values).clamp(min=0)
+        count = usable.sum()
+        ok = miss & (rank < count)
+        victim = torch.where(ok, v[place[rank.clamp(0, R - 1)]], S)
+        misses, got = miss.sum(), ok.sum()
+        # where the scan stopped: at the last miss's victim, or at the CPU tier's next victim once a miss found none
+        last = place[(got - 1).clamp(min=0)]
+        state[4:5].copy_(torch.where(got < misses, state[1].long(), torch.where(got > 0, last, state[4].long()))
+                         .int().view(1))
+        old = self.slot_key[victim].long()
+        self.key_slot.index_fill_(0, torch.where(ok & (old >= 0), old, K), EMPTY)
+        self.slot_key.index_copy_(0, victim, torch.where(ok, keys, EMPTY).int())
+        self.key_slot.index_copy_(0, torch.where(ok, keys, K), victim.int())
+        self.slot_last.index_copy_(0, victim, now.expand(E).contiguous())
+        self.key_slot[K:].fill_(EMPTY)
+        self.slot_key[S:].fill_(EMPTY)
+        self.slot_last[S:].fill_(NEVER)
+        self.tables[layer].copy_(torch.where(hit, slot_of, torch.where(ok, victim, torch.where(miss, CPU, NOT_ROUTED))))
+        self.copies[layer].index_copy_(0, torch.where(ok, rank, E), torch.stack([keys, victim], 1).int())
+        self.copy_count[layer:layer + 1].copy_(got.int().view(1))
+        span.copy_(torch.stack([state[3].long(), torch.zeros_like(got)]).int())
+        self.state[2:3].bitwise_or_(((got < misses).int() * 2).view(1))
+        self.counters[0:4].add_(torch.stack([routed.sum(), hit.sum(), got, misses - got]))
         if rows is not None and row_counters is not None:
             self._row_counts(flat, valid, hit, top, rows, row_counters)
 

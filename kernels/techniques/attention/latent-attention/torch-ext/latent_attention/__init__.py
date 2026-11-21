@@ -142,13 +142,66 @@ def prefill(q, cache, table, position, page, *, rank, scale=None, out: Optional[
     dummy = out if lse is None else lse
     grid = (triton.cdiv(T * H, bm) * vsplit,)
     _kernels._prompt_kernel[grid](q, codes, scales if fp8 else dummy, table, position if on_device else table, out,
-                                  lse if lse is not None else dummy, sinks if sinks is not None else dummy, T,
-                                  0 if on_device else int(position), q.stride(0), q.stride(1), out.stride(0),
-                                  out.stride(1), float(scale if scale is not None else width ** -0.5), H=H, R=R, P=P,
+                                  lse if lse is not None else dummy, sinks if sinks is not None else dummy, table,
+                                  table, T, 0 if on_device else int(position), q.stride(0), q.stride(1), out.stride(0),
+                                  out.stride(1), 0, float(scale if scale is not None else width ** -0.5), H=H, R=R, P=P,
                                   BLOCK_M=bm, PIECE=int(knobs["PIECE"]), PAGE=page, VSPLIT=vsplit, FP8=fp8,
                                   HW_FP8=_hardware_fp8(device), SCALES=int(scales.shape[-1]) if fp8 else 2,
-                                  POS_T=on_device, LSE=lse is not None, SINKS=sinks is not None,
+                                  POS_T=on_device, LSE=lse is not None, SINKS=sinks is not None, RAGGED=False,
                                   num_warps=int(knobs["WARPS"]), num_stages=int(knobs["STAGES"]))
+    return out
+
+
+_ragged_plans = {}   # (device, BLOCK_M, heads, starts, counts, positions) -> (tile map, metadata)
+
+
+def _ragged_plan(device, block_m, heads, starts, counts, positions):
+    """The tile map ([tiles][2] int32: the sequence, its tile) and metadata ([sequences][3] int64: first token, tokens,
+    first position) of a ragged prompt launch, made once a set of rows (every layer of a step takes the same) and kept
+    for the last 64 sets."""
+    key = (str(device), int(block_m), int(heads), tuple(starts), tuple(counts), tuple(positions))
+    found = _ragged_plans.get(key)
+    if found is None:
+        tiles = [(r, m) for r, n in enumerate(counts) for m in range(triton.cdiv(int(n) * heads, block_m))]
+        meta = torch.tensor([[s, n, p] for s, n, p in zip(starts, counts, positions)], dtype=torch.int64)
+        found = (torch.tensor(tiles, dtype=torch.int32).to(device, non_blocking=True),
+                 meta.to(device, non_blocking=True))
+        if len(_ragged_plans) >= 64:
+            _ragged_plans.pop(next(iter(_ragged_plans)))
+        _ragged_plans[key] = found
+    return found
+
+
+def prefill_rows(q, cache, tables, starts, counts, positions, page, *, rank, scale=None,
+                 out: Optional[torch.Tensor] = None, lse: Optional[torch.Tensor] = None,
+                 sinks: Optional[torch.Tensor] = None, scales: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Several sequences' prompt chunks in one launch (structure prompt): row i's queries q[starts[i] : starts[i] +
+    counts[i]] at positions positions[i] .. (host ints, their rows written), its page table tables[i] (int32 [rows]
+    [width]), causal; out, lse, sinks, scale and scales as prefill(). Each row's tiles are the ones prefill() runs for
+    the row alone, so a token has the bits prefill() gives it (the knobs are those of the call's tokens together: the
+    order knob PIECE is one a shape). Not under a capture (the rows are host values)."""
+    T, H, width = q.shape
+    R, P, fp8 = _check(q, cache, page, rank, sinks, scales)
+    starts, counts, positions = [int(x) for x in starts], [int(x) for x in counts], [int(x) for x in positions]
+    if (not (len(starts) == len(counts) == len(positions) == tables.shape[0]) or tables.dim() != 2 or
+            tables.dtype != torch.int32 or tables.stride(1) != 1):
+        raise ValueError("tables are int32 [rows][width], one row a chunk, as many as starts, counts and positions")
+    if not starts or any(x < 0 or n < 1 or x + n > T for x, n in zip(starts, counts)):
+        raise ValueError("each row's tokens lie in q, one row or more")
+    device = q.device
+    knobs = _knobs({"R": R, "P": P, "H": H, "PAGE": int(page), "KIND": int(fp8)}, T, "prompt")
+    vsplit, bm = int(knobs["VSPLIT"]), int(knobs["BLOCK_M"])
+    tiles, meta = _ragged_plan(device, bm, H, starts, counts, positions)
+    out = torch.empty(T, H, R, dtype=q.dtype, device=device) if out is None else out
+    codes = cache.view(torch.uint8) if fp8 else cache
+    dummy = out if lse is None else lse
+    _kernels._prompt_kernel[(tiles.shape[0] * vsplit,)](
+        q, codes, scales if fp8 else dummy, tables, tables, out, lse if lse is not None else dummy,
+        sinks if sinks is not None else dummy, tiles, meta, T, 0, q.stride(0), q.stride(1), out.stride(0),
+        out.stride(1), tables.stride(0), float(scale if scale is not None else width ** -0.5), H=H, R=R, P=P,
+        BLOCK_M=bm, PIECE=int(knobs["PIECE"]), PAGE=page, VSPLIT=vsplit, FP8=fp8, HW_FP8=_hardware_fp8(device),
+        SCALES=int(scales.shape[-1]) if fp8 else 2, POS_T=False, LSE=lse is not None, SINKS=sinks is not None,
+        RAGGED=True, num_warps=int(knobs["WARPS"]), num_stages=int(knobs["STAGES"]))
     return out
 
 

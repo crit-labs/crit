@@ -740,13 +740,12 @@ __global__ void __launch_bounds__(kPoolConvThreads) pool_conv_kernel(ConvInputs 
     }
 }
 
-// One long row, thread per (channel, kPoolConvSegment rows), recurrent_kernels.cu's conv_segments_kernel over pool windows.
+// One long row, thread per (channel, kPoolConvSegment rows), recurrent_kernels.cu's conv_segments_kernel over pool windows:
+// segment t0 of channel ch.
 template <int W, int D, class T>
-__global__ void __launch_bounds__(kPoolConvThreads) conv_segments_kernel(ConvInputs c, const float* window_in, float* window_out,
-                                                                         int rows) {
+__device__ __forceinline__ void conv_segment(const ConvInputs& c, const float* window_in, float* window_out, int rows, int ch,
+                                             int t0) {
     constexpr int S = kSpan<W, D>;
-    const int ch = blockIdx.x * kPoolConvThreads + threadIdx.x, t0 = blockIdx.y * kPoolConvSegment;
-    if(ch >= c.channels) return;
     const T* x = static_cast<const T*>(c.x);
     const int n = min(kPoolConvSegment, rows - t0);
     float win[S], wt[W];
@@ -764,13 +763,37 @@ __global__ void __launch_bounds__(kPoolConvThreads) conv_segments_kernel(ConvInp
         static_cast<T*>(c.out)[std::int64_t(t) * c.out_row + ch] = of_float<T>(pool_conv_value<W, D>(win, wt, b, xt, c.silu));
         pool_conv_shift<W, D>(win, xt);
     }
-    if(blockIdx.y == 0)
+    if(t0 == 0)
 #pragma unroll
         for(int i = 0; i < S; ++i) {   // the last S inputs, from the window where the row is shorter
             const int at = rows - S + i;
             window_out[std::int64_t(ch) * S + i] =
                 at >= 0 ? as_float<T>(x[std::int64_t(at) * c.x_row + ch]) : window_in[std::int64_t(ch) * S + S + at];
         }
+}
+
+template <int W, int D, class T>
+__global__ void __launch_bounds__(kPoolConvThreads) conv_segments_kernel(ConvInputs c, const float* window_in, float* window_out,
+                                                                         int rows) {
+    const int ch = blockIdx.x * kPoolConvThreads + threadIdx.x;
+    if(ch >= c.channels) return;
+    conv_segment<W, D, T>(c, window_in, window_out, rows, ch, blockIdx.y * kPoolConvSegment);
+}
+
+// Many long rows in one launch (blockIdx.z the row): row r's inputs x rows meta[r] = (first, count), its window before
+// them windows_in[r] and after them windows_out[r] ([channels][S] each): the row's segments are conv_segments_kernel's.
+template <int W, int D, class T>
+__global__ void __launch_bounds__(kPoolConvThreads) conv_segments_rows_kernel(ConvInputs c, const float* windows_in,
+                                                                              float* windows_out, const std::int32_t* meta) {
+    constexpr int S = kSpan<W, D>;
+    const int ch = blockIdx.x * kPoolConvThreads + threadIdx.x, t0 = blockIdx.y * kPoolConvSegment;
+    const int first = meta[2 * blockIdx.z], count = meta[2 * blockIdx.z + 1];
+    if(ch >= c.channels || t0 >= count) return;
+    ConvInputs row = c;
+    row.x = static_cast<const T*>(c.x) + std::int64_t(first) * c.x_row;
+    row.out = static_cast<T*>(c.out) + std::int64_t(first) * c.out_row;
+    const std::int64_t at = std::int64_t(blockIdx.z) * c.channels * S;
+    conv_segment<W, D, T>(row, windows_in + at, windows_out + at, count, ch, t0);
 }
 
 // One sequence's prompt chunk padded to `rows` tokens (a captured graph's bucket): meta [5] on the device (first unused,
@@ -884,6 +907,26 @@ cudaError_t prompt_typed(const ConvInputs& c, const PoolConv& p, const std::int3
         return cudaGetLastError();
     });
 }
+template <class T>
+cudaError_t rows_typed(const ConvInputs& c, const float* in, float* out, const std::int32_t* meta, int count, int widest,
+                       cudaStream_t stream) {
+    const int blocks = (c.channels + kPoolConvThreads - 1) / kPoolConvThreads;
+    return by_shape(c.width, c.dilation, [&](auto shape) {
+        constexpr int W = decltype(shape)::W, D = decltype(shape)::D;
+        conv_segments_rows_kernel<W, D, T><<<dim3(blocks, (widest + kPoolConvSegment - 1) / kPoolConvSegment, count),
+                                             kPoolConvThreads, 0, stream>>>(c, in, out, meta);
+        return cudaGetLastError();
+    });
+}
+cudaError_t rows_dispatch(const ConvInputs& c, const float* in, float* out, const std::int32_t* meta, int count, int widest,
+                          cudaStream_t stream) {
+    switch(c.dtype) {
+    case Scalar::bf16: return rows_typed<__nv_bfloat16>(c, in, out, meta, count, widest, stream);
+    case Scalar::f16: return rows_typed<__half>(c, in, out, meta, count, widest, stream);
+    default: return rows_typed<float>(c, in, out, meta, count, widest, stream);
+    }
+}
+
 cudaError_t prompt_dispatch(const ConvInputs& c, const PoolConv& p, const std::int32_t* meta, int rows, cudaStream_t stream) {
     switch(c.dtype) {
     case Scalar::bf16: return prompt_typed<__nv_bfloat16>(c, p, meta, rows, stream);
@@ -983,6 +1026,20 @@ cudaError_t enqueue_conv_segments(const ConvInputs& c, const float* window_in, f
         return cudaErrorInvalidValue;
     if(!rows) return cudaSuccess;
     return conv_dispatch(c, nullptr, nullptr, 1, window_in, window_out, rows, stream);
+#endif
+}
+
+cudaError_t enqueue_conv_segments_rows(const ConvInputs& c, const float* windows_in, float* windows_out,
+                                       const std::int32_t* meta, int count, int widest, cudaStream_t stream) {
+#if defined(CRIT_SWEEP_BUILD)
+    return cudaErrorNotSupported;
+#else
+    if(count < 0 || count > 65535 || widest < 1 || c.channels < 1 || !pool_conv_supported(c.width, c.dilation) || !c.x ||
+       !c.out || !c.weight || !windows_in || !windows_out || !meta || c.out == c.x ||
+       (widest + kPoolConvSegment - 1) / kPoolConvSegment > 65535)
+        return cudaErrorInvalidValue;
+    if(!count) return cudaSuccess;
+    return rows_dispatch(c, windows_in, windows_out, meta, count, widest, stream);
 #endif
 }
 

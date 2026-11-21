@@ -29,7 +29,7 @@ memory and `retain(key, bytes, protected)` it instead of dropping it: the next m
 the host link instead of rereading the file. Retained bytes are checked like a file read. An
 expert the current route selects (`protected`) is never evicted to make room, and an expert that
 cannot fit is refused (`False`), never half held. The capacity is part of the engine's
-[host-memory admission](../host-memory-admission/README.md), not memory beside it.
+host memory, which Core admits (`crit_plugins.host.memory`), not memory beside it.
 
 **Native gather.** `MappedFile(path, maximum_bytes)` maps the file through
 `crit::core::ReadOnlyFile` ([Core files](../../core/src/io/README.md#read-only-files));

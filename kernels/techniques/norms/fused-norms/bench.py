@@ -8,6 +8,8 @@ call replays: the sweep times what a captured decode round pays for the call, an
 timed as Triton's host launch path (tens of microseconds of Python a launch on a loaded machine)."""
 import torch
 
+from crit_kernels import contracts
+
 MOST = 4096            # the most tokens a structure's tune_rows asks for
 EPS = 1e-6
 BF16 = torch.bfloat16
@@ -23,12 +25,10 @@ def _normal(shape, seed, device, dtype=torch.float32, scale=1.0):
     return (torch.randn(shape, generator=g, device=device) * scale).to(dtype)
 
 
-def _within(got, want, step=2.0 ** -8):
-    """None when got is within 2e-5 + (2e-5 + step) |want| (+ 1% of a step of the largest value) of want."""
-    got, want = got.double(), want.double()
-    bound = 2e-5 + (2e-5 + step) * want.abs() + step * 0.01 * float(want.abs().max())
-    bad = int(((got - want).abs() > bound).sum())
-    return None if bad == 0 else f"{bad} values beyond FP32 rounding and one output rounding"
+def _within(operation, got, want, rounded=True):
+    """The norms operations' tolerance (crit_kernels.contracts): FP32 arithmetic, and with rounded one rounding into
+    the output's 16-bit type; FP32 outputs (rounded False) the arithmetic's alone."""
+    return contracts.check(operation, got, want, arithmetic=None if rounded else "fp32-output")
 
 
 def _replay(s, call):
@@ -127,7 +127,7 @@ class Rows(_Bench):
     def check(self, got, want, s):
         if s["residual"] is not None and not torch.equal(s["residual"], want[1]):
             return "the residual is not the FP32 sum"
-        return _within(got, want[0])
+        return _within("rms-norm", got, want[0])
 
     def yardstick(self, s):
         """FlashInfer's Gemma-style norms (the weight stored as weight - 1, as offset=1.0 reads it): with a residual
@@ -237,7 +237,7 @@ class Rope(_Bench):
     def check(self, got, want, s):
         if not s.get("same", True):
             return "the pair differs from the separate calls"
-        return _within(got[0], want[0]) or _within(got[1], want[1])
+        return _within("rotary-positions", got[0], want[0]) or _within("rotary-positions", got[1], want[1])
 
     def first_row(self, out):
         return torch.cat([out[0][0].flatten(), out[1][0].flatten()])
@@ -297,7 +297,7 @@ class ActMul(_Bench):
         return ((g * torch.sigmoid(g) * x[:, n:]).float(),)
 
     def check(self, got, want, s):
-        return _within(got, want[0])
+        return _within("gated-products", got, want[0])
 
     def yardstick(self, s):
         """FlashInfer's silu_and_mul on the same packed [gate | up] rows."""
@@ -342,7 +342,7 @@ class StreamSum(_Bench):
         return (((x.double() * g.double()[..., None]).sum(1)).float(),)
 
     def check(self, got, want, s):
-        return _within(got, want[0])
+        return _within("stream-mixes", got, want[0])
 
     def yardstick(self, s):
         """torch ops: (x * g[..., None]).sum(1) in FP32, cast to BF16 into the output (three kernels). No library
@@ -380,7 +380,7 @@ class StreamAdd(_Bench):
         return ((h.double() + w.double()[..., None] * x.double()[:, None]).float(),)
 
     def check(self, got, want, s):
-        return _within(got, want[0])
+        return _within("stream-mixes", got, want[0])
 
     def yardstick(self, s):
         """torch ops: h += w[..., None] * x[:, None] in place, the product in FP32 and one rounding to BF16 (two
@@ -425,7 +425,7 @@ class SoftplusDecay(_Bench):
         return -rate.double() * torch.nn.functional.softplus(v), torch.sigmoid(x[:, :n].double())
 
     def check(self, got, want, s):
-        return _within(got[0], want[0], 0.0) or _within(got[1], want[1], 0.0)
+        return _within("softplus-decay", got[0], want[0], False) or _within("softplus-decay", got[1], want[1], False)
 
     def first_row(self, out):
         return torch.cat([out[0][0], out[1][0]])

@@ -79,5 +79,48 @@ class NextStepTests(RunFixture, unittest.TestCase):
         self.assertIn("--lifecycle build_failed", found["command"])
 
 
+class EvaluatedStepTests(unittest.TestCase):
+    """An evaluated candidate's next step is one its command takes: where its checks keep its benchmarks exploratory,
+    measure refuses it and a completed seal needs them, so next names seal built, and the refusals name it too."""
+
+    def test_an_evaluated_candidate_whose_benchmarks_cannot_qualify_is_sealed_built(self):
+        from test_run_plans import PlanFixture, plan, status
+
+        class Fixture(PlanFixture, unittest.TestCase):
+            def runTest(self):
+                pass
+        f = Fixture()
+        f.setUp()
+        self.addCleanup(f.doCleanups)
+        f.resolve()
+        cid = f.candidate(plan_id=f.store.plan(f.run_id, plan(levers=[], forecast=None))["plan_id"])["candidate_id"]
+        package = f.package(read_json(f.directory / "candidates" / cid / "candidate.json"))
+        path = f.directory / "candidates" / cid / "logs" / "check-fixture.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"checks": []}', encoding="utf-8")
+
+        def check(status_, by):
+            f.store.append(f.run_id, cid, "check", {
+                "case_id": "case-0001", "package_sha256": digest(package), "gate": "functional",
+                "criteria_sha256": digest(f.run["spec"]["correctness"]), "status": status_, "rationale": "fixture",
+                "evidence": [{"path": path.relative_to(f.directory).as_posix(), "sha256": file_sha(path)}],
+                "evidence_level": "artifact_verified", "recorded_at": now(), "extensions": {"recorded_by": by}})
+        check("passed", "crit run serve --check")
+        f.evaluated(cid, status())
+        self.assertEqual(f.store.next(f.run_id)["step"], "record_checks")
+        check("unverified", "crit run check --from-eval")   # Eval could not verify its functional check
+        found = f.store.next(f.run_id)
+        self.assertEqual((found["step"], found["state"]["candidates"][-1]["state"]), ("seal", "evaluated"))
+        self.assertIn(f"seal --candidate {cid} --lifecycle built", found["command"])
+        self.assertIn("cannot qualify", found["why"])
+        from crit.run.measure import refusal, unqualified   # what crit run measure refuses it with
+        said = refusal(cid, unqualified(f.directory, f.run, cid))
+        self.assertRegex(said, f"seal it built .*seal --candidate {cid} --lifecycle built")
+        with self.assertRaisesRegex(ValueError, "seal it built"):
+            f.store.seal(f.run_id, cid, "completed")
+        f.store.seal(f.run_id, cid, "built")   # the step next named is one the store takes
+        self.assertEqual(f.store.next(f.run_id)["step"], "plan")
+
+
 if __name__ == "__main__":
     unittest.main()

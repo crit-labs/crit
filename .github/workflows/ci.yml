@@ -39,6 +39,8 @@ jobs:
     env:
       PYTHONDONTWRITEBYTECODE: '1'
       PYTHONUTF8: '1'
+      # A unit whose process dies in native code prints its Python stack instead of nothing.
+      PYTHONFAULTHANDLER: '1'
       SHARDS: ${{ matrix.os == 'windows-2022' && 4 || 2 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

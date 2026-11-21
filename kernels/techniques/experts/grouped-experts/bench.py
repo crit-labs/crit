@@ -301,6 +301,13 @@ class _Bench:
         touched = self._ids.get((store.shape[0], int(shape["top"]), rows), (None, store.shape[0]))[1]
         return per_expert * touched
 
+    arithmetic = "bf16"   # the experts' MMA: weights decoded to BF16
+
+    def flops(self, shape, rows):   # crit_kernels.floors: every route's pass
+        H, I = int(shape["hidden"]), int(shape["inter"])
+        outs, ins = (2 * I, H) if int(shape["gate_up"]) else (H, I)
+        return 2 * rows * int(shape["top"]) * outs * ins, self.arithmetic
+
 
 class Decode(_Bench):
     structure = "decode"
@@ -315,3 +322,121 @@ class Prompt(_Bench):
 class PromptWide(_Bench):
     structure = "prompt-wide"
     width = 64
+
+
+class _Fp4(_Bench):
+    """The FP4 tensor-core arithmetic's passes (nvfp4 W4A4 shapes, hidden and inter multiples of 128): the routes'
+    operands quantized once by the untuned build (fp4_inputs; the gate/up pass's intermediate for the down pass), then
+    one pass timed."""
+    arithmetic = "nvfp4"
+
+    def shapes(self, model):
+        return [dict(s) for s in expert_shapes(model) if int(s["a4"]) and int(s["hidden"]) % 128 == 0 and
+                int(s["inter"]) % 128 == 0]
+
+    def valid(self, knobs):
+        return knobs["DEPTH"] * knobs["TILES"] <= 12
+
+    def inputs(self, shape, rows, device):
+        s = super().inputs(dict(shape, a4=1), rows, device)
+        gx = self.untuned()
+        key = s["key"] + ("fp4",)
+        if key not in self._plans:
+            ws = self._plans[s["key"][:-1]][0]
+            fresh = gx.Workspace(rows, s["top_k"], ws.experts, s["hidden"], s["inter"], device, width=self.width)
+            x = self._x[(s["hidden"], rows)]
+            gx.route_outputs(x, s["ids"], s["store"], None, s["layout"], fresh, True, "fp4")
+            f = {k: v.clone() for k, v in fresh.fp4().items()}
+            self._plans[key] = (fresh, f)
+        fresh, f = self._plans[key]
+        H, I = s["hidden"], s["inter"]
+        s.update(items=(fresh.item_slot, fresh.item_routes, fresh.item_count), fp4=f, key=key)
+        if s["gate_up"]:
+            s["out"] = (torch.zeros(fresh.routes, I // 2, dtype=torch.uint8, device=device),
+                        torch.zeros(fresh.routes, I // 16, dtype=torch.uint8, device=device))
+        else:
+            s["out"] = torch.zeros(fresh.routes, H, dtype=torch.float32, device=device)
+        return s
+
+    def _call(self, module, s, out):
+        f = s["fp4"]
+        if s["gate_up"]:
+            module.ops.fp4_gate_up(f["x"], f["xs"], s["store"], s["layout"], *s["items"], out[0], out[1], s["tokens"])
+        else:
+            module.ops.fp4_down(f["h"], f["hs"], s["store"], s["layout"], *s["items"], out, s["tokens"])
+
+    def run(self, module, s):
+        self._call(module, s, s["out"])
+        return s["out"][0] if s["gate_up"] else s["out"]
+
+    def reference(self, s):
+        if s["key"] not in self._references:
+            want = tuple(torch.zeros_like(t) for t in s["out"]) if s["gate_up"] else torch.zeros_like(s["out"])
+            self._call(self.untuned(), s, want)
+            self._references[s["key"]] = want
+        found = self._references[s["key"]]
+        return found[0] if s["gate_up"] else found
+
+    def check(self, got, want, s):
+        view = torch.uint8 if got.dtype == torch.uint8 else torch.int32
+        bad = int((got.view(view) != want.view(view)).any(1).sum())
+        return None if bad == 0 else f"{bad} routes differ from the untuned build's bits"
+
+
+class _Fp8(_Bench):
+    """The FP8 tensor-core arithmetic's passes (fp8:channel and fp8:block shapes, hidden and inter multiples of 128,
+    W8A8): the routes' operands quantized once by the untuned build (the gate/up pass's intermediate for the down
+    pass), then one pass timed."""
+    arithmetic = "fp8"
+
+    def shapes(self, model):
+        return [dict(s) for s in expert_shapes(model) if NAMES[int(s["format"])] in ("fp8:channel", "fp8:block") and
+                int(s["hidden"]) % 128 == 0 and int(s["inter"]) % 128 == 0 and not int(s["a4"])]
+
+    def valid(self, knobs):
+        return knobs["DEPTH"] * knobs["TILES"] <= 12
+
+    def inputs(self, shape, rows, device):
+        s = super().inputs(dict(shape, a4=0), rows, device)
+        gx = self.untuned()
+        key = s["key"] + ("fp8",)
+        if key not in self._plans:
+            ws = self._plans[s["key"][:-1]][0]
+            fresh = gx.Workspace(rows, s["top_k"], ws.experts, s["hidden"], s["inter"], device, width=self.width)
+            x = self._x[(s["hidden"], rows)]
+            gx.route_outputs(x, s["ids"], s["store"], None, s["layout"], fresh, False, "fp8")
+            f = {k: v.clone() for k, v in fresh.fp8().items()}
+            self._plans[key] = (fresh, f)
+        fresh, f = self._plans[key]
+        H, I = s["hidden"], s["inter"]
+        s.update(items=(fresh.item_slot, fresh.item_routes, fresh.item_count), fp8=f, key=key)
+        s["out"] = (torch.zeros(fresh.routes, I, dtype=torch.bfloat16, device=device) if s["gate_up"] else
+                    torch.zeros(fresh.routes, H, dtype=torch.float32, device=device))
+        return s
+
+    def _call(self, module, s, out):
+        f = s["fp8"]
+        if s["gate_up"]:
+            module.ops.fp8_gate_up(f["x"], f["xs"], s["store"], s["layout"], *s["items"], out, s["tokens"])
+        else:
+            module.ops.fp8_down(f["h"], f["hs"], s["store"], s["layout"], *s["items"], out, s["tokens"])
+
+
+class Fp8Decode(_Fp8):
+    structure = "fp8-decode"
+    width = 8
+
+
+class Fp8Prompt(_Fp8):
+    structure = "fp8-prompt"
+    width = 32
+
+
+class Fp4Decode(_Fp4):
+    structure = "fp4-decode"
+    width = 8
+
+
+class Fp4Prompt(_Fp4):
+    structure = "fp4-prompt"
+    width = 32

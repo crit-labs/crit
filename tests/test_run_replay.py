@@ -168,6 +168,24 @@ class ReplayTests(PlanFixture, unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "at a candidate .* or before a plan"):
             replay.make(self.store, self.run_id, self.parent, self.root / "both", before="plan-0002")
 
+    def test_a_retroactive_plan_is_refused_where_a_plan_must_come_first(self):
+        # plan-0003 was recorded after its change was measured: the run before it already holds that measurement.
+        retro = self.store.plan(self.run_id, plan(self.parent, retroactive=True))
+        renders = self.rendered()
+        with renders[0], renders[1]:
+            with self.assertRaisesRegex(ValueError, f"{retro['plan_id']} is retroactive.*replay at {self.parent}"):
+                replay.make(self.store, self.run_id, None, self.out, before=retro["plan_id"])
+        self.assertFalse(self.out.exists())
+        # A replay's agent decides before any code: its plan check refuses the flag, and collect reports why.
+        self.make()
+        replica = RunStore(self.out / "replay-1", self.store.project)
+        with self.assertRaisesRegex(ValueError, "never retroactive"):
+            replica.plan(self.run_id, plan(self.parent, retroactive=True), check=True)
+        path = self.out / "replay-1" / self.run_id / "replay" / "plan.json"
+        path.write_text(json.dumps(plan(self.parent, retroactive=True)), encoding="utf-8")
+        row = replay.collect(self.out, self.run_id, RunStore, self.store.project)["replays"][0]
+        self.assertIn("never retroactive", row["error"])
+
     def test_a_replay_records_nothing_and_checks_plans_against_the_status_rendered_again(self):
         # Rendered again, decode is the family further from its limit; the stored status had prefill further.
         self.make(decode=50.0, prefill=3000.0)

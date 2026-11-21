@@ -57,6 +57,29 @@ class LatentTests(PluginTestCase):
             out.append(torch.einsum("thn,nr->thr", p, c[:, :R]))
         return torch.cat(out)
 
+    def test_a_steps_prompt_rows_in_one_launch_keep_each_rows_bits(self):
+        """Several prompt rows of a step (the kernel's prefill_rows) give each token the bits of its row's step
+        alone, beside a window row, on BF16 and fp8:row pages."""
+        torch = self.torch
+        for dtype in ("bf16", "fp8:row"):
+            rows = [("a", 0, 100), ("b", 0, 130), ("c", 0, 3), ("d", 0, 65)]
+            together = self.pool(dtype)
+            for s in "abcd":
+                together.open(s)
+            batch = StepBatch.build(rows, self.device())
+            self.write(together, batch)
+            q = self.queries(batch.tokens, 41)
+            out = self.attention.forward(0, q, together, batch, scale=SCALE, latent=R)
+            first = 0
+            for row in rows:
+                alone = self.pool(dtype)
+                alone.open(row[0])
+                one = StepBatch.build([row], self.device())
+                self.write(alone, one)
+                got = self.attention.forward(0, q[first:first + row[2]], alone, one, scale=SCALE, latent=R)
+                self.assertTrue(torch.equal(got, out[first:first + row[2]]), (dtype, row))
+                first += row[2]
+
     def test_steps_match_float64_latent_attention_on_every_reader(self):
         torch = self.torch
         sinks = torch.randn(H, generator=torch.Generator().manual_seed(3)).to(self.device())

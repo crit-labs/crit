@@ -559,6 +559,41 @@ class ModelConfigTests(unittest.TestCase):
             with self.subTest(config=config), self.assertRaisesRegex(mc.ConfigError, message):
                 mc.layer_kinds(config)
 
+    def test_sliding_layer_ids_and_layer_passes(self):
+        """A config that lists its sliding-window layers instead of layer_types, and loops a span of layers: the
+        kinds, the order the layers run, and one KV cache and window per pass of a looped layer."""
+        config = {"num_hidden_layers": 6, "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8,
+                  "local_layer_ids": [0, 1, 3, 4], "sliding_window_size": 16, "route_scale": 2.5,
+                  "n_routed_experts": 4, "num_experts_per_tok": 2,
+                  "loop_config": {"core_start": 2, "core_end": 4, "num_passes": 3}}
+        parsed = mc.parse_model_config(config)
+        S, F = mc.SLIDING_ATTENTION, mc.FULL_ATTENTION
+        self.assertEqual(parsed.layer_kinds(), (S, S, F, S, S, F))
+        self.assertEqual((parsed.sliding_window, parsed.layer_passes, parsed.moe.routed_scaling_factor),
+                         (16, ((2, 4, 3),), 2.5))
+        self.assertEqual(parsed.layer_applications(), (0, 1, 2, 3, 2, 3, 2, 3, 4, 5))
+        self.assertEqual(parsed.attention_shape(), (2, 4, 8, 2))
+        # full layers 2 (three passes) and 5: 4 caches of 2 tensors x 2 heads x 8
+        self.assertEqual(parsed.kv_elements_per_token(), 4 * 2 * 2 * 8)
+        # sliding layers 0, 1, 4 and 3 (three passes): 6 windows of 16 positions
+        self.assertEqual(parsed.fixed_state_bytes(2), 6 * 2 * 2 * 8 * 16 * 2)
+        self.assertEqual(mc.parse_model_config({"num_hidden_layers": 3}).layer_applications(), (0, 1, 2))
+        # The same model as transformers saves it: its own layer type names, the loop's keys at the top level
+        saved = {**{k: v for k, v in config.items() if k not in ("local_layer_ids", "loop_config")},
+                 "layer_types": ["hybrid_sliding", "hybrid_sliding", "hybrid", "hybrid_sliding", "hybrid_sliding",
+                                 "hybrid"],
+                 "loop_layer_index_start": 2, "loop_layer_index_end": 4, "loop_num_passes": 3}
+        resaved = mc.parse_model_config(saved)
+        self.assertEqual((resaved.layer_kinds(), resaved.layer_applications(), resaved.kv_elements_per_token(),
+                          resaved.fixed_state_bytes(2)),
+                         (parsed.layer_kinds(), parsed.layer_applications(), parsed.kv_elements_per_token(),
+                          parsed.fixed_state_bytes(2)))
+        for bad, message in (({"local_layer_ids": [0, 6]}, "outside 0..5"),
+                             ({"loop_config": {"core_start": 4, "core_end": 2, "num_passes": 2}}, "is empty"),
+                             ({"loop_config": {"core_start": 2, "num_passes": 2}}, "needs core_start")):
+            with self.subTest(bad=bad), self.assertRaisesRegex(mc.ConfigError, message):
+                mc.parse_model_config({**config, **bad})
+
     def test_effective_head_dim_and_kv_heads_validate_the_division(self):
         self.assertEqual(mc.effective_head_dim({"head_dim": 80, "hidden_size": 4096, "num_attention_heads": 32}), 80)
         self.assertEqual(mc.effective_head_dim({"head_dim": 0, "hidden_size": 4096, "num_attention_heads": 32}), 128)

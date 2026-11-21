@@ -5,7 +5,9 @@
   "title": "GGUF projections: rows quantized to int8 per 32 values times a matrix in its stored GGUF block format, 1 to 8 rows by dp4a (plain and gathered over experts) and any rows on the s8 tensor cores in the same order, and its dequantization",
   "package": "gguf_rows",
   "language": "cuda",
-  "operations": [],
+  "operations": [
+    "gguf-projection"
+  ],
   "sources": [
     "gguf_rows_cuda/binding.cu",
     "gguf_rows_cuda/gguf_rows.cu",

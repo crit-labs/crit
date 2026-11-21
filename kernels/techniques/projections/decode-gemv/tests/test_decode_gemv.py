@@ -475,15 +475,11 @@ def test_the_int4_gemv_refuses_what_it_cannot_read():
         with pytest.raises(RuntimeError):
             bad()
 
-# Knobs other than the defaults (one build for every structure): the CUDA GEMVs' and the Triton GEMV's WARPS, ROWS,
-# PREF, STREAM, BLOCK_N and STAGES only choose which rows a block or program takes and how its loads run, never a
-# row's order, so their bits are the default build's; the dot GEMV's plan comes from the tuning.
+# Knobs other than the defaults (one build for every structure): the CUDA GEMV's and the Triton GEMV's WARPS, ROWS,
+# PREF, STREAM, BN (the fma path's) and STAGES only choose which rows a block or program takes and how its loads run,
+# never a row's order, so their bits are the default build's.
 OTHER_KNOBS = {"gemv-cuda": {"WARPS": 2, "ROWS": 4, "PREF": 1, "STREAM": 1},
-               "gemv-nvfp4": {"WARPS": 8, "ROWS": 1, "PREF": 2, "STREAM": 1},
-               "gemv-fp8": {"WARPS": 2, "ROWS": 8, "PREF": 1, "STREAM": 1},
-               "gemv-bf16": {"WARPS": 8, "ROWS": 1, "PREF": 2, "STREAM": 1},
-               "gemv-nvfp4-triton": {"BLOCK_N": 16, "WARPS": 8, "STAGES": 2},
-               "gemv-fp8-dot": {"BN": 16, "BK": 128, "WARPS": 2, "SPLIT": 2}}
+               "gemv-triton": {"BN": 16, "WARPS": 8, "STAGES": 2}}
 
 
 def test_other_knobs_give_the_default_bits_where_they_keep_the_order():
@@ -510,15 +506,14 @@ def test_other_knobs_give_the_default_bits_where_they_keep_the_order():
             for module, out in zip((nr, other), pair):
                 module.gemv_bf16(x, w, out)
             assert torch.equal(*pair), ("bf16", rows, out_dtype)
-            for module, out in zip((nr, other), pair):   # INT4: gemv-cuda's own knobs (no alias)
+            for module, out in zip((nr, other), pair):
                 module.gemv_int4(x, i4[0], i4[1], i4[2], out, 128)
             assert torch.equal(*pair), ("int4", rows, out_dtype)
             if rows <= nr.TRITON_ROWS:
                 for module, out in zip((nr, other), pair):
                     module.gemv_triton(xn, c, s, i, out)
                 assert torch.equal(*pair), ("triton", rows, out_dtype)
-    assert other.fp8_dot_tile(1000, 2048, 170) == (16, 128, 2, 2)
-    assert other.fp8_dot_tile(1000, 640, 170) == nr.fp8_dot_tile(1000, 640, 170)   # split * BK does not divide K
+    assert other.fp8_dot_tile(1000, 2048, 170) == nr.fp8_dot_tile(1000, 2048, 170)   # BK 0: the rule's plan
     w8, s8 = fp8_dot_matrix(1000, 2048)
     x = activations(16, 2048)
     exact = x.double() @ (w8.float().double() * s8.double()[:, None]).t()
@@ -591,7 +586,7 @@ def test_the_triton_gemv_takes_every_format_on_both_paths_and_keeps_rows(weights
                 assert torch.equal(part, whole[first:first + rows]), (weights, shape, path, xd, rows, first)
 
 
-def test_the_triton_gemv_plans_from_the_shape_and_an_alias_tuning_still_applies():
+def test_the_triton_gemv_plans_from_the_shape():
     sms = torch.cuda.get_device_properties(dev).multi_processor_count
     assert nr.triton_plan(1, 16384, 5120, 1) == ("dot", nr.fp8_dot_tile(16384, 5120, sms))
     assert nr.triton_plan(0, 1000, 2080, 4)[0] == "fma"          # K not a multiple of 128
@@ -599,28 +594,37 @@ def test_the_triton_gemv_plans_from_the_shape_and_an_alias_tuning_still_applies(
     assert nr.triton_plan(3, 1000, 2048, 4, torch.float16)[0] == "fma"
     for rows in (1, 4, 16):                                       # the order knobs: one plan a matrix
         assert nr.triton_plan(0, 5000, 4096, rows) == nr.triton_plan(0, 5000, 4096, 1)
-    tuning = any_module._crit_tuning.TUNING
-    saved = {sid: tuning[sid] for sid in ("gemv-nvfp4-triton", "gemv-fp8-dot")}
-    try:
-        old = dict(saved["gemv-nvfp4-triton"]["configs"][0], BLOCK_N=16, WARPS=8, STAGES=2)
-        tuning["gemv-nvfp4-triton"] = {"configs": [saved["gemv-nvfp4-triton"]["configs"][0], old],
-                                       "table": [{"key": {"N": 5000, "K": 4096}, "rows": [1, 8], "config": 1}]}
-        assert nr.triton_plan(0, 5000, 4096, 4) == ("fma", 16, 512, 8, 2)
-        # The tuning tunes the alias and not gemv-triton: the alias's defaults for its other shapes (the autotuner)
-        assert nr.triton_plan(0, 5001, 4096, 4) == ("fma", 0, 512, 4, 3)
-        own = tuning["gemv-triton"]
-        tuning["gemv-triton"] = {"configs": own["configs"], "table": [{"key": None, "rows": [1, 16], "config": 0}]}
-        try:   # once gemv-triton is tuned too, the alias wins only where it names a configuration of its own
-            assert nr.triton_plan(0, 5000, 4096, 4) == ("fma", 16, 512, 8, 2)
-            assert nr.triton_plan(0, 5001, 4096, 4)[0] == "dot"
-        finally:
-            tuning["gemv-triton"] = own
-        dot = dict(saved["gemv-fp8-dot"]["configs"][0], BN=16, BK=128, WARPS=2, SPLIT=2)
-        tuning["gemv-fp8-dot"] = {"configs": [saved["gemv-fp8-dot"]["configs"][0], dot],
-                                  "table": [{"key": {"N": 5000, "K": 4096}, "rows": [1, 16], "config": 1}]}
-        assert nr.triton_plan(1, 5000, 4096, 9) == ("dot", (16, 128, 2, 2))
-    finally:
-        tuning.update(saved)
+
+
+def test_a_tuning_of_the_retired_structures_is_migrated_into_gemv_cuda_and_gemv_triton():
+    """A tuning written before gemv-nvfp4, gemv-fp8, gemv-bf16, gemv-nvfp4-triton and gemv-fp8-dot retired builds
+    with their tables in gemv-cuda's and gemv-triton's (kernel.json "retired"): their shapes plan as they did, the
+    other shapes by gemv-triton's rule, and the CUDA GEMVs keep the default bits."""
+    shape = {"N": 5000, "K": 4096}
+    old = {"schema": kbuild.TUNING_SCHEMA, "kernel": "decode-gemv", "structures": {
+        "gemv-nvfp4": {"configs": [{"WARPS": 8, "ROWS": 1, "PREF": 2, "STREAM": 1}],
+                       "table": [{"key": {"N": 1000, "K": 2080}, "rows": [1, 16], "config": 0}]},
+        "gemv-fp8": {"configs": [{"WARPS": 2, "ROWS": 8, "PREF": 1, "STREAM": 1}],
+                     "table": [{"key": {"N": 1000, "K": 2048}, "rows": [1, 16], "config": 0}]},
+        "gemv-nvfp4-triton": {"configs": [{"BLOCK_N": 16, "WARPS": 8, "STAGES": 2}],
+                              "table": [{"key": shape, "rows": [1, 8], "config": 0}]},
+        "gemv-fp8-dot": {"configs": [{"BN": 16, "BK": 128, "WARPS": 2, "SPLIT": 2}],
+                         "table": [{"key": shape, "rows": [1, 16], "config": 0}]}}}
+    migrated = kbuild.load("decode-gemv", tuning=old)
+    assert migrated.triton_plan(0, 5000, 4096, 4) == ("fma", 16, 512, 8, 2)
+    assert migrated.triton_plan(0, 5001, 4096, 4) == nr.triton_plan(0, 5001, 4096, 4)   # not in the old table
+    assert migrated.triton_plan(1, 5000, 4096, 9) == ("dot", (16, 128, 2, 2))
+    assert migrated.fp8_dot_tile(5000, 4096, 170) == (16, 128, 2, 2)
+    c, s, i = matrix(1000, 2080)
+    fc, fs = fp8_matrix(1000, 2048, False)
+    for rows in (1, 7, 16):
+        pair = [torch.empty(rows, 1000, device=dev) for _ in range(2)]
+        for module, out in zip((nr, migrated), pair):
+            module.gemv(activations(rows, 2080), c, s, i, out)
+        assert torch.equal(*pair), ("nvfp4", rows)
+        for module, out in zip((nr, migrated), pair):
+            module.gemv_fp8(activations(rows, 2048), fc, fs, out)
+        assert torch.equal(*pair), ("fp8", rows)
 
 
 def test_the_triton_gemv_captures_in_a_cuda_graph():

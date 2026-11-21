@@ -7,27 +7,29 @@ crit_core.model.routed_layers, swiglu elsewhere); the residual stream runs RMSNo
 for zero-centred norms), mixer, RMSNorm with the residual add fused, FFN, the next layer's norm with its add fused.
 
 Serving: a step of many sequences' rows is one batch, its matmuls in RowGroups (exact rows); a prompt chunk ends at
-its span (Spans: within the cancel grace, its peak within the device's room) or at a place the prompt cache marks;
+its span (Core's prompt-step budget, crit_plugins.steps: within the cancel grace at what such steps took, its peak within the device's room) or at a place the prompt cache marks;
 decode rows run in Core's captured rounds (crit_plugins.rounds.Rounds: sampled mode, greedy a row at temperature 0,
-drafted from the checkpoint's MTP layer when the selection drafts); replays, constrained (plain) rows and what rounds
-do not hold run through step(); fixed-text scores run the prompt path in the same spans; Core's prompt cache keeps
+drafted from the checkpoint's MTP layer when the selection drafts; a constrained row at width 0 where the sampler's
+rounds mask, Core staging its allowed set between rounds); replays, other constrained rows and what rounds do not hold
+run through step(); fixed-text scores run the prompt path in the same spans; Core's prompt cache keeps
 ended requests' sequences in the pools. Every tensor kept on the device is planned through the placement plugin
 first, the experts excepted where the experts plugin places them itself (experts:offload)."""
-import json
 import time
 
 from crit_core.batch import DECODE, DEFERRED, PREFILL, READY, PageReservations, StepLayout, step_item
 from crit_core.native import Scores, StepResult
 from crit_plugins import StepBatch
-from crit_plugins.device import RoundBatch, free_device_bytes, release_cached_under
+from crit_plugins.device import RoundBatch, free_device_bytes
 from crit_plugins.host import memory_bytes
 from crit_plugins.prompt_cache import PromptCache
+from crit_plugins.ranking import top_ranked
 
-from .blocks import BLOCKS, Context, GatedDelta, MoE, router_rule
+from .blocks import Context, GatedDelta, MoE, router_rule
 from .checkpoint import Matrices, open_checkpoint, stop_tokens
 from .passes import Pass
-from .residual import RESIDUALS
-from .rows import GRACE, QUANTUM, SECONDS, RowGroups, Spans, fit
+from .shape import PAGE, Shape
+from crit_plugins.steps import CONTRACT, GRACE, QUANTUM, StepBudget
+from .rows import RowGroups
 
 CORE_SAMPLING = ("temperature", "top_p", "top_k", "min_p", "seed")
 CONTINUATION = 8192   # replayed tokens a round slot holds
@@ -36,9 +38,13 @@ TOP = 20              # the alternatives a token's log-probabilities carry at mo
 PROMPT_TAIL = 8       # a prompt chunk ends this many tokens before the prompt's end, where the prompt cache marks
 PROMPT_CUT = 256      # the shortest prompt cut there: a shorter one is prefilled whole in about the cut's time
 SCORE_SLICE = 128     # rows of logits a score holds at once (FP32 [rows][vocabulary])
-PAGE = 16             # KV page tokens
 FILL = 8192           # positions of zero KV a calibration writes at once
 PASS = "pass"         # a session's phase in a step of a pass that did not end it (passes.py)
+
+
+def _via_prompt(request):
+    """Whether the request asks its decode rows through the prompt path (StepRequest.decode_via_prompt)."""
+    return bool(getattr(request, "decode_via_prompt", False))
 
 
 class Session:
@@ -149,37 +155,17 @@ def _host_available():
     return memory_bytes()["available"]
 
 
-class ComposedModel:
+class ComposedModel(Shape):
     def __init__(self, context, options, parts, layout, blocks=None, folder=None):
         import torch
         from crit_core.model import parse_model_config
-        self.torch, self.options, self.parts, self.layout = torch, options, parts, layout
+        self.torch, self.parts = torch, parts
         self.folder = folder   # the plugin's folder, whose plugin.json declares the kernels its blocks load
         self.placed = {}       # where the placement plugin put each planned group (a block's lookup table)
         self._ropes = {}       # rotary tables of other head widths than the model's (rope_of)
-        self.blocks = {**BLOCKS, **(blocks or {})}
-        config = self.config = parse_model_config(context.config)
+        config = parse_model_config(context.config)
         self.quant = context.config.get("quantization_config") or config.get("quantization_config") or {}
-        self.kinds = config.layer_kinds()
-        # The config's own names of its layer types, which a layout may key its mixers by (a name Core's kinds do
-        # not know is "other" there).
-        self.types = tuple(config.layer_types) if len(config.layer_types) == len(self.kinds) else self.kinds
-        self.layers, self.hidden = len(self.kinds), config.hidden_size
-        self.heads, self.kv_heads = config.num_attention_heads, config.num_key_value_heads or config.num_attention_heads
-        self.head_dim = config.effective_head_dim()
-        self.eps, self.vocabulary = config.rms_norm_eps or 1e-6, config.vocab_size
-        self.norm_offset = float(layout.get("norm_offset", 0.0))
-        res = dict(layout.get("residual") or {"block": "pre-norm"})
-        if res.get("block") not in RESIDUALS:
-            raise ValueError(f"model-template: no residual {res.get('block')!r} (residuals: "
-                             f"{', '.join(sorted(RESIDUALS))})")
         self.device = torch.device(str(getattr(context, "device", None) or "cuda"))
-        self.context = int(context.context_tokens or options["context"])
-        self.concurrency, self.pending_max = int(options["concurrency"]), int(options["pending"])
-        self.chunk = int(options["prefill_chunk"])
-        self.free_below = int(options["release_below_mib"]) << 20
-        self.sequences = self.concurrency + 1   # every request decoding at once, and a score's
-        self.kept = int(options["prompt_cache"])
         self.proj, self.attention, self.sampler = parts["projections"], parts["attention"], parts["sampler"]
         self.norms, self.embeddings = parts["norms"], parts["embeddings"]
         self.recurrence, self.router, self.experts = parts.get("recurrence"), parts.get("router"), parts.get("experts")
@@ -191,16 +177,17 @@ class ComposedModel:
         # names), or one the context hands over (a planner reading a checkpoint manifest, tests/support/dry_plan.py,
         # has headers and no weights).
         handed = getattr(context, "checkpoint", None)
-        ck, matrices = (handed, Matrices) if handed is not None else open_checkpoint(context.model, context.config)
-        self.ck = ck
+        ck, matrices = (handed, Matrices) if handed is not None else open_checkpoint(context.model, context.config,
+                                                                                      layout.get("names"))
         self.matrices = matrices(ck, self.proj, self.quant, self.device)
         # A GGUF's experts as stored where the experts plugin computes them so (experts:gguf), else their values
         self.matrices.stored_experts = "experts:gguf" in parts.facts("experts")
-        self.residual = RESIDUALS[res["block"]](self, res)
-        draft = layout.get("draft") or {}
-        self.draft_prefix = draft.get("prefix")
-        self.mtp = (bool(options["mtp"]) and self.drafter is not None and self.draft_prefix is not None
-                    and self.residual.draft_stored(self.draft_prefix))
+        # The model before its weights (shape.py): layer kinds, residual, draft layer, decoder prefix, KV pools. The
+        # plugin's resolve() is the same Shape alone, so what the load makes is what it resolved.
+        Shape.__init__(self, config, options, layout, blocks, ck, context_tokens=context.context_tokens,
+                       steps=getattr(context, "steps", None),
+                       drafter=self.drafter is not None)
+        prefix = self.prefix
         if self.drafter is not None and not self.mtp:
             raise ValueError("model-template drafts from the checkpoint's MTP layer: the selection has a drafter, so "
                              "set option mtp and give a checkpoint with its draft layer's tensors (the layout's draft "
@@ -213,39 +200,48 @@ class ComposedModel:
                              "at override 0 proposes prompt copies alone): select greedy-head-drafter for the draft "
                              "layer's chain, give mtp-decode an override of 1 or more (the chain, long copies over "
                              "it), or leave the drafter slot empty")
-        self.width = int(options["width"]) if self.mtp else 0
         for key, want in (layout.get("requires") or {}).items():   # parts of the family this layout does not compute
             found = config.get(key)
             if (found or type(want)()) != want:
                 raise ValueError(f"model-template: the {layout.get('name')} layout computes checkpoints whose {key} is "
                                  f"{want!r}, and this one's is {found!r}: its layers have a part no block here computes")
-        self.routed = set(config.routed_layers())
+        routed = set(config.routed_layers())   # checkpoint layers
         if layout.get("routed_if") and not self.setting(layout["routed_if"]):
-            self.routed = set()   # the family's switch for its experts (a config key) is off: every layer is dense
+            routed = set()   # the family's switch for its experts (a config key) is off: every layer is dense
+        self.routed = {i for i, source in enumerate(self.sources) if source in routed}
         # The gate of the MLPs' and the experts' product: SiLU (SwiGLU), or GELU in its tanh form.
         act = config.get("hidden_act") or config.get("hidden_activation") or "silu"
         self.activation = {"silu": "silu", "swish": "silu", "gelu_pytorch_tanh": "gelu_tanh"}.get(act)
         if self.activation is None:
             raise ValueError(f"model-template: the checkpoint's activation is {act}; its gated blocks compute silu "
                              "and gelu_pytorch_tanh")
+        # Experts whose SwiGLU caps its linear gate factor and its up projection (the layout's expert_caps: the
+        # config keys of the two caps)
+        caps = tuple(float(self.setting(key)) for key in layout.get("expert_caps") or ())
+        if caps and self.activation == "silu":
+            self.activation = "softcapped_silu"
         if self.routed and self.activation != "silu" and self.experts is not None:
             if "experts:activations" not in parts.facts("experts"):
-                raise ValueError(f"model-template: the checkpoint's experts are gated by {act}, and the experts "
-                                 f"plugin {parts.plugin('experts')} computes SwiGLU blocks alone (it does not provide "
-                                 "experts:activations)")
-            self.experts.activate(self.activation)
-        # The experts slot's layer ids: the routed layers in order, then the draft layer's (every experts plugin
-        # holds layers 0 .. n - 1)
-        self.expert_ids = {layer: k for k, layer in enumerate(sorted(self.routed))}
+                raise ValueError(f"model-template: the checkpoint's experts are gated by {self.activation}, and the "
+                                 f"experts plugin {parts.plugin('experts')} computes SwiGLU blocks alone (it does not "
+                                 "provide experts:activations)")
+            try:
+                if caps:
+                    self.experts.activate(self.activation, caps=caps)
+                else:
+                    self.experts.activate(self.activation)
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"model-template: the checkpoint's experts are gated by {self.activation}"
+                                 + (f" with caps {caps}" if caps else "") + f", which the experts plugin "
+                                 f"{parts.plugin('experts')} does not compute ({error})") from None
+        # The experts slot's layer ids: the routed checkpoint layers in order, then the draft layer's (every experts
+        # plugin holds layers 0 .. n - 1); the layers that run one checkpoint layer share its experts.
+        slot_of = {source: k for k, source in enumerate(sorted(routed))}
+        self.expert_ids = {layer: slot_of[self.sources[layer]] for layer in sorted(self.routed)}
+        self.expert_slots = len(slot_of)
         self._slots_needed()
 
         # -- names -----------------------------------------------------------------------------------------------------
-        anchor = "layers.0." + self.residual.anchor()
-        prefixes = [n[:-len(anchor)] for n in ck.names() if n.endswith(anchor)
-                    and not (self.draft_prefix and n.startswith(self.draft_prefix))]
-        if not prefixes:
-            raise ValueError("model-template: no decoder layer 0 in the checkpoint")
-        self.prefix = prefix = sorted(prefixes, key=len)[0]   # "model.language_model." or "model."
         tied = not self.matrices.has("lm_head")
         embed_name = prefix + "embed_tokens.weight"
         # Where a routed layer's experts are stored under its prefix: the FFN's prefix (none for a block made at
@@ -254,7 +250,7 @@ class ComposedModel:
         routed_block = self._block(ffn.get("routed", "moe") if ffn.get("block", "auto") == "auto" else ffn["block"])
         self.experts_at = (("" if getattr(routed_block, "at_layer", False) else ffn.get("prefix", "mlp."))
                            + ffn.get("experts", "experts."))
-        experts_prefixes = [f"{prefix}layers.{i}.{self.experts_at}".rstrip(".") for i in self.routed]
+        experts_prefixes = sorted({f"{self.layer_prefix(i)}{self.experts_at}".rstrip(".") for i in self.routed})
         if self.mtp:
             experts_prefixes.append(self.draft_prefix + "layers.0.mlp.experts")
         outside = set(self.residual.names(prefix))
@@ -263,56 +259,17 @@ class ComposedModel:
             for spec in self._before(i):
                 found = getattr(self._block(spec["block"]), "tables", None)
                 if found is not None:
-                    tables.update(found(self, f"{prefix}layers.{i}." + spec.get("prefix", ""), spec))
+                    tables.update(found(self, self.layer_prefix(i) + spec.get("prefix", ""), spec))
         tabled = tuple(at for _, at in tables.values())
         kept = [n for n in ck.names() if (n.startswith(prefix + "layers.") or n in outside
                                           or n.startswith("lm_head.") or (self.mtp and n.startswith(self.draft_prefix)))
                 and not n.startswith(tabled)]
         offloaded = [n for n in kept if self.offload and any(n.startswith(p) for p in experts_prefixes)]
-        self.kv_dtype = options["kv"]
-        # The attention layers whose keys and values the model's KV pools hold (a mixer may keep its own: keeps_kv).
-        full = [i for i, k in enumerate(self.kinds) if k != "linear_attention"
-                and getattr(self._block(self._layer_spec(i)["block"]), "keeps_kv", True)]
-        scales = bool(full) and all(f"{prefix}layers.{i}.self_attn.k_scale" in ck for i in full)
-        if self.kv_dtype == "auto":
-            self.kv_dtype = "fp8" if scales else "bf16"
-        if self.kv_dtype == "fp8" and not scales:
-            raise ValueError("model-template: fp8 KV pages take the checkpoint's static k_scale and v_scale, which it "
-                             "does not store: choose kv bf16 or fp8:row")
-        self.kv_scales = self.kv_dtype == "fp8"
 
         # -- the plan ----------------------------------------------------------------------------------------------------
-        self.kv_tokens = self.context + int(options["kv_margin"])
-        pages = -(-self.kv_tokens // PAGE)
         linear = [i for i, k in enumerate(self.kinds) if k == "linear_attention"]
-        windows = {}
-        for i in full:
-            windows.setdefault(self._window(i), []).append(i)
-
-        def pool_bytes(layers, dtype, tokens, shape=None):
-            kv_heads, head_dim = shape or (self.kv_heads, self.head_dim)
-            element = {"bf16": 2, "fp8": 1, "fp8:row": 1}[dtype]
-            pages_ = -(-tokens // PAGE)
-            found = 2 * layers * pages_ * PAGE * kv_heads * head_dim * element
-            if dtype == "fp8:row":
-                found += 2 * layers * pages_ * PAGE * kv_heads * 4
-            return found
-
-        # Each window's layers share a pool, so they share a head shape (a family whose layer kinds differ in shape
-        # differs in window too: its full layers a pool, its sliding ones another).
-        shapes = {}
-        for window, layers in windows.items():
-            found = {self.kv_shape(i, self._layer_spec(i)) for i in layers}
-            if len(found) > 1:
-                raise ValueError(f"model-template: the attention layers of window {window} have key/value heads x "
-                                 f"widths {sorted(found)}: layers that share a KV pool share a head shape")
-            shapes[window] = found.pop()
-        kv_bytes = 0
-        for window, layers in windows.items():
-            tokens = self.kv_tokens if not window else self.sequences * (window + self.chunk + 2 * PAGE)
-            kv_bytes += pool_bytes(len(layers), self.kv_dtype, tokens, shapes[window])
-        if self.mtp:
-            kv_bytes += pool_bytes(1, options["mtp_kv"], self.kv_tokens)
+        # The KV pools' bytes as the kv_cache plugin prices a position (its position_bytes), whole pages.
+        kv_bytes = self.kv_device_bytes(getattr(parts["kv_cache"], "position_bytes", None))
         state_bytes = 0
         if linear:
             lin = config.linear
@@ -323,17 +280,24 @@ class ComposedModel:
                                              + 2 * cap * (lin.num_key_heads * lin.key_head_dim + lin.num_value_heads
                                                           + lin.num_value_heads * lin.value_head_dim)) * 4
             state_bytes = int(state_bytes * 1.05) + (32 << 20)
-        declared = self._declared()
+        declared = self.declared
         for d in declared:
-            if d["kind"] == "keys":     # BF16 keys, a row a position
-                kv_bytes += len(d["layers"]) * pages * PAGE * d["heads"] * d["dim"] * 2
-            else:                       # a convolution's window of each sequence and round row, FP32
+            if d["kind"] == "window":   # a convolution's window of each sequence and round row, FP32 (keys: KV)
                 span = (d["kernel"] - 1) * d.get("dilation", 1) + 2 * (self.width + 1)
                 rows = len(d["layers"]) * (self.sequences + 1)
                 state_bytes += int(rows * d["channels"] * span * 4 * 1.05) + (8 << 20)
-        self.activations = int(options["activations_mib"]) << 20
+        self.activations = self.step_plan.activations(int(options["activations_mib"]) << 20)
         away = set(offloaded)   # once: a checkpoint of routed experts names hundreds of thousands of tensors
         tensors = {name: ck.nbytes(name) for name in kept if name not in away}
+        if self.routed and self.experts is not None and "experts:mxfp8" not in parts.facts("experts"):
+            # MXFP8 expert stacks an experts plugin without MXFP8 bundles takes as their BF16 values (MoE): two bytes a
+            # code where the checkpoint keeps one
+            for base in experts_prefixes:
+                for part in ("gate_up_proj", "down_proj"):
+                    name = f"{base}.{part}.weight"
+                    if name in tensors and self.matrices.has(f"{base}.{part}") \
+                            and self.matrices.format(f"{base}.{part}") == "mxfp8":
+                        tensors[name] *= 2
         # The token embeddings: a lookup table a placement may put off the device where they can be read in place,
         # else a device weight like any other.
         self.embed_plan = "tables.embed_tokens" if self._embed_in_place(embed_name) else "embed_tokens"
@@ -344,13 +308,16 @@ class ComposedModel:
             head_bytes = ck.nbytes("lm_head.weight" if not tied else embed_name)
             tensors["draft_head"] = head_bytes // 2 if options["draft_head"] == "nvfp4" else head_bytes
         if self.mtp and self._draft_moe():
-            self.expert_ids[self.layers] = len(self.expert_ids)
+            self.expert_ids[self.layers] = self.expert_slots
+            self.expert_slots += 1
         # The format the experts slot holds every layer's experts in: the first routed layer's. A draft layer's
         # experts stored otherwise are re-encoded to it (draft-only: the target verifies every draft).
         self.expert_format = None
         if self.routed:
-            first = f"{prefix}layers.{min(self.routed)}.{self.experts_at}"
+            first = f"{self.layer_prefix(min(self.routed))}{self.experts_at}"
             self.expert_format = ("bf16" if first + "gate_up_proj" in ck
+                                  else self.matrices.format(first + "gate_up_proj")
+                                  if self.matrices.has(first + "gate_up_proj")   # stacks stored as matrices
                                   else self.matrices.format(first + "0.gate_proj"))
         if self.offload:
             moe, fmt, stored = config.moe, self.expert_format, {}
@@ -358,13 +325,19 @@ class ComposedModel:
                 fmt = "bf16"
             if fmt.startswith("gguf:"):   # each layer's experts as the file stores them: its formats, a layer each
                 fmt, stored["formats"] = "gguf", {
-                    k: self.matrices.expert_formats(f"{prefix}layers.{i}.{self.experts_at}" if i < self.layers
+                    k: self.matrices.expert_formats(f"{self.layer_prefix(i)}{self.experts_at}" if i < self.layers
                                                     else f"{self.draft_prefix}layers.0.mlp.experts.")
                     for i, k in self.expert_ids.items()}
             # what the slot is begun with; a GGUF's layers each keep their own formats
             self.expert_format = None if fmt == "gguf" else fmt
-            self.experts.begin(len(self.expert_ids), moe.experts, fmt, self.hidden, moe.moe_intermediate_size,
-                               device_bytes=kv_bytes + state_bytes + self.activations, **stored)
+            # decode_rows and top: the most rows one decode round runs through a layer, the slots a layer whose misses
+            # go over the link may take a round. A captured round's victims are listed once, so every plan of the
+            # round counts: the draft layer runs each request's catch-up (width + 1 columns) and then its chain's
+            # width - 1 steps (MtpHead), the decoder's layers a verify of width + 1 columns.
+            rows = self.width + 1 + max(0, self.width - 1)
+            self.experts.begin(self.expert_slots, moe.experts, fmt, self.hidden, moe.moe_intermediate_size,
+                               device_bytes=kv_bytes + state_bytes + self.activations,
+                               decode_rows=self.concurrency * rows, top=moe.experts_per_token, **stored)
         free = self._free()   # after the load's own temporaries go back to the device
         placed = self.placed = parts["placement"].plan(tensors, {"device": free, "host": _host_available()})
         if any(place != "device" for name, place in placed.items() if not name.startswith("tables.")):
@@ -376,7 +349,8 @@ class ComposedModel:
 
         # -- the layers ------------------------------------------------------------------------------------------------
         self.residual.load(prefix)
-        self.head = self.matrices.load(["lm_head" if not tied else prefix + "embed_tokens"], "head")
+        self.head = self.matrices.load(["lm_head" if not tied else prefix + "embed_tokens"], "head",
+                                       rows=self.vocabulary)
         self.rope = Rope(config, self.head_dim, self.device)
         scale = layout.get("embed_scale")
         if scale not in (None, "sqrt_hidden"):
@@ -386,7 +360,7 @@ class ComposedModel:
         self.geometry = GatedDelta.geometry(self) if linear else None
         self.decoder = []
         for i, kind in enumerate(self.kinds):
-            p = f"{prefix}layers.{i}."
+            p = self.layer_prefix(i)
             before = [self._block(spec["block"])(self, i, p + spec.get("prefix", ""), spec) for spec in self._before(i)]
             self.decoder.append(Layer(kind, self._mixer(i, p), self._ffn(i, p), self.residual.layer(p), before))
         # The ids some blocks read beside each token's own (hashed n-grams): each token's window of this many ids.
@@ -407,17 +381,16 @@ class ComposedModel:
         # -- the pools -------------------------------------------------------------------------------------------------
         kv = parts["kv_cache"]
         self.pools = {}
-        for window, layers in windows.items():
-            key = ("kv", window) if window else "kv"
+        for spec in self.planned_pools():   # the KV pools Shape resolved, which the plugin's resolve() priced
+            window = spec["sliding"]
             extra = dict(sliding=window, span=self.chunk + self.width + 1, positions=self.kv_tokens) if window else {}
-            tokens = self.kv_tokens if not window else self.sequences * (window + self.chunk + 2 * PAGE)
-            self.pools[key] = kv.pool(layers, *shapes[window], tokens, self.device, self.kv_dtype, page=PAGE, **extra)
-            if self.kv_scales:
-                for i in layers:
-                    self.pools[key].set_scales(i, *self.decoder[i].mixer.kv_scales)
-        if self.mtp:
-            self.pools["mtp"] = kv.pool([self.layers], self.kv_heads, self.head_dim, self.kv_tokens, self.device,
-                                        options["mtp_kv"], page=PAGE)
+            if spec["value_dim"] is not None:
+                extra["value_dim"] = spec["value_dim"]
+            made = self.pools[spec["key"]] = kv.pool(spec["layers"], spec["kv_heads"], spec["head_dim"],
+                                                     spec["tokens"], self.device, spec["dtype"], page=PAGE, **extra)
+            if spec["kind"] == "kv" and self.kv_scales:
+                for i in spec["layers"]:
+                    made.set_scales(i, *self.decoder[i].mixer.kv_scales)
         if linear:
             lin = config.linear
             conv = 2 * lin.num_key_heads * lin.key_head_dim + lin.num_value_heads * lin.value_head_dim
@@ -427,10 +400,7 @@ class ComposedModel:
                                                         widest=self.width, conv=(conv, lin.conv_kernel_dim),
                                                         key_heads=lin.num_key_heads, rows=self.concurrency)
         for d in declared:
-            if d["kind"] == "keys":
-                self.pools[d["key"]] = kv.pool(d["layers"], d["heads"], d["dim"], self.kv_tokens, self.device, "bf16",
-                                               page=PAGE, value_dim=0)
-            else:
+            if d["kind"] == "window":   # a convolution's window (the pools of keys are KV pools, made above)
                 if self.recurrence is None:
                     raise ValueError(f"model-template: the selection leaves recurrence empty, which keeps the "
                                      f"convolution window {d['key']}")
@@ -449,6 +419,7 @@ class ComposedModel:
         self.state_pools = [self.pools[k] for k in self.state_keys]
         self.draft_pools = [self.pools[k] for k in self.draft_keys]
         self.states = self.state_pools[0] if self.state_pools else None
+        pages = -(-self.kv_tokens // PAGE)
         self.reservations = PageReservations(pages, PAGE, self.context, verify_rows=self.width + 1)
         self.stops = stop_tokens(context.model, context.config)
         self.handles = 0
@@ -461,7 +432,8 @@ class ComposedModel:
         self.layer_pools = [[key for key in (getattr(layer.mixer, "pool", None), getattr(layer.mixer, "index", None))
                              if key in self.kv_keys] for layer in self.decoder]
         self.layer_states = [[self.pools[key] for key in dict.fromkeys(
-            [getattr(layer.mixer, "pool", None)] + [getattr(block, "pool", None) for block in layer.before])
+            [getattr(layer.mixer, "pool", None)] + [getattr(block, "pool", None) for block in layer.before]
+            + list(getattr(layer.mixer, "windows", ())))
             if key in self.state_keys] for layer in self.decoder]
         self.passes, self.passes_reason = self._passes(options)
         self.pass_bytes = int(options["pass_mib"]) << 20
@@ -471,7 +443,7 @@ class ComposedModel:
                                // QUANTUM * QUANTUM)
         # A step of a pass ends within the span budget and half the cancel grace: a cancel then also gives back
         # what the pass holds (its states, the pages it reserved), which costs the driver time by the gigabyte.
-        self.pass_seconds = min(float(options["span_seconds"]) or SECONDS, GRACE / 2)
+        self.pass_seconds = min(self.step_plan.seconds(options["span_seconds"]), GRACE / 2)
         self.passed = {"passes": 0, "tokens": 0, "steps": 0, "chunks": 0, "dropped": 0, "open": 0}
 
         # -- spans: every prompt step within the cancel grace and the device's room ----------------------------------------
@@ -543,68 +515,6 @@ class ComposedModel:
         if missing:
             raise ValueError("model-template: the selection leaves " + " and ".join(missing) + " empty")
 
-    def _spec(self, kind, name=None):
-        """The layout's mixer of a layer kind (Core's: full_attention, sliding_attention, linear_attention), looked up
-        first by the config's own name of the layer type where it has another."""
-        mixers = self.layout.get("mixers") or {}
-        spec = mixers.get(name) if name else None
-        spec = mixers.get(kind) if spec is None else spec
-        if spec is None:
-            raise ValueError(f"model-template: the layout has no block for {name or kind} layers (its mixers: "
-                             f"{', '.join(sorted(mixers)) or 'none'})")
-        return {**spec, "kind": kind}
-
-    def _layer_spec(self, layer):
-        return self._spec(self.kinds[layer], self.types[layer])
-
-    def setting(self, key):
-        """The config's value of `key`, else what the family's reference assumes where config.json is silent (the
-        layout's `defaults`)."""
-        found = self.config.get(key)
-        return (self.layout.get("defaults") or {}).get(key) if found is None else found
-
-    def _before_layers(self, spec):
-        """The layers (numbered from 1, as configs list them) a `before` block runs ahead of."""
-        layers = spec["layers"]
-        return set(self.config.get(layers) or ()) if isinstance(layers, str) else set(layers)
-
-    def _before(self, layer):
-        return [spec for spec in self.layout.get("before") or [] if layer + 1 in self._before_layers(spec)]
-
-    def _declared(self):
-        """The pools the layout's blocks keep beside their layers' (a block class's pools(model, spec, layers)): one
-        declaration a key, for the layers that run the block; the draft layer's mixer declares its own."""
-        groups = {}
-        for i in range(self.layers):
-            spec = self._layer_spec(i)
-            groups.setdefault(json.dumps(spec, sort_keys=True), (spec, []))[1].append(i)
-        groups = list(groups.values())
-        for spec in self.layout.get("before") or []:
-            layers = [i for i in range(self.layers) if spec in self._before(i)]
-            if layers:
-                groups.append((spec, layers))
-        if self.mtp:
-            groups.append(({**self._spec("full_attention"), "window": 0, "pool": "mtp"}, [self.layers]))
-        found = {}
-        for spec, layers in groups:
-            declare = getattr(self._block(spec["block"]), "pools", None)
-            for d in (declare(self, spec, layers) if declare is not None else []):
-                if d["key"] in found or d["key"] in ("kv", "states", "mtp") or d["kind"] not in ("keys", "window"):
-                    raise ValueError(f"model-template: block {spec['block']} declares the pool {d['key']!r} "
-                                     f"({d['kind']}), which is taken or of no kind (keys, window)")
-                found[d["key"]] = d
-        return list(found.values())
-
-    def kv_shape(self, layer, spec):
-        """(key/value heads, head width) of a layer's attention: what the config states for the layer itself (its
-        per_layer_config entry, by the layer's number or its type), else the config keys the mixer's spec names
-        (`kv_heads`, `head_dim`), else the model's."""
-        per = self.config.get("per_layer_config") or {}
-        own = per.get(str(layer)) or per.get(self.types[layer] if layer < len(self.types) else None) or {}
-        kv_heads = own.get("num_key_value_heads") or (self.setting(spec["kv_heads"]) if spec.get("kv_heads") else None)
-        head_dim = own.get("head_dim") or (self.setting(spec["head_dim"]) if spec.get("head_dim") else None)
-        return int(kv_heads or self.kv_heads), int(head_dim or self.head_dim)
-
     def rope_for(self, layer, head_dim):
         """The rotary table of a layer's attention: its layer type's where the config keys its rope by layer type
         (each type its own base, type and rotated share, at heads of `head_dim`), else the model's."""
@@ -637,20 +547,6 @@ class ComposedModel:
         except Exception:   # a plugin over compose() that does not declare the kernel runs the torch form
             return None
 
-    def _block(self, name):
-        found = self.blocks.get(name)
-        if found is None:
-            raise ValueError(f"model-template: no block {name!r} (blocks: {', '.join(sorted(self.blocks))}); an engine "
-                             "passes its own to compose()")
-        return found
-
-    def _window(self, layer):
-        spec = self._layer_spec(layer)
-        window = spec.get("window")
-        if window is None and self.kinds[layer] == "sliding_attention":
-            window = self.config.sliding_window
-        return int(window or 0)
-
     def _mixer(self, layer, p):
         spec = self._layer_spec(layer)
         return self._block(spec["block"])(self, layer, p + spec.get("prefix", ""), spec)
@@ -664,8 +560,10 @@ class ComposedModel:
         made = self._block(name)
         block = made(self, layer, p if getattr(made, "at_layer", False) else p + spec.get("prefix", "mlp."), spec)
         if isinstance(block, MoE):
-            if not (self.offload and getattr(self.experts, "complete", False)):
+            loaded = self.__dict__.setdefault("_experts_loaded", set())   # a looped layer's experts: once
+            if block.slot not in loaded and not (self.offload and getattr(self.experts, "complete", False)):
                 block.load_experts()
+            loaded.add(block.slot)
         return block
 
     def _check_router(self):
@@ -866,7 +764,7 @@ class ComposedModel:
             s.produced = [token]
             if self.draft_head is not None:
                 s.last_hidden = feature.clone()   # the seed's feature: the prompt's last row
-            release_cached_under(self.free_below, self.device)   # a prompt ended: its temporaries leave room
+            self.step_plan.release(self.device)   # a prompt ended: its temporaries leave room
         return StepResult(made.tokens + reused, s.produced, ends, reused, 0, logprobs)
 
     def _passed(self, made, ended=True, stepped=True):
@@ -887,26 +785,47 @@ class ComposedModel:
     def _spans(self, options):
         seconds = float(options["span_seconds"])
         if seconds <= 0 or not self.device.type == "cuda" or self.chunk <= QUANTUM:   # no shorter span to choose
-            return Spans(self.chunk)
-        from crit_plugins import decisions
+            return self._budget(self.chunk)
         torch = self.torch
         key = {"device": torch.cuda.get_device_name(self.device), "layers": self.layers, "hidden": self.hidden,
                "kinds": sorted(set(self.kinds)), "chunk": self.chunk, "context": self.context,
                "vocabulary": self.vocabulary, "kv": self.kv_dtype,
                "plugins": {slot: self.parts.plugin(slot) for slot in self.parts.slots()}}
-        costs = decisions.settle("model-template", "spans", key=key, measure=self._measure_spans,
-                                 decide=lambda found: fit({(r, p): s for r, p, s in found["timings"]},
-                                                          {r: b for r, b in found["peaks"]}))
         room = None
-        if not self.offload:   # expert-offload makes room for a prompt step itself (its step frames)
-            room = max(0, free_device_bytes() - (int(options["headroom_mib"]) << 20))
+        if not self.offload:   # an experts plugin that gives memory back has the device make a step's room
+            # The device keeps the run's headroom (crit_plugins.memory's, which Core's loader sets): a span's peak
+            # leaves it free.
+            memory = getattr(getattr(self.parts, "context", None), "memory", None)
+            if memory is None:
+                from crit_plugins.memory import of
+                memory = of(self.device)
+            room = max(0, free_device_bytes() - int(memory.headroom))
         deepest = max(0, (self.kv_tokens - self.width - 1 - self.chunk) // QUANTUM * QUANTUM)
-        return Spans(self.chunk, costs, seconds, room, deepest, units=len(self.decoder) if self.passes else 1)
+        # Core's prompt-step budget, calibrated by Core from the three steps the model times (Steps.calibrated): Core
+        # times every prompt step and the spans follow what such steps take as the engine serves, unless a chunk's
+        # boundaries change its rows' bits (prompt rows below row-exact), where they stay the calibration's.
+        from crit_plugins.kernels import asks
+        return self._plan().calibrated("model-template", self.chunk, key=key, measure=self._measure_spans,
+                                       seconds=seconds, room=room, deepest=deepest,
+                                       units=len(self.decoder) if self.passes else 1,
+                                       adaptive=asks("prompt") not in (None, "repeatable"))
+
+    def _plan(self):
+        """Core's step plan for this engine (LoadContext.steps), or Core's defaults where no Core context made it (a
+        test, a bench)."""
+        return self.step_plan
+
+    def _budget(self, chunk, **options):
+        """Core's prompt-step budget for this engine (LoadContext.steps), or one of the plugin's own where no Core
+        context made it (a test, a bench)."""
+        steps = getattr(getattr(self.parts, "context", None), "steps", None)
+        return steps.budget(chunk, **options) if steps is not None else StepBudget(chunk, **options)
 
     def _measure_spans(self):
         """Three prompt steps on a sequence of its own: a short and a full chunk at position 0, a full chunk at the
-        deepest position served (its earlier KV positions written with zeros); each run twice, the second timed and its
-        peak measured above what the device held before it."""
+        deepest position served (its earlier KV positions written with zeros); each run twice as Core's measured step
+        (crit_plugins.memory: the step pool, so Core's arena holds it), the second timed and its peak what its
+        temporaries took from Core's allocator."""
         import time
         torch = self.torch
         memory = getattr(self.parts.context, "memory", None) if hasattr(self.parts, "context") else None
@@ -939,24 +858,31 @@ class ComposedModel:
                         pool.keep(sequence, first + count)
                 ids = torch.randint(3, self.vocabulary, (rows,), generator=g).to(self.device)
                 batch = StepBatch.build([(sequence, position, rows)], self.device)
+                timed = {}
+
+                def chunk():
+                    started = time.perf_counter()
+                    try:
+                        h = self._hidden(ids, batch, windows=self._windows([([], ids.tolist())]))
+                        self._logits_rows(h[-1:])
+                        del h
+                    finally:   # the experts' step ends however the chunk did: a chunk that ran out runs again
+                        if self.offload:
+                            self.experts.end_step(False)
+                    torch.cuda.synchronize(self.device)
+                    timed["seconds"] = time.perf_counter() - started
                 for run in range(2):
                     torch.cuda.synchronize(self.device)
-                    before = torch.cuda.memory_reserved(self.device)
-                    memory.mark()
-                    started = time.perf_counter()
-                    h = self._hidden(ids, batch, windows=self._windows([([], ids.tolist())]))
-                    self._logits_rows(h[-1:])
-                    if self.offload:
-                        self.experts.end_step(False)
-                    torch.cuda.synchronize(self.device)
-                    seconds = time.perf_counter() - started
-                    peak = max(0, (memory.peak() or before) - before)
-                    del h
+                    # Core's measured step: its temporaries come from the step pool and count as a prompt step's,
+                    # so the step arena holds the deepest chunk (no warm request reaches that position); where an
+                    # expert cache opened before it left no room, Core's givers make it and the chunk runs again
+                    step = memory.measure(chunk, "prompt")
+                    seconds, peak = timed["seconds"], step.took
                 timings.append([rows, position, seconds])
                 peaks[rows] = max(peaks.get(rows, 0), peak)
             finally:
                 self._close(sequence)
-        release_cached_under(self.free_below, self.device)
+        self.step_plan.release(self.device)
         return {"timings": timings, "peaks": [[r, b] for r, b in sorted(peaks.items())]}
 
     # -- Core's settings -------------------------------------------------------------------------------------------------
@@ -968,14 +894,23 @@ class ComposedModel:
                  "max_row_tokens": self.width + 1, "decode_token_work": self.width + 1, "stop_tokens": self.stops,
                  "sampling": dict.fromkeys(CORE_SAMPLING, True), "token_logprobs": True, "max_top_logprobs": TOP,
                  "scoring": True, "query_scoring": True, "score_paths": ["prefill"], "replay": True,
-                 "speculative": self.mtp, "plain": self.mtp,
+                 "speculative": self.mtp, "plain": self.mtp, "decode_via_prompt": True, "step_contract": CONTRACT,
                  **({"prompt_cache": True} if self.cache is not None else {})}
         if self.rounds is not None and self.rounds.counter_names:   # what the round's parts count (an expert cache)
             found["round_counters"] = list(self.rounds.counter_names)
+        found["step_bytes"] = self.step_bytes()   # Core's step arena: the most one step takes
         if self.passes:   # Core's prefill passes: a pass runs a chunk through a layer a step at least
             found.update(prefill_pass_tokens=self.pass_tokens,
                          prefill_pass_steps=self.layers * (self.pass_tokens // QUANTUM + 2))
+        # A sparse attention selects its blocks once a row's blocks pass the budget: Core serves a prompt past it at
+        # load (two whole chunks past, so a chunk of rows that all select runs), and its kernels compile there.
+        budgets = [layer.mixer.top * layer.mixer.block for layer in self.decoder if getattr(layer.mixer, "sparse", False)]
+        if budgets:
+            found["warm_prompts"] = [max(budgets) + 2 * self.chunk + 37]
         if self.mtp:
+            # The widest width a round drafts (an engine fact: crit-eval prices a drafting engine's batched round, its
+            # concurrency ceilings among them, at it; without it those ceilings are left unpriced)
+            found["draft_width"] = self.width
             found["draft_bytes_per_step"] = self.draft_bytes
             found["drafter_kind"] = "checkpoint MTP layer"
             if self.rounds is not None:
@@ -1032,16 +967,16 @@ class ComposedModel:
             found += [joined[i:i + k + 1] for i in range(len(inputs))]
         return self.torch.tensor(found, dtype=self.torch.int64, device=self.device).view(len(found), k + 1)
 
-    def _hidden(self, ids, batch, feature=False, windows=None):
+    def _hidden(self, ids, batch, feature=False, windows=None, via_prompt=()):
         """The hidden rows of the batch's tokens the head reads; with feature, also what a draft layer reads of them
         (the residual's: the same rows, or its streams). windows: _windows of the batch's rows (a round's come from
-        its token ring)."""
+        its token ring). via_prompt: the batch's decode rows that run as one-token prompt chunks (RowGroups.of)."""
         x = self.embedded(ids)       # the embedding rows the residual starts from
         if self.window_tokens and windows is None:
             if not batch.round or self.ring is None:
                 raise RuntimeError("model-template: a step of a model whose blocks read token windows gives them")
             windows = self.ring.windows(ids.view(batch.rows, -1), self.window_tokens).reshape(-1, self.window_tokens)
-        ctx = Context(self, batch, self.rows.of(batch),
+        ctx = Context(self, batch, self.rows.of(batch, via_prompt),
                       self._reserve(batch, self.kv_keys), ids=ids, windows=windows)
         h, found = self.residual.forward(self.decoder, x, ctx)
         return (h, found) if feature else h
@@ -1102,20 +1037,12 @@ class ComposedModel:
             logits = self.torch.tanh(logits / self.softcap) * self.softcap
         return logits
 
-    def _score_bytes(self, rows, top_k=0):
-        """The device bytes a score's slice of `rows` rows holds at once: FP32 logits (twice with a cap on them) and
-        their log-softmax, with top_k the whole sorted row beside its int64 order."""
-        per = 4 * (2 + (1 if self.softcap else 0)) + (12 if top_k else 0)
-        return int(rows) * self.vocabulary * per
-
-    def _need(self, nbytes):
-        """`nbytes` the step is about to take beyond what its experts plugin measured steps of its size to take:
-        the device's ledger has its givers (an elastic expert cache) make room for them first, so the device's free
-        memory stays at what they keep (crit_plugins.memory: need). Nothing on the CPU, or inside a capture."""
-        if self.device.type != "cuda" or self.torch.cuda.is_current_stream_capturing():
-            return
-        from crit_plugins.memory import of
-        of(self.device).need(nbytes)
+    def step_bytes(self):
+        """The most device bytes a step at a position no warm request reaches takes, for Core's step arena (info's
+        step_bytes): a full prompt chunk at the deepest position served, at the bytes a row the calibration's
+        measured steps took (the spans decision records them, so a load that replays it states the same). Core's
+        warm requests measure the rest, a score's slices of logits among them."""
+        return int(float(getattr(self.spans, "per_row", 0.0) or 0.0) * self.chunk)
 
     def _logits_at(self, h, logit_rows):
         torch = self.torch
@@ -1230,10 +1157,16 @@ class ComposedModel:
         packed, ids, logit_rows, placed, prompts, graphed, tails, history = [], [], [], [], [], [], [], []
         mtp = self.pools.get("mtp")
         marking = self.cache is not None and mtp is not None
-        for placement in layout.placements:
+        # A request that asks decode_via_prompt (a debug option: crit smoke tells a decode gap's rounding from a fault
+        # by it) has its decode rows computed as one-token prompt chunks, after the step's other decode rows, which
+        # keep their decode arithmetic (an experts plugin splits a step's rows at its first prompt row).
+        via, via_prompt = (lambda p: p.phase == DECODE and _via_prompt(rows[p.item].session.request)), set()
+        for placement in sorted(layout.placements, key=lambda p: p.phase != DECODE or via(p)):
             s = rows[placement.item].session
             inputs = [s.pending] if placement.phase == DECODE else s.prompt[s.done:s.done + placement.rows]
             s.phase, s.rows, s.produced, s.graphed, s.settled = placement.phase, len(inputs), [], False, False
+            if placement.phase == PREFILL:   # Core's budget hears the step's prompt chunks (it times the step)
+                self.spans.ran(len(inputs), s.done)
             if placement.phase == PREFILL and s.resume is not None:
                 if mtp is not None and s.mtp_done < s.done:
                     self._mtp_prompt([(s, s.mtp_done, 1, 0)], s.resume[None])
@@ -1253,6 +1186,8 @@ class ComposedModel:
                 count = min(s.done + len(inputs), len(s.prompt) - 1) - s.done
                 if count > 0:
                     prompts.append((s, s.done, count, len(ids)))
+            if via(placement):
+                via_prompt.add(len(packed))
             packed.append((s.handle, s.done, len(inputs)))
             if self.window_tokens:   # the row's ids and the sequence's before it (its prompt, then its outputs)
                 before = s.prompt[:s.done] if s.done <= len(s.prompt) else s.prompt + s.outputs[:s.done - len(s.prompt)]
@@ -1267,7 +1202,7 @@ class ComposedModel:
         if packed:
             batch = StepBatch.build(packed, self.device)
             head_rows, hidden = self._hidden(torch.tensor(ids, dtype=torch.int64, device=self.device), batch,
-                                             feature=True, windows=self._windows(history))
+                                             feature=True, windows=self._windows(history), via_prompt=via_prompt)
             eager_logits = self._logits_at(head_rows, logit_rows)
             del head_rows
             if mtp is not None and prompts:
@@ -1295,7 +1230,7 @@ class ComposedModel:
         logits = torch.cat(rows_logits) if rows_logits else None
         emitted = iter(self._emit([(s, rows[placement.item].allowed) for placement, s, has in placed if has], logits))
         if any(placement.phase == PREFILL and has for placement, _, has in placed):
-            release_cached_under(self.free_below, self.device)   # a prompt ended: its temporaries leave room
+            self.step_plan.release(self.device)   # a prompt ended: its temporaries leave room
         results = [None] * len(rows)
         for placement, s, has in placed:
             logprobs = None
@@ -1325,20 +1260,21 @@ class ComposedModel:
             token, logprobs = s.request.replay[len(s.outputs)] if s.request.replay else tokens[j], None
             if s.request.logprobs is not None:
                 row = torch.log_softmax(logits[j], -1)
-                ranked, order = row.sort(descending=True, stable=True)
-                k = min(int(s.request.logprobs), TOP)
-                logprobs = [(float(row[token]), list(zip(order[:k].tolist(), ranked[:k].tolist())))]
+                ranked, order = top_ranked(row, min(int(s.request.logprobs), TOP))
+                logprobs = [(float(row[token]), list(zip(order.tolist(), ranked.tolist())))]
             found.append((token, logprobs))
         return found
 
     def _roundable(self, s):
         """Whether a request whose prompt is in decodes in round slots from here: rounds on and able to run, a free
-        slot, no long replay, no constrained decoding, its stops within a slot's, its log-probabilities within the
-        driver's alternatives."""
+        slot, no long replay, constrained decoding only where the rounds mask (Rounds.masks: Core stages its allowed
+        set between rounds), no decode through the prompt path, its stops within a slot's, its log-probabilities within
+        the driver's alternatives."""
         r, rounds = s.request, self.rounds
-        return (rounds is not None and rounds.native is not None and not rounds.problems
+        return (rounds is not None and rounds.native is not None and not rounds.problems and not _via_prompt(r)
                 and len(self.slots) < rounds.rows and (not r.replay or len(r.replay) <= CONTINUATION)
-                and not s.constrained and (not r.plain or float(r.sampling.get("temperature", 1.0)) == 0.0)
+                and (not s.constrained or rounds.masks)
+                and (not r.plain or float(r.sampling.get("temperature", 1.0)) == 0.0)
                 and len(r.stop_tokens) <= STOPS and (r.logprobs is None or int(r.logprobs) <= rounds.top)
                 and (self.draft_head is None or s.last_hidden is not None))
 
@@ -1388,7 +1324,9 @@ class ComposedModel:
             ran_natively = native is not None and native.last is not None and native.last[2]
             if ran_natively:
                 rounds.adopt(*native.last[:2])
-                emitted = rounds.n_emitted[:len(self.slots)].tolist()
+                # The round's block in host memory, not the device's counts: Core commits after every round that ran
+                # a constrained row, and this then reads no device memory.
+                emitted = [len(native.emitted(slot)) for slot in range(len(self.slots))]
             else:
                 emitted = [len(s.produced) for s in self.slots]
             keep = [min(count, trims.get(slot, count)) for slot, count in enumerate(emitted)]
@@ -1467,14 +1405,13 @@ class ComposedModel:
             """The scores of the scored positions among [start, end), from their head rows h."""
             for lo in range(max(start, wanted.start), end, SCORE_SLICE):
                 hi = min(lo + SCORE_SLICE, end)
-                self._need(self._score_bytes(hi - lo, top_k))
                 logp = torch.log_softmax(self._logits_rows(h[lo - start:hi - start]), -1)
                 nxt = torch.tensor(ids[lo + 1:hi + 1], dtype=torch.int64, device=self.device)
                 target.extend(logp.gather(1, nxt[:, None])[:, 0].tolist())
                 argmax.extend(logp.argmax(-1).tolist())
-                if top_k:
-                    ranked, order = logp.sort(dim=-1, descending=True, stable=True)
-                    top.extend(list(zip(o, v)) for o, v in zip(order[:, :top_k].tolist(), ranked[:, :top_k].tolist()))
+                if top_k:   # Core's order (equal values: the lower id first), without sorting the vocabulary
+                    ranked, order = top_ranked(logp, top_k)
+                    top.extend(list(zip(o, v)) for o, v in zip(order.tolist(), ranked.tolist()))
                 if queries:
                     for r in range(lo, hi):
                         row = queries[r - wanted.start]
@@ -1513,8 +1450,10 @@ class ComposedModel:
             for key, pool in self.pools.items():
                 if key not in self.draft_keys:
                     pool.close(sequence)
-            release_cached_under(self.free_below, self.device)
+            self.step_plan.release(self.device)
         return Scores(target, query, argmax, top or None)
 
     def close(self):
+        if self.cache is not None:   # the prompt cache leaves the device's givers
+            self.cache.close()
         self.decoder.clear()

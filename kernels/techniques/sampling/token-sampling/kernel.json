@@ -1,0 +1,94 @@
+{
+  "schema": "crit-kernel-v1",
+  "id": "token-sampling",
+  "family": "sampling",
+  "title": "Core's sampling law on the device: a draw per logits row by Core's rules and Philox draws, rejection-sampling verify predictions and log-probabilities; an exact top-64 fast path and the full-vocabulary law by prefix searches, spread over several blocks a row",
+  "package": "token_sampling",
+  "language": "cuda",
+  "core_include": true,
+  "operations": [
+    "sampling"
+  ],
+  "sources": [
+    "sampling_cuda/sampling.cu",
+    "torch-ext/torch_binding.cpp"
+  ],
+  "cuda_flags": [
+    "-std=c++20",
+    "--expt-relaxed-constexpr"
+  ],
+  "cxx_flags": [
+    "-std=c++20"
+  ],
+  "capabilities": [
+    "8.0",
+    "8.6",
+    "8.9",
+    "9.0",
+    "10.0",
+    "10.3",
+    "11.0",
+    "12.0",
+    "12.1"
+  ],
+  "libraries": [],
+  "structures": {
+    "fast-law": {
+      "what": "the fast path (sample, verify): stage blocks of 256 threads x 16 logits a row, each block's exact top 65 packed keys (value descending, id ascending, no atomics) and its FP64 weight partials, then a law block a row merging them in block order and running Core's steps 7 to 12 in FP64 on the candidates; greedy rows, 1 <= top_k <= 64 and the open rows whose kept set closes within the candidates. Its block sizes set the FP64 sums' grouping, so they are fixed: no knobs",
+      "call": "sample",
+      "rows": [
+        1,
+        65535
+      ],
+      "tune_rows": [
+        1,
+        8,
+        64
+      ],
+      "key": [
+        "vocab"
+      ],
+      "exactness": "row-exact",
+      "yardstick": {
+        "library": "torch ops: argmax for greedy rows (torch.argmax, the lower id on ties as torch takes the first)"
+      },
+      "bench": "bench.py:Greedy"
+    },
+    "full-law": {
+      "what": "the full-vocabulary law of the rows the fast path leaves (one block of 1,024 threads a row): Core's processing into FP32 values, prefix searches over the keys' eight 4-bit digits (per-thread FP32 sums over a fixed stride, FP64 over the warps in order) and the boundary key's ties in id order (the tiles holding a token of it only), the draw; untuned (its order is its block's)",
+      "call": "sample",
+      "rows": [
+        1,
+        65535
+      ],
+      "key": [
+        "vocab"
+      ],
+      "exactness": "row-exact"
+    },
+    "spread-law": {
+      "what": "the full law spread over PARTS blocks a row of a cooperative launch (where the device runs one and the occupancy API says the grid fits; else full-law): the 1,024 threads as virtual threads, every per-thread sum and warp tree the one-block law's, the cross-warp steps through slots in scratch and a per-row barrier, so the full law's bits; CRIT_SAMPLING_ONE_BLOCK=1 takes full-law",
+      "call": "sample",
+      "exactness": "exact",
+      "bits_of": "full-law",
+      "key": [
+        "vocab"
+      ],
+      "rows": [
+        1,
+        65535
+      ],
+      "knobs": {
+        "PARTS": {
+          "values": [
+            8,
+            16,
+            32
+          ],
+          "default": 32,
+          "what": "blocks a row's 1,024 threads spread over (whole warps a block: 128, 64 or 32 threads): more of the GPU's multiprocessors for a row against more rows' blocks resident at once; no bit changes"
+        }
+      }
+    }
+  }
+}

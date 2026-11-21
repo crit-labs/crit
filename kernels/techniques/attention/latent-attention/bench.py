@@ -8,6 +8,8 @@ from pathlib import Path
 
 import torch
 
+from crit_kernels import contracts
+
 PAGE = 64
 LENGTH = 8192
 _spec = importlib.util.spec_from_file_location(
@@ -89,8 +91,7 @@ class Window:
         return self._refs[key]
 
     def check(self, got, want, st):
-        err = float((got.double() - want).abs().max())
-        return None if err < 8e-3 + 2e-2 * float(want.abs().max()) else f"max error {err:.3g}"
+        return contracts.check("latent-attention", got, want)
 
     def first_row(self, out):
         return out[0]

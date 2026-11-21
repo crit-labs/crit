@@ -92,16 +92,12 @@
   ],
   "interactions": [
     "mtp-decode",
-    "session-scheduling",
-    "checkpoint-storage",
-    "concurrent-request-execution"
+    "checkpoint-storage"
   ],
   "techniques": [
     "attention-state",
     "mtp-decode",
-    "session-scheduling",
-    "checkpoint-storage",
-    "concurrent-request-execution"
+    "checkpoint-storage"
   ],
   "validation": {
     "host": "Python fixtures retain the dense transaction/formula example and check rope_table.py against Hugging Face's ROPE_INIT_FUNCTIONS",

@@ -6,6 +6,7 @@ blocks, as an NVFP4 checkpoint keeps its MTP layer's experts): it is re-encoded 
 the stored target verifies every draft."""
 import json
 import os
+import re
 from pathlib import Path
 
 
@@ -39,9 +40,12 @@ class Checkpoint:
     """The checkpoint's safetensors headers ({name: TensorInfo}) and its tensors read one at a time onto a device:
     the shards its index names (model.safetensors.index.json: wherever it keeps them, a tensors/ subfolder too) and
     the safetensors files beside it that the index does not list (a draft layer stored apart); without an index,
-    every safetensors file of the folder."""
+    every safetensors file of the folder. `names`: the layout's rules for a checkpoint that names its tensors its own
+    way, [[pattern, replacement], ...] regular expressions applied in order to every name (re.sub), so the blocks
+    read it under the names they know; each tensor keeps its bytes where they are. A rule's third entry shifts the
+    number its first group matched (a layer's tensor the checkpoint keeps under the number before)."""
 
-    def __init__(self, model):
+    def __init__(self, model, names=None):
         from safetensors import safe_open
         from crit_core.model.safetensors import INDEX_NAME, inspect_model, inspect_safetensors
         self.folder = model = Path(model)
@@ -62,6 +66,27 @@ class Checkpoint:
                 self.headers[tensor.name] = tensor
         if not self.headers:
             raise ValueError(f"model-template: no safetensors files in {model}")
+        self.stored_names = {}   # the names the rules changed: {the blocks' name: the checkpoint's}
+        if names:
+            def rule(entry):
+                pattern, replacement = re.compile(entry[0]), entry[1]
+                if len(entry) < 3:
+                    return pattern, replacement
+                shift = int(entry[2])
+                return pattern, lambda m: m.expand(replacement.replace("\\1", str(int(m.group(1)) + shift)))
+            rules = [rule(entry) for entry in names]
+            renamed = {}
+            for name, info in self.headers.items():
+                new = name
+                for pattern, replacement in rules:
+                    new = pattern.sub(replacement, new)
+                if new in renamed:
+                    raise ValueError(f"model-template: the layout's names give {self.stored_names.get(new, new)} and "
+                                     f"{name} one name, {new}")
+                renamed[new] = info
+                if new != name:
+                    self.stored_names[new] = name
+            self.headers = renamed
         for path in sorted({str(info.shard) for info in self.headers.values()}):
             self.files[path] = safe_open(path, "pt", device="cpu")
 
@@ -85,7 +110,7 @@ class Checkpoint:
             dtype = getattr(torch, DTYPES[info.dtype])
             flat = torch.frombuffer(self._buffer, dtype=torch.uint8, count=info.nbytes, offset=at)
             return flat.clone().view(dtype).reshape(tuple(info.shape)).to(device)
-        return self.files[str(info.shard)].get_tensor(name).to(device)
+        return self.files[str(info.shard)].get_tensor(self.stored_names.get(name, name)).to(device)
 
     def hold(self, prefix):
         """Reads the bytes of every tensor named `prefix`... into memory of the checkpoint's own, past the OS's page
@@ -153,12 +178,13 @@ class Checkpoint:
         self.files.clear()
 
 
-def open_checkpoint(model, config):
-    """(checkpoint, its Matrices class): the safetensors files, or a GGUF read under the same names (gguf.py)."""
+def open_checkpoint(model, config, names=None):
+    """(checkpoint, its Matrices class): the safetensors files (renamed by the layout's `names`), or a GGUF read under
+    the same names (gguf.py)."""
     from .gguf import GgufCheckpoint, GgufMatrices, is_gguf
     if is_gguf(model):
         return GgufCheckpoint(model, config), GgufMatrices
-    return Checkpoint(model), Matrices
+    return Checkpoint(model, names), Matrices
 
 
 def stop_tokens(model, config):
@@ -205,15 +231,30 @@ class Matrices:
                                                                          "mxfp8" if self._mx(p) else "fp8:block")
         return p.scheme
 
-    def stored(self, base, device=None):
+    def stored(self, base, device=None, index=None):
         """(format, tensors) of matrix `base` as the projections slot's load takes them, on `device` (the model's
-        by default)."""
+        by default); `index`: of a stack of matrices stored as one tensor ([experts][out][in]), matrix `index`."""
         torch, ck = self.torch, self.ck
         p = self.parts(ck.headers, base, self.quant)
         if p is None:
             raise KeyError(f"model-template: no matrix {base} in the checkpoint")
         device = self.device if device is None else device
-        get = lambda name: ck.get(name, device)  # noqa: E731
+        if index is None:
+            get = lambda name: ck.get(name, device)  # noqa: E731
+        else:
+            stack = p.shape[:-2]
+            if len(stack) != 1 or not 0 <= index < stack[0]:
+                raise ValueError(f"model-template: {base} is no stack of matrices with a matrix {index} "
+                                 f"(shape {list(p.shape)})")
+
+            def get(name):   # the stack's tensor of matrix `index`, or a tensor the stack shares
+                cache = self.__dict__.setdefault("_stacks", {})   # a layer's stacks, read once for all its matrices
+                if name not in cache:
+                    if len(cache) >= 8:
+                        cache.clear()
+                    cache[name] = ck.get(name, "cpu")
+                found = cache[name]
+                return (found[index] if found.dim() and found.shape[0] == stack[0] else found).contiguous().to(device)
         if p.scheme == "plain":
             return "bf16", {"weight": get(p.codes).to(torch.bfloat16)}
         if p.scheme == "fp8":
@@ -223,10 +264,12 @@ class Matrices:
                 return "fp8:tensor", {"weight": get(p.codes), "scale": get(p.scales).float().reshape(())}
             if self._mx(p):
                 return "mxfp8", {"weight": get(p.codes), "scale": get(p.scales)}
-            # FP8 in blocks (a multiplier per b0 x b1 block): no slot loads it as stored; reformat() re-encodes it
+            # FP8 in blocks (a multiplier per b0 x b1 block): the projections slot loads it as stored (fp8-block-rows)
             return "fp8:block", {"weight": get(p.codes), "scale": get(p.scales).float(), "block": tuple(p.block)}
         g = get(p.global_scale).float().reshape(())
-        if not p.global_divides:
+        if p.global_denominator is not None:   # weight = code * scale * amax / denominator: the slot's divisor
+            g = get(p.global_denominator).float().reshape(()) / g
+        elif not p.global_divides:
             g = 1.0 / g
         if p.scale_encoding == "csf":   # ModelOpt's compressed scales: E4M3 bytes again, as an uncompressed one stores
             from crit_core.model.schemes import CSF_EXCEPTIONS
@@ -291,18 +334,37 @@ class Matrices:
                 tensors["input_scale"] = inputs[0]
         return fmt, tensors
 
-    def load(self, bases, role, encode=None):
+    def load(self, bases, role, encode=None, rows=None):
         """The matrices `bases` stacked into one, loaded in the projections slot (re-encoded to `encode` when only a
-        drafter reads it: by the slot, or here where the slot does not take the stored format)."""
+        drafter reads it: by the slot, or here where the slot does not take the stored format). Loaded once: the
+        layers that run one checkpoint layer (a looped decoder's passes) get the same loaded matrix. rows: the
+        first rows alone (a head stored with padded rows past the vocabulary)."""
+        key = (id(self.proj), tuple(bases), role, encode, rows)   # what one projections slot loaded
+        cache = self.__dict__.setdefault("_loaded", {})
+        if key not in cache:
+            cache[key] = self._load(bases, role, encode, rows)
+        return cache[key]
+
+    def _load(self, bases, role, encode=None, rows=None):
         if encode is not None and any(self.format(b) == "fp8:block" for b in bases):
-            fmt, tensors = self._stack([self.reformat(b, encode if encode != "fp8" else "fp8:channel") for b in bases],
-                                       bases)
+            # The slot loads no FP8 blocks: the matrices re-encode here, to what is asked where its kernels take the
+            # shape, else to their BF16 values, which the slot keeps as stored and reports (encoding_problem).
+            want = encode if encode != "fp8" else "fp8:channel"
+            problem = getattr(self.proj, "encoding_problem", None)
+            rows = sum(self.ck.shape(b + ".weight")[0] for b in bases) if hasattr(self.ck, "shape") else None
+            columns = self.ck.shape(bases[0] + ".weight")[1] if hasattr(self.ck, "shape") else None
+            if problem is not None and rows is not None and problem(want, rows, columns):
+                fmt, tensors = self._stack([self.reformat(b, "bf16") for b in bases], bases)
+                return self.proj.load(tensors, fmt, role=role, encode=encode)
+            fmt, tensors = self._stack([self.reformat(b, want) for b in bases], bases)
             return self.proj.load(tensors, fmt, role=role)
         fmt, tensors = self.stacked(bases)
-        if fmt == "fp8:block":
-            raise ValueError(f"model-template: {bases[0]} is FP8 in blocks of {tensors['block']}, which the projections "
-                             "slot does not load (it loads FP8 per channel, per tensor and MXFP8); a draft layer's "
-                             "matrix re-encodes (option mtp_encode)")
+        if rows is not None and tensors["weight"].shape[0] > rows:   # each row's tensors: its codes and scales
+            tensors = {k: (v[:rows].contiguous() if hasattr(v, "dim") and v.dim() >= 1 and v.shape[0] ==
+                           tensors["weight"].shape[0] else v) for k, v in tensors.items()}
+        if fmt == "fp8:block" and "fp8:block" not in getattr(self.proj, "formats", ()):   # a slot's stated formats
+            raise ValueError(f"model-template: {bases[0]} is FP8 in blocks of {tensors['block']}, which this "
+                             "projections slot does not load; a draft layer's matrix re-encodes (option mtp_encode)")
         if encode is not None:
             return self.proj.load(tensors, fmt, role=role, encode=encode)
         return self.proj.load(tensors, fmt, role=role)
@@ -329,6 +391,23 @@ class Matrices:
         if p is None:
             raise KeyError(f"model-template: no matrix {base} in the checkpoint")
         return p.shape[0]
+
+    def stacked_expert(self, gate_up, down, index, interleaved=False, device=None):
+        """(format, gate_up, down) of expert `index` of experts stored as two stacks, gate_up [experts][2 * inter][in]
+        and down [experts][hidden][inter] (any format stored(): BF16, MXFP8, NVFP4), as the experts slot's load() takes
+        them: the gate's rows, then the up projection's. `interleaved`: the stack keeps each gate row beside its up
+        row (gate rows at even, up rows at odd places), moved apart here as whole rows with their scales."""
+        fmt, gu = self.stored(gate_up, device, index)
+        _, dn = self.stored(down, device, index)
+        if interleaved:
+            torch = self.torch
+            for key in ("weight", "scale"):
+                if key in gu and gu[key].dim() >= 2:
+                    rows = gu[key]
+                    gu[key] = torch.cat([rows[0::2], rows[1::2]]).contiguous()
+        if fmt == "bf16":
+            return fmt, gu["weight"], dn["weight"]
+        return fmt, gu, dn
 
     def expert(self, gate, up, down, want=None, device=None):
         """(format, gate_up, down) of one routed expert as the experts slot's load() takes it: bfloat16 matrices, or the

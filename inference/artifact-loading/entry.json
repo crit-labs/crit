@@ -62,8 +62,7 @@
   ],
   "interactions": [
     "checkpoint-storage",
-    "ssd-expert-materialization",
-    "host-memory-admission"
+    "ssd-expert-materialization"
   ],
   "techniques": [
     "artifact-loading",

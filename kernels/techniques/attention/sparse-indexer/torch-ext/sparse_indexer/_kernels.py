@@ -17,8 +17,11 @@ threshold's ties from the lowest position), -1 past the token's valid keys."""
 import triton
 import triton.language as tl
 
+from crit_kcore import radix   # the keys: a NaN as 0, below every number
 
-@triton.jit
+
+@triton.jit(do_not_specialize=["T", "N", "GROUP", "stride_ot", "stride_sg"],
+            do_not_specialize_on_alignment=["end_ptr"])   # ends: a slice of a request's, any offset
 def score_kernel(q_ptr, k_ptr, ks_ptr, w_ptr, end_ptr, out_ptr, slot_ptr, T, N, GROUP, scale, stride_qt, stride_qh,
                  stride_kn, stride_wt, stride_ot, stride_sg, H: tl.constexpr, D: tl.constexpr, TM: tl.constexpr,
                  BN: tl.constexpr, FP8: tl.constexpr, HW_FP8: tl.constexpr, LOG_H: tl.constexpr, SLOTS: tl.constexpr):
@@ -64,15 +67,8 @@ def score_kernel(q_ptr, k_ptr, ks_ptr, w_ptr, end_ptr, out_ptr, slot_ptr, T, N, 
     tl.store(out_ptr + t2[:, None].to(tl.int64) * stride_ot + n[None, :], total, mask=tm[:, None] & nm[None, :])
 
 
-@triton.jit
-def _order_key(x):
-    """FP32 scores as uint32 keys of the same order, a NaN as 0 (below every number, -inf included)."""
-    u = x.to(tl.uint32, bitcast=True)
-    key = tl.where((u & 0x80000000) != 0, ~u, u | 0x80000000)
-    return tl.where(x != x, 0, key).to(tl.uint32)
-
-
-@triton.jit
+@triton.jit(do_not_specialize=["N", "SLICE", "stride_st", "stride_ot"],
+            do_not_specialize_on_alignment=["end_ptr"])   # ends: a slice of a request's, any offset
 def topk_kernel(s_ptr, pos_ptr, end_ptr, out_ptr, sout_ptr, N, K, SLICE, stride_st, stride_ot, BLOCK: tl.constexpr,
                 KB: tl.constexpr, POS: tl.constexpr, ENDS: tl.constexpr, SOUT: tl.constexpr):
     """Program (token t, slice p): the k best of the token's valid scores in positions p x SLICE .. (p + 1) x SLICE
@@ -102,7 +98,7 @@ def topk_kernel(s_ptr, pos_ptr, end_ptr, out_ptr, sout_ptr, N, K, SLICE, stride_
             nm = n < hi
             if POS:
                 nm = nm & (tl.load(prow + n, mask=nm, other=-1) >= 0)
-            key = _order_key(tl.load(row + n, mask=nm, other=0.0))
+            key = radix.radix_key(tl.load(row + n, mask=nm, other=0.0))
             if d == 0:
                 match = nm
             else:
@@ -129,7 +125,7 @@ def topk_kernel(s_ptr, pos_ptr, end_ptr, out_ptr, sout_ptr, N, K, SLICE, stride_
             where = tl.load(prow + n, mask=nm, other=-1)
             nm = nm & (where >= 0)
         x = tl.load(row + n, mask=nm, other=0.0)
-        key = _order_key(x)
+        key = radix.radix_key(x)
         tie = nm & (key == prefix)
         tie_rank = ties + tl.cumsum(tie.to(tl.int32), 0) - 1
         take = nm & ((key > prefix) | (tie & (tie_rank < need)))

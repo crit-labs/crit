@@ -30,6 +30,18 @@ def random_drafter(seed, vocab=12):
     return rows
 
 
+class ChainHeadTests(unittest.TestCase):
+    def test_model_templates_chain_head_does_not_claim_a_tree_head(self):
+        # model-template's MTP head drafts one chain a row: it provides draft:head-device and not draft:head-tree, which
+        # draft-trees needs, so the pair is refused at resolve (draft-trees' own tests show the refusal).
+        import json
+        manifest = lambda plugin: json.loads((ROOT / "inference" / plugin / "plugin.json").read_text(encoding="utf-8"))
+        template, trees = manifest("model-template"), manifest("draft-trees")
+        self.assertIn("draft:head-device", template["provides"])
+        self.assertNotIn("draft:head-tree", template["provides"])
+        self.assertIn("draft:head-tree", trees["needs"])
+
+
 class DraftTreeTests(unittest.TestCase):
     def test_trees_are_ancestor_closed_with_path_masks(self):
         m = load()

@@ -18,8 +18,10 @@ class DeviceMatrices:
     device, activations, prompt, gemm, gemv, loaded, roles = None, "nvfp4", "bf16", "auto", "auto", frozenset(), {}
     decode, decode_rows, rows, tile_rows, invariant = "prompt", None, device_matrices.GEMV_ROWS, "auto", None
     fp8_activations = "fp8"
+    formats = device_matrices.FORMATS   # the stored formats load() takes (model-template reads it: fp8:block)
     decode_formats = {}   # decode_formats: a format's decode activations where they differ from decode_activations
     head, head_by, head_encoding = "stored", None, None   # the `head` option as create() resolved it (asked_head)
+    head_kept = None   # why an FP8 head stayed as stored (a shape cuBLASLt does not take), for facts()
     stored_heads = ()   # (weak reference, device) of each stored 16-bit head re-encoded here, until release_dropped()
     scratch = None        # the engine's scratch (context.scratch), which the calls on its device compute in
 
@@ -27,6 +29,11 @@ class DeviceMatrices:
         if self.scratch is not None:   # the engine closes: its scratch is used no more
             device_matrices.use_scratch(self.device, self.scratch, use=False)
             self.scratch = None
+
+    def encoding_problem(self, encode, rows, columns):
+        """Why a draft-only matrix of rows x columns stays as stored where `encode` is asked (a shape the encoded
+        format's kernels do not take), or None: load() keeps such a matrix as stored and facts() name it."""
+        return device_matrices.encoding_problem(encode, rows, columns)
 
     def load(self, tensors, format, role=None, encode=None):
         """role: the matrix's role in the model, as the model plugin names it (qkv, gate_up, ...), which picks its
@@ -42,7 +49,11 @@ class DeviceMatrices:
         same)."""
         self.release_dropped()
         activations, draft, encoded_on = self.activations, encode is not None, None
-        if role == HEAD_ROLE and not draft and self.head == "fp8" and format in device_matrices.ENCODINGS["fp8"]:
+        kept = None   # why a matrix asked to re-encode stays as stored: a shape the encoded format does not take
+        if (role == HEAD_ROLE and not draft and self.head == "fp8" and format in device_matrices.ENCODINGS["fp8"]
+                and device_matrices.encoding_problem("fp8", *tensors["weight"].shape[:2])):
+            self.head_kept = device_matrices.encoding_problem("fp8", *tensors["weight"].shape[:2])
+        elif role == HEAD_ROLE and not draft and self.head == "fp8" and format in device_matrices.ENCODINGS["fp8"]:
             stored, before = format, device_matrices.stored_bytes(tensors, format)
             self.stored_heads = (*self.stored_heads, (weakref.ref(tensors["weight"]), tensors["weight"].device))
             tensors, format = device_matrices.reencode(tensors, format, "fp8", self.device)
@@ -57,15 +68,24 @@ class DeviceMatrices:
         if draft:
             stored, before = format, device_matrices.stored_bytes(tensors, format)
             if encode != format.split(":")[0]:
-                tensors, format = device_matrices.reencode(tensors, format, encode, self.device)
-                activations = "bf16"
+                # A matrix whose shape the encoded format does not take stays as stored (a draft layer's 324 x 10240
+                # matrix in FP8): the rest of its role re-encodes, and the facts name it (draft_encoding's kept).
+                kept = (device_matrices.encoding_problem(encode, *tensors["weight"].shape[:2])
+                        if format in device_matrices.ENCODINGS.get(encode, ()) else None)
+                if kept is None:
+                    tensors, format = device_matrices.reencode(tensors, format, encode, self.device)
+                    activations = "bf16"
             # One group per role and stored format: a role whose matrices are stored in two formats (a draft layer's
-            # BF16 and FP8 matrices) records each apart, under role:stored for the second.
+            # BF16 and FP8 matrices) records each apart, under role:stored for the second; a matrix kept as stored,
+            # under role:kept.
             key = role or "draft"
-            if key in self.encodings and self.encodings[key]["stored"] != stored:
+            if kept is not None:
+                key = f"{key}:kept"
+            elif key in self.encodings and self.encodings[key]["stored"] != stored:
                 key = f"{key}:{stored}"
             group = self.encodings.setdefault(key, {"stored": stored, "encoded": format, "matrices": 0,
-                                                    "stored_bytes": 0, "encoded_bytes": 0})
+                                                    "stored_bytes": 0, "encoded_bytes": 0,
+                                                    **({"asked": encode, "kept": kept} if kept else {})})
             if group["encoded"] != format:
                 raise ValueError(f"quantized-projections: draft-only role {role or 'draft'} re-encodes "
                                  f"{group['stored']} to {group['encoded']}, not {stored} to {format}")
@@ -184,7 +204,7 @@ class DeviceMatrices:
         return device_matrices.matmul(x, matrix, out_dtype, prompt=prompt)
 
     def exactness(self):
-        """The level the loaded matrices' rows keep (crit_kernels.exactness; Core's facts carry it and its loader
+        """The level the loaded matrices' rows keep (crit_plugins.exactness; Core's facts carry it and its loader
         compares it with the level the configuration asks). Decode rows are row-exact: in a call of up to the
         facts' row_invariance rows each row has the bits of the row alone. Prompt rows are exact where every target
         matrix runs the prompt tile (the bits of the same row decoded), row-exact through the fixed-tile and pinned
@@ -241,7 +261,7 @@ class DeviceMatrices:
         if "mxfp8" in self.loaded:   # its prompt rows multiply 16-bit rows or MXFP8 ones (mxfp8_activations)
             found["mxfp8"] = "stored" if self.mx_activations == "mxfp8" else "bf16"
             if self.mx_by is not None:
-                chosen["mxfp8_activations"] = f"mxfp8_activations auto in quality mode {self.mx_by}"
+                chosen["mxfp8_activations"] = f"mxfp8_activations auto by {self.mx_by}"
         if "int4_zp" in self.loaded:
             found["int4_zp"] = "bf16"   # weight only (W4A16)
         prompt = {k: v for k, v in found.items() if k != "row_invariance"}
@@ -258,6 +278,7 @@ class DeviceMatrices:
                 **({"prompt_kernels": dict(self.prompt_kernels)} if self.prompt_kernels else {}),
                 **({"draft_encoding": draft} if draft else {}),
                 **({"head_encoding": dict(self.head_encoding)} if self.head_encoding else {}),
+                **({"head_kept": self.head_kept} if self.head_kept else {}),
                 **({"matrices": [{"N": n, "K": k, "format": f} for n, k, f in sorted(self.shapes)]} if self.shapes else {})}
 
 
@@ -308,17 +329,25 @@ def asked_head(head, mode):
 MX_ACTIVATIONS = ("auto", "bf16", "mxfp8")
 
 
-def asked_mx(activations, mode):
-    """The `mxfp8_activations` option under the quality mode the engine states: auto is mxfp8 in speed, where a
-    quantized format's prompt rows start at its stored activations (a speed run's plans declare them so, and crit
-    run refuses 16-bit ones without a measurement), and bf16 in preserve or where no mode is stated. An option set
-    to one way is that way. Returns (activations, the mode that chose them or None)."""
+# The MXFP8 prompt activation each asked activation (crit_plugins.kernels.activation) is served by.
+MX_ASKED = {"stored": "mxfp8", "bf16": "bf16"}
+
+
+def asked_mx(activations, mode, asked=None):
+    """The `mxfp8_activations` option under what the engine is asked: auto serves the prompt activation the
+    configuration asks for MXFP8 matrices (`asked`, crit_plugins.kernels.activation("mxfp8"): what the build plan
+    declared; stored is mxfp8, W8A8), and where nothing is asked follows the quality mode: mxfp8 in speed, where a
+    quantized format's prompt rows start at its stored activations, and bf16 in preserve or where no mode is stated.
+    An option set to one way is that way (Core's loader refuses it where it is not what is asked). Returns
+    (activations, what chose them or None)."""
     if activations not in MX_ACTIVATIONS:
         raise ValueError(f"quantized-projections: mxfp8_activations is one of {', '.join(MX_ACTIVATIONS)}, not "
                          f"{activations!r}")
     if activations != "auto":
         return activations, None
-    return ("mxfp8", mode) if mode == "speed" else ("bf16", None)
+    if asked in MX_ASKED:
+        return MX_ASKED[asked], f"the configuration's prompt_activations ({asked})"
+    return ("mxfp8", f"quality mode {mode}") if mode == "speed" else ("bf16", None)
 
 
 def asked_gemm(gemm, gemv, asked):
@@ -336,7 +365,7 @@ def asked_gemm(gemm, gemv, asked):
 
 
 def create(context, options, parts):
-    from crit_plugins.kernels import asks, quality_mode
+    from crit_plugins.kernels import activation, asks, quality_mode
     if options["format"] == "nvfp4":
         found = NVFP4Projections(options["four_over_six"])
     else:
@@ -362,7 +391,7 @@ def create(context, options, parts):
     found.rows = options["decode_rows"]
     found.tile_rows = options["tile_rows"] if options["tile_rows"] == "auto" else int(options["tile_rows"])
     found.fp8_activations = options["fp8_activations"]
-    found.mx_activations, found.mx_by = asked_mx(options["mxfp8_activations"], quality_mode())
+    found.mx_activations, found.mx_by = asked_mx(options["mxfp8_activations"], quality_mode(), activation("mxfp8"))
     if found.device is not None and str(found.device).startswith("cuda"):
         device_matrices.buffers(found.device)   # the shared buffers memory() declares: each made at its first use
         found.scratch = getattr(context, "scratch", None)

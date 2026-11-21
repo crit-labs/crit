@@ -1,40 +1,44 @@
-"""directory_ops.cu built at load through Core's native build (crit_plugins.native.extension), once a process for the
-device's architecture and cached across processes under a name hashed from the source's path and bytes (each engine
-has its own copy of the plugin); None where it does not build, and device_directory.py runs its torch ops instead."""
+"""The directory's plan and fill on the device: crit's kernel expert-directory (kernels/techniques/experts/
+expert-directory), built for the device by crit's kernel build through crit_plugins.kernels.load_kernel, once a process,
+and recorded in the engine's facts; None where it does not build (no CUDA compiler, no crit_kernels: the kernel's
+fallback with its reason), and device_directory.py runs its torch ops instead. The plugin that loads it is the one
+whose package imports this code (crit_plugins.kernels.plugin_folder): device-expert-cache itself, or a plugin that
+imports its code as a source (expert-offload), whose plugin.json declares the kernel too."""
 from pathlib import Path
 import threading
 import warnings
 
 HERE = Path(__file__).resolve().parent
+KERNEL = "expert-directory"   # plugin.json "kernels"
 _BUILT = {}
 _LOCK = threading.Lock()
-_WHY = {}
 
 
-def directory_ops(device, arch=None):
-    """The directory's plan and fill on `device` (a CUDA device), or None (the reason in why(device))."""
+def directory_ops(device):
+    """The directory's plan and fill on `device` (a CUDA device): crit's kernel expert-directory, or None (the reason
+    in why())."""
     import torch
     device = torch.device(device)
     if device.type != "cuda":
         return None
-    major, minor = torch.cuda.get_device_capability(device)
-    arch = arch or f"{major}.{minor}"
-    with _LOCK:
-        if arch not in _BUILT:
-            _BUILT[arch] = _build(arch)
-    return _BUILT[arch]
+    from crit_plugins.kernels import plugin_folder
+    folder = plugin_folder(__name__, HERE.parent)
+    with _LOCK:   # once a process for each plugin that asks (load_kernel builds it once)
+        if folder not in _BUILT:
+            _BUILT[folder] = _build(folder)
+    return _BUILT[folder]
 
 
-def why(arch):
-    return _WHY.get(arch)
+def why():
+    """Why the kernel did not build here (crit_plugins.kernels.fallbacks), or None."""
+    from crit_plugins.kernels import fallbacks
+    return fallbacks().get(KERNEL)
 
 
-def _build(arch):
-    from crit_plugins.native import NativeUnavailable, extension
-    try:
-        return extension("crit_expert_directory", [HERE / "directory_ops.cu"], arch=arch)
-    except NativeUnavailable as error:   # no compiler, or headers that do not match: the torch ops serve
-        _WHY[arch] = str(error).splitlines()[0][:300]
-        warnings.warn(f"device-expert-cache: the directory's CUDA ops did not build for {arch} ({_WHY[arch]}); its "
+def _build(folder):
+    from crit_plugins.kernels import load_kernel
+    module = load_kernel(KERNEL, folder=folder)
+    if module is None:   # no compiler, or headers that do not match: the torch ops serve
+        warnings.warn(f"device-expert-cache: crit's kernel {KERNEL} did not build here ({why()}); the directory's "
                       "torch ops plan and fill instead (slower, same rule)")
-        return None
+    return module

@@ -2,7 +2,7 @@
   "schema": "crit-plugin-v1",
   "id": "gguf-projections",
   "title": "GGUF projections: a GGUF checkpoint's quantized matrices at their stored bits",
-  "description": "The projections slot over matrices as a GGUF checkpoint stores them: format gguf:<TYPE> (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, TQ1_0, TQ2_0, MXFP4, Q1_0, Q2_0) with the stored rows uint8 [N][row bytes] (crit_core.model.gguf_blocks.GgufTensors reads them from the file without copying), or a stack of experts [E][N][row bytes] for matmul_experts; the file's dense tensors as bf16. Decode rows (calls of up to 8 rows) run crit's kernel gguf-rows' gemv: each row quantized to int8 per 32 values, each stored sub-block's exact integer dot on dp4a, FP32 in a declared order, a row's bits its own (an expert stack's rows each against their expert, the plain call's bits). Prompt rows take option prompt: dequantize (the default: the matrix decoded to BF16 a call and cuBLAS's GEMM) or exact (gguf-rows' gemm on the s8 tensor cores: every prompt row with its decode row's bits, the facts' prompt_exact). Its host form encodes the slot's dense cases to Q8_0 and projects with exact sums over the stored values (Core's decoders, the formats' own decoders bit for bit).",
+  "description": "The projections slot over matrices as a GGUF checkpoint stores them: format gguf:<TYPE> (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, TQ1_0, TQ2_0, MXFP4, Q1_0, Q2_0) with the stored rows uint8 [N][row bytes] (crit_core.model.gguf_blocks.GgufTensors reads them from the file without copying), or a stack of experts [E][N][row bytes] for matmul_experts; the file's dense tensors as bf16: with prompt exact every dense row has its decode row's bits too, on crit's kernel mma-rows' BF16 decode tile and its prompt tile (the pair quantized-projections' prompt_gemm tile runs for stored BF16 matrices), else one row a call through torch; with dequantize one row a call for decode rows and cuBLAS's GEMM for prompt rows. Decode rows (calls of up to 8 rows) run crit's kernel gguf-rows' gemv: each row quantized to int8 per 32 values, each stored sub-block's exact integer dot on dp4a, FP32 in a declared order, a row's bits its own (an expert stack's rows each against their expert, the plain call's bits). Prompt rows take option prompt: dequantize (the default: the matrix decoded to BF16 a call and cuBLAS's GEMM) or exact (gguf-rows' gemm on the s8 tensor cores: every prompt row with its decode row's bits, the facts' prompt_exact). Its host form encodes the slot's dense cases to Q8_0 and projects with exact sums over the stored values (Core's decoders, the formats' own decoders bit for bit).",
   "fills": [
     "projections"
   ],
@@ -25,13 +25,17 @@
         "dequantize",
         "exact"
       ],
-      "description": "prompt rows' path: auto (the default), the faster path that keeps the level the engine's configuration asks of its prompt rows (exactness, docs/PLUGINS.md#exactness): dequantize where it asks repeatable or nothing, exact where it asks row-exact, exact or declared; dequantize, the matrix decoded to BF16 a call and cuBLAS's BF16 GEMM (FP32 sums; faster today, not the decode rows' bits); exact, gguf-rows' gemm in the decode rows' order (each prompt row's output the bits it has decoded)"
+      "description": "prompt rows' path: auto (the default), the faster path that keeps the level the engine's configuration asks of its prompt rows (exactness, docs/PLUGINS.md#exactness): dequantize where it asks repeatable or nothing, exact where it asks row-exact, exact or declared; dequantize, the matrix decoded to BF16 a call and cuBLAS's BF16 GEMM (FP32 sums; faster today, not the decode rows' bits); exact, gguf-rows' gemm in the decode rows' order (each prompt row's output the bits it has decoded), and for dense matrices mma-rows' prompt tile with its decode tile's bits (one row a call where it does not build)"
     }
   },
   "kernels": [
     {
       "name": "gguf-rows",
       "fallback": "the stored values decoded exactly on the host at load (crit_core.model.gguf_blocks) as a BF16 matrix through torch, one row a call for decode rows (also on a CPU device)"
+    },
+    {
+      "name": "mma-rows",
+      "fallback": "with prompt exact, a dense matrix's decode and prompt rows one row a call through torch (each prompt row the bits of its decode row; slower)"
     }
   ],
   "sources": {

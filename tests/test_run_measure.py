@@ -295,7 +295,8 @@ class MeasureChecksTests(MeasureFixture, unittest.TestCase):
         self.check("functional")
         self.check("resources", "unverified")
         lasting = ("since arithmetic check check-0001 \\(case-0001\\) failed; resources check check-0003 \\(case-0001\\) "
-                   "unverified\\. No later record undoes that, so candidate-0001 cannot become eligible: build the fix "
+                   "unverified\\. No later record undoes that, so candidate-0001 cannot become eligible: seal it built "
+                   "\\(crit run \\.\\.\\. seal --candidate candidate-0001 --lifecycle built\\) and build the fix "
                    "as a new candidate \\(its plan repairs a failed check with a requirement lever serving "
                    "check:arithmetic\\)\\. To measure it anyway")
         self.refused(lasting)
@@ -310,8 +311,9 @@ class MeasureChecksTests(MeasureFixture, unittest.TestCase):
         self.store.append(self.run_id, candidate, "benchmark", data)
         with self.assertRaisesRegex(ValueError, "since benchmark-0001 \\(case-0001\\) failed resources: its free memory "
                                                 "is below the run's headroom or unmeasured\\. No later record undoes "
-                                                "that, so candidate-0001 cannot become eligible: build the fix as a new "
-                                                "candidate\\. To measure"):
+                                                "that, so candidate-0001 cannot become eligible: seal it built "
+                                                "\\(crit run \\.\\.\\. seal --candidate candidate-0001 --lifecycle "
+                                                "built\\) and build the fix as a new candidate\\. To measure"):
             measure.measure(self.store, self.run_id, candidate)
 
     def test_exploratory_measures_anyway_and_its_benchmarks_stay_exploratory(self):

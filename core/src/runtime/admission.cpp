@@ -1,4 +1,4 @@
-// Concurrent admission: first in, first out, into free generation lanes.
+// Concurrent admission into free generation lanes: by priority, the oldest first among equals, scores as barriers.
 #include "engine.h"
 #include <chrono>
 #include <cstddef>
@@ -20,6 +20,15 @@ template<class Call> auto unlocked(std::unique_lock<std::mutex>& lock, Call&& ca
     const Relock relock{lock};
     return call();
 }
+// The index in `waiting` of the generation admitted next: of the requests queued before the first score (an
+// exclusive barrier: no request overtakes it, and it overtakes none), the lowest priority value, the oldest among
+// equals; `waiting.size()` where the queue is empty or a score is its head.
+std::size_t next_waiting(const std::deque<std::shared_ptr<detail::Request>>& waiting) {
+    std::size_t best = waiting.size();
+    for(std::size_t i=0;i<waiting.size() && !waiting[i]->scoring;++i)
+        if(best == waiting.size() || waiting[i]->options.priority < waiting[best]->options.priority) best = i;
+    return best;
+}
 }
 void Engine::Impl::admit() {
     std::unique_lock lock(wakeup->mutex);
@@ -37,30 +46,33 @@ void Engine::Impl::admit() {
         auto& lane = lanes[i];
         if(lane.request) continue;
         while(!lane.request && !waiting.empty()) {
-            auto r=waiting.front();
-            if(r->scoring) break; // An exclusive barrier: generation behind it waits.
-            if(!r->output) { waiting.pop_front(); complete(r,Finish::length); continue; }
+            // An index, not an iterator: submit() appends while the lock is released around model callbacks.
+            const std::size_t index = next_waiting(waiting);
+            if(index == waiting.size()) break; // A score heads the queue: an exclusive barrier generation waits behind.
+            auto r=waiting[index];
+            const auto taken = [&] { waiting.erase(waiting.begin()+std::ptrdiff_t(index)); };
+            if(!r->output) { taken(); complete(r,Finish::length); continue; }
             if(generations[i] == std::numeric_limits<std::uint64_t>::max()) throw std::overflow_error("lane generation exhausted");
             RequestKey key{r->id,generations[i]+1,std::uint32_t(i)};
             RequestView view{key,r->prompt,r->output,&r->options};
             const auto admission = unlocked(lock,[&]{return model->admission(view);});
             if(admission == Admission::deferred) break;
             if(admission == Admission::infeasible) {
-                waiting.pop_front();
+                taken();
                 complete(r,Finish::failed,runtime_failure("request memory entitlement infeasible"));
                 continue;
             }
             if(admission != Admission::ready) throw std::runtime_error("invalid admission decision");
             // Retain before open: a throwing open may leave live readers.
             lane.key=key; lane.request=r; generations[i]=key.generation;
-            waiting.pop_front();
+            taken();
             r->phases.admit();
             unlocked(lock,[&]{
                 lane.session=model->open(view);
                 if(!lane.session) throw std::runtime_error("model opened null session");
             });
         }
-        // A deferred head or a barrier applies equally to all free lanes. Retry
+        // A deferred next request (no lower priority overtakes it) or a barrier applies equally to all free lanes. Retry
         // on the next worker turn, after active work/retirement can progress.
         if(!lane.request) break;
     }

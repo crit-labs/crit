@@ -1,14 +1,16 @@
 """Measured decisions (crit_plugins.decisions): a recorded choice is replayed, another key measures again."""
+import itertools
 import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "core/python"))
 
-from crit_plugins import decisions  # noqa: E402
+from crit_plugins import decisions, policy  # noqa: E402
 
 
 class Decisions(unittest.TestCase):
@@ -18,6 +20,7 @@ class Decisions(unittest.TestCase):
         self.addCleanup(decisions.use_record, None)
         self.path = Path(self.tmp.name) / "decisions.json"
         decisions.use_record(None)
+        decisions.use_record(None)          # the process's second load: what it measures is a warm load's
         self.calls = 0
 
     def settle(self, cpu, key=None):
@@ -51,6 +54,34 @@ class Decisions(unittest.TestCase):
         row = decisions.settled("offload", "misses")
         self.assertEqual(row["source"], "measured")
         self.assertIn("another key", row["stale"])
+
+    def test_a_first_loads_measurement_is_not_replayed_and_a_warm_loads_is(self):
+        with mock.patch.object(policy, "_LOADS", itertools.count(1)):
+            decisions.use_record(None)                  # a process's first load: stores built, pages read cold
+            self.settle(50.0)
+            self.assertEqual(decisions.settled("offload", "misses")["conditions"], {"load": 1, "first_load": True})
+            decisions.write(self.path)
+            decisions.use_record(self.path)             # its second load reads the record and measures again
+            self.assertEqual(self.settle(90.0), "link")
+            row = decisions.settled("offload", "misses")
+            self.assertEqual((row["source"], row["conditions"]), ("measured", {"load": 2, "first_load": False}))
+            self.assertIn("first load", row["stale"])
+            decisions.write(self.path)
+            decisions.use_record(self.path)             # the warm load's record answers
+            self.assertEqual(self.settle(10.0), "link")
+            self.assertEqual(decisions.settled("offload", "misses")["source"], "recorded")
+        self.assertEqual(self.calls, 2)
+
+    def test_a_record_that_does_not_say_how_it_was_measured_is_measured_again(self):
+        self.settle(50.0)
+        decisions.write(self.path)
+        record = json.loads(self.path.read_text(encoding="utf-8"))
+        for row in record["decisions"]:
+            del row["conditions"]                       # a record written before decisions carried conditions
+        self.path.write_text(json.dumps(record), encoding="utf-8")
+        decisions.use_record(self.path)
+        self.assertEqual(self.settle(90.0), "link")
+        self.assertIn("does not say how", decisions.settled("offload", "misses")["stale"])
 
     def test_a_process_settles_a_decision_once(self):
         self.assertEqual(self.settle(50.0), "cpu")

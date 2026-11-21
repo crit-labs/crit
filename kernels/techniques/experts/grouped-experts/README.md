@@ -24,6 +24,29 @@ bit. W4A4 inputs are quantized once per route (a pre-pass) for both.
 (host-expert-arithmetic's host_int.h, which crit's CPU expert tier computes) for nvfp4 W4A4 and int4 W4A8, so a route
 computed on the CPU has the device's bits: exact int32 block dots (dp4a), block b to lane b % 16, fmaf of the dot by the
 rounded product of the scales, the halving tree, times the row's post; the declared SwiGLU and quantizers.
+`fp4` (nvfp4 bundles with input scales, hidden and inter multiples of 128, the sm_120 family): W4A4 on the block-scaled
+FP4 tensor cores (mma.sync kind::mxf4nvf4 m16n8k64, `mma_experts.cu`'s FP4 atom). Every route's gate/up inputs are quantized once by
+crit's declared NVFP4 quantizer at its expert's input scale into E2M1 codes and UE4M3 block scales (the operands the
+tensor arithmetic's W4A4 multiplies as BF16 values, the same values), the weights enter as their own codes and scales,
+and the gate/up epilogue quantizes the intermediate the same way at the down's input scale. K is cut into k_parts(K)
+parts at fixed 128-k block boundaries (4 from 2,048 k, 2 from 512, else 1: K's alone, so both structures cut it the
+same); each output is one chain of MMAs a part over its 64-element blocks in order from zero, the parts' sums added in
+part order in FP32. Decode items run a part a warp (a block's warps are row-tile groups of k_parts(K) warps) and add
+the parts through shared memory; prompt items run the parts one after another in a warp, into a second accumulator.
+The split spreads a decode pass's few row tiles over more warps (one token's grid is small): at one token on 2048 x 768
+a layer went from 37.2 to 33.9 us, the BF16 path's speed, and FP8 from 68.8 to 48.4 us, while FP4 prompts lost 12-16%
+to the second accumulator (Measured speed). Decode items (8 routes, operands from global memory,
+`fp4-decode`) and prompt items (32 or 64, codes and scales staged a chunk at a time, `fp4-prompt`) give a route the same
+bits, another arithmetic than `tensor`'s W4A4 (the tensor core's own sums of the same operands). A block holding a NaN
+or an infinity gets the format's NaN scale, so its route carries NaN.
+`fp8` (fp8:channel and fp8:block bundles, hidden and inter multiples of 128, 8.9 on): W8A8 on the E4M3 tensor cores
+(mma.sync e4m3 m16n8k32; kind::mxf8f6f4 with unit scales on the sm_120 family), the same mainloop (`mma_experts.cu`) with
+its FP8 atom. Every route's inputs and the intermediate (after the gate/up epilogue writes it in BF16) are quantized
+by crit's declared group quantizer (each 128 values of a row in E4M3 at amax / 448, quantized-projections'
+`fp8_block.h` rule); K is cut into the same k_parts(K) parts as `fp4`'s, and each 128-k block's sum (four MMAs from
+zero) is folded into its part's running sum with one fmaf by the activation's scale times the weight's (fp8:block's
+grid entry; fp8:channel's row scale multiplies the finished sum), the parts' sums added in part order in FP32.
+`fp8-decode` and `fp8-prompt` give a route the same bits.
 
 **A baseline to replace**: measure a provider's grouped GEMM on the format's own tensor cores against it on the
 engine's shapes, and keep the faster one that keeps the same row invariance.
@@ -71,20 +94,29 @@ id is out of range or whose slot is negative is skipped (its rows of y keep what
 One structure per item width, each keyed by the format, W4A4 or not, the pass (gate/up or down), hidden and inter, and
 the call's token count:
 
-| Structure | Items | Tuned at (tokens) | WARPS | TILES | DEPTH | CHUNK | READ |
+| Structure | Items | Tuned at (tokens) | WARPS | TILES | DEPTH | CHUNK | READ / FETCH |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `decode` | 8 routes, operands from global memory | 1, 2, 4, 8, 32 | 2, 4, 8 (4) | 1, 2, 4 (1) | 0-4, 6, 8 (0) | | 0, 1, 2 (0) |
 | `prompt` | 32 routes, operands staged by cp.async | 256, 1,024, 4,096 | 2, 4, 8 (4) | 1, 2, 4 (2) | 0-4 (0) | 64, 128, 256 (256) | |
 | `prompt-wide` | 64 routes (`Workspace(width=64)`) | 1,024, 4,096 | 2, 4, 8 (4) | 1, 2, 4 (1) | 0-4 (0) | 64, 128 (128) | |
+| `fp4-decode` | 8 routes, FP4 MMA, operands from global memory | 1, 2, 4, 8, 32 | 2, 4, 8 (4) | 1, 2, 4 (1; gate/up 2) | 1-4, 6 (3) | | FETCH 0, 1 (1 at one token, else 0) |
+| `fp4-prompt` | 32 or 64 routes, FP4 MMA, staged by cp.async | 256, 1,024, 4,096 | 2, 4, 8 (4) | 1, 2, 4 (2) | 1-4 (2) | 128, 256, 512 (256) | |
+| `fp8-decode` | 8 routes, E4M3 MMA, operands from global memory | 1, 2, 4, 8, 32 | 2, 4, 8 (4) | 1, 2, 4 (1) | 1-4, 6 (4) | | FETCH 0, 1 (1 at one token, else 0) |
+| `fp8-prompt` | 32 or 64 routes, E4M3 MMA, staged by cp.async | 256, 1,024, 4,096 | 2, 4, 8 (8) | 1, 2, 4 (4) | 1-4 (1) | 128, 256, 512 (128) | |
 | `declared` | the integer block order | | | | | | |
 | `plan-combine` | grouping and the route-order sum | | | | | | |
 
-WARPS: warps a block; TILES: MMA row tiles a warp owns (gate/up 8 inter rows each, down 16 output rows), sharing each
-B fragment; DEPTH: 64-k blocks of weights in flight a warp (0 is the format's own depth, 2 to 6); CHUNK: k values of the
+WARPS: warps a block (fp4-decode, fp8-decode: WARPS / k_parts(K) row-tile groups, at least one, of k_parts(K) warps
+each, one a K part, so a pass of 2,048 k at WARPS 2 runs 4 warps a block); TILES: MMA row tiles a warp owns (gate/up 8 inter rows each, down 16 output rows), sharing each
+B fragment (fp4 gate/up at least 2: a warp holds the intermediate's 16-row blocks); DEPTH: 64-k blocks of weights in
+flight a warp (0 is the format's own depth, 2 to 6; fp4: 128-k steps, fp8: 64-k steps); CHUNK: k values of the
 inputs staged a pass (two halves of shared memory); READ: how a decode warp asks for its weights, 1 a 64-k block at a
 time (32 bytes of a row of a 4-bit format, 64 of FP8), 2 128 bytes of a row at a time (4 blocks of a 4-bit format, 2
 of FP8, loaded together; BF16 is 128 bytes a block either way), 0 the launch's choice (2 for a pass of 256 k values or
-more). Defaults in parentheses: the launches the kernel had before it had knobs, but for READ, which before was 1. No
+more). FETCH (fp4-decode, fp8-decode): 0, a lane loads 16 bytes of a step's row and a quad transpose gives it its
+fragment words; 1, it loads its four fragment words directly, the same registers with fewer instructions (one token
+of 2048 x 768: FP4 1.34x, FP8 1.17x a layer before K was split; level or slower from 2 tokens, fetch_ab in the
+evidence). Defaults in parentheses: the launches the kernel had before it had knobs, but for READ, which before was 1. No
 knob changes a route's MMA chain or any other operation (no order knob), so every configuration gives the same bits; the sweep keeps one only when every route equals the untuned build's. `declared` and `plan-combine` have
 no knobs. Which width a call takes stays the caller's (`width_for`, or `Workspace(width=...)`).
 
@@ -132,6 +164,23 @@ own chain of weight requests, and what a request brings is the pass's rate: 32 b
 weights at 0.6 to 0.9 TB/s, 64 bytes (FP8's blocks, or two 4-bit blocks) at 1.25 to 1.4, 128 bytes at 1.4 to 1.7, where
 the BF16 experts (128 bytes a block) always were; 192 and 256 bytes a request are no faster, and neither are more
 blocks in flight (DEPTH), a prefetch instruction or copies ahead through shared memory.
+
+**The `fp4` and `fp8` arithmetics** (RTX 5090, 2026-11-21, default knobs, nvfp4 W4A4 and fp8 experts of 128 x top 8 at
+2048 x 768 and 64 x top 8 at 4096 x 1536; decode: a layer, gate/up and down, CUDA graph replays after a 256 MB L2
+flush, us; in parentheses the same structures before K was split):
+
+| Shape, tokens | BF16 path, nvfp4 W4A4 | `fp4` | BF16 path, fp8 W8A16 | `fp8` |
+| --- | --- | --- | --- | --- |
+| 2048 x 768, 1 | 33.6 | 33.9 (37.2) | 39.7 | 48.4 (68.8) |
+| 2048 x 768, 16 | 189.0 | 195.7 (241.4) | 292.2 | 302.5 (392.3) |
+| 4096 x 1536, 1 | 84.1 | 97.5 (98.0) | 113.8 | 147.2 (178.0) |
+| 4096 x 1536, 16 | 455.8 | 449.1 (605.2) | 708.9 | 814.3 (967.5) |
+
+FP8 decode stays at 0.77-0.97x of the BF16 path's W8A16: it reads twice FP4's weight bytes and folds a scale every
+128 k. FP4 prompts (a gate/up pass) take 603 us at 2,048 tokens and 2,046 at 8,192
+on 2048 x 768 (the BF16 path 1,115 and 3,980) and 7,653 at 8,192 tokens on 4096 x 1536 (15,493): 1.8-2.0x the BF16
+path, 12-16% slower than before K was split (539, 1,760, 6,590). Both arithmetics stay opt-in (the plugin's
+`arithmetic`).
 
 ## Against the library
 

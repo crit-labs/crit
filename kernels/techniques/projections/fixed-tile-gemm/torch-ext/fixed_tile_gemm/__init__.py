@@ -33,7 +33,7 @@ from . import _crit_cuda
 __all__ = ["mm", "mm_split", "mm_cuda", "mm_cuda_split", "cuda_ok", "tile", "split_tile", "MM_TILE", "MM_SMALL"]
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _mm_kernel(x_ptr, w_ptr, out_ptr, M, N, K, stride_xm, stride_wn, stride_om,
                BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr):
     tm, tn = _load.grouped_tile(tl.program_id(0), M, N, BLOCK_M, BLOCK_N, GROUP_M)
@@ -52,7 +52,7 @@ def _mm_kernel(x_ptr, w_ptr, out_ptr, M, N, K, stride_xm, stride_wn, stride_om,
              mask=(rm < M)[:, None] & (rn < N)[None, :])
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _split_kernel(x_ptr, w_ptr, p_ptr, M, N, K, KC, stride_xm, stride_wn,
                   BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr):
     """A tile's sums over K range [s KC, (s + 1) KC) (s = program_id(1)) into the partials p[s][M][N] (FP32)."""
@@ -75,7 +75,7 @@ def _split_kernel(x_ptr, w_ptr, p_ptr, M, N, K, KC, stride_xm, stride_wn,
              mask=(rm < M)[:, None] & (rn < N)[None, :])
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _split_sum_kernel(p_ptr, out_ptr, M, N, stride_om, S: tl.constexpr, BLOCK: tl.constexpr):
     """out = the partials p[0] + p[1] + ... in split order, rounded once to out's dtype."""
     i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)

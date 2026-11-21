@@ -51,7 +51,7 @@ class DenseProjections:
         return {"row_invariance": {"rows": DECODE_ROWS, "prompt_rows": False}}
 
     def exactness(self):
-        """The level its rows keep (crit_kernels.exactness; Core compares it with the level the configuration asks):
+        """The level its rows keep (crit_plugins.exactness; Core compares it with the level the configuration asks):
         decode rows one row a call, each row's bits those of the row alone (row-exact); prompt rows one GEMM, whose
         kernel cuBLAS picks by the row count (repeatable). It has one way to compute each, so an engine on it asks
         repeatable prompt rows."""

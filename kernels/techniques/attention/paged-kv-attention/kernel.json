@@ -16,7 +16,8 @@
   ],
   "operations": [
     "paged-attention",
-    "partial-attention-merge"
+    "partial-attention-merge",
+    "kv-page-write"
   ],
   "cuda": {
     "sources": [
@@ -107,6 +108,9 @@
   "structures": {
     "write": {
       "what": "a step's keys and values into their page slots in one launch, one program per token and KV head, encoded for the page kind (exact: the same codes and scales whatever the warps)",
+      "operations": [
+        "kv-page-write"
+      ],
       "call": "write",
       "rows": [
         1,
@@ -145,6 +149,9 @@
     },
     "split": {
       "what": "how a row's keys split over the KV partitions of every split-KV launch over a cache (decode, verify windows, fused prompt rows, block lists): positions a piece and the partition count, piece i to partition i mod P; one value each per cache, read by partitions() and piece_size()",
+      "operations": [
+        "paged-attention"
+      ],
       "call": "attend",
       "rows": [
         1,
@@ -195,6 +202,9 @@
     },
     "window": {
       "what": "the split-KV window launch: a query tile of a row's columns times a KV head's query heads over the pieces of one partition, mma.sync on every GPU (tile_for's tile), its partials written for the merge",
+      "operations": [
+        "paged-attention"
+      ],
       "call": "attend",
       "rows": [
         1,
@@ -248,6 +258,9 @@
     },
     "merge": {
       "what": "the merge after a split launch: one program per column and query head folding its partitions' partials in partition order (elementwise: its warps and the partials loaded a turn change no bits)",
+      "operations": [
+        "partial-attention-merge"
+      ],
       "call": "attend",
       "rows": [
         1,
@@ -299,6 +312,9 @@
     },
     "fused": {
       "what": "the fused window launch (prompt rows as windows of up to 64 columns): each program reads every partition of its tile in turn and folds them as the merge does, over a part of the value columns: the split launch's bits, no partials",
+      "operations": [
+        "paged-attention"
+      ],
       "call": "attend",
       "rows": [
         1,
@@ -357,6 +373,9 @@
     },
     "sparse": {
       "what": "the block-sparse launch: one program per token, partition and KV head over the positions of the token's listed KV blocks, partials merged as the window launch's",
+      "operations": [
+        "paged-attention"
+      ],
       "call": "attend",
       "rows": [
         1,
@@ -404,6 +423,9 @@
     },
     "prefill": {
       "what": "a causal prompt chunk of one sequence: a block of queries over blocks of its positions in one online softmax (FP32 row sums), through its page table; INT8 queries on integer tensor cores over INT8 pages with int8_qk",
+      "operations": [
+        "paged-attention"
+      ],
       "call": "prefill",
       "rows": [
         1,
@@ -472,6 +494,9 @@
     },
     "flash-window": {
       "what": "the flash window launch (attend(..., flash=True)): a row's columns times a KV head's query heads packed into tiles of the cache's one shape (ROWS x WARPS), the row's keys in contiguous splits of CHUNK positions walked in blocks of BLOCK_N with the online softmax on the tensor cores (base 2, FP32 row sums), every block masked (one rounding for every block), the splits merged in split order; CHUNK, BLOCK_N, ROWS and WARPS one per cache for every flash launch over it (flash_chunk(), flash_block(), flash_tile())",
+      "operations": [
+        "paged-attention"
+      ],
       "call": "attend",
       "rows": [
         1,
@@ -545,6 +570,9 @@
     },
     "flash-fused": {
       "what": "the fused flash launch (attend(..., flash=True, fused=True), prompt rows as windows of up to 64 columns): each program walks every split of its tile in turn and folds them in split order as the flash merge does, over a part of the value columns, in the cache's tile: the flash window launch's bits, no partials",
+      "operations": [
+        "paged-attention"
+      ],
       "call": "attend",
       "rows": [
         1,
@@ -591,6 +619,9 @@
     },
     "flash-prefill": {
       "what": "the flash prompt chunk (prefill(..., flash=True)): the chunk's tokens times a KV head's query heads packed into tiles, its positions split on the device over SPLITS programs a tile (merged by their states) or read in one range (written directly), blocks a tile sees in full without the causal mask, exp2 with the scale folded in, FP32 row sums; a token's bits follow the chunk's length",
+      "operations": [
+        "paged-attention"
+      ],
       "call": "prefill",
       "rows": [
         1,
@@ -660,6 +691,9 @@
     },
     "cuda-window": {
       "what": "the CUDA flash tile's window launch (attend(..., flash=\"cuda\"), cuda_window.cu): a row's columns times a KV head's query heads in tiles of 16 rows a warp, the queries in shared memory (ldmatrix a k-step), the row's keys and values in blocks of BLOCK_N through a cp.async ring the CTA's warps share, BF16 mma.sync with FP32 accumulators, each warp's online softmax in registers (no cross-warp reduction), contiguous splits of CHUNK positions merged in split order; CHUNK and BLOCK_N one per cache for every cuda launch over it (cuda_chunk(), cuda_block()), the warps change no bit",
+      "operations": [
+        "paged-attention"
+      ],
       "call": "attend",
       "rows": [
         1,
@@ -705,7 +739,7 @@
           ],
           "default": 0,
           "order": true,
-          "what": "positions a split (0: the GPU's rule, a decode row of 90,112 positions over two programs an SM, its KV heads counted by their square root: 90,112 x sqrt(KV heads) / (2 x SMs) to the nearest 128, 128 to 2,048), a multiple of BLOCK_N"
+          "what": "positions a split (0: the GPU's rule, a decode row of 90,112 positions over six programs an SM, its KV heads counted by their square root: 90,112 x sqrt(KV heads) / (6 x SMs) to the nearest 128, 128 to 2,048), a multiple of BLOCK_N"
         },
         "BLOCK_N": {
           "values": [
@@ -760,7 +794,7 @@
             2,
             3
           ],
-          "default": 0,
+          "default": 1,
           "order": true,
           "what": "a row's first positions in RAMP bands of 16 splits (CUDA_RAMP_SPLITS), band b's of CHUNK / 2^(RAMP - b) positions, then splits of CHUNK (0: every split CHUNK positions): short rows in many small splits, long ones in about as many as without; one per cache for every cuda launch over it (cuda_ramp()), CHUNK a multiple of BLOCK_N x 2^RAMP"
         }
@@ -771,7 +805,10 @@
       "bench": "bench.py:CudaWindow"
     },
     "cuda-fused": {
-      "what": "the CUDA flash tile's fused launch (attend(..., flash=\"cuda\", fused=True), prompt rows as windows of up to 64 columns): the window launch's programs, one a split, each writing its state into a ring its tile owns, the last of a group of splits folding the group's states in split order with the merge's steps into the tile's running state, over VSPLIT parts of the value columns: the cuda window launch's bits, a workspace that follows the tiles, no partials a split; its block and chunk cuda-window's",
+      "what": "the CUDA flash tile's fused launch (attend(..., flash=\"cuda\", fused=True), prompt rows as windows of up to 64 columns): the cuda window launch's tiles, splits and blocks with no partials a split, each tile's split states folded in split order with the merge's steps, over VSPLIT parts of the value columns: the cuda window launch's bits. Where the launch's tiles fill the GPU (SERIAL), one program a tile walks its row's splits in turn and folds each into the tile's running state as it ends (64 query rows a program, the queries in shared memory, the running outputs in registers up to 128 value columns a program and in the launch's workspace past them); below that one program a split, each writing its state into a ring its tile owns, the next group's programs folding a group's states (or, where the partials fit, the window launch and its merge): short launches over long rows still fill the GPU. A workspace that follows the tiles; its block and chunk cuda-window's",
+      "operations": [
+        "paged-attention"
+      ],
       "call": "attend",
       "rows": [
         1,
@@ -846,6 +883,18 @@
           ],
           "default": 0,
           "what": "where 8-bit pages' codes become 16-bit operands: 1 a 16-bit block in shared memory the CTA converts once a block, 2 each warp's fragments in registers (0: the rule, registers; launches with fresh rows always the shared block): speed only, the same operands"
+        },
+        "SERIAL": {
+          "values": [
+            0,
+            1,
+            25,
+            100,
+            200,
+            100000
+          ],
+          "default": 0,
+          "what": "the launch's tiles, as a percent of the programs the device holds at once, from which each tile is one program walking its splits in turn (0: 50; 1: every launch; 100000: none, every launch a program a split): speed only, the same states folded in the same order"
         }
       },
       "yardstick": {
@@ -855,6 +904,9 @@
     },
     "cuda-prefill": {
       "what": "the CUDA flash tile's prompt chunk (prefill(..., flash=\"cuda\")): the chunk's tokens times a KV head's query heads in tiles of 16 rows a warp, its positions split on the device over SPLITS programs a tile (merged by their states) or read in one range (written directly); a token's bits follow the chunk's length",
+      "operations": [
+        "paged-attention"
+      ],
       "call": "prefill",
       "rows": [
         1,

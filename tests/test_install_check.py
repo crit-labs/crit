@@ -49,9 +49,31 @@ class StepLibraryTests(unittest.TestCase):
         environment = {k: v for k, v in os.environ.items() if k != native.STEP_LIBRARY}
         with patch.dict(os.environ, environment, clear=True):
             found = native.step_library()
-        built = [ROOT / folder / name for folder in native.STEP_LIBRARY_FOLDERS for name in native.STEP_LIBRARY_FILES
-                 if (ROOT / folder / name).is_file()]
-        self.assertEqual(found, str(built[0]) if built else None)
+        built = [ROOT / folder / native.STEP_LIBRARY_FILE for folder in native.STEP_LIBRARY_FOLDERS
+                 if (ROOT / folder / native.STEP_LIBRARY_FILE).is_file()]
+        if built:
+            self.assertEqual(found, str(built[0]))
+        elif found is not None:   # none in the checkout: Core's cache's, still this OS's file
+            self.assertEqual(Path(found).name, native.STEP_LIBRARY_FILE)
+
+    def test_another_oses_library_is_never_taken(self):
+        # A checkout two OSes share (Windows and WSL) holds both builds; each loader takes only the file it can open.
+        with tempfile.TemporaryDirectory() as folder:
+            checkout = Path(folder)
+            (checkout / "core" / "include" / "crit").mkdir(parents=True)
+            (checkout / "core" / "include" / "crit" / "core.h").write_text("")
+            names = ("libcrit_core_steps.so", "crit_core_steps.dll", "libcrit_core_steps.dylib")
+            for platform in ("linux", "win32", "darwin"):
+                for sub in (f"build/core-steps/{platform}", f"build/core-steps/{platform}/Release"):
+                    (checkout / sub).mkdir(parents=True)
+                    for name in names:
+                        (checkout / sub / name).write_text("")
+            environment = {k: v for k, v in os.environ.items() if k != native.STEP_LIBRARY}
+            with patch.dict(os.environ, environment, clear=True), \
+                    patch.object(native, "__file__", str(checkout / "core" / "python" / "crit_core" / "native.py")):
+                found = Path(native.step_library())
+        self.assertEqual(found.name, native.STEP_LIBRARY_FILE)
+        self.assertEqual(found.parent, checkout / native.STEP_BUILD)
 
     def test_crit_core_where_names_it_or_says_how_to_build_it(self):
         environment = {k: v for k, v in os.environ.items() if k != native.STEP_LIBRARY}

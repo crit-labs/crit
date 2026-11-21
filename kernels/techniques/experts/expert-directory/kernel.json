@@ -1,0 +1,60 @@
+{
+  "schema": "crit-kernel-v1",
+  "id": "expert-directory",
+  "family": "experts",
+  "title": "A device expert cache's directory on the device: one routed layer's plan over a step's routes (clock or recent residency, admission limits, the CPU tier, prompt ring slots) and the fills that copy the admitted bundles into the slots by SM loads, capture-safe",
+  "package": "expert_directory",
+  "language": "cuda",
+  "operations": [
+    "expert-residency"
+  ],
+  "sources": [
+    "directory_cuda/directory_ops.cu",
+    "torch-ext/torch_binding.cpp"
+  ],
+  "capabilities": [
+    "8.0",
+    "8.6",
+    "8.9",
+    "9.0",
+    "10.0",
+    "10.3",
+    "11.0",
+    "12.0",
+    "12.1"
+  ],
+  "libraries": [],
+  "structures": {
+    "plan": {
+      "what": "one block of 256 threads a routed layer: the distinct experts in route order (atomicMin of route indices, a block scan), hits pinned and referenced, misses decided in that order by thread 0 (quota, quota by miss count, second touch, the CPU tier), clock victims by warp 0 over 32-slot windows with a ballot (the victims, reference bits and hand of a one-slot-at-a-time scan), recent residency's victim list and link layers' reserve, a prompt plan's ring slots; per-row counters. Mechanism with no sums: device_cache.LayerDirectory's decisions",
+      "call": "plan",
+      "exactness": "declared"
+    },
+    "fill": {
+      "what": "the plan's copies (key -> slot): bundle words of 4, 8 or 16 bytes (the call's vector) loaded from the store's device address (registered host memory over the link, or device memory) and stored into the slots by a fixed grid (the call's blocks) that exits once the copies are done; the bytes of the store's bundles",
+      "call": "fill",
+      "rows": [
+        1,
+        4096
+      ],
+      "tune_rows": [
+        1,
+        8,
+        64
+      ],
+      "key": [
+        "bundle"
+      ],
+      "exactness": "declared",
+      "yardstick": {
+        "library": "torch ops: store.index_copy_(0, slots, source.index_select(0, keys)), a gather into a staging tensor and a scatter into the slots"
+      },
+      "bench": "bench.py:Fill"
+    },
+    "fill-program": {
+      "what": "fill from a store in another layout (expert_store.csf_layout: CSF-compressed NVFP4 scales): a program of component copies and slab decodes in shared memory, then the decodes' exceptions, rebuilding each copy's bundle into the slot layout byte for byte",
+      "call": "fill_program",
+      "exactness": "declared"
+    }
+  }
+}

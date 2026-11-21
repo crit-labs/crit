@@ -79,6 +79,39 @@ class ShutdownFixture(ServeFixture):
         return connection, response
 
 
+SLOW_CLOSE_ADAPTER = r'''
+_close = Engine.close
+
+def slow_close(self):
+    time.sleep(6.5)   # a large engine's close: its expert tier's threads, tens of gigabytes of pinned memory
+    return _close(self)
+
+Engine.close = slow_close
+'''
+
+
+class SlowCloseShutdownTests(ShutdownFixture, unittest.TestCase):
+    adapter_suffix = SLOW_CLOSE_ADAPTER
+
+    def test_a_stop_waits_for_an_engine_whose_close_is_slow_and_retires_nothing(self):
+        # A stop with every request answered unloads the engine as an unload does: a close of more than a few seconds
+        # ends, and the host exits on its own; it used to get 5 s, a cancel no unload can settle, and a kill.
+        import contextlib
+        import io
+        engine = self.engine(timeout=60)
+        self.ask(engine)
+        tree = engine.runtime.tree
+        printed = io.StringIO()
+        started = time.monotonic()
+        with contextlib.redirect_stderr(printed):
+            engine.close()
+        self.assertGreater(time.monotonic() - started, 6)
+        self.assertNotIn("retired", printed.getvalue())
+        self.assertNotIn("settled no cancel", printed.getvalue())
+        self.assertIsNotNone(tree.process.poll())
+        self.assertFalse(engine.ownership.path.exists())
+
+
 class EngineShutdownTests(ShutdownFixture, unittest.TestCase):
     def test_shutdown_during_command_preparation_does_not_dispatch_or_switch(self):
         # Exercise both entry to call() and the publication boundary after start().

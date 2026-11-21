@@ -20,69 +20,20 @@ from .memory import POISON
 from .slots import CASES, compare, missing, model_problems
 
 
-def _entries(folder):
-    try:
-        return set(os.listdir(folder)) if folder and os.path.isdir(folder) else set()
-    except OSError:
-        return set()
-
-
 @contextmanager
 def compiles():
-    """Every kernel compile and extension build while the block runs, as a list of descriptions it fills: a Triton
-    JIT compile (Triton's jit_cache_hook, which runs whenever a kernel's specialization is not yet in memory, compiled
-    or read from Triton's cache), new entries in Triton's cache beyond those (kernels compiled outside triton.jit,
-    such as torch.compile's), and a torch extension build or load (torch.utils.cpp_extension). It uses only what is
-    already loaded (triton, torch's cpp_extension), so it reads nothing a device without them would have. A plugin
-    compiles at load, never on a request: a test wraps a request after load in it and expects no entry."""
-    found, restore = [], []
-    triton = sys.modules.get("triton")
-    runtime = getattr(getattr(triton, "knobs", None), "runtime", None)
-    hooked = runtime is not None and hasattr(runtime, "jit_cache_hook")
-    jit_compiles = []
-    if hooked:
-        previous = runtime.jit_cache_hook
-
-        def hook(*args, **kwargs):
-            fn, options = kwargs.get("fn"), kwargs.get("compile") or {}
-            names = list(getattr(getattr(fn, "jit_function", None), "arg_names", None) or [])
-            constants = ", ".join(
-                f"{names[key[0]] if isinstance(key, tuple) and len(key) == 1 and key[0] < len(names) else key}="
-                f"{value}" for key, value in (options.get("constants") or {}).items())
-            signature = ", ".join(f"{name}: {kind}" for name, kind in (options.get("signature") or {}).items()
-                                  if kind != "constexpr")
-            what = (f"Triton compile of {getattr(fn, 'module', '?')}.{getattr(fn, 'name', '?')}({signature}) "
-                    f"constexprs {constants or 'none'}")
-            found.append(what)
-            jit_compiles.append(what)
-            return previous(*args, **kwargs) if previous else False
-        runtime.jit_cache_hook = hook
-        restore.append(lambda: setattr(runtime, "jit_cache_hook", previous))
-    cache = getattr(getattr(getattr(triton, "knobs", None), "cache", None), "dir", None) if triton is not None else None
-    cached = _entries(cache)
-    extension = sys.modules.get("torch.utils.cpp_extension")
-    built = None
-    if extension is not None and hasattr(extension, "_jit_compile"):
-        jit = extension._jit_compile
-
-        def building(name, *args, **kwargs):
-            found.append(f"torch extension build or load of {name}")
-            return jit(name, *args, **kwargs)
-        extension._jit_compile = building
-        restore.append(lambda: setattr(extension, "_jit_compile", jit))
-        built = os.environ.get("TORCH_EXTENSIONS_DIR") or extension.get_default_build_root()
-    extensions = _entries(built)
+    """Every kernel compile and extension build while the block runs, as a list of descriptions it fills
+    (crit_plugins.compiles.Watch: Triton JIT compiles, Triton cache entries made outside triton.jit, torch extension
+    builds and loads). It uses only what is already loaded (triton, torch's cpp_extension), so it reads nothing a
+    device without them would have. A plugin compiles at load, never on a request: a test wraps a request after load
+    in it and expects no entry, as Core's loader watches every engine once it serves."""
+    from .compiles import Watch
+    found = []
+    watch = Watch()
     try:
         yield found
     finally:
-        for undo in reversed(restore):
-            undo()
-        new = sorted(_entries(cache) - cached)
-        if len(new) > len(jit_compiles):
-            found.append(f"{len(new) - len(jit_compiles)} new Triton cache entries beyond the JIT compiles "
-                         f"(compiled outside triton.jit): {', '.join(new[:8])}")
-        for name in sorted(_entries(built) - extensions):
-            found.append(f"a new torch extension build directory {name}")
+        found.extend(watch.stop())
 
 
 @functools.lru_cache(maxsize=None)
@@ -91,6 +42,34 @@ def _plugin_folder(path):
         if (folder / MANIFEST).is_file():
             return folder
     raise ValueError(f"{path} lies in no plugin folder")
+
+
+# A skip that leaves the plugin's correctness unchecked says so in its reason (unchecked()): the plugin's comparison
+# with its reference, or the engine run on Core's runtime, did not run although the plugin runs on a device here.
+# crit plugins test fails such a skip. Any other skip is the machine's (a CUDA-only plugin's tests without CUDA) and
+# passes, listed.
+UNCHECKED = "unchecked: "
+NO_CORE_RUNTIME = ("Core's runtime crit_core_steps is not built: `crit core build` builds it "
+                   "(CRIT_CORE_STEP_LIBRARY names another)")
+
+
+def unchecked(reason):
+    """A unittest.SkipTest that crit plugins test fails: raise it where a test skips without checking what the plugin
+    is tested for (a model plugin's comparison with its reference, the engine run on Core's runtime) although the
+    plugin runs on a device here. A skip because no device the plugin runs on is here stays a plain skipTest()."""
+    return unittest.SkipTest(UNCHECKED + reason)
+
+
+def core_runtime():
+    """The crit_core_steps library a test that runs the engine on Core's runtime loads (crit_core.native's
+    step_library: CRIT_CORE_STEP_LIBRARY, else the checkout's build, else the one `crit core build` built). Without
+    one it raises unchecked(NO_CORE_RUNTIME): the engine does not run, so the test checks nothing, and crit plugins
+    test fails, saying how to build it. For setUpClass; a test method calls PluginTestCase.core_runtime()."""
+    from crit_core.native import step_library
+    found = step_library()
+    if found is None:
+        raise unchecked(NO_CORE_RUNTIME)
+    return found
 
 
 # A test process reads its plugins folder's manifests once: discovery stats and reads every plugin's files, which took
@@ -144,13 +123,14 @@ class PluginTestCase(unittest.TestCase):
     def core_runtime(self):
         """The crit_core_steps library a test that runs the engine on Core's runtime loads (crit_core.native's
         step_library: CRIT_CORE_STEP_LIBRARY, else the checkout's build, else the one `crit core build` built). The
-        test is skipped, with how to build it, when there is none: crit plugins test lists it."""
-        from crit_core.native import step_library
-        found = step_library()
-        if found is None:
-            self.skipTest("Core's runtime crit_core_steps is not built: `crit core build` builds it "
-                          "(CRIT_CORE_STEP_LIBRARY names another)")
-        return found
+        test is skipped, with how to build it, when there is none, and crit plugins test fails that skip
+        (core_runtime(): unchecked)."""
+        return core_runtime()
+
+    def skipUnchecked(self, reason):
+        """Skip the test as unchecked(reason), which crit plugins test fails: for a skip that leaves the plugin's
+        correctness unchecked although it runs here, never for a missing device (skipTest, device())."""
+        raise unchecked(reason)
 
     def device(self):
         """The device a test of a plugin's device form runs on, one of the devices its manifest names: CUDA when the
@@ -323,16 +303,24 @@ SKIPPED = re.compile(r"^(\w+) \(([\w.]+?)(?:\.\1)?\)(?:\n[^\n]*?)? \.\.\. skippe
 
 
 def _skips(output):
-    """[{test, reason}] of the tests unittest's verbose output reports skipped."""
+    """[{test, reason, unchecked}] of the tests unittest's verbose output reports skipped; unchecked: the skip was
+    unchecked()'s (its UNCHECKED prefix taken off the reason)."""
     import ast
     found = []
     for name, where, reason in SKIPPED.findall(output):
         try:
-            reason = ast.literal_eval(reason)
+            reason = str(ast.literal_eval(reason))
         except (ValueError, SyntaxError):
             pass   # shown as printed
-        found.append({"test": f"{where}.{name}", "reason": str(reason)})
+        hides = reason.startswith(UNCHECKED)
+        found.append({"test": f"{where}.{name}", "reason": reason[len(UNCHECKED):] if hides else reason,
+                      "unchecked": hides})
     return found
+
+
+def _skip_line(skip):
+    return (f"           skipped {skip['test']}: {skip['reason']}"
+            + (" (unchecked: fails the plugin)" if skip.get("unchecked") else ""))
 
 
 def _tree_hash(digest, folder):
@@ -397,21 +385,39 @@ def cache_folder():
     return Path(os.environ.get("CRIT_PLUGIN_TEST_CACHE") or cache_home("plugin-tests"))
 
 
-def run_tests(registry, only=None, timeout=600, log=print, cache=False):
-    """Each plugin's tests (unittest files test*.py in its tests folder), one plugin per process. Returns one item per
-    plugin: {name, state, detail, seconds, skipped}; a plugin without tests fails, since every plugin is checked on its
-    own. skipped lists the tests that skipped ({test, reason}), each also logged: a skip is no failure (a CUDA-only
-    plugin's tests skip without CUDA), but "passed" does not cover what it skipped.
+# Plugins whose tests run at once (one process each): CRIT_PLUGIN_TEST_JOBS, else half the cores up to 4 (a plugin's
+# tests may use the GPU, which the processes share).
+TEST_JOBS = "CRIT_PLUGIN_TEST_JOBS"
+
+
+def test_jobs():
+    given = os.environ.get(TEST_JOBS, "").strip()
+    if given:
+        return max(1, int(given))
+    return max(1, min(4, (os.cpu_count() or 2) // 2))
+
+
+def run_tests(registry, only=None, timeout=600, log=print, cache=False, jobs=None):
+    """Each plugin's tests (unittest files test*.py in its tests folder), one plugin per process, `jobs` plugins at
+    once (test_jobs()). Returns one item per plugin, in the registry's order, each logged in that order:
+    {name, state, detail, seconds, skipped}; a plugin without tests fails, since every plugin is checked on its
+    own. skipped lists the tests that skipped ({test, reason, unchecked}), each also logged. The machine's skip is no
+    failure (a CUDA-only plugin's tests skip without CUDA), but "passed" does not cover what it skipped; an unchecked
+    skip (unchecked(): Core's runtime missing, a model plugin's reference comparison not run) fails a plugin whose
+    tests otherwise passed, and its item lists those skips again as `unchecked`.
     cache: skip a plugin whose tests passed before under the same key (test_key: its files, the plugins its tests
     use, crit's packages and the environment), reported as passed with `cached` true, and keep each new pass
     (cache_folder()); a library plugin copied unchanged into engine after engine is tested once per machine."""
+    from concurrent.futures import ThreadPoolExecutor
     if not isinstance(registry, Registry):
         registry = Registry.discover(registry)
     package_root = str(Path(__file__).resolve().parents[1])
-    items = []
-    for manifest in registry:
-        if only and manifest["id"] not in only:
-            continue
+    chosen = [m for m in registry if not only or m["id"] in only]
+    jobs = max(1, jobs or test_jobs())
+
+    def one(manifest):
+        """(item, its log lines)."""
+        lines = []
         key = test_key(registry, manifest) if cache else None
         stored = cache_folder() / f"{key}.json" if key else None
         if stored is not None and stored.is_file():
@@ -422,21 +428,19 @@ def run_tests(registry, only=None, timeout=600, log=print, cache=False):
                 found = None
             if found and found.get("state") == "passed":
                 skipped = found.get("skipped") or []
-                items.append({"name": manifest["id"], "state": "passed", "detail": found.get("detail", ""),
-                              "seconds": 0.0, "cached": True, "skipped": skipped})
-                log(f" passed  {manifest['id']:<32}   cached  {found.get('detail', '')} (unchanged since they passed)")
-                for skip in skipped:
-                    log(f"           skipped {skip['test']}: {skip['reason']}")
-                continue
+                lines.append(f" passed  {manifest['id']:<32}   cached  {found.get('detail', '')} (unchanged since they "
+                             "passed)")
+                lines += [_skip_line(skip) for skip in skipped]
+                return {"name": manifest["id"], "state": "passed", "detail": found.get("detail", ""),
+                        "seconds": 0.0, "cached": True, "skipped": skipped}, lines
         started = time.perf_counter()
         tests = Path(manifest["tests"]).resolve()   # the tests run in the plugin's folder, so never relative
         files = sorted(tests.glob("test*.py")) if tests.is_dir() else []
         if not files:
-            items.append({"name": manifest["id"], "state": "failed", "seconds": 0.0,
-                          "detail": f"no tests: write unittest files test*.py in {tests.name}/, against the plugin's "
-                                    "reference" + (" plugins" if manifest["reference"] else "")})
-            log(f" failed  {manifest['id']}: no tests")
-            continue
+            return {"name": manifest["id"], "state": "failed", "seconds": 0.0,
+                    "detail": f"no tests: write unittest files test*.py in {tests.name}/, against the plugin's "
+                              "reference" + (" plugins" if manifest["reference"] else "")}, \
+                [f" failed  {manifest['id']}: no tests"]
         env = dict(os.environ)
         env["PYTHONPATH"] = os.pathsep.join([package_root] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
         env["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -448,15 +452,24 @@ def run_tests(registry, only=None, timeout=600, log=print, cache=False):
             output = done.stdout + done.stderr
             ran = RAN.search(output)
             count = int(ran.group(1)) if ran else 0
-            passed = done.returncode == 0 and count > 0
+            ran = done.returncode == 0 and count > 0
             skipped = _skips(output)
-            detail = (f"{count} tests" + (f", {len(skipped)} skipped" if skipped else "") if passed
+            hidden = [skip for skip in skipped if skip["unchecked"]] if ran else []
+            passed = ran and not hidden
+            detail = (f"{count} tests" + (f", {len(skipped)} skipped" if skipped else "") if ran
                       else f"exit code {done.returncode}\n{output.strip()[-2000:]}".rstrip())
+            if hidden:
+                reasons = {}
+                for skip in hidden:
+                    reasons.setdefault(skip["reason"], []).append(skip["test"])
+                detail += f"; {len(hidden)} of them leave its correctness unchecked: " + "; ".join(
+                    f"{reason} ({tests[0]}" + (f" and {len(tests) - 1} more)" if len(tests) > 1 else ")")
+                    for reason, tests in reasons.items())
         except subprocess.TimeoutExpired:
-            passed, detail, skipped = False, f"the tests ran past {timeout:g} s", []
+            passed, detail, skipped, hidden = False, f"the tests ran past {timeout:g} s", [], []
         seconds = time.perf_counter() - started
-        items.append({"name": manifest["id"], "state": "passed" if passed else "failed", "detail": detail,
-                      "seconds": round(seconds, 2), "skipped": skipped})
+        item = {"name": manifest["id"], "state": "passed" if passed else "failed", "detail": detail,
+                "seconds": round(seconds, 2), "skipped": skipped, **({"unchecked": hidden} if hidden else {})}
         if passed and stored is not None:
             import json
             try:
@@ -465,8 +478,15 @@ def run_tests(registry, only=None, timeout=600, log=print, cache=False):
                                               "skipped": skipped}), encoding="utf-8")
             except OSError:
                 pass   # a cache that cannot be written leaves the next run to test again
-        log(f" {'passed' if passed else 'failed'}  {manifest['id']:<32} {seconds:6.2f}s  "
-            f"{detail if passed else detail.splitlines()[-1]}")
-        for skip in skipped:
-            log(f"           skipped {skip['test']}: {skip['reason']}")
+        lines.append(f" {'passed' if passed else 'failed'}  {manifest['id']:<32} {seconds:6.2f}s  "
+                     f"{detail if passed or hidden else detail.splitlines()[-1]}")
+        lines += [_skip_line(skip) for skip in skipped]
+        return item, lines
+
+    items = []
+    with ThreadPoolExecutor(max_workers=min(jobs, max(1, len(chosen)))) as pool:
+        for item, lines in pool.map(one, chosen):   # in the registry's order, each as soon as those before it are
+            items.append(item)
+            for line in lines:
+                log(line)
     return items

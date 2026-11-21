@@ -68,6 +68,9 @@ class Mm:
         n, k = int(shape["N"]), int(shape["K"])
         return (n * k + rows * k + rows * n) * 2
 
+    def flops(self, shape, rows):   # crit_kernels.floors: BF16 multiply-adds
+        return 2 * rows * int(shape["N"]) * int(shape["K"]), "bf16"
+
 
 class MmSplit(Mm):
     """mm_split on the same operands (structure mm-split: K split over programs, not row invariant)."""

@@ -63,7 +63,7 @@ class StreamWriter:
         if self.tools is not None and calls != self.tools.calls:
             raise ValueError("Final tool calls differ from emitted tool calls")
         response_content(response, tool_size(calls), continued=bool(self.request.get("continue_final_message")),
-                         blank="prompt" in self.request)
+                         blank="prompt" in self.request, truncated=output == limit)
 
     def close(self):
         self.closed = True

@@ -54,8 +54,8 @@ def parser():
                         help="Requests that may wait while the engine is busy; one more is refused at once with 429 "
                              "(Anthropic 529, /api/chat 503) and Retry-After (default: 64)")
     result.add_argument("--max-concurrency", type=int, metavar="N",
-                        help="Run at most N requests at once, below the engine's declared capacity "
-                             "(max_concurrent_requests; default: the engine's)")
+                        help="Hold at most N requests in the engine at once, below what it takes on its own "
+                             "(max_concurrent_requests; Core's runtime applies it; default: the engine's)")
     result.add_argument("--queue-timeout", type=float,
                         help="Seconds a request may wait for the engine before it is refused the same way "
                              "(default: no limit; --timeout starts when the engine takes the request)")

@@ -39,6 +39,41 @@ class ExpertOffloadTests(PluginTestCase):
         self.assertEqual(tier(20 * GB, None, 0, 90 * GB, GB, 2 * GB), "ram")      # no device memory to read
         self.assertEqual(tier(20 * GB, 32 * GB, 6 * GB, 90 * GB, GB, 2 * GB, "disk"), "disk")
 
+    def test_the_store_is_keyed_by_the_code_that_packs_it_not_by_every_plugin(self):
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp:
+            plugins = Path(temp) / "plugins"
+
+            def plugin(folder, name, sources=None, code="x = 1\n"):
+                folder = plugins / folder
+                (folder / "code").mkdir(parents=True)
+                (folder / "plugin.json").write_text(json.dumps({"id": name, "sources": sources or {}}), "utf-8")
+                (folder / "code" / "main.py").write_text(code, encoding="utf-8")
+                (folder / "tests").mkdir()
+                (folder / "tests" / "test_it.py").write_text("# a test\n", encoding="utf-8")
+            plugin("toy-model", "toy-model")
+            plugin("toy-experts", "toy-experts", {"offload": "code", "cache": "../toy-cache/code"})
+            plugin("toy-cache", "toy-cache")
+            plugin("base/toy-source", "toy-source")
+            plugin("toy-sampler", "toy-sampler")
+            use = {"plugins": {"use": {"model": "toy-model", "experts": "toy-experts",
+                                       "expert_source": "toy-source", "sampler": "toy-sampler"}}}
+            folders = offload.packing_folders(plugins, use)
+            self.assertEqual([f.relative_to(plugins.resolve()).as_posix() for f in folders],
+                             ["toy-model", "base/toy-source", "toy-experts", "toy-experts/code", "toy-cache/code"])
+            context = type("Context", (), {"package": temp, "configuration": use})()
+            experts = offload.ExpertOffload.__new__(offload.ExpertOffload)
+            experts.context = context
+            before = experts._code()
+            (plugins / "toy-sampler" / "code" / "main.py").write_text("x = 2\n", encoding="utf-8")
+            (plugins / "toy-experts" / "tests" / "test_it.py").write_text("# changed\n", encoding="utf-8")
+            self.assertEqual(experts._code(), before)    # another slot's plugin, a test: the same store
+            (plugins / "toy-cache" / "code" / "main.py").write_text("x = 3\n", encoding="utf-8")
+            self.assertNotEqual(experts._code(), before)  # code the experts plugin packs with: another store
+            # a selection that does not name the three: every plugin's code, as before
+            self.assertIsNone(offload.packing_folders(plugins, {"plugins": {"use": {"model": "toy-model"}}}))
+
     def test_the_cache_takes_every_byte_past_the_margin(self):
         self.assertEqual(offload.cache_slots(24 * GB + 1000, 2 * GB, 2780176), (22 * GB + 1000) // 2780176 - 1)
         self.assertEqual(offload.cache_slots(GB, 2 * GB, 2780176), 0)
@@ -102,27 +137,6 @@ class ExpertOffloadTests(PluginTestCase):
                     store.read([5], two[:1])
                     self.assertTrue(torch.equal(two[0], bundles[9]))
                     store.close()
-
-    def test_a_prompt_steps_bytes_follow_the_steps_measured(self):
-        need = offload.prompt_bytes
-        self.assertEqual(need({}, 1024), 0)
-        self.assertEqual(need({37: 700}, 16), 700)                    # the part that does not grow with the tokens
-        self.assertEqual(need({37: 700}, 74), 1400)                   # one size: in proportion past it
-        seen = {37: 700, 601: 2956}                                   # 4 bytes a token over 700
-        self.assertEqual(need(seen, 37), 700)
-        self.assertEqual(need(seen, 319), 1828)
-        self.assertEqual(need(seen, 1024), 2956 * 1024 // 601)        # past the largest: in proportion, for a step
-        # Peaks of the load are first steps (their captures' temporaries): one stands until a served step of its
-        # size or larger took less; a larger size's stays, and served peaks keep their most.
-        peaks, first = {}, set()
-        for tokens, peak in ((7, 358), (37, 234), (601, 350)):
-            offload.learn(peaks, first, tokens, peak, serving=False)
-        offload.learn(peaks, first, 40, 128, serving=True)
-        self.assertEqual((peaks, first), ({40: 128, 601: 350}, {601}))
-        offload.learn(peaks, first, 40, 110, serving=True)
-        offload.learn(peaks, first, 601, 400, serving=True)
-        self.assertEqual((peaks, first), ({40: 128, 601: 400}, set()))
-        self.assertEqual(need({37: 900, 601: 400}, 602), 900)         # never less than a smaller chunk took
 
     def test_the_diagnosis_names_the_hit_rate_and_the_next_lever(self):
         line = offload.diagnosis({"tier": "ram", "misses": "cpu", "expert_cache": {"reads": 1000, "hits": 620,

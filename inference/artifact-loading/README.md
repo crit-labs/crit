@@ -49,7 +49,7 @@ cache; file systems that refuse fall back to buffered reads with
 `ReadStats::fallback_reason`. A region past the end throws `std::out_of_range`, and
 `verify_unchanged()` rejects a file replaced since open. Choose a chunk of a few MiB that
 is a multiple of the alignment, and pair large staging with
-[host memory admission](../host-memory-admission/README.md).
+Core's host memory admission (`crit_plugins.host.memory`, which `crit_plugins.host.memory_bytes()` answers by).
 
 For safetensors, `crit_core.model` ([model files](../../core/python/crit_core/model/README.md#safetensors))
 supplies descriptors and tensor bytes. Manifest digest checks and representation metadata

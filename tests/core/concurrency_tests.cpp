@@ -52,6 +52,8 @@ struct State {
     std::string fault;
     std::uint32_t declared_concurrency=8;
     bool work_entered=false, score_entered=false;
+    bool hold_admission=false, admission_entered=false;   // a deferred 89's admission check waits for release
+    std::atomic<bool> release_admission{false};
     int opened_at_score=0;
     std::vector<RequestKey> opened_keys;
     std::vector<std::uint64_t> prefill_order;
@@ -106,7 +108,12 @@ struct FixtureModel final:Model {
     Admission admission(const RequestView& v) override {
         if(v.prompt.front()==90) return Admission::infeasible;
         if(v.prompt.front()==89 && !state->release_blocked) {
-            std::lock_guard lock(state->mutex); ++state->blocked_checks; state->cv.notify_all();
+            std::unique_lock lock(state->mutex); ++state->blocked_checks; state->cv.notify_all();
+            if(state->hold_admission && !state->release_admission) {   // Core's worker waits here, inside admit()
+                state->admission_entered=true; state->cv.notify_all();
+                require(state->cv.wait_for(lock,std::chrono::seconds(3),[&]{return state->release_admission.load();}),
+                        "fixture admission wait expired");
+            }
             return Admission::deferred;
         }
         return state->admit_enabled ? Admission::ready : Admission::deferred;
@@ -434,17 +441,32 @@ void scoring_barrier() {
     std::lock_guard lock(s->mutex);
     require(s->opened_keys.back().lane==0 && s->opened_keys.back().generation==2,"scoring consumed a generation lane identity");
 }
-// A score queued behind a deferred head is cancelled, or expires, without reaching the model.
+// A score queued behind a deferred head is cancelled without reaching the model; one that waits past the pending
+// deadline expires without reaching it, and so does the generation queued behind it.
 void scoring_pending(bool timeout) {
     auto s=std::make_shared<State>(); s->admit_enabled=true;
     auto p=profile(2,1); if(timeout) p.pending_timeout_ms=30; auto e=engine(s,p);
-    auto a=e->submit({89},2); s->wait_for([&]{return s->blocked_checks>=1;});
-    auto b=e->submit_score({1,2},1);
-    if(timeout) { rejects([&]{b.wait();},"pending request deadline"); rejects([&]{a.wait();},"pending request deadline"); }
-    else {b.cancel(); require(b.wait().finish==Finish::cancelled,"queued score cancellation ignored");}
-    require(s->score_calls==0,"cancelled or expired score invoked model");
-    s->release_blocked=true;
-    if(!timeout) require(a.wait().tokens==expected(89,2),"removed score still blocked its head");
+    if(timeout) {
+        // Both wait past the deadline before Core's worker looks at its queue again: it is held in the head's
+        // admission check while the score is queued and both deadlines pass, so one pass expires both. Let go at
+        // once, the head's deadline fell first, and the score, heading the queue with no lane busy, ran before its
+        // own (score_next): on a busy host one run in four.
+        s->hold_admission=true;
+        auto a=e->submit({89},2); s->wait_for([&]{return s->admission_entered;});
+        auto b=e->submit_score({1,2},1);
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));   // past both requests' 30 ms
+        { std::lock_guard lock(s->mutex); s->release_admission=true; s->cv.notify_all(); }
+        rejects([&]{b.wait();},"pending request deadline"); rejects([&]{a.wait();},"pending request deadline");
+        require(s->score_calls==0,"cancelled or expired score invoked model");
+        s->release_blocked=true;
+    } else {
+        auto a=e->submit({89},2); s->wait_for([&]{return s->blocked_checks>=1;});
+        auto b=e->submit_score({1,2},1);
+        b.cancel(); require(b.wait().finish==Finish::cancelled,"queued score cancellation ignored");
+        require(s->score_calls==0,"cancelled or expired score invoked model");
+        s->release_blocked=true;
+        require(a.wait().tokens==expected(89,2),"removed score still blocked its head");
+    }
     require(e->submit({20},2).wait().tokens==expected(20,2),"removed score still blocked later generation");
     require(e->submit_score({1,2},1).wait().scores==std::vector<float>({-0.25F}),"queued score failure poisoned engine");
 }
@@ -596,6 +618,40 @@ void admission_fifo() {
     require(s->opened==0 && s->score_calls==0,"admission crossed a deferred head or a score barrier");
     head.cancel(); head.wait(); score.wait(); tail.wait();
     require(s->opened_at_score==0 && s->score_calls==1,"score barrier ordering changed");
+}
+// Admission by priority: a lower value first, the oldest among equals; a deferred next request holds the lower ones,
+// a score stays a barrier no priority crosses, and a score takes no priority.
+void admission_priority() {
+    const auto with=[](std::int32_t priority){ RequestOptions o; o.priority=priority; return o; };
+    {
+        auto s=std::make_shared<State>(); auto e=engine(s,profile(1,4));
+        auto low=e->submit({1},1,with(5)), plain=e->submit({10},1), high=e->submit({20},1,with(-1)),
+             later=e->submit({30},1);
+        s->admit_enabled=true;
+        low.wait(); plain.wait(); high.wait(); later.wait();
+        std::lock_guard lock(s->mutex);
+        std::vector<std::uint64_t> order;
+        for(const auto& key:s->opened_keys) order.push_back(key.request);
+        require(order==std::vector<std::uint64_t>({high.id(),plain.id(),later.id(),low.id()}),
+                "admission did not go by priority, then arrival");
+    }
+    {
+        auto s=std::make_shared<State>(); auto e=engine(s,profile(1,3));
+        auto low=e->submit({1},1,with(5)), blocked=e->submit({89},1,with(-1));
+        s->admit_enabled=true;
+        s->wait_for([&]{return s->blocked_checks>=3;});
+        require(s->opened==0,"a lower priority overtook a deferred request");
+        s->release_blocked=true; blocked.wait(); low.wait();
+        require(s->opened_keys.front().request==blocked.id(),"the deferred request lost its place");
+    }
+    {
+        auto s=std::make_shared<State>(); auto e=engine(s,profile(1,3));
+        auto low=e->submit({1},1,with(5)), score=e->submit_score({1,2,3},1), high=e->submit({20},1,with(-9));
+        s->admit_enabled=true;
+        low.wait(); score.wait(); high.wait();
+        require(s->opened_at_score==1 && s->opened_keys.back().request==high.id(),"a priority crossed a score barrier");
+        rejects([&]{e->submit_score({1,2,3},1,with(1));},"generation options");
+    }
 }
 void many_aged_prefills() {
     auto s=std::make_shared<State>(); s->mixed=true;
@@ -914,6 +970,7 @@ int main(int argc,char** argv) {
         const std::string only=argc>1 ? argv[1] : "";
         const std::vector<std::pair<std::string,std::function<void()>>> tests{
             {"scaled_batches",scaled_batches}, {"decode_priority",decode_priority}, {"admission_fifo",admission_fifo},
+            {"admission_priority",admission_priority},
             {"many_aged_prefills",many_aged_prefills},
             {"mixed_batches",mixed_batches},
             {"padded_prefill",padded_prefill},

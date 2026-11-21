@@ -1,0 +1,28 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "fused-router",
+  "title": "A test extension of topk-router: its default rule in one fused selection, the rest topk-router's",
+  "description": "topk-router subclassed, not copied: its options (extends), its host reference and every rule but one are topk-router's own code; the default rule (softmax over the selected logits, no groups, bias or renormalization) selects by one top-k over keys that order the logits as topk-router's stable sort does (NaN below -inf, ties to the lower id). For crit_plugins.compose's tests, in an engine that holds topk-router where crit plugins add puts it.",
+  "fills": [
+    "router"
+  ],
+  "devices": [
+    "cuda",
+    "cpu"
+  ],
+  "options": {
+    "fused": {
+      "type": "bool",
+      "default": true,
+      "description": "the default rule through the fused selection; false: topk-router's"
+    }
+  },
+  "sources": {
+    "base": "../base/topk-router"
+  },
+  "extends": "base",
+  "reference": [
+    "topk-router"
+  ],
+  "entry": "plugin.py:create"
+}

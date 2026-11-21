@@ -54,10 +54,6 @@
       "purpose": "Routing description, its host reference for one token and the mapping from Core's parsed config fields"
     },
     {
-      "path": "inference/heterogeneous-expert-dispatch/code/cpu_routes.cu",
-      "purpose": "The post and scatter kernels of a layer's CPU routes over the slots of one of the host's handoffs (Core's crit_plugins.host), and their torch binding, built at load"
-    },
-    {
       "path": "inference/heterogeneous-expert-dispatch/code/device_dispatch.py",
       "purpose": "DeviceDispatch: the CUDA device form's post, join, scatter and combine, the measured link/CPU split; DeclaredRoutes, the baseline device part"
     }
@@ -104,9 +100,7 @@
   "interactions": [
     "async-expert-contributions",
     "expert-residency",
-    "quantized-projections",
-    "recorded-selection",
-    "host-memory-admission"
+    "quantized-projections"
   ],
   "techniques": [
     "heterogeneous-expert-dispatch",

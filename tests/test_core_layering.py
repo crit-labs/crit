@@ -21,8 +21,9 @@ CORE = ROOT / "core"
 PACKAGES = ("crit_core", "crit_plugins")
 ALLOWLIST = ROOT / "tests/support/core_layering_allowlist.json"
 
-# What Core is built on. crit_kernels is the kernel workbench: Core's kernel loader calls it (crit_plugins.kernels),
-# and its exactness levels are the ones an engine's configuration asks (crit_core.engine).
+# What Core is built on. crit_kernels is the kernel workbench: Core's kernel loader builds and loads kernels through
+# it (crit_plugins.kernels, crit_plugins.testing). Its exactness module is not Core's to import: the levels are Core's
+# (test_core_ownership.py).
 LIBRARIES = {
     "crit_core": {"crit_core", "crit_kernels", "crit_plugins", "jinja2", "numpy", "tokenizers", "torch"},
     "crit_plugins": {"crit_core", "crit_plugins", "crit_kernels", "numpy", "torch"},

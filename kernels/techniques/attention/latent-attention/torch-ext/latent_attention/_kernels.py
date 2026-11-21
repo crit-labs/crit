@@ -15,7 +15,7 @@ from crit_kcore import attention_softmax as asm
 from crit_kcore import formats
 
 
-@triton.jit
+@triton.jit(do_not_specialize=[])
 def _window_kernel(q_ptr, c_ptr, cs_ptr, tab_ptr, trow_ptr, start_ptr, count_ptr, first_ptr, po_ptr, pm_ptr, pl_ptr,
                    stride_qt, stride_qh, tab_stride, tab_width, n_parts, sm_scale, count_all,
                    H: tl.constexpr, R: tl.constexpr, P: tl.constexpr, COLS: tl.constexpr, BLOCK_M: tl.constexpr,
@@ -97,7 +97,7 @@ def _window_kernel(q_ptr, c_ptr, cs_ptr, tab_ptr, trow_ptr, start_ptr, count_ptr
         tl.store(pl_ptr + idx, l_i, mask=live & (vs == 0))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=[])
 def _fused_kernel(q_ptr, c_ptr, cs_ptr, tab_ptr, trow_ptr, start_ptr, count_ptr, first_ptr, out_ptr, lse_ptr, sink_ptr,
                   stride_qt, stride_qh, tab_stride, tab_width, n_parts, sm_scale, count_all, stride_ot, stride_oh,
                   H: tl.constexpr, R: tl.constexpr, P: tl.constexpr, COLS: tl.constexpr, BLOCK_M: tl.constexpr,
@@ -191,21 +191,34 @@ def _fused_kernel(q_ptr, c_ptr, cs_ptr, tab_ptr, trow_ptr, start_ptr, count_ptr,
             tl.store(lse_ptr + (start + c) * H + h, asm.lse(m_run, l_run, False), mask=live & (vs == 0))
 
 
-@triton.jit(do_not_specialize=["pos0", "T"])
-def _prompt_kernel(q_ptr, c_ptr, cs_ptr, tab_ptr, pos_ptr, out_ptr, lse_ptr, sink_ptr, T, pos0, stride_qt, stride_qh,
-                   stride_ot, stride_oh, sm_scale, H: tl.constexpr, R: tl.constexpr, P: tl.constexpr,
-                   BLOCK_M: tl.constexpr, PIECE: tl.constexpr, PAGE: tl.constexpr, VSPLIT: tl.constexpr,
-                   FP8: tl.constexpr, HW_FP8: tl.constexpr, SCALES: tl.constexpr, POS_T: tl.constexpr,
-                   LSE: tl.constexpr, SINKS: tl.constexpr):
+@triton.jit(do_not_specialize=["pos0", "T", "tab_stride"])
+def _prompt_kernel(q_ptr, c_ptr, cs_ptr, tab_ptr, pos_ptr, out_ptr, lse_ptr, sink_ptr, map_ptr, meta_ptr, T, pos0,
+                   stride_qt, stride_qh, stride_ot, stride_oh, tab_stride, sm_scale, H: tl.constexpr, R: tl.constexpr,
+                   P: tl.constexpr, BLOCK_M: tl.constexpr, PIECE: tl.constexpr, PAGE: tl.constexpr,
+                   VSPLIT: tl.constexpr, FP8: tl.constexpr, HW_FP8: tl.constexpr, SCALES: tl.constexpr,
+                   POS_T: tl.constexpr, LSE: tl.constexpr, SINKS: tl.constexpr, RAGGED: tl.constexpr):
     """Program (query tile, value part): a prompt chunk of one sequence, T tokens at positions pos0 .. (or with POS_T
     pos_ptr[0], read on the device) over its page table, causal; tile rows j -> token j // H, head j % H (the chunk's
     tokens times their heads packed into the tile, each piece of cached rows loaded once for all of them); the pieces
     of PIECE positions in order up to the tile's last token in one online softmax, the head's sink last, the output
-    normalized and written (no partitions, no partials). A token's bits do not depend on the chunk's length."""
+    normalized and written (no partitions, no partials). A token's bits do not depend on the chunk's length.
+    RAGGED: several sequences' chunks in one launch, program p's tile the map's (map_ptr [p] = sequence, its tile),
+    the sequence's first token, tokens and first position from meta_ptr [sequence][3] (int64) and its page table row
+    tab_ptr + sequence * tab_stride: each tile is the one prefill() runs for that chunk alone."""
     mt = tl.program_id(0) // VSPLIT
     vs = tl.program_id(0) % VSPLIT
     DVP: tl.constexpr = R // VSPLIT
-    if POS_T:
+    if RAGGED:
+        seq = tl.load(map_ptr + 2 * mt)
+        mt = tl.load(map_ptr + 2 * mt + 1)
+        first = tl.load(meta_ptr + 3 * seq)
+        T = tl.load(meta_ptr + 3 * seq + 1).to(tl.int32)
+        pos0 = tl.load(meta_ptr + 3 * seq + 2).to(tl.int32)
+        q_ptr += first * stride_qt
+        out_ptr += first * stride_ot
+        lse_ptr += first * H
+        tab_ptr += seq.to(tl.int64) * tab_stride
+    elif POS_T:
         pos0 = tl.load(pos_ptr).to(tl.int32)
     j = mt * BLOCK_M + tl.arange(0, BLOCK_M)
     t = j // H
@@ -266,7 +279,7 @@ def _prompt_kernel(q_ptr, c_ptr, cs_ptr, tab_ptr, pos_ptr, out_ptr, lse_ptr, sin
         tl.store(lse_ptr + t.to(tl.int64) * H + h, asm.lse(m_i, l_i, False), mask=live & (vs == 0))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=[])
 def _merge_kernel(po_ptr, pm_ptr, pl_ptr, out_ptr, lse_ptr, sink_ptr, start_ptr, count_ptr, first_ptr, n_parts,
                   stride_ot, stride_oh, count_all, H: tl.constexpr, R: tl.constexpr, COLS: tl.constexpr,
                   PIECE: tl.constexpr, COUNTS: tl.constexpr, LSE: tl.constexpr, SINKS: tl.constexpr,

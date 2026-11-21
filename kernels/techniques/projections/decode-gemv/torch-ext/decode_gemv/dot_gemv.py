@@ -5,25 +5,23 @@ scale. The program's shape never depends on the call's row count (rows past it a
 are the same alone and beside up to 15 others; tile() picks the shape from the build's tuning for the matrix's
 [N, K], or untuned from that shape and the device's multiprocessor count (rule()), so a process keeps one order a
 matrix. Adapted from a crit-labs engine's Triton decode GEMV (Apache-2.0), as general code. The kernel is the
-format-generic Triton GEMV's dot path (triton_any, structure gemv-triton) on FP8, the same operations as before:
-structure gemv-fp8-dot is an alias of gemv-triton."""
+format-generic Triton GEMV's dot path (triton_any, structure gemv-triton) on FP8, the same operations as before."""
 import torch
 
-from ._crit_tuning import knobs
-from .triton_any import dot, dot_rule, partial_elements as _partial_elements
+from .triton_any import MUL_FMA, dot, dot_rule, partial_elements as _partial_elements, tuned as _tuned
 
 MAX_ROWS = 16
 
 
 def tile(n: int, k: int, multiprocessors: int):
-    """(BN, BK, warps, split) for an [N, K] FP8 matrix: the build's tuning for this shape (kernel.json's structure
-    gemv-fp8-dot, one plan a matrix for every row count), or, untuned, rule()'s. A tuned BK and split that do not
-    divide K give the rule's plan."""
+    """(BN, BK, warps, split) for an [N, K] FP8 matrix: gemv-triton's dot knobs for this shape at one row (one plan a
+    matrix for every row count), or, untuned or where the tuning picks the fma path, rule()'s. A tuned BK and split
+    that do not divide K give the rule's plan."""
     if k % 128:
         raise ValueError(f"the FP8 dot GEMV takes K a multiple of 128, not {k}")
-    tuned = knobs("gemv-fp8-dot", {"N": n, "K": k}, 1)
-    plan = (tuned["BN"], tuned["BK"], tuned["WARPS"], tuned["SPLIT"])
-    if 0 in plan or k % (plan[1] * plan[3]):
+    knobs = _tuned(1, n, k, 1)   # weights 1: FP8 with row scales
+    plan = (knobs["BN"], knobs["BK"], knobs["WARPS"], knobs["SPLIT"])
+    if knobs["MUL"] == MUL_FMA or 0 in plan or k % (plan[1] * plan[3]):
         return rule(n, k, multiprocessors)
     return plan
 

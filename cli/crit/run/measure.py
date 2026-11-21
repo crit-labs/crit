@@ -134,10 +134,11 @@ def unqualified(root, run, candidate_id):
 def refusal(candidate_id, found):
     """Why crit run measure refuses a candidate whose benchmarks could not qualify (unqualified), and what to do."""
     if found["lasting"]:
-        what = (f" No later record undoes that, so {candidate_id} cannot become eligible: build the fix as a new "
-                "candidate" + (" (its plan repairs a failed check with a requirement lever serving "
-                               + ", ".join(f"check:{gate}" for gate in sorted(found["failed"])) + ")"
-                               if found["failed"] else "") + ".")
+        what = (f" No later record undoes that, so {candidate_id} cannot become eligible: seal it built (crit run ... "
+                f"seal --candidate {candidate_id} --lifecycle built) and build the fix as a new candidate"
+                + (" (its plan repairs a failed check with a requirement lever serving "
+                   + ", ".join(f"check:{gate}" for gate in sorted(found["failed"])) + ")"
+                   if found["failed"] else "") + ".")
     else:
         what = (f" Record its checks first: crit run ... check --candidate {candidate_id} --from-eval records the "
                 "arithmetic, functional and resources checks of every case from its completed Eval (crit run ... eval "

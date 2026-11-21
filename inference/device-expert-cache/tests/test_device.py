@@ -195,10 +195,11 @@ class DeviceTests(PluginTestCase):
             self.assertEqual(d.snapshot()[0], _twin_state(twin, 24)[0])   # prompts admit nothing
 
     # -- the cache ----------------------------------------------------------------------------------------------
-    def cache(self, store, layers, experts, slots, layout=None, **options):
+    def cache(self, store, layers, experts, slots, layout=None, link=None, **options):
         plugin = self.assemble(options={"native": options.pop("native", True), **options})["expert_residency"]
         layout = layout or {"bundle_bytes": store.bundle_bytes}
-        return plugin.cache(layers, experts, layout, slots, self.device(), store)
+        extra = {"link_layers": link[0], "link_slots": link[1]} if link else {}
+        return plugin.cache(layers, experts, layout, slots, self.device(), store, **extra)
 
     def test_slots_hold_their_experts_bundles_and_telemetry_counts_them(self):
         torch, device = self.torch, self.device()
@@ -703,6 +704,88 @@ class DeviceTests(PluginTestCase):
         self.assertEqual(seen["cpu"], twin.reads - twin.hits)
         self.assertGreater(twin.copies, swaps)
         self.assertGreater(twin.hits, twin.reads // 3)
+
+    def test_a_link_layers_misses_are_admitted_now_from_the_rounds_reserve(self):
+        # Beside CPU-tier layers (misses -2, copied beside the round) a link layer, whose experts the CPU tier does not
+        # compute, gets a slot for every miss in the same plan, its bundle copied before the table is read, from the
+        # round's victims above the reserve's floor; the CPU tier's copies take those below. Kernel and torch ops alike,
+        # plan for plan.
+        torch, device = self.torch, self.device()
+        layers, experts, slots, swaps, reserve = 3, 24, 30, 4, 8
+        found = {}
+        for native in self.kernels():
+            store = self.store(layers, experts, bundle=1024)
+            cache = self.cache(store, layers, experts, slots, native=native, policy="recent", cpu_tier=True,
+                               ring_slots=0, max_swaps=swaps, link=((2,), reserve))
+            self.assertEqual(cache._recent.swaps, swaps + reserve)
+            rng = random.Random(9)
+            seen = []
+            for r in range(30):
+                view = _View(torch, device, 4)
+                cache.start_round(view)
+                tables = []
+                for layer in range(layers):
+                    routes = [[rng.randrange(experts) for _ in range(2)] for _ in range(3)]
+                    tables.append(cache.plan(layer, torch.tensor(routes, device=device)).clone())
+                cache.count_round(view)
+                if device == "cuda":
+                    torch.cuda.synchronize()
+                link = tables[2].tolist()
+                self.assertNotIn(-2, link, r)                  # every routed expert of the link layer has a slot
+                self.check_slots(cache, store, 2, link)        # ... holding its bundle when the plan returns
+                self.assertLessEqual(int(cache._recent.state[3]), swaps)   # the CPU tier's copies stay below the floor
+                seen.append([t.tolist() for t in tables])
+            found[native] = seen
+            telemetry = cache.telemetry(sync=True)
+            self.assertGreater(telemetry["fills"], 0)
+            self.assertGreater(telemetry["cpu"], 0)            # the other layers' misses went to the CPU tier
+        if len(found) == 2:
+            self.assertEqual(found[True], found[False])        # the kernel's rule is the torch ops'
+        # A ring of a layer's 8 experts beside a reserve of 8 takes 16 slots: 12 are refused, as is a decode-only
+        # cache whose 6 slots hold fewer than the reserve.
+        with self.assertRaisesRegex(ValueError, "holds no prompt ring.*link layers' misses may take"):
+            self.cache(self.store(layers, 8), layers, 8, 12, policy="recent", cpu_tier=True, max_swaps=swaps,
+                       link=((2,), 8))
+        with self.assertRaisesRegex(ValueError, "link layers' misses take slots"):
+            self.cache(self.store(layers, 8), layers, 8, 6, policy="recent", cpu_tier=True, max_swaps=swaps,
+                       ring_slots=0, link=((2,), 8))
+
+    def test_a_link_plan_whose_reserve_the_rounds_hits_took_goes_below_it(self):
+        # A step decodes the decoder's layers before the draft layer in one round: their hits stamp the slots they
+        # read, some of them among the reserve's victims (the list's last), which the link layer's plan then cannot
+        # take. It goes on below the reserve, down to the CPU tier's next victim, and loses no route while the list
+        # has open victims (a round's CPU-tier copies and hits take at most the decoder's distinct experts). The
+        # reserve alone lost routes here. Kernel and torch ops alike, plan for plan.
+        torch, device = self.torch, self.device()
+        layers, experts, slots, swaps, reserve, tokens, top = 2, 16, 16, 8, 6, 3, 2
+        found = {}
+        for native in self.kernels():
+            store = self.store(layers, experts, bundle=1024)
+            cache = self.cache(store, layers, experts, slots, native=native, policy="recent", cpu_tier=True,
+                               ring_slots=0, max_swaps=swaps, link=((1,), reserve))
+            rng = random.Random(4)
+            seen, below = [], 0
+            for r in range(80):
+                view = _View(torch, device, 4)
+                cache.start_round(view)
+                floor = int(cache._recent.state[2]) - reserve
+                tables = []
+                for layer in range(layers):   # the decoder's layer first, the link layer last
+                    routes = [rng.sample(range(experts), top) for _ in range(tokens)]
+                    tables.append(cache.plan(layer, torch.tensor(routes, device=device)).clone())
+                below += int(cache._recent.state[4]) < floor
+                cache.count_round(view)
+                if device == "cuda":
+                    torch.cuda.synchronize()
+                link = tables[1].tolist()
+                self.assertNotIn(-2, link, r)
+                self.check_slots(cache, store, 1, link)
+                seen.append([t.tolist() for t in tables])
+            self.assertGreater(below, 0)                       # the reserve alone was short in some rounds
+            self.assertEqual(cache.telemetry(sync=True)["failure"], 0)
+            found[native] = seen
+        if len(found) == 2:
+            self.assertEqual(found[True], found[False])
 
     def test_recent_residency_lends_a_prompt_its_ring_and_takes_it_back(self):
         torch, device = self.torch, self.device()

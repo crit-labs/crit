@@ -58,8 +58,7 @@
   ],
   "interactions": [
     "host-expert-arithmetic",
-    "heterogeneous-expert-dispatch",
-    "host-memory-admission"
+    "heterogeneous-expert-dispatch"
   ],
   "techniques": [
     "dense-layer-offload",

@@ -110,7 +110,7 @@ class ExpertCache:
                  quota_tables=None, second_touch=False, cpu_tier=False, ring_slots=None, ring="borrow",
                  stage_routes=None, fill_blocks=0, fill_vector=16, decay=0.85, period=3, max_swaps=96,
                  burst_swaps=384, burst_fraction=0.25, kernel=True, raw_chunk=32, rows=64, record_routes=0,
-                 side_swaps=False, max_slots=0, owner="device-expert-cache"):
+                 side_swaps=False, max_slots=0, owner="device-expert-cache", link_layers=(), link_slots=0):
         import torch
         self.torch = torch
         self.device = torch.device(device)
@@ -122,6 +122,10 @@ class ExpertCache:
             self._trace_pos = torch.zeros(1, dtype=torch.int64, device=self.device)
         self.layers, self.experts = int(layers), int(experts)
         self.bundle_bytes = int(layout["bundle_bytes"])
+        # The bytes of a slot its rows use: the bundle, or an opaque row of fewer bytes padded to the slot (row_cache)
+        self.row_bytes = int(layout.get("row_bytes", self.bundle_bytes))
+        if not 0 < self.row_bytes <= self.bundle_bytes:
+            raise ValueError(f"a row of {self.row_bytes} bytes does not fit a slot of {self.bundle_bytes}")
         if self.layers < 1 or self.experts < 1 or self.bundle_bytes < 16 or self.bundle_bytes % 16:
             raise ValueError("a cache has layers, experts and bundles of a multiple of 16 bytes")
         if policy not in ("clock", "ranked", "recent"):
@@ -135,6 +139,13 @@ class ExpertCache:
             raise ValueError("an admission quota or second touch sends misses to the CPU tier: give cpu_tier=True with "
                              "a CPU half beside the experts plugin")
         self.policy, self.cpu_tier, self.ring_mode = policy, bool(cpu_tier), ring
+        # Link layers: layers whose experts the CPU tier does not compute (a W4A16 draft layer beside W4A4 ones) in a
+        # recent cache: their misses are admitted at once from a reserve of `link_slots` victims a round (what one
+        # decode round can route in them) and copied before they are read, never sent to the CPU tier.
+        self.link_layers = frozenset(int(layer) for layer in link_layers)
+        self.link_slots = min(int(link_slots), int(experts)) if self.link_layers else 0
+        if self.link_layers and (policy != "recent" or not self.link_slots):
+            raise ValueError("link layers are a recent cache's (beside the CPU tier), with link_slots a round")
         # -- the source --------------------------------------------------------------------------------------------
         self.source = source
         if source.keys != self.layers * self.experts:
@@ -194,7 +205,8 @@ class ExpertCache:
         if not self.own:
             raise ValueError("a cache needs at least one slot of its own")
         swaps = max(burst_swaps, max_swaps) if policy == "ranked" else 0
-        keep = 0 if cpu_tier else self.experts + swaps     # own slots a plan may need beside the ring
+        # own slots a plan may need beside the ring: a layer's experts without a CPU tier, the link layers' reserve
+        keep = (self.link_slots if cpu_tier else self.experts + swaps)
         self.plan_slots = keep   # which a shrink leaves too: without a CPU tier a miss with no slot is a lost route
         room = int(slots) if self.elastic is not None else len(self.own)   # an elastic cache: the slots backed first
         if ring_slots is None:
@@ -203,15 +215,21 @@ class ExpertCache:
                 need = self.experts + keep + (1 if self.elastic is not None else 0)
                 raise ValueError(
                     f"a cache of {room} own slots holds no prompt ring: a ring takes a layer's {self.experts} experts "
-                    + (f"beside the {keep} slots a plan may need without a CPU tier (every miss takes a slot), "
+                    + ((f"beside the {keep} slots its link layers' misses may take a round, "
+                        if self.link_layers else
+                        f"beside the {keep} slots a plan may need without a CPU tier (every miss takes a slot), ")
                        if keep else "")
                     + f"so prompts take {need} slots or more ({need * B / 2**30:.2f} GiB of bundles); give the "
-                    "cache that much device memory" + (", or the CPU tier the misses" if keep else "")
+                    "cache that much device memory"
+                    + (", or the CPU tier the misses" if keep and not self.link_layers else "")
                     + ", or make a decode-only cache with ring_slots 0")
         ring_slots = int(ring_slots)
         if ring_slots and ring_slots < self.experts:
             raise ValueError(f"a prompt ring holds a layer's every expert: {self.experts} slots or more, not "
                              f"{ring_slots} (or 0: no prompts)")
+        if self.link_layers and room - ring_slots < keep:
+            raise ValueError(f"the link layers' misses take slots: the cache's {room} own slots less its ring of "
+                             f"{ring_slots} leave fewer than the {keep} a round may route in them")
         if not cpu_tier and room - ring_slots < keep:
             raise ValueError(f"without a CPU tier every miss takes a slot: the cache's {room} own slots less "
                              f"its ring of {ring_slots} and {swaps} swaps leave fewer than the {self.experts} experts "
@@ -276,7 +294,7 @@ class ExpertCache:
             self._ranked = _Ranked(self, decay, period, max_swaps, max(burst_swaps, max_swaps), burst_fraction,
                                    side=bool(side_swaps))
         if policy == "recent":
-            self._recent = _Recent(self, max_swaps)
+            self._recent = _Recent(self, max_swaps, self.link_slots)
         if lend is not None:
             lend.on_reserve(self._lend_changed)
 
@@ -406,10 +424,18 @@ class ExpertCache:
         # the plan gave them away.
         prior = (self.directory.slot_key.clone()
                  if not capturing and self.program is None and getattr(self.source, "retains", False) else None)
-        self.directory.plan(layer, ids, top, rows, self._row_counters if rows is not None else None, recent=recent)
+        link = recent is not None and layer in self.link_layers
+        self.directory.plan(layer, ids, top, rows, self._row_counters if rows is not None else None, recent=recent,
+                            link=link)
         table = self.directory.tables[layer]
         if decided is not None:
             decided(table)
+        if link:   # its misses copied in now, before the layer reads them: the CPU tier does not compute them
+            self._fill(layer, min(ids.numel(), self.experts), capturing, prior)
+            if not capturing and int(self.directory.state[2]) & 2:
+                raise RuntimeError(f"a plan of link layer {layer} found no victim for a miss: the cache lost a route "
+                                   f"(its reserve of {self.link_slots} slots a round is smaller than what it routed)")
+            return table
         if recent is not None:
             self._recent.fill(recent[3], capturing)   # beside the round: the CPU tier computes these misses now
             return table
@@ -629,9 +655,10 @@ class ExpertCache:
         the CPU takes the chunk where its missed routes cost under `wins` of their experts' copies (a route of an
         expert the tier has just read costs it less than the first, so the CPU's side is an upper bound). None also
         for a chunk of stage_routes routes or more (it routes nearly every expert of the layer, each for many rows:
-        the link's), for a layer that is staged, and without a CPU tier. Host-driven, not captured."""
+        the link's), for a layer that is staged, for a link layer (the CPU tier does not compute its experts), and
+        without a CPU tier. Host-driven, not captured."""
         torch = self.torch
-        if (not self.cpu_tier or ids.numel() >= self.stage_routes
+        if (not self.cpu_tier or layer in self.link_layers or ids.numel() >= self.stage_routes
                 or (self.device.type == "cuda" and torch.cuda.is_current_stream_capturing())
                 or (self._prompt_open and self._table is not None and layer == self._prompt_layer)):
             return None
@@ -1054,6 +1081,11 @@ class ExpertCache:
         return (max(free) if free else -1), (min(held) if held else self._pages)
 
     # -- telemetry -----------------------------------------------------------------------------------------------
+    def rows(self):
+        """The store's slots as rows of the caller's own bytes ([S][row_bytes] uint8, a view of store without the
+        padding): a slot table's slot s holds its key's row at rows()[s]."""
+        return self.store[:, :self.row_bytes]
+
     def telemetry(self, sync=False):
         """{slots, resident, lent, reads, hits, fills, fill_bytes, cpu, prompt_reads, prompt_hits, prompt_copies,
         failure, swaps, kernel}: decode plans' distinct experts read and hit, copies and their bytes (decode fills,
@@ -1127,17 +1159,20 @@ class _Recent:
     was missed in) and lists the victims: the `swaps` open slots whose expert was routed longest ago, empty slots
     first, ties to the lower slot. Fixed shapes, capture-safe; the copies need the directory's kernel in a capture."""
 
-    def __init__(self, cache, swaps):
+    def __init__(self, cache, swaps, reserve=0):
         torch = cache.torch
         d, dev = cache.directory, cache.device
         if int(swaps) < 1:
             raise ValueError("recent residency copies at least one miss a round (max_swaps)")
         self.cache = cache
         S = d.slots
-        R = self.swaps = min(int(swaps), S)
+        # the round's victims: `swaps` for the CPU tier's copies beside the round, then the link layers' reserve
+        R = self.swaps = min(int(swaps) + int(reserve), S)
         i32 = dict(dtype=torch.int32, device=dev)
         self.victims = torch.full((R + 1,), S, **i32)        # the last a dummy
-        self.state = torch.zeros(4, **i32)                   # the round, the next victim, the victims, the copies
+        # the round, the next victim, the victims, the copies, the link layers' next victim (from the end), the reserve
+        self.state = torch.zeros(6, **i32)
+        self.state[5] = int(reserve)
         self.pending = torch.zeros(R + 1, 2, **i32)          # the round's copies (key, slot); the last a dummy
         self.ranges = torch.zeros(4 * cache.layers, 2, **i32)   # each plan call's range of pending (first, count)
         self.calls = 0
@@ -1222,6 +1257,7 @@ class _Recent:
         self.victims[:R].copy_(torch.where(found, first % (1 << 21), S).int())
         self.state[1:2].zero_()
         self.state[2:3].copy_(found.sum().int().view(1))
+        self.state[4:5].copy_(self.state[2:3])   # the link layers take victims from the list's end
         self.calls = 0
         self.listed = True
 

@@ -88,6 +88,7 @@ per 2,048 tokens without a measurable change in time to first token.
 | [reference.py](code/reference.py) | Python formula, output-only verification and accepted-prefix reconstruction |
 | [chunked_prefill.py](code/chunked_prefill.py) | `prepare_chunk`, `apply_chunk`, `two_pass`, `sequential`, `max_difference` |
 | [device_states.py](code/device_states.py) | The recurrence slot's device form: `StatePool` (states, stashes, convolution windows, round slot table), `forward`, `convolve`, `accept`, `commit_round` by strategy, over recurrent-scans' pool kernels or a capture-safe torch formula; `FLA_TILES` and `fla_pinned`, the stated tiles fla's chunked kernels run on |
+| [slot.py](code/slot.py) | `RecurrenceSlot`, the device form both gated-delta recurrence plugins (this one and sequential-recurrence) fill the slot with: the kernel for a pool, `StatePool`s from the options, prompt-row crossovers, facts, exactness, `close()` |
 
 Default native limits (65,536 state elements, 1,024 nodes, chain length 64,
 magnitude `1e12`, and others in `Limits`) are mechanism choices an engine may
@@ -242,6 +243,24 @@ outputs); one through a chunked kernel agrees with it within `2e-3 + 2e-2 |x|`. 
 engine (prompt chunks of 1,024 tokens) `exact_rows` 1,024 against 512 cost 12-13% of
 prefill (6,213 against 7,040 tokens/s at 8K, 4,994 against 5,511 at 32K) and nothing below
 512 tokens.
+
+**`decode: scan` or `chunk`.** `scan`, the default, runs decode and verify rows through the
+column scan and prompt rows as `prompt_rows` and `exact_rows` say. `chunk` runs every row
+(decode, verify, prompt, captured rounds and captured prompt chunks) through recurrent-scans'
+chunk-aligned exact form (`delta-chunk-rows`, [chunk_states.py](code/chunk_states.py)): a
+sequence keeps the state at its last 64-aligned position and the chunk's tokens since, and each
+step recomputes the chunk so far from that state, so a prompt row has the bits of decoding its
+tokens and runs on tensor cores. It buys exact prompt rows with decode time. On one RTX 5090
+over Qwen3.8-27B's 48 gated-delta layers (16 key and 48 value heads x 128), an exact prompt
+takes 78.8 ms through the scan and 12.3 ms through `chunk` at 2,048 tokens (312.7 and 44.8 ms
+at 8,192), while a decode step costs 0.84 ms more at one sequence (0.52 against 1.36 ms), 1.34
+ms more at 8 and 5.1 ms more at 32. So `chunk` wins only when answers are short and prompts
+long: at one sequence an 8K prompt's 268 ms saved pays for about 320 decoded tokens, a 2K
+prompt's 66 ms for about 80. Where an engine asks `row-exact` or higher of its prompt rows and
+its requests answer in fewer tokens than that, `chunk` is faster; otherwise keep `scan`. An
+engine that does not ask exact prompt rows gains nothing from it: the chunked prefill
+(`prefill: tensor_cores`) already runs its prompts about as fast. That is why `scan` stays the
+default and `chunk` is the option an engine build ablates against its own requests.
 
 **fla's tiles.** fla autotunes the six Triton kernels of its chunked forward (the L2 norm,
 the decay cumsum, the fused `K K^T` solve, the WY recompute, the state pass and the output)

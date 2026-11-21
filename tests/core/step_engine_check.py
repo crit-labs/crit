@@ -1,9 +1,10 @@
 """Drive a toy Python step model through crit_core.native.StepEngine and Core's concurrent runtime (crit/step_engine.h,
 the crit_core_steps library): requests decode the same tokens batched as one at a time, steps hold several requests
 and mix prompt chunks with decode rows, cancellation and retirement reach the model and release every session,
-page-reserving admission defers requests, log-probabilities, replay and stop tokens pass through, prompts run in
-prefill passes, scores run as Core's barrier, parts with step frames hear of every step and score, and a failing step
-fails the engine. Core's loader and its adapters over a model plugin are tests/test_core_engine.py's."""
+page-reserving admission defers requests, log-probabilities, replay and stop tokens pass through, constrained requests
+decode in native rounds that mask with step()'s tokens, prompts run in prefill passes, scores run as Core's barrier,
+parts with step frames hear of every step and score, and a failing step fails the engine. Core's loader and its
+adapters over a model plugin are tests/test_core_engine.py's."""
 import ctypes
 import sys
 import threading
@@ -523,6 +524,159 @@ def native_round_forms(library):
         engine.close()
 
 
+# A byte vocabulary for constrained requests over the toy's tokens: each token one of five pieces, STOP the EOS.
+PIECES = (b"a", b"b", b"c", b"ab", b"ba")
+LANGUAGE = "(a|b)(ab|ba|c){3,8}b"   # at most 18 bytes: every reply ends within 24 tokens
+
+
+def masked_successor(seen, allowed):
+    """The toy's next token under a constraint: one of the allowed tokens, picked by successor(seen)."""
+    ids = list(allowed)
+    return ids[successor(seen) % len(ids)]
+
+
+class MaskedRoundModel(RoundModel):
+    """RoundModel whose rounds mask (NativeRounds' stage): a constrained slot emits one token a round, its drafts cut,
+    from the allowed set Core staged for it, which stays in the slot as a device buffer would: a round whose
+    constrained slot finds no set staged since its last round (or since a move) is counted in `stale`, so Core must
+    stage the next set between every two rounds. step() masks each constrained row by its StepRow.allowed. With
+    masks=False the rounds do not mask, and Core sends constrained requests to step(). `ignore`: the rounds draw a
+    constrained slot's token without its mask (a model plugin that drops it)."""
+
+    def __init__(self, masks=True, ignore=False, **options):
+        super().__init__(**options)
+        self.masks, self.ignore = masks, ignore
+        self.staged, self.constrained, self.stages, self.stale = [None] * self.rows, [False] * self.rows, 0, []
+        self.fresh = [False] * self.rows
+
+    def native_rounds(self, _library):
+        self.native = NativeRounds(self._launch, self._wait, None, ctypes.addressof(self.block), self.stride, 8,
+                                   self.rows, ctypes.addressof(self.width_array), self.width,
+                                   stage=self.stage if self.masks else None)
+        return self.native
+
+    def stage(self, slot, allowed):
+        self.staged[slot], self.fresh[slot] = list(allowed), True
+        self.stages += 1
+
+    def launch(self, _user, rows, width, logprobs):
+        masked = {}
+        for slot in range(rows):
+            if self.constrained[slot]:
+                if not self.fresh[slot]:
+                    self.stale.append((slot, self.native_rounds_run))
+                    if self.staged[slot] is None:
+                        return 1
+                masked[slot], self.fresh[slot] = self.staged[slot], False
+        code = super().launch(_user, rows, width, logprobs)
+        for slot, allowed in masked.items():   # its drafts cut: column 0's token alone, under the mask
+            at = slot * self.stride
+            count = self.block[at]
+            if not count:
+                continue
+            seen = self.history[slot]
+            del seen[len(seen) - count:]
+            self.allowance[slot] += count - 1
+            token = successor(seen) if self.ignore else masked_successor(seen, allowed)
+            seen.append(token)
+            self.block[at], self.block[at + 1], self.block[at + 2], self.block[at + 3] = 1, 0, len(seen), token
+        return code
+
+    def step(self, rows):
+        out = {}
+        for r in rows:
+            s = r.session
+            if not r.prefill_complete:
+                s.slot = len(self.slots)
+                self.slots.append(s)
+                self.constrained[s.slot], self.staged[s.slot], self.fresh[s.slot] = r.allowed is not None, None, False
+                first = masked_successor(s.prompt, r.allowed) if r.allowed is not None else successor(s.prompt)
+                self.history[s.slot] = list(s.prompt) + [first]
+                self.continuation[s.slot] = []
+                self.allowance[s.slot] = s.request.output_tokens - 1
+                self.native.bind(s.slot, s)
+                out[id(s)] = StepResult(len(s.prompt), [first], True)
+                continue
+            self.decode_steps += 1
+            seen, token = self.history[s.slot], None
+            if self.allowance[s.slot] > 0:
+                token = masked_successor(seen, r.allowed) if r.allowed is not None else successor(seen)
+                seen.append(token)
+                self.allowance[s.slot] -= 1
+            out[id(s)] = StepResult(0, [token] if token is not None else [], True)
+        return [out[id(r.session)] for r in rows]
+
+    def retire(self, session, finish):
+        slot, last = session.slot, len(self.slots) - 1
+        if slot != last:   # the moved session's staged set stays behind: Core stages it in its new slot
+            self.constrained[slot], self.staged[slot], self.fresh[slot] = self.constrained[last], None, False
+        self.constrained[last], self.staged[last], self.fresh[last] = False, None, False
+        super().retire(session, finish)
+
+
+def constrained_rounds(library):
+    """Constrained requests share Core's native rounds where the rounds mask: Core stages each one's allowed set for
+    its slot between two rounds (the set of round n + 1 from the matcher after round n's token), checks each token the
+    round emits against it and appends it to the matcher, and the tokens are those step() gives; rounds that do not
+    mask send constrained requests to step(); a round that draws outside the set fails that request alone."""
+    from crit_core.constraints import compile_language
+    from crit_core.constraints.vocabulary import ByteVocabulary
+    pieces = tuple(b"" if t == STOP else PIECES[t % len(PIECES)] for t in range(VOCAB))
+    vocabulary = ByteVocabulary(pieces, STOP, "toy-pieces")
+    grammar = {"type": "json_schema", "grammar": compile_language("regex", LANGUAGE)}
+    requests = [(p, 24 if r % 2 else 12, r % 2 == 1) for r, p in enumerate(prompts())]
+
+    def generate(engine, request):
+        prompt, n, constrained = request
+        if constrained:
+            return engine.generate(prompt, n, stop_tokens=[STOP], constraint=grammar)[0]
+        return engine.generate(prompt, n, stop_tokens=[])[0]
+
+    def serve(model):
+        engine = StepEngine(model, library)
+        engine.constrain(vocabulary)
+        try:
+            alone = [generate(engine, q) for q in requests if q[2]]
+            with ThreadPoolExecutor(len(requests)) as pool:
+                together = list(pool.map(lambda q: generate(engine, q), requests))
+            return alone, together, engine.telemetry()["core"]
+        finally:
+            engine.close()
+    stepped = MaskedRoundModel(masks=False)
+    want_alone, want_together, _ = serve(stepped)
+    expect(stepped.decode_steps > 0 and stepped.stages == 0, ("rounds that do not mask: step() decodes them",
+                                                             stepped.decode_steps))
+    expect(want_alone == [t for t, q in zip(want_together, requests) if q[2]],
+           "a constrained request batched decodes its tokens alone")
+    for tokens, (prompt, n, constrained) in zip(want_together, requests):
+        if constrained:
+            expect(len(tokens) > 2 and tokens[-1] == STOP, ("the reply ends where its language is complete", tokens))
+        else:
+            expect(tokens == oracle(prompt, n), "a free request beside constrained ones keeps the oracle's tokens")
+    model = MaskedRoundModel()
+    alone, together, core = serve(model)
+    expect(not model.stale, ("Core staged each constrained slot's set before every round", model.stale))
+    expect(alone == want_alone and together == want_together, ("the rounds give step()'s tokens", alone, want_alone))
+    expect(model.decode_steps == 0 and core["native_rounds"] == model.native_rounds_run > 0,
+           ("Core ran every decode step natively", model.decode_steps, core))
+    expect(model.stages >= sum(len(t) - 1 for t in alone), ("a set staged for every round", model.stages))
+    # A round that draws outside the staged set fails its request alone (Core stages nothing more for it; a round
+    # that runs it before Core ends it keeps its last set, and its tokens are never published); the engine serves on.
+    model = MaskedRoundModel(ignore=True)
+    engine = StepEngine(model, library)
+    engine.constrain(vocabulary)
+    try:
+        try:
+            generate(engine, requests[1])
+        except NativeError as error:
+            expect("does not allow" in str(error), error)
+        else:
+            raise AssertionError("a round's token outside the constraint must fail its request")
+        expect(generate(engine, requests[2]) == oracle(prompts()[2], 12), "the engine serves on")
+    finally:
+        engine.close()
+
+
 class ChunkedModel(ToyStepModel):
     """ToyStepModel recording where each prompt chunk starts, with prompt work granted in whole chunks
     (prefill_work_quantum, the prefill chunk) when `quantum`."""
@@ -771,6 +925,7 @@ def main(library):
     batched_equals_serial(library)
     native_rounds(library)
     native_round_forms(library)
+    constrained_rounds(library)
     request_facts(library)
     prefill_quantum(library)
     prefill_passes(library)

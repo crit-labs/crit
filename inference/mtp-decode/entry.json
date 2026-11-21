@@ -93,15 +93,11 @@
   ],
   "interactions": [
     "attention-state",
-    "concurrent-request-execution",
-    "device-speculative-round",
-    "session-scheduling",
-    "recorded-selection"
+    "device-speculative-round"
   ],
   "techniques": [
     "mtp-decode",
-    "attention-state",
-    "concurrent-request-execution"
+    "attention-state"
   ],
   "validation": {
     "host": "Prompt/history lookup, repeat bounds, append/rewind, stop/vocabulary caps, shared batch costs, greedy mismatch/bonus and commit handoff",
