@@ -8,7 +8,7 @@ from unittest.mock import patch
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "api", "../crit-eval", "kernels", "cli", "tests"): sys.path.insert(0, str(ROOT / _folder))
+for _folder in ("inference/core/python", "api", "../crit-eval", "kernels", "cli", "tests"): sys.path.insert(0, str(ROOT / _folder))
 from crit.pull import bench, report  # noqa: E402
 from crit.run.records import read_json, write_json  # noqa: E402
 from test_pull import ENGINE, PullTests, yaml  # noqa: E402
@@ -61,7 +61,8 @@ class BenchTests(Installed):
             write_json(out, result)
             return result
         # The fixture package streams no replies; crit serve's chat API is all this test reaches.
-        with patch("crit_eval.run.runner.run", run), patch("sys.stderr"),                 patch.object(bench, "SERVED", ("chat-json-v1", "chat-resident-v1")):
+        with patch("crit_eval.run.runner.run", run), patch("sys.stderr"), \
+                patch.object(bench, "SERVED", ("chat-json-v1", "chat-resident-v1")):
             result, card, label, out = bench.bench(ENGINE, self.store, data, device=self.device, project=ROOT)
         self.assertEqual(seen["model"], str(self.store.root / record["checkpoint"]["folder"]))
         self.assertEqual(seen["parts"], ("speed",), "no reference scores in the data: speed only")
@@ -72,8 +73,8 @@ class BenchTests(Installed):
         self.assertEqual(out.parent, self.store.folder(ENGINE) / "bench")
         self.assertEqual((label, card["decode_tok_s"]), ("card (rtx5090, preserve)", 100.0))
         lines = bench.comparison(card, bench.measured_stats(result), label).splitlines()
-        self.assertIn("100.0", next(l for l in lines if l.startswith("decode")))
-        self.assertIn("99.0", next(l for l in lines if l.startswith("decode")))
+        self.assertIn("100.0", next(l for l in lines if l.startswith("sampled decode")))
+        self.assertIn("99.0", next(l for l in lines if l.startswith("sampled decode")))
         self.assertTrue(next(l for l in lines if l.startswith("context")).endswith("4,096"))
 
     def test_quality_needs_the_reference_scores_and_the_packages_score_call(self):
@@ -87,7 +88,8 @@ class BenchTests(Installed):
             seen["parts"] = parts
             write_json(out, {"speed": {}})
             return {"speed": {}}
-        with patch("crit_eval.run.runner.run", run), patch("sys.stderr"),                 patch.object(bench, "SERVED", ("chat-json-v1", "chat-resident-v1")):
+        with patch("crit_eval.run.runner.run", run), patch("sys.stderr"), \
+                patch.object(bench, "SERVED", ("chat-json-v1", "chat-resident-v1")):
             bench.bench(ENGINE, self.store, data, device=self.device, project=ROOT)
         # The fixture package declares no chat-score-v1: quality cannot be measured whatever the data holds.
         self.assertEqual(seen["parts"], ("speed",))
@@ -97,9 +99,11 @@ class BenchTests(Installed):
                   "quality": {"sets": {"a/served": {"ppl_ratio": 1.01, "kld_mean": 0.02},
                                        "a/prompt": {"ppl_ratio": 1.5, "kld_mean": 0.03}}},
                   "context": {"tokens": 4096}}
-        self.assertEqual(bench.measured_stats(result), {"decode_tok_s": 80.0, "prefill_tok_s": 900.0, "ttft_ms": 120.0,
+        # Decode speed is sampled decode: the greedy suite's score is never the decode stat.
+        self.assertEqual(bench.measured_stats(result), {"decode_tok_s": None, "prefill_tok_s": 900.0, "ttft_ms": 120.0,
                                                         "ppl": {"vs_reference": 1.01}, "kld_mean": 0.03,
                                                         "context_tokens": 4096})
+        self.assertEqual(bench.measured_stats({**result, "sampled_speed": {"decode_score": 70.0}})["decode_tok_s"], 70.0)
         card = {"results": [{"gpu": "rtx5090", "model": "m"}, {"gpu": "rtx4090", "model": "m"}]}
         self.assertEqual(bench.gpu_of(card, "NVIDIA GeForce RTX 4090"), "rtx4090")
         self.assertEqual(bench.gpu_of(card, "NVIDIA GeForce RTX 3090"), "rtx3090")
@@ -115,7 +119,8 @@ class BenchTests(Installed):
             result = {"speed": {"decode_score": 80.0}, "context": {"tokens": options["context_tokens"]}}
             write_json(out, result)
             return result
-        with patch("crit_eval.run.runner.run", run), patch("sys.stderr"),                 patch.object(bench, "SERVED", ("chat-json-v1", "chat-resident-v1")):
+        with patch("crit_eval.run.runner.run", run), patch("sys.stderr"), \
+                patch.object(bench, "SERVED", ("chat-json-v1", "chat-resident-v1")):
             # The card's result was judged in preserve: measured in speed, its numbers are left out.
             _, card, label, _ = bench.bench(ENGINE, self.store, data, device=self.device, project=ROOT,
                                             quality_mode="speed")

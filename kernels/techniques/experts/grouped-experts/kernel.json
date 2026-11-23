@@ -302,7 +302,7 @@
       "bench": "bench.py:Fp4Decode"
     },
     "fp4-prompt": {
-      "what": "nvfp4 W4A4 items of 32 or 64 routes (prompt chunks) with fp4-decode's bits: the same parts, chains and part-order sum an output (a warp runs the parts one after another, adding each into a second accumulator), the routes' codes and scales staged in shared memory a CHUNK at a time by cp.async (the next landing while the current one computes), each weight fragment feeding the item's 4 or 8 n-tiles",
+      "what": "nvfp4 W4A4 items of 32 or 64 routes (prompt chunks; 64-route items with tile run fp4-tile) with fp4-decode's bits: the same parts, chains and part-order sum an output (a warp runs the parts one after another, adding each into a second accumulator), the routes' codes and scales staged in shared memory a CHUNK at a time by cp.async (the next landing while the current one computes), each weight fragment feeding the item's 4 or 8 n-tiles",
       "call": "route_outputs",
       "rows": [
         1,
@@ -363,6 +363,67 @@
         "library": "FlashInfer grouped GEMM (flashinfer.grouped_mm.grouped_mm_bf16, cuDNN MoE backend) on the pass's weights widened to BF16 once, as the BF16 path's benches: no library takes grouped NVFP4 W4A4 one pass at a time"
       },
       "bench": "bench.py:Fp4Prompt"
+    },
+    "fp4-tile": {
+      "what": "nvfp4 W4A4 items of 64 routes a call asks the block tile for (Workspace(tile=True); the plugin's prompt_items) through a block tile with fp4-decode's bits: WM x WN warps, warp (wm, wn) TILES row tiles of row group wm for the item's n-tiles wn * 8 / WN on; the block's weight rows (a 128-k step's codes and scales) and the item's routes staged a step at a time through a STAGES-deep cp.async ring the block shares, so a weight fragment leaves global memory once a block and feeds WN warps; the same chains, parts and part-order sum an output as fp4-prompt (a warp runs the parts one after another, adding each into a second accumulator)",
+      "call": "route_outputs",
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        2048,
+        4096,
+        8192
+      ],
+      "key": [
+        "gate_up",
+        "hidden",
+        "inter"
+      ],
+      "exactness": "exact",
+      "bits_of": "fp4-decode",
+      "knobs": {
+        "WM": {
+          "values": [
+            1,
+            2,
+            4
+          ],
+          "default": 4,
+          "what": "warps along the block's matrix rows (row groups)"
+        },
+        "WN": {
+          "values": [
+            1,
+            2,
+            4
+          ],
+          "default": 2,
+          "what": "warps along the item's routes, each 8 / WN of its n-tiles, sharing the staged weights"
+        },
+        "TILES": {
+          "values": [
+            2,
+            4
+          ],
+          "default": 2,
+          "what": "MMA row tiles a warp owns, sharing each B fragment"
+        },
+        "STAGES": {
+          "values": [
+            2,
+            3,
+            4
+          ],
+          "default": 2,
+          "what": "128-k steps of weights and routes in the block's cp.async ring (default 2 with TILES 2: 36 KiB a block, within every GPU's shared memory without opting in)"
+        }
+      },
+      "yardstick": {
+        "library": "FlashInfer grouped GEMM (flashinfer.grouped_mm.grouped_mm_bf16, cuDNN MoE backend) on the pass's weights widened to BF16 once, as the BF16 path's benches: no library takes grouped NVFP4 W4A4 one pass at a time"
+      },
+      "bench": "bench.py:Fp4Tile"
     },
     "fp8-decode": {
       "what": "fp8:channel and fp8:block W8A8 items of 8 routes (decode rows) on the E4M3 tensor cores (mma.sync e4m3 m16n8k32, 8.9 on; kind::mxf8f6f4 with unit scales on the sm_120 family): every route's inputs and the intermediate quantized by crit's declared group quantizer (each 128 values of a row in E4M3 at amax / 448), the weights' own E4M3 codes the A operand, K cut into k_parts(K) parts at fixed 128-k block boundaries as fp4-decode's, each part's 128-k block sums folded into its running sum with one fmaf by the activation's scale times the weight's (fp8:block's grid; fp8:channel's row scale on the finished sum), the parts' sums added in part order in FP32 (a part a warp, through shared memory), the routes' operands read straight from global memory, DEPTH weight steps (64 k) in flight (mma_experts.cu's mainloop, its FP8 atom)",

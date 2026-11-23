@@ -26,7 +26,10 @@ the same bits (structures fp4-decode and fp4-prompt), another arithmetic than th
 (fp8:channel and fp8:block bundles, hidden and inter multiples of 128, where fp8_available()): W8A8 on the E4M3 tensor
 cores, every route's inputs and intermediate quantized per 128 values of a row in E4M3 at amax / 448 (crit's declared
 group quantizer), each 128-k block's sum folded by the activation's and the weight's scales in block order (structures
-fp8-decode and fp8-prompt: again a route's bits whatever its item).
+fp8-decode and fp8-prompt: again a route's bits whatever its item). arithmetic="fp4-row" and "fp4-row2" (nvfp4
+bundles with or without input scales): the same FP4 MMAs at a scale of each route's own, g = 6 * 448 / amax of its row
+(the inputs', then the intermediate's, which passes between the two as BF16): "fp4-row" one FP4 term a value (W4A4),
+"fp4-row2" two (the first term's remainder at the same g, about 8 bits a value, twice the MMAs over the same weights).
 """
 import math
 
@@ -56,7 +59,8 @@ MAX_EXPERTS = 65535   # the experts a call may name, in either plan
 
 def width_for(routes, experts):
     """Routes per item: 32 once a call averages 8 or more routes per expert (prompt chunks), else 8 (decode rows); 64
-    is a choice of the caller's (Workspace(width=64)). The width changes the speed only, never a route's bits."""
+    is a choice of the caller's (Workspace(width=64); FP4 items of 64 run fp4-prompt, or fp4-tile with tile=True). The
+    width changes the speed only, never a route's bits."""
     return 32 if routes >= 8 * experts else 8
 
 
@@ -65,14 +69,16 @@ class Workspace:
     shape: the items, the intermediate h and the unweighted route rows y. Allocated once; reuse it for every call of
     the shape (and capture after one call). rows: where its row buffers come from, rows(name, count, width, dtype)
     -> [count][width] of dtype on the device (any contents), for a caller whose workspaces of every shape share
-    their rows (calls of one stream run one after another); by default each workspace has its own."""
+    their rows (calls of one stream run one after another); by default each workspace has its own. tile: FP4 items
+    of 64 routes run the block tile (structure fp4-tile) in place of fp4-prompt's 64-route form, the same bits."""
 
-    def __init__(self, tokens, top, experts, hidden, inter, device, width=None, rows=None):
+    def __init__(self, tokens, top, experts, hidden, inter, device, width=None, rows=None, tile=False):
         routes = tokens * top
         if not 1 <= experts <= MAX_EXPERTS:
             raise ValueError(f"a call names 1 to {MAX_EXPERTS} experts, not {experts}")
         self.tokens, self.top, self.experts, self.routes = tokens, top, experts, routes
         self.width = width or width_for(routes, experts)
+        self.tile = bool(tile) and self.width == 64
         if self.width not in (8, 32, 64):
             raise ValueError("items hold 8, 32 or 64 routes")
         self.capacity = math.ceil(routes / self.width) + min(experts, routes)
@@ -88,6 +94,7 @@ class Workspace:
         self.ones = torch.ones(routes, **ints) if routes > SMALL_PLAN else None
         self.hidden, self.inter, self.device, self._declared, self.xa = hidden, inter, device, None, None
         self._fp4 = self._fp8 = None
+        self._fp4_rows = {}
 
     def declared(self, layout):
         """The declared arithmetic's buffers (made at its first call): quantized inputs and intermediate, gate/up rows."""
@@ -111,6 +118,20 @@ class Workspace:
                          "h": self._rows("fp4.h", n, I // 2, torch.uint8),
                          "hs": self._rows("fp4.hs", n, I // 16, torch.uint8)}
         return self._fp4
+
+    def fp4_rows(self, terms):
+        """The FP4 row-scale arithmetic's buffers (made at its first call): the routes' input codes, scales and 1 / g
+        (terms a row), the intermediate's (h itself is the workspace's)."""
+        if terms not in self._fp4_rows:
+            n, H, I = self.routes, self.hidden, self.inter
+            name = f"fp4r{terms}"
+            self._fp4_rows[terms] = {"x": self._rows(name + ".x", n, terms * H // 2, torch.uint8),
+                                     "xs": self._rows(name + ".xs", n, terms * H // 16, torch.uint8),
+                                     "xr": self._rows(name + ".xr", n, 1, torch.float32).view(-1),
+                                     "h": self._rows(name + ".h", n, terms * I // 2, torch.uint8),
+                                     "hs": self._rows(name + ".hs", n, terms * I // 16, torch.uint8),
+                                     "hr": self._rows(name + ".hr", n, 1, torch.float32).view(-1)}
+        return self._fp4_rows[terms]
 
     def fp8(self):
         """The FP8 arithmetic's buffers (made at its first call): the routes' input codes and group scales, the
@@ -141,7 +162,8 @@ def _plan(ids, slots, ws):
     ops.items(order, counts, starts, item_end, slots, experts, ws.item_slot, ws.item_routes, ws.item_count)
 
 
-ARITHMETICS = ("tensor", "declared", "fp4", "fp8")
+ARITHMETICS = ("tensor", "declared", "fp4", "fp4-row", "fp4-row2", "fp8")
+ROW_TERMS = {"fp4-row": 1, "fp4-row2": 2}   # FP4 at each route's own scale: its operands' terms
 _probed = {}
 
 
@@ -176,9 +198,10 @@ def route_outputs(x, ids, store, slots, layout, ws, a4=False, arithmetic="tensor
         raise ValueError(f"the workspace takes ids [{ws.tokens}][{ws.top}], not {list(ids.shape)}")
     if arithmetic not in ARITHMETICS:
         raise ValueError(f"arithmetic is {' or '.join(ARITHMETICS)}, not {arithmetic!r}")
-    if arithmetic == "fp4" and (layout[0] != FORMATS["nvfp4"] or ws.hidden % 128 or ws.inter % 128):
-        raise ValueError("the fp4 arithmetic takes nvfp4 bundles with input scales, hidden and inter multiples of 128")
-    if arithmetic == "fp4" and not fp4_available(x.device):
+    if arithmetic.startswith("fp4") and (layout[0] != FORMATS["nvfp4"] or ws.hidden % 128 or ws.inter % 128):
+        raise ValueError(f"the {arithmetic} arithmetic takes nvfp4 bundles (fp4: with input scales), hidden and inter "
+                         "multiples of 128")
+    if arithmetic.startswith("fp4") and not fp4_available(x.device):
         raise ValueError("the fp4 arithmetic runs on the block-scaled FP4 tensor cores (the sm_120 family): this "
                          "device's code has none")
     if arithmetic == "fp8" and (layout[0] not in (FORMATS["fp8:channel"], FORMATS["fp8:block"]) or ws.hidden % 128 or
@@ -191,8 +214,17 @@ def route_outputs(x, ids, store, slots, layout, ws, a4=False, arithmetic="tensor
     if arithmetic == "fp4":
         f = ws.fp4()
         ops.fp4_inputs(x, ws.top, store, list(layout), *items, f["x"], f["xs"])
-        ops.fp4_gate_up(f["x"], f["xs"], store, list(layout), *items, f["h"], f["hs"], ws.tokens)
-        ops.fp4_down(f["h"], f["hs"], store, list(layout), *items, ws.y, ws.tokens)
+        ops.fp4_gate_up(f["x"], f["xs"], store, list(layout), *items, f["h"], f["hs"], ws.tokens, int(ws.tile))
+        ops.fp4_down(f["h"], f["hs"], store, list(layout), *items, ws.y, ws.tokens, int(ws.tile))
+        return ws.y
+    if arithmetic in ROW_TERMS:   # each route's own scale: the inputs, then h, quantized as they come
+        terms, f = ROW_TERMS[arithmetic], ws.fp4_rows(ROW_TERMS[arithmetic])
+        ops.fp4_rows(x, ws.top, *items, terms, f["x"], f["xs"], f["xr"])
+        ops.fp4_gate_up_rows(f["x"], f["xs"], f["xr"], terms, store, list(layout), *items, ws.h, ws.tokens,
+                             int(ws.tile))
+        ops.fp4_rows(ws.h, 1, *items, terms, f["h"], f["hs"], f["hr"])
+        ops.fp4_down_rows(f["h"], f["hs"], f["hr"], terms, store, list(layout), *items, ws.y, ws.tokens,
+                          int(ws.tile))
         return ws.y
     if arithmetic == "fp8":
         f = ws.fp8()

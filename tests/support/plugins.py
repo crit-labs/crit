@@ -55,6 +55,20 @@ DEVICE_FORM = """
         return []
 """
 
+def library_defines():
+    """The slots and facts crit's base plugins define (their manifests' defines, merged), for a fixture plugin that
+    stands in for them: a folder of fixture plugins knows the layer parts' slots only through a plugin that defines
+    them (crit_plugins.contracts)."""
+    found = {"slots": {}, "facts": {}}
+    library = Path(__file__).resolve().parents[2] / "inference" / "techniques"
+    for path in sorted(library.glob("*/*/plugin.json")):
+        defines = json.loads(path.read_text(encoding="utf-8")).get("defines") or {}
+        for kind in found:
+            for name, spec in defines.get(kind, {}).items():
+                found[kind][name] = {k: v for k, v in spec.items() if k != "cases"}
+    return found
+
+
 PLUGINS = {
     "kv-bf16": {"fills": ["kv_cache"], "provides": ["kv:bf16"], "memory": {"device": 2 << 30}, "scale": 1.0},
     "kv-fp8": {"fills": ["kv_cache"], "provides": ["kv:fp8"], "memory": {"device": 1 << 30}, "scale": 1.0},
@@ -81,7 +95,7 @@ def write_plugins(root, plugins=None, tests=None):
         manifest = {"schema": "crit-plugin-v1", "id": plugin_id, "title": f"Fixture {plugin_id}",
                     "fills": spec["fills"], "entry": "plugin.py:create",
                     **{key: spec[key] for key in ("provides", "needs", "needs_when", "conflicts", "options", "reference",
-                                                  "requires", "requires_when", "devices")
+                                                  "requires", "requires_when", "devices", "defines")
                        if key in spec}}
         (folder / "plugin.json").write_text(json.dumps(manifest, indent=1), encoding="utf-8")
         (folder / "plugin.py").write_text(PLUGIN.format(id=plugin_id, memory=spec.get("memory", {}),

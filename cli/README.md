@@ -1,6 +1,6 @@
 # crit CLI
 
-The `crit` command is installed with the Python distribution (`python -m pip install -e core/python -e .` from
+The `crit` command is installed with the Python distribution (`python -m pip install -e inference/core/python -e models/core/python -e .` from
 the checkout, or `python -m pip install .`) and drives every part of crit; `crit core build` then builds Core's
 runtime, which every engine runs on. Each subcommand prints its own options with
 `--help`. Both installs build engines: the wheel carries crit's plugin library (Inference) as package data, so
@@ -17,14 +17,14 @@ installed release's guides, crit's repository at its tag, instead of a checkout.
 | `crit pull` | Installs a crit-hub engine (requirements, pinned source, build, checked checkpoint) for `crit serve --engine` | [Installed engines](../docs/SERVING.md#installed-engines) |
 | `crit bench` | Measures an installed crit-hub engine with crit Eval beside its card's numbers | [Benchmark your machine](../docs/SERVING.md#benchmark-your-machine) |
 | `crit hub` | Adds a `crit bench` result to its crit-hub card (`crit hub report`) for a pull request | [Benchmark your machine](../docs/SERVING.md#benchmark-your-machine) |
-| `crit core` | Builds Core's runtime, `crit_core_steps`, where Core's loader finds it (`build`), or names the one it loads (`where`) | [Core](../core/README.md) |
+| `crit core` | Builds Core's runtime, `crit_core_steps`, where Core's loader finds it (`build`), or names the one it loads (`where`) | [Core](../inference/core/README.md) |
 | `crit smoke` | Checks a served engine's quality paths in minutes: prefill that never depends on prompt length, decode against prefill, request isolation, recall | [Smoke tests](../smoke/README.md) |
 | `crit kernels` | Finds, inspects and retains external kernels for the target hardware | [Kernels](../kernels/README.md) |
-| `crit models` | Quantizes weights, distills draft heads and records each transform | [Models](../models/README.md) |
+| `crit models` | Inspects a checkpoint against the model techniques and finished model plugins, makes tiny random checkpoints, diffs a model plugin against its reference, keeps a built model plugin | [Models](../models/README.md) |
 | `crit plugins` | Lists, checks and tests an engine's plugins and shows the variants `crit run ... ablate` serves | [Plugins](../docs/PLUGINS.md) |
 | `crit inference` | Lists, searches, shows and checks the Inference techniques | [Inference](../inference/README.md) |
 | `crit mcp` | Serves these commands to an agent as MCP tools, long ones as jobs it waits on | [MCP](../mcp/README.md) |
-| `crit contracts` | Prints where Core's native contracts live | [Core](../core/README.md) |
+| `crit contracts` | Prints where Core's native contracts live | [Core](../inference/core/README.md) |
 
 ## A run, start to finish
 

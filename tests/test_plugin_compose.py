@@ -14,7 +14,7 @@ import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "core" / "python"))
+sys.path.insert(0, str(ROOT / "inference" / "core" / "python"))
 sys.path.insert(0, str(ROOT / "cli"))
 
 from crit_plugins import PluginError, Registry, assemble  # noqa: E402
@@ -70,11 +70,11 @@ class ExtendsTests(Engine, unittest.TestCase):
             with self.assertRaisesRegex(PluginError, message):
                 load_manifest(folder)
         refused({"extends": "other"}, "extends names one of the plugin's sources")
-        refused({"sources": {**data["sources"], "code": "../_sources/heterogeneous-expert-dispatch/code"},
+        refused({"sources": {**data["sources"], "code": "../_sources/experts/heterogeneous-expert-dispatch/code"},
                  "extends": "code"}, "holds no plugin.json")
         refused({"extends": ["base"]}, "extends names one of the plugin's sources")
         # topk-router extending its extension: a circle
-        base = self.plugins / "base" / "topk-router" / "plugin.json"
+        base = self.plugins / "experts" / "topk-router" / "plugin.json"
         original = json.loads(base.read_text(encoding="utf-8"))
         base.write_text(json.dumps({**original, "sources": {**original["sources"], "ext": "../../fused-router"},
                                     "extends": "ext"}), encoding="utf-8")

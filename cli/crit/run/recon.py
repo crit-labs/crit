@@ -6,7 +6,7 @@ facts, the files they came from and the `frozen` block every later candidate tak
 and scaffolds work/recon.md, whose model-card, reference-code, drafting-plan and prefill-arithmetic-plan sections the
 agent writes (crit refuses a candidate while either plan is unfinished: recon.unfinished). With
 `--drafter PATH` (repeatable) it also reads each companion drafter's config.json through crit_core.model.drafters
-(EAGLE-3, DFlash, DSpark and crit's own `crit models drafter` heads) and records what the engine wires: kind, taps
+(EAGLE-3, DFlash and DSpark) and records what the engine wires: kind, taps
 into the target, draft vocabulary, block size and mask token, checked against the target's depth. With `--data DATA`
 (crit Eval's prepared data for the run's model, holding the reference's scores) it records smoke's reference
 (smoke_reference): a few quality texts and the reference's log-probability of each written-answer token, which crit
@@ -174,7 +174,7 @@ def _drafters(paths, architecture, model=None):
         except ConfigError as error:
             raise ValueError(f"Drafter {path}: {error}") from None
         if drafter is None:
-            raise ValueError(f"Drafter {path}: not a hidden-state drafter crit reads (EAGLE-3, DFlash, DSpark or crit models drafter)")
+            raise ValueError(f"Drafter {path}: not a hidden-state drafter crit reads (EAGLE-3, DFlash or DSpark)")
         hidden = architecture.get("hidden_size")
         if drafter.target_hidden_size and isinstance(hidden, int) and drafter.target_hidden_size != hidden:
             raise ValueError(f"Drafter {path}: its taps are {drafter.target_hidden_size} wide; the target's hidden size is {hidden}")
@@ -678,7 +678,7 @@ def scaffold(value):
                        + (f", draft vocabulary {d['draft_vocab_size']} (map through d2t)" if d["draft_vocab_size"] else "")
                        + (f", publisher width {d['speculative_tokens']}" if d["speculative_tokens"] else "") + "\n"
                        for d in found) or ("- none given: `crit run ... recon --force --drafter PATH` records a published "
-                                         "EAGLE-3, DFlash or DSpark drafter, or one from `crit models drafter`\n")
+                                         "EAGLE-3, DFlash or DSpark drafter\n")
     if g.get("derived_files"):
         card += (f". {', '.join(f'`{n}`' for n in g['derived_files'])} came from the weights' own metadata (crit "
                  "derives them from a GGUF); check them against the base model's repository")

@@ -1,0 +1,16 @@
+{
+  "schema": "crit-model-checkpoints-v1",
+  "layouts": {
+    "safetensors (transformers names)": [
+      "models/cache/llama-qwen3-model/tests/test_device.py::DecoderTests",
+      "models/cache/llama-qwen3-model/tests/test_device.py::MoeTests"
+    ],
+    "safetensors (a release's own tensor names, which names rules map back)": [
+      "models/cache/llama-qwen3-model/tests/test_device.py::RespelledMoeTests"
+    ],
+    "GGUF": [
+      "models/cache/llama-qwen3-model/tests/test_device.py::GgufDecoderTests",
+      "tests/test_model_template.py::GgufMoeHostTierTests"
+    ]
+  }
+}

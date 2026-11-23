@@ -25,9 +25,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("fp4_inputs(Tensor x, int top, Tensor store, int[] layout, Tensor item_slot, Tensor item_routes, "
           "Tensor item_count, Tensor! codes, Tensor! scales) -> ()");
   ops.def("fp4_gate_up(Tensor codes, Tensor scales, Tensor store, int[] layout, Tensor item_slot, Tensor item_routes, "
-          "Tensor item_count, Tensor! h_codes, Tensor! h_scales, int tokens=0) -> ()");
+          "Tensor item_count, Tensor! h_codes, Tensor! h_scales, int tokens=0, int tile=0) -> ()");
   ops.def("fp4_down(Tensor h_codes, Tensor h_scales, Tensor store, int[] layout, Tensor item_slot, Tensor item_routes, "
-          "Tensor item_count, Tensor! y, int tokens=0) -> ()");
+          "Tensor item_count, Tensor! y, int tokens=0, int tile=0) -> ()");
+  ops.def("fp4_rows(Tensor rows, int div, Tensor item_slot, Tensor item_routes, Tensor item_count, int terms, "
+          "Tensor! codes, Tensor! scales, Tensor! rcp) -> ()");
+  ops.def("fp4_gate_up_rows(Tensor codes, Tensor scales, Tensor rcp, int terms, Tensor store, int[] layout, "
+          "Tensor item_slot, Tensor item_routes, Tensor item_count, Tensor! h, int tokens=0, int tile=0) -> ()");
+  ops.def("fp4_down_rows(Tensor h_codes, Tensor h_scales, Tensor rcp, int terms, Tensor store, int[] layout, "
+          "Tensor item_slot, Tensor item_routes, Tensor item_count, Tensor! y, int tokens=0, int tile=0) -> ()");
   ops.def("fp8_available() -> bool");
   ops.def("fp8_inputs(Tensor rows, int div, Tensor item_slot, Tensor item_routes, Tensor item_count, Tensor! codes, "
           "Tensor! scales) -> ()");
@@ -44,6 +50,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("fp4_inputs", torch::kCUDA, &fp4_inputs);
   ops.impl("fp4_gate_up", torch::kCUDA, &fp4_gate_up);
   ops.impl("fp4_down", torch::kCUDA, &fp4_down);
+  ops.impl("fp4_rows", torch::kCUDA, &fp4_rows);
+  ops.impl("fp4_gate_up_rows", torch::kCUDA, &fp4_gate_up_rows);
+  ops.impl("fp4_down_rows", torch::kCUDA, &fp4_down_rows);
   ops.impl("a4_inputs", torch::kCUDA, &a4_inputs);
   ops.impl("declared_inputs", torch::kCUDA, &declared_inputs);
   ops.impl("declared_rows", torch::kCUDA, &declared_rows);

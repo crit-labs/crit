@@ -31,7 +31,7 @@ def test_a_forwarded_target_takes_the_tuning_folder_a_plugin_sets(tmp_path):
     pk.forget()
     pk.use_tuning(tmp_path)
     try:
-        fb = pk.load_kernel("fp8-block-rows", folder=ROOT / "inference" / "quantized-projections")
+        fb = pk.load_kernel("fp8-block-rows", folder=ROOT / "inference" / "techniques" / "projections" / "quantized-projections")
         target = _target(fb)
         held = sys.modules[target.__name__ + "._crit_tuning"].TUNING["rows-fp8-block"]
         assert held["configs"][held["table"][0]["config"]] == other
@@ -45,7 +45,7 @@ def test_a_forwarded_target_takes_the_tuning_folder_a_plugin_sets(tmp_path):
 def test_a_forwarded_target_is_recorded_for_the_plugin():
     pk.forget()
     try:
-        folder = ROOT / "inference" / "host-expert-arithmetic"
+        folder = ROOT / "inference" / "techniques" / "experts" / "host-expert-arithmetic"
         ib = pk.load_kernel("int-block-experts", folder=folder)
         g = torch.Generator().manual_seed(1)
         codes = torch.randint(0, 256, (64, 64), dtype=torch.uint8, generator=g).to(dev)

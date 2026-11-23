@@ -1,0 +1,42 @@
+{
+  "schema": "crit-model-technique-v1",
+  "id": "gated-delta",
+  "category": "mixers",
+  "summary": "Gated delta-rule linear attention through the recurrence slot, either projection layout a checkpoint stores",
+  "provides": {
+    "blocks": [
+      "gated-delta"
+    ]
+  },
+  "source": "gated_delta",
+  "needs_sources": [
+    "template"
+  ],
+  "path": "models/techniques/mixers/gated-delta/README.md",
+  "code_path": "models/techniques/mixers/gated-delta/code",
+  "code_files": [
+    {
+      "path": "models/techniques/mixers/gated-delta/code/gated_delta.py",
+      "purpose": "The block class and its registry (BLOCKS)"
+    }
+  ],
+  "reads": {
+    "tensors": [
+      "A_log",
+      "conv1d.weight",
+      "dt_bias",
+      "in_proj_a",
+      "in_proj_b",
+      "in_proj_ba",
+      "in_proj_qkv",
+      "in_proj_qkvz",
+      "in_proj_z",
+      "norm.weight",
+      "out_proj"
+    ],
+    "config": [],
+    "layout": [
+      "norm_gate"
+    ]
+  }
+}

@@ -11,7 +11,7 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "tests"): sys.path.insert(0, str(ROOT / _folder))
+for _folder in ("inference/core/python", "tests"): sys.path.insert(0, str(ROOT / _folder))
 from crit_core.model import TorchFileError, inspect_torch, inspect_torch_model, open_model  # noqa: E402
 from torch_writer import Call, Global, pickle_bytes, tensor_call, torch_bytes  # noqa: E402
 

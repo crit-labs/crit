@@ -63,12 +63,12 @@ def extract(status):
     gaps. Read defensively: a missing field is unknown, never an error."""
     status = status if isinstance(status, dict) else {}
     kpis = dict(status.get("kpis") or {})
-    # crit-eval names the headline decode decode_sampled (else decode_greedy); earlier results call it decode and the
-    # greedy suite's beside it greedy_decode.
+    # crit-eval names the headline decode decode_sampled and the greedy suite's beside it decode_greedy; earlier
+    # results call them decode and greedy_decode. Decode speed is sampled decode: a greedy decode is a comparison,
+    # never the decode a plan freezes, so a result without a sampled suite has no decode score.
     if "decode" not in kpis and ("decode_sampled" in kpis or "decode_greedy" in kpis):
-        sampled = kpis.get("decode_sampled")
-        kpis["decode"] = sampled or kpis.get("decode_greedy")
-        kpis["greedy_decode"] = kpis.get("decode_greedy") if sampled else None
+        kpis["decode"] = kpis.get("decode_sampled")
+        kpis["greedy_decode"] = kpis.get("decode_greedy")
     end_to_end = kpis.get("end_to_end") or {}
     context = kpis.get("context") or {}
     rows = {"decode": (_get(kpis, "decode", "score"), _get(kpis, "decode", "ceiling"),
@@ -114,7 +114,8 @@ def standing(status, kpis=HEADLINE):
     fraction a plan's priorities rank by, stated so a low one cannot be missed ("decode 46.6 tok/s is 11% of its limit
     419.5 tok/s; pass at 16% of its floor; largest gaps: ..."). A KPI Eval gives no limit is left out."""
     facts = extract(status)
-    decode = (status or {}).get("kpis", {}).get("decode_sampled") or (status or {}).get("kpis", {}).get("decode_greedy")         or (status or {}).get("kpis", {}).get("decode") or {}
+    found = (status or {}).get("kpis", {})
+    decode = (found.get("decode_sampled") if "decode_sampled" in found else found.get("decode")) or {}
     lines = []
     for kpi in kpis:
         row = facts["kpis"].get(kpi) or {}
@@ -1095,8 +1096,11 @@ def build(root, run, bounds, data, status_for=None):
             raise ValueError(f"The run records {ladder.state_text(blocked)}: a plan starts from the newest candidate on "
                              f"the ladder, {max(counted)}, not {parent}")
         found = completed_evals(root, parent)
-        if not found and blocked is None and (parent in evaluated_candidates(root)
-                                              or ladder.scope_of(root, parent) == "full"):
+        # An Eval that stopped before it completed, its candidate sealed eval_failed, measured nothing a plan starts
+        # from: the plan follows its build (the next candidate is its fix).
+        stopped = not found and ladder.sealed_lifecycle(root, parent) == "eval_failed"
+        if not found and blocked is None and not stopped and (parent in evaluated_candidates(root)
+                                                              or ladder.scope_of(root, parent) == "full"):
             raise ValueError(f"{parent} has no completed Eval attempt: run crit run ... eval --candidate {parent} "
                              "(--resume goes on from a stopped one) before planning from it")
         # The newest attempt that measured decode and prefill, so a partial rerun (quality alone) leaves the attempt
@@ -1761,7 +1765,8 @@ def _cpu_wins(root):
     placement = (read_json(facts).get("gathered") or {}).get("placement") or {}
     floors = placement.get("plain_pass_floor_ms") or {}
     cpu = min((floors[k] for k in ("cpu", "split") if floors.get(k)), default=None)
-    if placement.get("scenario") not in ("sparse_device_host", "sparse_device_host_disk") or not cpu or             not floors.get("link") or cpu >= floors["link"]:
+    if placement.get("scenario") not in ("sparse_device_host", "sparse_device_host_disk") or not cpu or \
+            not floors.get("link") or cpu >= floors["link"]:
         return None
     return {key: floors[key] for key in ("link", "cpu", "split") if key in floors}
 

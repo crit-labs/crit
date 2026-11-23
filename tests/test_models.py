@@ -1,642 +1,213 @@
-"""crit models: recipes, plans, calibration windows, codecs, the PTQ workflow and its records, on tiny host fixtures."""
-import importlib.util
+"""crit models: the model techniques and finished model plugins it lists, a checkpoint inspected against them, tiny
+configs, a model plugin checked, kept in the user's cache and added to another engine by its id; each technique's
+own tests; and, with torch and transformers, a tiny random checkpoint whose engine scores as its reference does, with
+the finished model plugin and with one being built that brings a technique of its own."""
+import contextlib
+import io
 import json
+import os
 from pathlib import Path
-import struct
 import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "api", "../crit-eval", "../crit-eval/tests", "kernels", "models", "cli"): sys.path.insert(0, str(ROOT / _folder))
-from crit.run.records import write_json
-from crit_core.model import inspect_model
-from crit_models import calibration, recipe as recipes
-LAUNCHER = str(ROOT / "tests/run_crit.py")
+for _folder in ("inference/core/python", "cli", "kernels"):
+    sys.path.insert(0, str(ROOT / _folder))
 
-HAS_TORCH = importlib.util.find_spec("torch") is not None and importlib.util.find_spec("safetensors") is not None
-HAS_TRANSFORMERS = HAS_TORCH and importlib.util.find_spec("transformers") is not None
+from crit import models  # noqa: E402
 
-
-def recipe(**overrides):
-    value = {"schema_version": 1, "record_kind": "models_recipe", "method": "ptq", "format": "nvfp4", "algorithm": "rtn"}
-    value.update(overrides)
-    return value
-
-
-def write_header_only(path, tensors):
-    """A safetensors file of zero bytes per tensor spec {name: (dtype, shape)}; the standard library is enough."""
-    width = {"BF16": 2, "F32": 4, "F8_E4M3": 1, "U8": 1}
-    header, offset = {}, 0
-    for name, (dtype, shape) in tensors.items():
-        size = width[dtype] * shape[0] * (shape[1] if len(shape) > 1 else 1)
-        header[name] = {"dtype": dtype, "shape": list(shape), "data_offsets": [offset, offset + size]}
-        offset += size
-    data = json.dumps(header).encode()
-    data += b" " * (-len(data) % 8)
-    Path(path).write_bytes(struct.pack("<Q", len(data)) + data + bytes(offset))
-
-
-def layer_specs(layers=2, hidden=32, inter=64):
-    specs = {"model.embed_tokens.weight": ("BF16", (64, hidden)), "model.norm.weight": ("BF16", (hidden,)),
-             "lm_head.weight": ("BF16", (64, hidden))}
-    for i in range(layers):
-        p = f"model.layers.{i}."
-        specs.update({p + "input_layernorm.weight": ("BF16", (hidden,)),
-                      p + "post_attention_layernorm.weight": ("BF16", (hidden,)),
-                      p + "self_attn.q_proj.weight": ("BF16", (hidden, hidden)),
-                      p + "self_attn.o_proj.weight": ("BF16", (hidden, hidden)),
-                      p + "mlp.gate_proj.weight": ("BF16", (inter, hidden)),
-                      p + "mlp.down_proj.weight": ("BF16", (hidden, inter))})
-    return specs
-
-
-class RecipeTests(unittest.TestCase):
-    def test_defaults_are_frozen_into_the_recipe(self):
-        value = recipes.load_recipe(recipe(algorithm="gptq", format="fp8-channel"))
-        self.assertEqual(value["include"], list(recipes.DEFAULT_INCLUDE))
-        self.assertEqual(value["calibration"], recipes.DEFAULT_CALIBRATION)
-        self.assertEqual(value["gptq"], recipes.DEFAULT_GPTQ)
-        self.assertEqual(value["seed"], 0)
-        self.assertNotIn("calibration", recipes.load_recipe(recipe()))
-
-    def test_invalid_recipes_are_rejected(self):
-        for bad in (recipe(method="prune"), recipe(format="int4"), recipe(algorithm="awq"),
-                    recipe(calibration={"samples": 4}), recipe(algorithm="gptq", gptq={"block": 24}),
-                    recipe(include=["("]), recipe(include=[]), recipe(seed=-1), recipe(extra=1),
-                    recipe(algorithm="gptq", calibration={"samples": 4, "unknown": 1}), recipe(schema_version=2)):
-            with self.subTest(bad=bad), self.assertRaises(ValueError):
-                recipes.load_recipe(bad)
-
-
-class PlanTests(unittest.TestCase):
-    def test_plan_matches_projections_and_counts_bytes(self):
-        with tempfile.TemporaryDirectory() as directory:
-            write_header_only(Path(directory) / "model.safetensors", layer_specs())
-            plan = recipes.plan(recipes.load_recipe(recipe(exclude=[r"\.o_proj$"])), inspect_model(directory))
-            self.assertEqual(plan["prefix"], "model.")
-            self.assertEqual([t["module"] for t in plan["targets"]],
-                             ["layers.0.mlp.down_proj", "layers.0.mlp.gate_proj", "layers.0.self_attn.q_proj",
-                              "layers.1.mlp.down_proj", "layers.1.mlp.gate_proj", "layers.1.self_attn.q_proj"])
-            self.assertEqual(plan["stored_bytes"], 2 * 2 * (64 * 32 * 2 + 32 * 32))
-            self.assertEqual(plan["targets"][0]["transformed_bytes"], 32 * 64 // 2 + 32 * 64 // 16 + 4)
-            fp8 = recipes.plan(recipes.load_recipe(recipe(format="fp8-channel")), inspect_model(directory))
-            self.assertEqual(fp8["targets"][0]["transformed_bytes"], 32 * 64 + 32 * 4)
-
-    def test_plan_rejects_quantized_odd_and_empty_targets(self):
-        with tempfile.TemporaryDirectory() as directory:
-            specs = layer_specs(layers=1)
-            specs["model.layers.0.self_attn.q_proj.weight"] = ("F8_E4M3", (32, 32))
-            specs["model.layers.0.self_attn.q_proj.weight_scale"] = ("F32", (32, 1))
-            write_header_only(Path(directory) / "model.safetensors", specs)
-            with self.assertRaisesRegex(ValueError, "unquantized"):
-                recipes.plan(recipes.load_recipe(recipe()), inspect_model(directory))
-            with self.assertRaisesRegex(ValueError, "matches no module"):
-                recipes.plan(recipes.load_recipe(recipe(include=["nothing"])), inspect_model(directory))
-        with tempfile.TemporaryDirectory() as directory:
-            specs = layer_specs(layers=1)
-            specs["model.layers.0.mlp.down_proj.weight"] = ("BF16", (32, 40))
-            write_header_only(Path(directory) / "model.safetensors", specs)
-            with self.assertRaisesRegex(ValueError, "divisible by 16"):
-                recipes.plan(recipes.load_recipe(recipe()), inspect_model(directory))
-            self.assertTrue(recipes.plan(recipes.load_recipe(recipe(format="fp8-channel")), inspect_model(directory)))
-
-    def test_layers_without_an_input_norm_take_the_prefix_holding_the_most_layer_tensors(self):
-        # Hyper-connection layers norm their streams instead (Qwen4Exp's attn_hyper_connection.hc_norm); the draft
-        # layer under mtp. has a layer 0 of its own.
-        with tempfile.TemporaryDirectory() as directory:
-            specs = {name.replace("model.", "model.language_model.").replace("input_layernorm", "hc.hc_norm"): spec
-                     for name, spec in layer_specs().items()}
-            specs.update({"mtp.layers.0.self_attn.q_proj.weight": ("BF16", (32, 32)),
-                          "mtp.layers.0.hc.hc_norm.weight": ("BF16", (32,))})
-            write_header_only(Path(directory) / "model.safetensors", specs)
-            plan = recipes.plan(recipes.load_recipe(recipe()), inspect_model(directory))
-            self.assertEqual(plan["prefix"], "model.language_model.")
-            self.assertEqual(len(plan["targets"]), 2 * 4)
-
-    def test_plan_command_prints_targets_without_torch_imports(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            write_header_only(root / "model.safetensors", layer_specs(layers=1))
-            write_json(root / "recipe.json", recipe())
-            out = subprocess.run([sys.executable, "-B", "-c", "import sys, runpy; sys.modules['torch'] = None; "
-                                  f"sys.argv = ['crit', 'models', 'plan', '--recipe', {str(root / 'recipe.json')!r}, "
-                                  f"'--source', {directory!r}]; runpy.run_path({LAUNCHER!r}, run_name='__main__')"],
-                                 capture_output=True, text=True, timeout=60)
-            self.assertEqual(out.returncode, 0, out.stderr)
-            self.assertIn("layers.0.mlp.gate_proj  BF16 64x32", out.stdout)
-            self.assertIn("4 modules", out.stdout)
-
-
-class CalibrationTests(unittest.TestCase):
-    def test_windows_are_seeded_and_bounded(self):
-        documents = [f"doc {i}" for i in range(10)]
-
-        def encode(text):
-            return [ord(c) for c in text]
-        first = calibration.windows(documents, encode, [0], 3, 5, seed=7)
-        self.assertEqual(first, calibration.windows(documents, encode, [0], 3, 5, seed=7))
-        self.assertNotEqual(first, calibration.windows(documents, encode, [0], 3, 5, seed=8))
-        self.assertTrue(all(len(w) == 5 for w in first))
-        with self.assertRaisesRegex(ValueError, "needs 30 x 5"):
-            calibration.windows(documents, encode, [0], 30, 5, seed=7)
-
-    def test_documents_quoting_the_eval_suite_are_found(self):
-        texts = calibration.suite_texts()
-        self.assertTrue(texts)
-        from crit_eval import SUITE_DIR
-        quality = json.loads((SUITE_DIR / "quality.json").read_text(encoding="utf-8"))
-        quoted = max((m["content"] for c in quality["conversations"] for m in c["messages"]), key=len)
-        found = calibration.suite_overlap(["An unrelated document about rivers and maps.",
-                                           "Notes:\n" + quoted + "\nend"], texts)
-        self.assertEqual(found, [1])
-
-    def test_jsonl_documents_are_validated(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "data.jsonl"
-            path.write_text('{"text": "one"}\n\n{"text": "two"}\n', encoding="utf-8")
-            self.assertEqual(calibration.read_documents(path), ["one", "two"])
-            path.write_text('{"text": ""}\n', encoding="utf-8")
-            with self.assertRaises(ValueError):
-                calibration.read_documents(path)
-
-
-@unittest.skipUnless(HAS_TORCH, "needs torch and safetensors")
-class CodecTests(unittest.TestCase):
-    def setUp(self):
-        import torch
-        self.torch = torch
-        from crit_models import codecs
-        self.codecs = codecs
-        generator = torch.Generator().manual_seed(3)
-        self.weight = torch.randn(24, 64, generator=generator) * torch.linspace(0.01, 2.0, 64)
-
-    def test_nvfp4_matches_the_inference_codec(self):
-        spec = importlib.util.spec_from_file_location("nvfp4", ROOT / "inference/quantized-projections/code/nvfp4.py")
-        reference = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(reference)
-        tensors, values, errors = self.codecs.quantize("nvfp4", self.weight)
-        g = float(tensors["weight_global_scale"][0])
-        self.assertEqual(g, self.torch.tensor(reference.global_scale(self.weight.flatten().tolist())).float().item())
-        for r, row in enumerate(self.weight.tolist()):
-            codes, scales = reference.quantize_row(row, g)
-            self.assertEqual(bytes(tensors["weight_packed"][r].tolist()), reference.pack(codes))
-            self.assertEqual(bytes(tensors["weight_scale"][r].view(self.torch.uint8).tolist()), bytes(scales))
-            decoded = reference.dequantize_row(codes, scales, g)
-            self.assertTrue(all(abs(a - b) <= 1e-6 * max(1.0, abs(b)) for a, b in zip(values[r].tolist(), decoded)))
-        self.assertLess(errors["weight_error"], 0.2)
-
-    def test_nvfp4_four_over_six_matches_the_inference_codec(self):
-        spec = importlib.util.spec_from_file_location("nvfp4", ROOT / "inference/quantized-projections/code/nvfp4.py")
-        reference = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(reference)
-        tensors, values, errors = self.codecs.quantize("nvfp4-4over6", self.weight)
-        _, _, plain = self.codecs.quantize("nvfp4", self.weight)
-        g = float(tensors["weight_global_scale"][0])
-        for r, row in enumerate(self.weight.tolist()):
-            codes, scales = reference.quantize_row(row, g, four_over_six=True)
-            self.assertEqual(bytes(tensors["weight_packed"][r].tolist()), reference.pack(codes))
-            self.assertEqual(bytes(tensors["weight_scale"][r].view(self.torch.uint8).tolist()), bytes(scales))
-        self.assertLess(errors["weight_error"], plain["weight_error"])
-        # GPTQ with an identity Hessian gives the round-to-nearest codes, scale choice included.
-        gptq_tensors, _, _ = self.codecs.quantize("nvfp4-4over6", self.weight, self.torch.eye(self.weight.shape[1]),
-                                                  {"dampening": 0.0, "block": 16})
-        self.assertTrue(self.torch.equal(gptq_tensors["weight_scale"].view(self.torch.uint8),
-                                         tensors["weight_scale"].view(self.torch.uint8)))
-
-    def test_nvfp4_block_scales_encode_the_shared_vectors(self):
-        from e4m3_vectors import e4m3_magnitude, e4m3_scale_vectors
-        vectors = e4m3_scale_vectors()
-        scales = self.torch.tensor([b for b, _ in vectors], dtype=self.torch.int64).to(self.torch.int32).view(self.torch.float32)
-        # The codec's block-scale encoder applied to the vectors themselves (saturation, 256 .. 448, ties).
-        self.assertEqual(self.codecs.e4m3_scale_codes(scales).view(self.torch.uint8).tolist(), [c for _, c in vectors])
-        # The codec's blocks go through it: _block_scale of amax with global scale 6 encodes amax * 6 / 6.
-        codec = self.codecs.Nvfp4(self.weight)
-        codec.global_scale = self.torch.tensor(6.0)
-        amax = scales[self.torch.isfinite(scales) & (scales < 1e30)]
-        self.assertTrue(self.torch.equal(codec._block_scale(amax).view(self.torch.uint8),
-                                         self.codecs.e4m3_scale_codes(amax * 6.0 / 6.0).view(self.torch.uint8)))
-        # torch's E4M3FN decode, which the codec's checkpoints are read with, agrees with the fields' value.
-        decoded = self.torch.arange(0x80, dtype=self.torch.uint8).view(self.torch.float8_e4m3fn).float().tolist()
-        self.assertEqual([None if b == 0x7F else v for b, v in enumerate(decoded)], [e4m3_magnitude(b) for b in range(0x80)])
-
-    def test_fp8_channel_scales_rows_and_round_trips(self):
-        tensors, values, errors = self.codecs.quantize("fp8-channel", self.weight)
-        self.assertEqual(tensors["weight"].dtype, self.torch.float8_e4m3fn)
-        self.assertEqual(list(tensors["weight_scale"].shape), [24, 1])
-        self.assertTrue(self.torch.equal(tensors["weight"].float() * tensors["weight_scale"], values))
-        self.assertTrue(self.torch.equal(tensors["weight"].float().abs().amax(dim=1), self.torch.full((24,), 448.0)))
-        self.assertLess(errors["weight_error"], 0.05)
-
-    def test_gptq_with_an_identity_hessian_is_round_to_nearest(self):
-        for format in ("fp8-channel", "nvfp4"):
-            with self.subTest(format=format):
-                rtn, _, _ = self.codecs.quantize(format, self.weight)
-                gptq, _, _ = self.codecs.quantize(format, self.weight, self.torch.eye(64), {"dampening": 0.0, "block": 32})
-                self.assertEqual(rtn.keys(), gptq.keys())
-                for key in rtn:
-                    self.assertTrue(self.torch.equal(rtn[key].view(self.torch.uint8) if rtn[key].dtype == self.torch.float8_e4m3fn else rtn[key],
-                                                     gptq[key].view(self.torch.uint8) if gptq[key].dtype == self.torch.float8_e4m3fn else gptq[key]), key)
-
-    def test_gptq_lowers_the_output_error_on_correlated_inputs(self):
-        torch = self.torch
-        generator = torch.Generator().manual_seed(5)
-        mix = torch.randn(64, 64, generator=generator)
-        inputs = torch.randn(512, 64, generator=generator) @ mix
-        hessian = 2 * inputs.T @ inputs / inputs.shape[0]
-        for format in ("fp8-channel", "nvfp4"):
-            with self.subTest(format=format):
-                _, rtn, _ = self.codecs.quantize(format, self.weight)
-                _, gptq, errors = self.codecs.quantize(format, self.weight, hessian, {"dampening": 0.01, "block": 32})
-                rtn_error = ((inputs @ (self.weight - rtn).T) ** 2).sum()
-                gptq_error = ((inputs @ (self.weight - gptq).T) ** 2).sum()
-                self.assertLess(float(gptq_error), float(rtn_error))
-                self.assertIn("output_error", errors)
-
-
-def tiny_model(directory, layers=2, sharded=True):
-    """A random Qwen3-style checkpoint: config, a byte-level tokenizer and BF16 weights in one or two shards."""
+try:
     import torch
-    from safetensors.torch import save_file
-    from core_text_fixtures import byte_level_json
-    directory = Path(directory)
-    directory.mkdir(parents=True, exist_ok=True)
-    tokenizer = byte_level_json()
-    vocab = len(json.loads(tokenizer)["model"]["vocab"]) + 16
-    (directory / "tokenizer.json").write_text(tokenizer, encoding="utf-8")
-    (directory / "tokenizer_config.json").write_text(json.dumps({"eos_token": "<|end_of_text|>"}), encoding="utf-8")
-    hidden, inter, heads, kv, head_dim = 64, 128, 4, 2, 16
-    config = {"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3", "hidden_size": hidden,
-              "intermediate_size": inter, "num_hidden_layers": layers, "num_attention_heads": heads,
-              "num_key_value_heads": kv, "head_dim": head_dim, "vocab_size": vocab, "max_position_embeddings": 512,
-              "rms_norm_eps": 1e-6, "rope_theta": 10000.0, "tie_word_embeddings": False, "torch_dtype": "bfloat16",
-              "hidden_act": "silu", "attention_bias": False, "eos_token_id": json.loads(tokenizer)["added_tokens"][1]["id"]}
-    (directory / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
-    generator = torch.Generator().manual_seed(11)
-
-    def tensor(*shape, scale=0.08):
-        return (torch.randn(*shape, generator=generator) * scale).to(torch.bfloat16)
-    shards = [{"model.embed_tokens.weight": tensor(vocab, hidden, scale=0.5)}, {}]
-    for i in range(layers):
-        p = f"model.layers.{i}."
-        target = shards[i % 2] if sharded else shards[0]
-        target.update({p + "input_layernorm.weight": torch.ones(hidden, dtype=torch.bfloat16),
-                       p + "post_attention_layernorm.weight": torch.ones(hidden, dtype=torch.bfloat16),
-                       p + "self_attn.q_norm.weight": torch.ones(head_dim, dtype=torch.bfloat16),
-                       p + "self_attn.k_norm.weight": torch.ones(head_dim, dtype=torch.bfloat16),
-                       p + "self_attn.q_proj.weight": tensor(heads * head_dim, hidden),
-                       p + "self_attn.k_proj.weight": tensor(kv * head_dim, hidden),
-                       p + "self_attn.v_proj.weight": tensor(kv * head_dim, hidden),
-                       p + "self_attn.o_proj.weight": tensor(hidden, heads * head_dim),
-                       p + "mlp.gate_proj.weight": tensor(inter, hidden),
-                       p + "mlp.up_proj.weight": tensor(inter, hidden),
-                       p + "mlp.down_proj.weight": tensor(hidden, inter)})
-    shards[-1 if sharded else 0].update({"model.norm.weight": torch.ones(hidden, dtype=torch.bfloat16),
-                                         "lm_head.weight": tensor(vocab, hidden)})
-    if not sharded:
-        save_file(shards[0], str(directory / "model.safetensors"), metadata={"format": "pt"})
-        return directory
-    weight_map = {}
-    for n, shard in enumerate(shards, 1):
-        name = f"model-0000{n}-of-00002.safetensors"
-        save_file(shard, str(directory / name), metadata={"format": "pt"})
-        weight_map.update({key: name for key in shard})
-    total = sum(t.numel() * t.element_size() for s in shards for t in s.values())
-    (directory / "model.safetensors.index.json").write_text(json.dumps({"metadata": {"total_size": total},
-                                                                         "weight_map": weight_map}), encoding="utf-8")
-    return directory
+    import transformers
+except ImportError:
+    torch = transformers = None
 
 
-@unittest.skipUnless(HAS_TORCH, "needs torch and safetensors")
-class PtqTests(unittest.TestCase):
+class CatalogTests(unittest.TestCase):
+    def test_every_technique_and_model_plugin_lists_and_checks(self):
+        found = models.techniques()
+        self.assertTrue(found)
+        provided = {name for entry in found for names in entry["provides"].values() for name in names} | {"auto"}
+        shipped = models.model_plugins([("library", models.CACHE)])
+        self.assertTrue(shipped)
+        for plugin in shipped:
+            with self.subTest(plugin=plugin["id"]):
+                layout = plugin["layout"]
+                self.assertTrue(plugin["model_types"])
+                used = ({spec["block"] for spec in layout["mixers"].values()}
+                        | {spec["block"] for spec in layout.get("before", [])}
+                        | {layout.get("residual", {}).get("block", "pre-norm"), layout.get("ffn", {}).get("block", "auto")})
+                self.assertEqual(used - provided, set())   # a shipped plugin composes library techniques only
+        served = [t for plugin in shipped for t in plugin["model_types"]]
+        self.assertEqual(len(served), len(set(served)))   # one finished plugin a model type
+        self.assertIn("pre-norm", provided)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(models.main(["list", "--json"]), 0)
+        rows = json.loads(out.getvalue())
+        self.assertEqual(len(rows["techniques"]), len(found))
+        self.assertEqual({row["id"] for row in rows["plugins"] if row["where"] == "library"},
+                         {plugin["id"] for plugin in shipped})
+
+    def test_each_technique_s_own_tests_pass(self):
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(ROOT / "cli"), str(ROOT / "inference/core/python"),
+                                                            os.environ.get("PYTHONPATH", "")])}
+        for entry in models.techniques():
+            with self.subTest(technique=entry["id"]):
+                done = subprocess.run([sys.executable, "-B", "-m", "unittest", "discover", "-s", "tests", "-t",
+                                       "tests"], cwd=entry["folder"], env=env, capture_output=True, text=True,
+                                      timeout=120)
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
+    def test_a_technique_holds_no_model_name(self):
+        # The model plugins' model_types are the only names: none appears in a technique's files.
+        names = {t for plugin in models.model_plugins([("library", models.CACHE)]) for t in plugin["model_types"]}
+        for path in models.TECHNIQUES.rglob("*"):
+            if path.is_file() and path.suffix in (".py", ".json", ".md"):
+                text = path.read_text(encoding="utf-8").lower()
+                for name in names:
+                    self.assertNotIn(name, text, path)
+
+
+OWN_MIXER = """from pathlib import Path
+
+from .core.attention.attention import Attention
+from .core.template.compose import model_plugin
+
+
+class MyMixer(Attention):
+    pass
+
+
+resolve, memory, create = model_plugin(Path(__file__).resolve().parent, blocks={"my-mixer": MyMixer})
+"""
+
+
+class ModelPluginTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
-        sys.path.insert(0, str(ROOT / "tests"))
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        patcher = mock.patch.object(models, "user_cache", return_value=self.root / "user")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        from crit import plugins
+        patcher = mock.patch.object(plugins, "user_models", side_effect=lambda: {
+            path.parent.name: path.parent for path in sorted((self.root / "user").glob("*/plugin.json"))})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
-    def test_rtn_exports_targets_keeps_everything_else_and_records_hashes(self):
-        import torch
-        from safetensors import safe_open
-        from crit_eval.quality.checkpoints import Checkpoint
-        from crit_models.evaluate import load_record
-        from crit_models.ptq import run_ptq, verify
-        source = tiny_model(self.root / "source")
-        value = recipes.load_recipe(recipe(exclude=[r"\.down_proj$"], seed=4))
-        record = run_ptq(value, source, self.root / "out", self.root / "transform.json", device="cpu", log=lambda m: None)
-        self.assertEqual(load_record(self.root / "transform.json"), record)
-        out = self.root / "out"
-        self.assertEqual(sorted(p.name for p in out.iterdir()),
-                         ["config.json", "model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors",
-                          "model.safetensors.index.json", "tokenizer.json", "tokenizer_config.json"])
-        self.assertEqual(record["output"]["copied_files"], ["tokenizer.json", "tokenizer_config.json"])
-        config = json.loads((out / "config.json").read_text(encoding="utf-8"))
-        group = config["quantization_config"]["config_groups"]["group_0"]
-        self.assertEqual(len(group["targets"]), record["plan"]["modules"])
-        self.assertEqual(record["plan"]["modules"], 2 * 6)
-        self.assertNotIn("model.layers.0.mlp.down_proj", group["targets"])
-        index = json.loads((out / "model.safetensors.index.json").read_text(encoding="utf-8"))
-        self.assertEqual(index["weight_map"]["model.layers.1.self_attn.q_proj.weight_packed"],
-                         "model-00002-of-00002.safetensors")
-        self.assertEqual(inspect_model(out).tensor_bytes, index["metadata"]["total_size"])
-        before, after = Checkpoint(source), Checkpoint(out)
-        for key in before.where:
-            base, _, leaf = key.rpartition(".")
-            if base in group["targets"]:
-                self.assertFalse(after.has(key))
-                restored = after.dense(base, "cpu")
-                original = before.raw(key).float()
-                self.assertLess(float((restored - original).norm() / original.norm()), 0.2)
-            else:
-                self.assertTrue(torch.equal(before.raw(key), after.raw(key)), key)
-        self.assertEqual(record["seed"], 4)
-        self.assertIsNone(record["calibration"])
-        self.assertEqual(record["source"]["manifest_sha256"],
-                         __import__("crit.run.records", fromlist=["digest"]).digest(record["source"]["files"]))
-        self.assertIn("quantize_and_export", record["cost"]["phases"])
-        self.assertGreater(record["errors"]["weight_error"]["mean"], 0)
-        self.assertNotEqual(record["source"]["eval_model_sha256"], record["output"]["eval_model_sha256"])
-        self.assertEqual(verify(record), [])
-        with safe_open(str(out / "model-00001-of-00002.safetensors"), "pt") as handle:
-            self.assertEqual(handle.metadata(), {"format": "pt"})
-        (out / "tokenizer_config.json").write_text("{}", encoding="utf-8")
-        self.assertEqual(verify(record), ["output differs from the record: tokenizer_config.json"])
+    def built(self, model_type="tiny_test_decoder", mixer=None):
+        """An engine whose agent built the model plugin `mine`: the models core beside it as crit plugins add puts
+        it, the plugin's own manifest, layout and code (mixer: a block of its own for the sliding-window layers)."""
+        from crit.plugins import add
+        plugins = self.root / "engine" / "plugins"
+        add(plugins, ["model-template", "softmax-attention"])
+        shipped = models.CACHE / "llama-qwen3-model"
+        folder = plugins / "mine"
+        folder.mkdir()
+        manifest = json.loads((shipped / "plugin.json").read_text(encoding="utf-8"))
+        manifest.update(id="mine", title="A test's own model plugin", needs=[[f"model_type:{model_type}"]],
+                        sources={"core": "../model-template"}, test_with=["softmax-attention"])
+        (folder / "plugin.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        layout = json.loads((shipped / "layout.json").read_text(encoding="utf-8"))
+        if mixer:
+            layout["mixers"]["sliding_attention"]["block"] = "my-mixer"
+        (folder / "layout.json").write_text(json.dumps(layout), encoding="utf-8")
+        (folder / "plugin.py").write_text(mixer or (shipped / "plugin.py").read_text(encoding="utf-8"),
+                                          encoding="utf-8")
+        return folder
 
-    def test_rtn_twice_gives_identical_bytes(self):
-        from crit_models.ptq import run_ptq
-        source = tiny_model(self.root / "source", sharded=False)
-        value = recipes.load_recipe(recipe(format="fp8-channel"))
-        first = run_ptq(value, source, self.root / "a", self.root / "a.json", device="cpu", log=lambda m: None)
-        second = run_ptq(value, source, self.root / "b", self.root / "b.json", device="cpu", log=lambda m: None)
-        self.assertEqual(first["output"]["manifest_sha256"], second["output"]["manifest_sha256"])
-        self.assertFalse((self.root / "a/model.safetensors.index.json").exists())
+    def test_a_model_plugin_is_kept_once_and_added_to_another_engine_by_its_id(self):
+        folder = self.built()
+        self.assertEqual(models.check_plugin(folder), [])
+        kept = models.cache_add(folder)
+        self.assertEqual(kept, self.root / "user" / "mine")
+        with self.assertRaisesRegex(ValueError, "--force"):
+            models.cache_add(folder)
+        mine = next(plugin for plugin in models.model_plugins() if plugin["id"] == "mine")
+        self.assertEqual((mine["where"], mine["model_types"]), ("cache", ["tiny_test_decoder"]))
+        self.assertEqual(models.plugin_for(["tiny_test_decoder"])["id"], "mine")
+        # Another engine takes it by its id, with the core it extends and the plugin its tests use.
+        from crit.plugins import add
+        from crit_plugins import Registry
+        other = self.root / "other" / "plugins"
+        report = add(other, ["mine"])
+        added = dict(report["added"])
+        self.assertEqual(added["mine"], "named, from your cache of model plugins")
+        self.assertEqual((added["model-template"], added["softmax-attention"]), ("mine uses it", "mine uses it"))
+        self.assertEqual((other / "mine" / "plugin.json").read_bytes(), (folder / "plugin.json").read_bytes())
+        registry = Registry.discover(other)
+        self.assertEqual(registry["mine"]["extends"]["id"], "model-template")
+        self.assertEqual(registry["mine"]["options"].keys(), registry["model-template"]["options"].keys())
+        with self.assertRaisesRegex(ValueError, "the engine has mine already"):
+            add(other, ["mine"])
 
-    def test_workflow_refuses_unsafe_paths_and_quantized_sources(self):
-        from crit_models.ptq import run_ptq
-        source = tiny_model(self.root / "source", sharded=False)
-        value = recipes.load_recipe(recipe())
-        quiet = lambda m: None
-        (self.root / "full").mkdir()
-        (self.root / "full/file").write_text("x")
-        for out, record in ((source / "out", self.root / "r.json"), (self.root / "full", self.root / "r.json"),
-                            (self.root / "out", self.root / "out/r.json"), (self.root / "out", source / "r.json")):
-            with self.subTest(out=out, record=record), self.assertRaises(ValueError):
-                run_ptq(value, source, out, record, device="cpu", log=quiet)
-        with self.assertRaisesRegex(ValueError, "rtn takes none"):
-            run_ptq(value, source, self.root / "out", self.root / "r.json", calibration=self.root / "c.jsonl",
-                    device="cpu", log=quiet)
-        config = json.loads((source / "config.json").read_text(encoding="utf-8"))
-        config["quantization_config"] = {"quant_method": "fp8"}
-        (source / "config.json").write_text(json.dumps(config), encoding="utf-8")
-        with self.assertRaisesRegex(ValueError, "unquantized checkpoint"):
-            run_ptq(value, source, self.root / "out", self.root / "r.json", device="cpu", log=quiet)
+    def test_a_kept_plugin_goes_into_the_library_with_the_library_s_sources(self):
+        folder = self.built()
+        self.assertEqual(models.library_sources(folder), {"core": "../../core/model-template"})
+        shipped = json.loads((models.CACHE / "llama-qwen3-model" / "plugin.json").read_text(encoding="utf-8"))
+        self.assertEqual(shipped["sources"], models.library_sources(folder))
 
-    @unittest.skipUnless(HAS_TRANSFORMERS, "needs transformers")
-    def test_gptq_calibrates_layer_by_layer_and_tracks_the_original(self):
-        from crit_eval.quality.reference import StreamingReference
-        from crit_models.ptq import run_ptq
-        source = tiny_model(self.root / "source")
-        words = "river map stone cloud lantern harbor meadow copper violin orchard".split()
-        lines = [json.dumps({"text": " ".join(words[(i + j) % len(words)] for j in range(40))}) for i in range(20)]
-        (self.root / "calibration.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
-        value = recipes.load_recipe(recipe(algorithm="gptq", format="nvfp4", seed=2,
-                                           calibration={"samples": 4, "sequence_tokens": 32}, gptq={"block": 32}))
-        record = run_ptq(value, source, self.root / "out", self.root / "transform.json",
-                         calibration=self.root / "calibration.jsonl", device="cpu", log=lambda m: None)
-        facts = record["calibration"]
-        self.assertEqual((facts["samples"], facts["sequence_tokens"], facts["documents"]), (4, 32, 20))
-        self.assertEqual(facts["suite_overlap"], "checked")
-        self.assertEqual(len(facts["windows_sha256"]), 64)
-        self.assertIn("calibrate_and_quantize", record["cost"]["phases"])
-        self.assertIn("output_error", record["errors"])
-        self.assertFalse((self.root / "out/.crit-staging").exists())
-        ids = list(range(1, 40))
-        original = StreamingReference(source, "cpu").score_texts([ids], 1, None, self.root / "scratch-a",
-                                                                 log=lambda m: None)[0][0]
-        transformed = StreamingReference(self.root / "out", "cpu").score_texts([ids], 1, None, self.root / "scratch-b",
-                                                                              log=lambda m: None)[0][0]
-        self.assertLess(float((original - transformed).abs().mean()), 0.5)
-        repeat = run_ptq(value, source, self.root / "again", self.root / "again.json",
-                         calibration=self.root / "calibration.jsonl", device="cpu", log=lambda m: None)
-        self.assertEqual(repeat["calibration"]["windows_sha256"], facts["windows_sha256"])
-
-    @unittest.skipUnless(HAS_TRANSFORMERS and importlib.util.find_spec("transformers.models.qwen4_exp") is not None,
-                         "needs transformers with qwen4_exp")
-    def test_gptq_feeds_each_layer_what_the_models_forward_hands_it(self):
-        # Qwen4Exp's layers take four hyper-connection streams, n-gram token ids (PLE) and indexer masks from the
-        # model's forward, not the embeddings and one causal mask.
-        import torch
-        from transformers import AutoConfig, AutoModelForCausalLM
-        from core_text_fixtures import byte_level_json
-        from crit_eval.quality.reference import StreamingReference
-        from crit_models.ptq import run_ptq
-        from test_eval_gguf_qwen4exp import TINY
-        source = self.root / "source"
-        tokenizer = byte_level_json()
-        vocab = len(json.loads(tokenizer)["model"]["vocab"]) + 16
-        torch.manual_seed(0)
-        model = AutoModelForCausalLM.from_config(AutoConfig.for_model(
-            "qwen4_exp_text", vocab_size=vocab, eos_token_id=json.loads(tokenizer)["added_tokens"][1]["id"], **TINY))
-        with torch.no_grad():
-            for key, parameter in model.named_parameters():
-                parameter.copy_(torch.randn_like(parameter) * 0.2 + (0.5 if "norm" in key else 0)
-                                - (1.0 if "A_log" in key else 0))
-        model.to(torch.bfloat16).save_pretrained(source)
-        (source / "tokenizer.json").write_text(tokenizer, encoding="utf-8")
-        (source / "tokenizer_config.json").write_text(json.dumps({"eos_token": "<|end_of_text|>"}), encoding="utf-8")
-        words = "river map stone cloud lantern harbor meadow copper violin orchard".split()
-        lines = [json.dumps({"text": " ".join(words[(i + j) % len(words)] for j in range(60))}) for i in range(20)]
-        (self.root / "calibration.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
-        value = recipes.load_recipe(recipe(algorithm="gptq", format="nvfp4", exclude=[r"\.experts\."],
-                                           calibration={"samples": 4, "sequence_tokens": 48}, gptq={"block": 16}))
-        record = run_ptq(value, source, self.root / "out", self.root / "transform.json",
-                         calibration=self.root / "calibration.jsonl", device="cpu", log=lambda m: None)
-        config = json.loads((self.root / "out/config.json").read_text(encoding="utf-8"))
-        targets = config["quantization_config"]["config_groups"]["group_0"]["targets"]
-        self.assertEqual(len(targets), record["plan"]["modules"])
-        self.assertIn("model.layers.1.ple.key_proj", targets)
-        rtn = recipes.load_recipe(recipe(format="nvfp4", exclude=[r"\.experts\."]))
-        run_ptq(rtn, source, self.root / "rtn", self.root / "rtn.json", device="cpu", log=lambda m: None)
-        ids = list(range(1, 40))
-
-        def scores(model):
-            return StreamingReference(model, "cpu").score_texts([ids], 1, None, self.root / f"scratch-{model.name}",
-                                                                log=lambda m: None)[0][0]
-        original = scores(source)
-        drift = {name: float((original - scores(self.root / name)).abs().mean()) for name in ("out", "rtn")}
-        # Calibrated on the inputs the layers really see, GPTQ drifts less than rounding to nearest.
-        self.assertLess(drift["out"], drift["rtn"])
+    def test_a_folder_that_is_no_model_plugin_is_refused(self):
+        folder = self.built()
+        plugins = folder.parent
+        problems = models.check_plugin(plugins / "attention" / "softmax-attention")
+        self.assertTrue(any("a model plugin fills model" in p for p in problems), problems)
+        self.assertTrue(any("extends the models core" in p for p in problems), problems)
+        self.assertTrue(any("no layout.json" in p for p in problems), problems)
+        self.assertTrue(any("sits at ENGINE/plugins/ID" in p for p in problems), problems)
+        self.assertTrue(any("no plugin.json" in p for p in models.check_plugin(plugins / "nothing")))
+        with self.assertRaisesRegex(ValueError, "no plugin.json"):
+            models.cache_add(plugins / "nothing")
 
 
-@unittest.skipUnless(HAS_TORCH, "needs torch and safetensors")
-class EvaluationTests(unittest.TestCase):
-    status = {"gates": [{"name": "quality", "state": "pass"}],
-              "kpis": {"quality": {"passed": True, "worst_ppl_ratio": 1.01}, "decode": {"score": 90.0},
-                       "prefill": {"score": 900.0}, "ttft": {"score_ms": 12.0}}}
-    requirements = {"quality_budget": {"ppl_ratio_max": 1.4, "kld_mean_max": 0.4, "kld_p99_max": 4.0},
-                    "exactness": "reported", "quality_mode": "speed"}
+class ConfigTests(unittest.TestCase):
+    def test_a_tiny_config_keeps_the_structure_and_shrinks_the_sizes(self):
+        config = {"model_type": "x", "hidden_size": 4096, "num_attention_heads": 32, "num_hidden_layers": 12,
+                  "layer_types": ["full_attention", "linear_attention"] * 6, "num_experts": 128,
+                  "num_experts_per_tok": 8, "loop_layer_index_start": 2, "tie_word_embeddings": False,
+                  "text_config": {"hidden_size": 2048, "num_hidden_layers": 12}}
+        small = models.tiny_config(config)
+        self.assertEqual((small["hidden_size"], small["num_attention_heads"], small["num_experts"]), (64, 4, 8))
+        self.assertEqual(small["layer_types"], ["full_attention", "linear_attention"] * 2)
+        self.assertEqual((small["num_hidden_layers"], small["loop_layer_index_start"]), (4, 2))
+        self.assertEqual(small["text_config"]["hidden_size"], 64)
+        self.assertIs(small["tie_word_embeddings"], False)
 
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
-        sys.path.insert(0, str(ROOT / "tests"))
-        from crit_models.ptq import run_ptq
-        self.source = tiny_model(self.root / "source", sharded=False)
-        run_ptq(recipes.load_recipe(recipe()), self.source, self.root / "out", self.root / "transform.json",
-                device="cpu", log=lambda m: None)
-        self.data = self.root / "data"
-        self.data.mkdir()
+    def test_a_tensor_pattern_numbers_layers_and_experts_alike(self):
+        self.assertEqual(models.pattern("model.layers.12.mlp.experts.3.up_proj.weight"),
+                         "model.layers.N.mlp.experts.N.up_proj.weight")
+        self.assertEqual(models.pattern("model.attn_res.queries.7"), "model.attn_res.queries.N")
+        self.assertEqual(models.rename("a.wq.weight", [["\\.wq\\.", ".q_proj."]]), "a.q_proj.weight")
 
-    def prepared(self, model):
-        from crit_eval.quality.prepare import model_identity
-        self.model_sha256 = model_identity(model)["sha256"]
-        write_json(self.data / "prepared.json", {"model": model_identity(model), "suite_sha256": "suite"})
 
-    def result(self, **fields):
-        value = {"model_sha256": self.model_sha256, "suite_sha256": "suite", "adapter": None,
-                 "server": "http://127.0.0.1:8000/v1", "engine": {"name": "out"}, "status": self.status,
-                 "requirements": self.requirements,
-                 "ended_at": "2026-10-21T00:00:00+00:00", **fields}
-        write_json(self.root / "result.json", {k: v for k, v in value.items() if v is not ...})
-
-    def evaluate(self):
-        from crit_models.evaluate import evaluate
-        return evaluate(self.root / "transform.json", self.data, self.root / "result.json",
-                        self.root / "evaluation.json")
-
-    def test_eval_requires_data_prepared_from_the_source_model(self):
-        with self.assertRaisesRegex(ValueError, "prepare it from the source"):
-            self.evaluate()
-        self.prepared(self.root / "out")
-        with self.assertRaisesRegex(ValueError, "another model than the source"):
-            self.evaluate()
-
-    def test_eval_refuses_a_result_that_states_no_known_quality_mode(self):
-        self.prepared(self.source)
-        for requirements in ({"quality_budget": {}, "exactness": "reported"},
-                             {**self.requirements, "quality_mode": "as_quantized"}):
-            self.result(requirements=requirements)
-            with self.assertRaisesRegex(ValueError, "preserve or speed"):
-                self.evaluate()
-
-    def test_eval_binds_the_served_result_to_the_transform(self):
-        self.prepared(self.source)
-        self.result()
-        evaluation = self.evaluate()
-        self.assertEqual(evaluation["server"], {"url": "http://127.0.0.1:8000/v1", "model": "out"})
-        self.assertEqual(evaluation["summary"]["gates"], {"quality": "pass"})
-        self.assertEqual(evaluation["summary"]["decode_score"], 90.0)
-        # The quality terms Eval judged it under, for the run to check against its own.
-        self.assertEqual(evaluation["summary"]["requirements"], self.requirements)
-        self.assertEqual(json.loads((self.root / "evaluation.json").read_text(encoding="utf-8")), evaluation)
-        with self.assertRaisesRegex(ValueError, "already exists"):
-            self.evaluate()
-        (self.root / "evaluation.json").unlink()
-        (self.root / "out/config.json").write_text("{}")
-        with self.assertRaisesRegex(ValueError, "output differs"):
-            self.evaluate()
-
-    def test_eval_refuses_other_data_adapter_and_unfinished_results(self):
-        self.prepared(self.source)
-        for fields, message in (({"suite_sha256": "other"}, "other prepared data"),
-                                ({"adapter": "adapter.py", "server": None}, "adapter's engine"),
-                                ({"aborted": {"reason": "disturbed"}}, "no finished Eval round"),
-                                ({"status": ...}, "no finished Eval round")):
-            with self.subTest(fields=fields):
-                self.result(**fields)
-                with self.assertRaisesRegex(ValueError, message):
-                    self.evaluate()
-        self.assertFalse((self.root / "evaluation.json").exists())
-
-    def test_eval_records_the_quality_its_round_judged_without_running_the_reference(self):
-        # The round judged quality against the source's reference scores stored under the data (crit eval reference
-        # --model SOURCE --data DATA): the record takes its gates as they are.
-        self.prepared(self.source)
-        self.result(quality={"status": "scored", "passed": True})
-        with patch("crit_eval.quality.reference.score_data", side_effect=AssertionError("ran the reference")):
-            evaluation = self.evaluate()
-        self.assertEqual(evaluation["summary"]["gates"], {"quality": "pass"})
+@unittest.skipIf(torch is None, "torch and transformers")
+class TinyTests(unittest.TestCase):
+    def test_a_tiny_checkpoint_inspects_and_its_composed_engine_scores_as_its_reference(self):
+        if os.environ.get("CRIT_CORE_STEP_LIBRARY") is None and not (ROOT / "build").is_dir():
+            from crit_plugins.testing import unchecked
+            raise unchecked("Core's runtime (crit core build), which the composed engine runs on")
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "config-only"
+            transformers.Qwen3Config(vocab_size=2048, hidden_size=256, intermediate_size=512, num_hidden_layers=6,
+                                     num_attention_heads=8, num_key_value_heads=4, head_dim=32).save_pretrained(source)
+            tiny = models.tiny(source, Path(folder) / "tiny")
+            found = models.inspect(tiny)
+            self.assertEqual(found["plugins"], ["llama-qwen3-model"])
+            self.assertIn("attention", found["techniques"])
+            compared = models.diff(tiny)
+            self.assertIsNone(compared["first_divergent"], compared)
+            # A model plugin being built, with a technique of its own, served from its engine's plugins.
+            building = ModelPluginTests("built")
+            building.setUp()
+            self.addCleanup(building.doCleanups)
+            compared = models.diff(tiny, plugin=building.built("qwen3", mixer=OWN_MIXER))
+            self.assertIsNone(compared["first_divergent"], compared)
 
 
 if __name__ == "__main__":
     unittest.main()
-
-
-@unittest.skipUnless(HAS_TRANSFORMERS, "needs torch, safetensors and transformers")
-class DrafterTests(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
-        sys.path.insert(0, str(ROOT / "tests"))
-
-    def drafter_recipe(self, **overrides):
-        value = {"schema_version": 1, "record_kind": "models_recipe", "method": "drafter", "seed": 3,
-                 "calibration": {"samples": 6, "sequence_tokens": 32}, "heldout_fraction": 0.34,
-                 "train": {"steps": 12, "windows_per_step": 2, "learning_rate": 1e-3, "warmup_steps": 2}}
-        value.update(overrides)
-        return value
-
-    def test_drafter_recipes_fill_their_defaults_and_refuse_the_unknown(self):
-        value = recipes.load_recipe(self.drafter_recipe())
-        self.assertEqual((value["kind"], value["dtype"], value["init_layer"]), ("mtp-head", "bf16", -1))
-        self.assertEqual(value["train"]["weight_decay"], 0.0)
-        self.assertEqual(recipes.load_recipe({"schema_version": 1, "record_kind": "models_recipe", "method": "drafter"})["calibration"],
-                         {"samples": 64, "sequence_tokens": 1024})
-        for bad in (self.drafter_recipe(kind="eagle"), self.drafter_recipe(heldout_fraction=0.9),
-                    self.drafter_recipe(format="nvfp4"), self.drafter_recipe(train={"epochs": 1})):
-            with self.assertRaises(ValueError):
-                recipes.load_recipe(bad)
-        with self.assertRaises(ValueError):
-            recipes.load_recipe(recipe(method="prune"))
-
-    def test_a_drafter_is_distilled_recorded_and_reloadable(self):
-        import torch
-        from safetensors import safe_open
-        from crit_models import main
-        from crit_models.drafter import run_drafter
-        from crit_models.evaluate import load_record
-        from crit_models.ptq import verify
-        source = tiny_model(self.root / "source")
-        words = "river map stone cloud lantern harbor meadow copper violin orchard".split()
-        lines = [json.dumps({"text": " ".join(words[(i + j) % len(words)] for j in range(40))}) for i in range(20)]
-        (self.root / "calibration.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
-        write_json(self.root / "recipe.json", self.drafter_recipe())
-        value = recipes.load_recipe(self.drafter_recipe())
-        record = run_drafter(value, source, self.root / "drafter", self.root / "drafter.json", self.root / "calibration.jsonl",
-                             device="cpu", log=lambda m: None)
-        self.assertEqual(load_record(self.root / "drafter.json"), record)
-        out = self.root / "drafter"
-        self.assertEqual(sorted(p.name for p in out.iterdir()), ["config.json", "model.safetensors"])
-        config = json.loads((out / "config.json").read_text(encoding="utf-8"))
-        self.assertEqual(config["num_hidden_layers"], 1)
-        self.assertEqual(config["crit_drafter"]["kind"], "mtp-head")
-        self.assertEqual((config["crit_drafter"]["init_layer"], config["crit_drafter"]["target_layers"]), (1, 2))
-        self.assertEqual(config["crit_drafter"]["target"]["eval_model_sha256"], record["source"]["eval_model_sha256"])
-        with safe_open(str(out / "model.safetensors"), "pt") as handle:
-            keys = set(handle.keys())
-            self.assertEqual(handle.get_tensor("drafter.fc.weight").shape, (64, 128))
-            self.assertEqual(handle.get_tensor("drafter.fc.weight").dtype, torch.bfloat16)
-        for name in ("drafter.layers.0.self_attn.q_proj.weight", "drafter.norm.weight", "drafter.pre_fc_norm_hidden.weight",
-                     "drafter.pre_fc_norm_embedding.weight"):
-            self.assertIn(name, keys)
-        self.assertEqual(record["plan"]["init_layer"], 1)
-        self.assertEqual(sorted(record["plan"]["tensors"]), sorted(keys))
-        self.assertEqual((record["calibration"]["train_windows"], record["calibration"]["heldout_windows"]), (4, 2))
-        errors = record["errors"]
-        self.assertEqual(errors["train_loss"]["steps"], 12)
-        self.assertTrue(0 <= errors["heldout"]["top1_agreement"] <= 1)
-        self.assertGreaterEqual(errors["heldout"]["kl_mean"], 0)
-        self.assertIn("heldout_before", errors)
-        self.assertEqual(sorted(record["cost"]["phases"]), ["export", "hash_source", "target_pass", "train"])
-        self.assertEqual(verify(record), [])
-        shown = subprocess.run([sys.executable, "-B", LAUNCHER, "models", "plan", "--recipe", str(self.root / "recipe.json"),
-                                "--source", str(source)], capture_output=True, text=True)
-        self.assertEqual(shown.returncode, 0, shown.stderr)
-        self.assertIn("drafter from layer 1 of 2", shown.stdout)
-        with self.assertRaises(SystemExit):
-            main(["ptq", "--recipe", str(self.root / "recipe.json"), "--source", str(source), "--out", str(self.root / "x"),
-                  "--record", str(self.root / "x.json")])

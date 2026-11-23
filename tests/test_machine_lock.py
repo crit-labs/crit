@@ -9,7 +9,7 @@ import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "core/python"))
+sys.path.insert(0, str(ROOT / "inference/core/python"))
 from crit_core import machine  # noqa: E402
 
 # Holds the lock for argv[1] seconds, or until its input closes: start it with stdin=subprocess.PIPE, and end it early
@@ -49,7 +49,7 @@ class EngineLockTest(unittest.TestCase):
     def holder_process(self, seconds):
         env = dict(os.environ)
         env.pop(machine.HELD_ENV, None)
-        proc = subprocess.Popen([sys.executable, "-c", HOLD, str(seconds), str(ROOT / "core/python")], env=env,
+        proc = subprocess.Popen([sys.executable, "-c", HOLD, str(seconds), str(ROOT / "inference/core/python")], env=env,
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         self.assertEqual(proc.stdout.readline().strip(), "held")
         return proc
@@ -176,7 +176,7 @@ class FullSpeedTest(unittest.TestCase):
         if sys.platform != "win32":
             self.assertTrue(machine.keep_full_speed())
             return
-        out = subprocess.run([sys.executable, "-I", "-c", READ_THROTTLING, str(ROOT / "core/python")],
+        out = subprocess.run([sys.executable, "-I", "-c", READ_THROTTLING, str(ROOT / "inference/core/python")],
                              capture_output=True, text=True, timeout=60, check=True).stdout.split()
         self.assertEqual(out[0], "True")
         if out[1] == "True":   # Windows Server accepts the setting but does not always read it back

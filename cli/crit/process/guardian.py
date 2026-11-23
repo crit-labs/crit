@@ -10,7 +10,7 @@ if __package__ in {None, ""}:
     # Started as a script: crit from this checkout, and Core's Python package beside it when it is not installed
     # (records read JSON with crit_core.jsonfile).
     _root = Path(__file__).resolve().parents[3]
-    for _folder in (_root / "core" / "python", _root / "cli"):
+    for _folder in (_root / "inference" / "core" / "python", _root / "cli"):
         if _folder.is_dir():
             sys.path.insert(0, str(_folder))
 from crit.process.identity import process_identity

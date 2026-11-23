@@ -1,40 +1,51 @@
-"""model-template's mixture-of-experts, hybrid, streams and drafting layouts as whole engines, on the plugin's own
-harness (inference/model-template/tests/test_device.py: a small random checkpoint of a transformers architecture, the
-template beside library plugins in a package, run by Core's loader, on CUDA or where there is none on the CPU): scores
-and greedy choices against transformers, requests together as alone, prompt spans timed at load, for Qwen3-MoE (over
-experts-reference and over expert-offload in its device, host-memory and file tiers, the router's rule checked),
-Qwen3-Next, Qwen3.5 with an MTP layer whose drafted greedy replies are the plain ones, and Qwen4Exp (several residual
-streams, hashed n-gram rows, block-sparse attention, its own draft layer); and captured prompt chunks over
-quantized-projections decoding as eager ones. They live here, not in the plugin's tests, so that `crit plugins add
-model-template` copies no plugin a dense engine does not use."""
+"""The finished model plugins (models/cache) as whole engines beyond their own tests, on the harness those use
+(crit_models.testing: a small random checkpoint of a transformers architecture, the model plugin beside library
+plugins in a package, run by Core's loader, on CUDA or where there is none on the CPU): each plugin's own class
+varied over other library plugins. Qwen3-MoE over expert-offload in its device, host-memory and file tiers; Qwen3.5
+with an MTP layer whose drafted greedy replies are the plain ones, and its experts in the host tier; Qwen4Exp's
+sparse attention, off-device tables, published shapes and echo drafts; Gemma 4 and the looped decoder over the
+expert tiers; every architecture written as GGUF; and captured prompt chunks over quantized-projections decoding as
+eager ones. They live here, not in the plugins' tests, so that `crit plugins add` of a model plugin copies only the
+plain plugins its own tests use."""
 from concurrent.futures import ThreadPoolExecutor
 import importlib.util
+import json
 from pathlib import Path
 import sys
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "cli", "kernels"):   # crit_kernels: the exactness levels Core holds an engine to
+for _folder in ("inference/core/python", "cli", "kernels"):   # crit_kernels: the exactness levels Core holds an engine to
     sys.path.insert(0, str(ROOT / _folder))
 
-_spec = importlib.util.spec_from_file_location("model_template_engines",
-                                               ROOT / "inference" / "model-template" / "tests" / "test_device.py")
-t = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(t)
+from crit_models import testing as t  # noqa: E402
+
+
+def _plugin_tests(plugin):
+    """A finished model plugin's own engine tests (models/cache/ID/tests/test_device.py), whose classes these vary."""
+    spec = importlib.util.spec_from_file_location(f"crit_model_tests_{plugin.replace('-', '_')}",
+                                                  ROOT / "models" / "cache" / plugin / "tests" / "test_device.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+llama, q35, deepseek = (_plugin_tests(name) for name in ("llama-qwen3-model", "qwen3-5-model", "deepseek-v3-model"))
+q4, gemma, inkling = (_plugin_tests(name) for name in ("qwen4-exp-model", "gemma4-model", "inkling2-loop-model"))
 torch, transformers, GREEDY = t.torch, t.transformers, t.GREEDY
-MOE = {"router": "topk-router", "experts": "experts-reference", "expert_source": "expert-tensors"}
 
 
 @unittest.skipIf(torch is None, "torch")
 class PromptBucketTests(t.Engines):
     """The decoder layout over quantized-projections, whose prompt form runs inside a captured graph."""
+    plugin = llama.HERE
     library = t.BASE + ["quantized-projections"]
     devices = ("cuda",)
 
     @classmethod
     def checkpoint(cls, root):
-        return t.DecoderTests.checkpoint.__func__(cls, root)
+        return llama.DecoderTests.checkpoint.__func__(cls, root)
 
     def test_captured_prompt_chunks_decode_what_eager_chunks_decode(self):
         # Prompt buckets over a projections plugin whose prompt form captures (prompts:projections): a chunk that fits
@@ -53,44 +64,14 @@ class PromptBucketTests(t.Engines):
 
 
 @unittest.skipIf(torch is None, "torch")
-class MoeTests(t.Layout):
-    """The decoder layout with routed experts: a Qwen3-MoE checkpoint through the router and experts slots."""
-    library = t.BASE + ["topk-router", "experts-reference", "expert-tensors"]
-    use = {**t.USE, **MOE}
-    plugin_options = {"topk-router": {"score_before_selection": True, "renormalize": True}}
-    sharp_routes = True
-    # Judged on average: on CI's CPU torch the BF16 rounding of one route moves a position 0.37 nats from the
-    # reference, beyond the per-position limit, where CUDA's arithmetic keeps every position within it.
-    on_average = True
-
-    @classmethod
-    def checkpoint(cls, root):
-        if not hasattr(transformers, "Qwen3MoeForCausalLM"):
-            return None
-        config = transformers.Qwen3MoeConfig(vocab_size=256, hidden_size=128, intermediate_size=256,
-                                             moe_intermediate_size=64, num_hidden_layers=2, num_attention_heads=4,
-                                             num_key_value_heads=2, head_dim=32, num_experts=8, num_experts_per_tok=2,
-                                             norm_topk_prob=True, decoder_sparse_step=1, max_position_embeddings=2048,
-                                             rms_norm_eps=1e-6, tie_word_embeddings=False)
-        return cls.save(transformers.Qwen3MoeForCausalLM(config), root, fp32=True)
-
-    def test_a_router_whose_rule_is_not_the_checkpoints_is_refused(self):
-        from crit_core.engine import load
-        selection = self.selection()
-        selection["options"]["topk-router"] = {"score_before_selection": True, "renormalize": False}
-        with self.assertRaisesRegex(Exception, "routes its experts by .*renormalize=True"):
-            load(self.package, self.model, {"plugins": selection}, device=self.device)
-
-
-@unittest.skipIf(torch is None, "torch")
-class MoeOffloadTests(MoeTests):
+class MoeOffloadTests(llama.MoeTests):
     """The same engine with expert-offload in the experts slot: the model plans no device bytes for the routed experts,
     begins the plugin before the loads, opens it after its pools and calls it with each step's decode rows and prompt
     chunks apart. The tier is the device's here (the experts fit), so the test takes no more of a shared GPU."""
     library = t.BASE + ["topk-router", "expert-offload", "expert-tensors"]
-    use = {**t.USE, **MOE, "experts": "expert-offload"}
+    use = {**t.USE, **t.MOE, "experts": "expert-offload"}
     devices = ("cuda",)
-    plugin_options = {**MoeTests.plugin_options, "expert-offload": {"tier": "device", "misses": "link"}}
+    plugin_options = {**llama.MoeTests.plugin_options, "expert-offload": {"tier": "device", "misses": "link"}}
     on_average = True   # its device rows are grouped-experts' BF16 tensor arithmetic, not the reference's FP64 sums
 
     def test_the_experts_plugin_placed_the_experts(self):
@@ -104,7 +85,7 @@ class MoeHostTierTests(MoeOffloadTests):
     """The same engine with the experts in host memory (expert-offload's ram tier) behind a device cache that holds
     half of them: decode rows plan through the cache in captured rounds, each round counting its expert reads and
     hits, and prompt chunks stage their misses through the cache's ring."""
-    plugin_options = {**MoeTests.plugin_options,
+    plugin_options = {**llama.MoeTests.plugin_options,
                       "expert-offload": {"tier": "ram", "misses": "link", "settings": "offload.json"}}
 
     @classmethod
@@ -171,18 +152,15 @@ def _nvfp4_experts(path, input_scale=0.004, weight_only=()):
     format expert-offload's CPU tier computes. weight_only: the name prefixes whose experts get no input scale
     (W4A16), as published checkpoints store a draft layer's."""
     from safetensors.torch import load_file, save_file
-    sys.path.insert(0, str(ROOT / "models"))
-    from crit_models.codecs import Nvfp4
+    sys.path.insert(0, str(ROOT / "tests"))
+    from nvfp4_checkpoint import nvfp4
     (shard,) = sorted(path.glob("*.safetensors"))
     tensors = load_file(str(shard))
     stored = [n for n in tensors if ".mlp.experts." in n and n.endswith("_proj.weight")]
     if not stored:
         raise unittest.SkipTest("the checkpoint stores its experts in another layout than a matrix per expert")
     for name in stored:
-        matrix = tensors.pop(name).float()
-        codec = Nvfp4(matrix)
-        codes, _ = codec.rtn(matrix)
-        found, at = codec.tensors(codes), name[:-len("weight")]
+        found, at = nvfp4(tensors.pop(name)), name[:-len("weight")]
         tensors[at + "weight"] = found["weight_packed"]
         tensors[at + "weight_scale"] = found["weight_scale"]
         tensors[at + "weight_scale_2"] = (1.0 / found["weight_global_scale"]).reshape(())
@@ -200,8 +178,9 @@ class OffloadTierTests(t.Engines):
     rounds that count each request's expert reads and hits, and answers as the engine with every expert on the device
     does: bit for bit where the device computes every route in the same arithmetic (misses over the link, a file),
     within rounding where the CPU's order serves decode rows."""
+    plugin = llama.HERE
     library = t.BASE + ["topk-router", "expert-offload", "expert-tensors"]
-    use = {**t.USE, **MOE, "experts": "expert-offload"}
+    use = {**t.USE, **t.MOE, "experts": "expert-offload"}
     devices = ("cuda",)
     plugin_options = {"topk-router": {"score_before_selection": True, "renormalize": True},
                       "expert-offload": {"tier": "device"}}
@@ -209,7 +188,7 @@ class OffloadTierTests(t.Engines):
 
     @classmethod
     def checkpoint(cls, root):
-        path = MoeTests.checkpoint.__func__(cls, root)
+        path = llama.MoeTests.checkpoint.__func__(cls, root)
         if path is not None:
             _nvfp4_experts(path)
         return path
@@ -292,58 +271,6 @@ class OffloadTierTests(t.Engines):
         self.assertEqual([tokens for tokens, _ in self.replies(again)], want)
 
 
-def _hybrid_weights(model):
-    with torch.no_grad():
-        for name, parameter in model.named_parameters():
-            if name.endswith("norm.weight") and "linear_attn" not in name:
-                parameter.normal_(0.0, 0.1)   # zero-centred norms scale by 1 + weight: not all ones
-            if name.endswith("A_log"):
-                parameter.copy_(torch.empty_like(parameter).uniform_(0.05, 1.0).log())   # milder decays
-
-
-@unittest.skipIf(torch is None, "torch")
-class HybridMoeTests(t.Layout):
-    """The gated-hybrid layout with routed experts: a Qwen3-Next checkpoint (gated delta-rule layers, gated attention,
-    a gated shared expert), its BF16 weights computed by transformers in FP32."""
-    library = t.BASE + ["sequential-recurrence", "topk-router", "experts-reference", "expert-tensors"]
-    use = {**t.USE, **MOE, "recurrence": "sequential-recurrence"}
-    plugin_options = {"topk-router": {"score_before_selection": True, "renormalize": True}}
-    reference_fp32 = on_average = True
-
-    @classmethod
-    def checkpoint(cls, root):
-        if not hasattr(transformers, "Qwen3NextForCausalLM"):
-            return None
-        config = transformers.Qwen3NextConfig(
-            vocab_size=256, hidden_size=128, intermediate_size=256, num_hidden_layers=4,
-            layer_types=["linear_attention", "linear_attention", "full_attention", "linear_attention"],
-            num_attention_heads=4, num_key_value_heads=2, head_dim=32, linear_num_key_heads=2,
-            linear_num_value_heads=4, linear_key_head_dim=32, linear_value_head_dim=32, linear_conv_kernel_dim=4,
-            num_experts=8, num_experts_per_tok=2, moe_intermediate_size=64, shared_expert_intermediate_size=64,
-            decoder_sparse_step=1, norm_topk_prob=True, max_position_embeddings=2048, rms_norm_eps=1e-6,
-            tie_word_embeddings=False)
-        model = transformers.Qwen3NextForCausalLM(config)
-        _hybrid_weights(model)
-        return cls.save(model, root)
-
-
-def _hybrid_moe(root, cls):
-    """A Qwen3.5-MoE text checkpoint (gated delta-rule layers, a gated attention layer, routed experts with a gated
-    shared expert; its router always renormalizes the kept probabilities, which its config has no key for)."""
-    if not hasattr(transformers, "Qwen3_5MoeForCausalLM"):
-        return None
-    config = transformers.Qwen3_5MoeTextConfig(
-        vocab_size=256, hidden_size=128, num_hidden_layers=4,
-        layer_types=["linear_attention", "linear_attention", "linear_attention", "full_attention"],
-        num_attention_heads=4, num_key_value_heads=2, head_dim=32, linear_num_key_heads=2, linear_num_value_heads=4,
-        linear_key_head_dim=32, linear_value_head_dim=32, linear_conv_kernel_dim=4, num_experts=8,
-        num_experts_per_tok=2, moe_intermediate_size=64, shared_expert_intermediate_size=64,
-        max_position_embeddings=2048, rms_norm_eps=1e-6, tie_word_embeddings=False)
-    model = transformers.Qwen3_5MoeForCausalLM(config)
-    _hybrid_weights(model)
-    return cls.save(model, root)
-
-
 def _draft_layer(path, hidden):
     """A draft layer added to a pre-norm checkpoint: its decoder layer a copy of the last layer's tensors (its
     experts too), fc and its norms random."""
@@ -363,27 +290,13 @@ def _draft_layer(path, hidden):
 
 
 @unittest.skipIf(torch is None, "torch")
-class HybridRoutedTests(t.Layout):
-    """The gated-hybrid layout on Qwen3.5-MoE, whose config does not say that its router renormalizes: the layout's
-    defaults do, and the router's rule is checked against them."""
-    library = t.BASE + ["sequential-recurrence", "topk-router", "experts-reference", "expert-tensors"]
-    use = {**t.USE, **MOE, "recurrence": "sequential-recurrence"}
-    plugin_options = {"topk-router": {"score_before_selection": True, "renormalize": True}}
-    reference_fp32 = on_average = sharp_routes = True
-
-    @classmethod
-    def checkpoint(cls, root):
-        return _hybrid_moe(root, cls)
-
-
-@unittest.skipIf(torch is None, "torch")
-class GgufHybridRoutedTests(t.GgufEngines, HybridRoutedTests):
+class GgufHybridRoutedTests(t.GgufEngines, q35.HybridRoutedTests):
     """The same Qwen3.5-MoE checkpoint written as GGUF (architecture qwen35moe): its zero-centred norms stored 1 + w,
     A_log as -exp(A_log), the delta net's value heads tiled (two key heads, four value heads), convolution kernels
     squeezed, the experts stacked, every matrix Q8_0; the experts reach experts-reference as their stored values."""
     arch = "qwen35moe"
-    library = HybridRoutedTests.library + ["gguf-projections"]
-    use = {**HybridRoutedTests.use, "projections": "gguf-projections"}
+    library = q35.HybridRoutedTests.library + ["gguf-projections"]
+    use = {**q35.HybridRoutedTests.use, "projections": "gguf-projections"}
 
 
 @unittest.skipIf(torch is None, "torch")
@@ -395,9 +308,10 @@ class DraftExpertTierTests(t.Engines):
     of the round's victims, as many as a decode round routes in it, and copied over the link before it reads them;
     the engine loads, drafts in captured rounds and answers within rounding of the device tier's engine. Over the
     link every layer is cached and the replies are the device tier's, token for token."""
+    plugin = q35.HERE
     library = t.BASE + ["sequential-recurrence", "topk-router", "expert-offload", "expert-tensors",
                         "greedy-head-drafter"]
-    use = {**t.USE, **MOE, "experts": "expert-offload", "recurrence": "sequential-recurrence",
+    use = {**t.USE, **t.MOE, "experts": "expert-offload", "recurrence": "sequential-recurrence",
            "drafter": "greedy-head-drafter"}
     devices = ("cuda",)
     options = {**t.OPTIONS, "mtp": True, "width": 2}
@@ -407,7 +321,7 @@ class DraftExpertTierTests(t.Engines):
 
     @classmethod
     def checkpoint(cls, root):
-        path = _hybrid_moe(root, cls)
+        path = q35.hybrid_moe(root, cls)
         if path is not None:
             _draft_layer(path, 128)
             _nvfp4_experts(path, weight_only=("mtp.",))
@@ -472,6 +386,7 @@ class HybridDraftTests(t.Layout):
     """The gated-hybrid layout, dense, with an MTP layer: a Qwen3.5 text checkpoint (separate in_proj_qkv / z / b / a)
     with an MTP layer added (its decoder layer a copy of the full-attention layer's tensors, fc and norms random), whose
     engine drafts in captured rounds: greedy drafted replies are the plain engine's, each round counting its drafts."""
+    plugin = q35.HERE
     library = t.BASE + ["sequential-recurrence", "greedy-head-drafter"]
     use = {**t.USE, "recurrence": "sequential-recurrence"}
     reference_fp32 = True
@@ -488,7 +403,7 @@ class HybridDraftTests(t.Layout):
             linear_num_value_heads=4, linear_key_head_dim=32, linear_value_head_dim=32, linear_conv_kernel_dim=4,
             max_position_embeddings=2048, rms_norm_eps=1e-6, tie_word_embeddings=False)
         model = transformers.Qwen3_5ForCausalLM(config)
-        _hybrid_weights(model)
+        q35.hybrid_weights(model)
         path = cls.save(model, root)
         from safetensors.torch import load_file, save_file
         (shard,) = sorted(path.glob("*.safetensors"))
@@ -552,156 +467,23 @@ class GgufHybridDraftTests(t.GgufEngines, HybridDraftTests):
 
 
 @unittest.skipIf(torch is None, "torch")
-class LatentTests(t.Layout):
-    """The latent layout: a DeepSeek V3 checkpoint (multi-head latent attention with low-rank queries and interleaved
-    rotary pairs, a dense MLP on its first layer, then experts routed by sigmoid scores within the best group, with a
-    shared expert), its BF16 weights computed by transformers in FP32."""
-    library = t.BASE + ["topk-router", "experts-reference", "expert-tensors"]
-    use = {**t.USE, **MOE}
-    plugin_options = {"topk-router": {"scoring": "sigmoid", "score_before_selection": True, "renormalize": True,
-                                      "scaling": 2.5, "groups": 2, "selected_groups": 1, "group_score_top": 2}}
-    reference_fp32 = on_average = sharp_routes = True
-    flips = 0.02   # two groups' scores, or two sigmoid scores near 1, may tie within BF16's step: a route flips
-
-    @classmethod
-    def checkpoint(cls, root):
-        if not hasattr(transformers, "DeepseekV3ForCausalLM"):
-            return None
-        config = transformers.DeepseekV3Config(
-            vocab_size=256, hidden_size=128, intermediate_size=256, moe_intermediate_size=64, num_hidden_layers=3,
-            num_attention_heads=4, num_key_value_heads=4, n_shared_experts=1, n_routed_experts=8,
-            routed_scaling_factor=2.5, kv_lora_rank=32, q_lora_rank=48, qk_rope_head_dim=16, v_head_dim=32,
-            qk_nope_head_dim=32, n_group=2, topk_group=1, num_experts_per_tok=2, first_k_dense_replace=1,
-            norm_topk_prob=True, max_position_embeddings=2048, rope_interleave=True, rms_norm_eps=1e-6,
-            tie_word_embeddings=False)
-        model = transformers.DeepseekV3ForCausalLM(config)
-        with torch.no_grad():
-            for name, buffer in model.named_buffers():
-                if name.endswith("e_score_correction_bias"):
-                    buffer.normal_(0.0, 0.05)
-        return cls.save(model, root)
-
-    def test_the_layers_keep_one_latent_row_a_position_and_no_kv(self):
-        model = self.engine.model
-        self.assertEqual(model.facts()["layout"], "latent")
-        self.assertEqual(list(model.pools), ["latent"])
-        pool = model.pools["latent"]
-        self.assertEqual((pool.kv_heads, pool.head_dim, pool.value_dim), (1, 32 + 16, 0))
-
-
-@unittest.skipIf(torch is None, "torch")
-class GgufLatentTests(t.GgufEngines, LatentTests):
+class GgufLatentTests(t.GgufEngines, deepseek.LatentTests):
     """The DeepSeek V3 checkpoint written as GGUF (architecture deepseek2): kv_b_proj split by heads into attn_k_b
     (transposed) and attn_v_b, read joined back; the router's score correction as exp_probs_b.bias, the shared experts
     as *_shexp, the experts stacked, every matrix whose inputs fill Q8_0's blocks Q8_0."""
     arch = "deepseek2"
-    library = LatentTests.library + ["gguf-projections"]
-    use = {**LatentTests.use, "projections": "gguf-projections"}
-
-
-QWEN4 = dict(vocab_size=256, hidden_size=128, num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
-             head_dim=32, linear_num_key_heads=2, linear_num_value_heads=4, linear_key_head_dim=32,
-             linear_value_head_dim=32, linear_conv_kernel_dim=4, num_experts=8, num_experts_per_tok=2,
-             moe_intermediate_size=64, shared_expert_intermediate_size=64, hc_count=4, hc_lowrank=16,
-             ple_layer_ids=[2], ngram_vocab_size_base=48, seed=4321, split_ngram_parts=3, indexer_n_heads=2,
-             indexer_kv_heads=1, indexer_head_dim=64, indexer_compress_ratio=4, output_gate_type="sigmoid",
-             max_position_embeddings=4096, eos_token_id=2, rms_norm_eps=1e-6, tie_word_embeddings=False,
-             rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 0.5,
-                              "mrope_section": [4, 2, 2], "mrope_interleaved": True})
+    library = deepseek.LatentTests.library + ["gguf-projections"]
+    use = {**deepseek.LatentTests.use, "projections": "gguf-projections"}
 
 
 @unittest.skipIf(torch is None, "torch")
-class StreamsTests(t.Layout):
-    """The gated-streams layout: a Qwen4Exp checkpoint (four residual streams mixed for every block, gated delta-rule
-    layers whose norm gate is a sigmoid, the second with hashed n-gram table rows ahead of it, a gated attention layer
-    with an indexer, routed experts with a gated shared expert), its BF16 weights computed by transformers in FP32.
-    The indexer's budget is past the engine's context here, so its attention reads every position."""
-    library = t.BASE + ["sequential-recurrence", "topk-router", "experts-reference", "expert-tensors"]
-    use = {**t.USE, **MOE, "recurrence": "sequential-recurrence"}
-    plugin_options = {"topk-router": {"score_before_selection": True, "renormalize": True}}
-    reference_fp32 = on_average = sharp_routes = True
-    budget = 8192
-
-    @classmethod
-    def checkpoint(cls, root):
-        try:
-            config = transformers.AutoConfig.for_model("qwen4_exp_text", indexer_budget=cls.budget, **QWEN4)
-        except (KeyError, ValueError):
-            return None
-        model = transformers.AutoModelForCausalLM.from_config(config)
-        with torch.no_grad():
-            for name, parameter in model.named_parameters():
-                if "norm" in name and name.endswith(".weight") and "linear_attn" not in name:
-                    parameter.normal_(0.0, 0.1)   # zero-centred norms scale by 1 + weight: not all ones
-                if name.endswith("A_log"):
-                    parameter.copy_(torch.empty_like(parameter).uniform_(0.05, 1.0).log())
-                if "ple.conv1d" in name:
-                    parameter.normal_(0.0, 0.2)   # the reference starts the n-gram rows' convolution at zero
-                if "ngram_embedding" in name:
-                    parameter.normal_(0.0, 0.5)
-        path = cls.save(model, root)
-        cls.draft_layer(path, config)
-        return path
-
-    @classmethod
-    def draft_layer(cls, path, config):
-        """A draft layer in the checkpoint's own layout (transformers runs none for this architecture): its decoder
-        layer and last mix copies of the attention layer's and the model's, its input maps random."""
-        from safetensors.torch import load_file, save_file
-        (shard,) = sorted(path.glob("*.safetensors"))
-        tensors = load_file(str(shard))
-        g = torch.Generator().manual_seed(3)
-        last, hidden, streams = config.num_hidden_layers - 1, config.hidden_size, config.hc_count
-        for name in [n for n in tensors if n.startswith(f"model.layers.{last}.")]:
-            tensors["mtp.layers.0." + name[len(f"model.layers.{last}."):]] = tensors[name].clone()
-        for name in [n for n in tensors if n.startswith("model.hyper_connection_mixer.")]:
-            tensors["mtp." + name[len("model."):]] = tensors[name].clone()
-        for name in ("fc_embedding", "fc_hidden"):
-            tensors[f"mtp.{name}.weight"] = (torch.randn(hidden, hidden, generator=g) * 0.05).to(torch.bfloat16)
-        tensors["mtp.pre_fc_norm_embedding.weight"] = (torch.randn(hidden, generator=g) * 0.1).to(torch.bfloat16)
-        tensors["mtp.pre_fc_norm_hidden.weight"] = (torch.randn(streams * hidden, generator=g) * 0.1).to(torch.bfloat16)
-        save_file(tensors, str(shard), metadata={"format": "pt"})
-
-    def test_the_layout_composes_streams_ngram_rows_and_an_indexed_attention(self):
-        model = self.engine.model
-        self.assertEqual(model.facts()["layout"], "gated-streams")
-        self.assertEqual(model.residual.count, 4)
-        self.assertEqual([len(layer.before) for layer in model.decoder], [0, 1, 0, 0])
-        self.assertEqual(model.decoder[3].mixer.sparse, self.budget // 4 < model.kv_tokens // 4)
-        self.assertEqual("index" in model.pools, model.decoder[3].mixer.sparse)
-        self.assertIn("ngram", model.state_keys)
-        self.assertEqual(model.facts()["block_selection"] is not None, model.decoder[3].mixer.sparse)
-        # its chunks' windows of ids come from the request on the host: captured prompt chunks are refused by name
-        bucketed = self.load(prompt_buckets="16")
-        self.assertIn("NgramRows", bucketed.model.facts()["prompt_graphs"]["problems"][0])
-        bucketed.close()
-        self.engines.remove(bucketed)
-
-    def test_a_prompt_in_several_steps_and_one_with_end_tokens_decode_as_whole(self):
-        # The n-gram rows' ids before a chunk and the block keys' earlier positions come from the sequence: chunks of
-        # 16 tokens decode what chunks of 64 decode; an end token inside a prompt stops the n-grams after it.
-        (prompt,) = self.prompts(1, 90)
-        prompt[40], prompt[41], prompt[77] = 2, 2, 2
-        expected, _ = self.engine.generate(prompt, 10, stop_tokens=[], sampling=GREEDY)
-        short = self.load(prefill_chunk=16)
-        found, _ = short.generate(prompt, 10, stop_tokens=[], sampling=GREEDY)
-        self.assertEqual(found, expected)
-        logits = self.logits(prompt + expected)
-        for i, token in enumerate(expected):
-            row = logits[len(prompt) - 1 + i]
-            self.assertGreaterEqual(float(row[token]), float(row.max()) - 0.25, (i, token, int(row.argmax())))
-        short.close()
-        self.engines.remove(short)
-
-
-@unittest.skipIf(torch is None, "torch")
-class GgufStreamsTests(t.GgufEngines, StreamsTests):
+class GgufStreamsTests(t.GgufEngines, q4.StreamsTests):
     """The Qwen4Exp checkpoint written as GGUF (architecture qwen4exp, as Qwen3.8-Flash-Next's GGUFs are): the
     hyper-connections renamed, their norms and the n-gram rows' norms stored 1 + w, the indexer's query and key rows
     split, the n-gram table renamed and its hash constants moved to metadata, beside the qwen35moe steps."""
     arch = "qwen4exp"
-    library = StreamsTests.library + ["gguf-projections"]
-    use = {**StreamsTests.use, "projections": "gguf-projections"}
+    library = q4.StreamsTests.library + ["gguf-projections"]
+    use = {**q4.StreamsTests.use, "projections": "gguf-projections"}
 
     def test_the_draft_layer_reads_from_the_draft_block(self):
         # The converter writes the MTP layer as the block after the text layers, its fc_embedding and fc_hidden
@@ -712,7 +494,7 @@ class GgufStreamsTests(t.GgufEngines, StreamsTests):
 
 
 @unittest.skipIf(torch is None, "torch")
-class SparseStreamsTests(StreamsTests):
+class SparseStreamsTests(q4.StreamsTests):
     """The same model with a budget of two blocks of four positions, far below the engine's context: every token past
     eight positions attends the two blocks its indexer scores highest and its own block's tail. A cut between two
     blocks that score alike may pick the other block than transformers' FP32 scores do (and blocks that score exactly
@@ -777,14 +559,14 @@ class SparseStreamsTests(StreamsTests):
 
 
 @unittest.skipIf(torch is None, "torch")
-class OffDeviceTablesTests(StreamsTests):
+class OffDeviceTablesTests(q4.StreamsTests):
     """The same engine with its lookup tables placed off the device (device-placement's off_device "tables.", as an
     engine for a checkpoint whose n-gram table is larger than the device places them): the token embeddings and the
     n-gram table are read where the checkpoint stores them through lookup-table-rows (embeddings:host), the plan's
-    device bytes leave them out, and every comparison of StreamsTests holds."""
-    library = StreamsTests.library + ["lookup-table-rows"]
-    use = {**StreamsTests.use, "embeddings": "lookup-table-rows"}
-    plugin_options = {**StreamsTests.plugin_options, "device-placement": {"off_device": "tables."}}
+    device bytes leave them out, and every comparison of q4.StreamsTests holds."""
+    library = q4.StreamsTests.library + ["lookup-table-rows"]
+    use = {**q4.StreamsTests.use, "embeddings": "lookup-table-rows"}
+    plugin_options = {**q4.StreamsTests.plugin_options, "device-placement": {"off_device": "tables."}}
 
     def test_the_tables_the_plan_puts_off_the_device_are_read_where_they_are_stored(self):
         model = self.engine.model
@@ -796,12 +578,12 @@ class OffDeviceTablesTests(StreamsTests):
 
 @unittest.skipIf(torch is None, "torch")
 @unittest.skipIf(sys.platform == "win32", "host memory regions need libc's mmap")
-class OffDeviceMemoryTablesTests(StreamsTests):
+class OffDeviceMemoryTablesTests(q4.StreamsTests):
     """The same off-device tables through memory-table-rows (embeddings:host): the plain embeddings plugin reads
     each table the plan put off the device from the checkpoint's files once into registered host memory (the
     Flash-Next build's candidate that refused at load with "does not provide embeddings:host"), and every comparison
-    of StreamsTests holds."""
-    plugin_options = {**StreamsTests.plugin_options, "device-placement": {"off_device": "tables."}}
+    of q4.StreamsTests holds."""
+    plugin_options = {**q4.StreamsTests.plugin_options, "device-placement": {"off_device": "tables."}}
 
     def test_the_tables_the_plan_puts_off_the_device_are_held_in_host_memory(self):
         model = self.engine.model
@@ -813,11 +595,11 @@ class OffDeviceMemoryTablesTests(StreamsTests):
 
 
 @unittest.skipIf(torch is None, "torch")
-class PublishedStreamsTests(StreamsTests):
+class PublishedStreamsTests(q4.StreamsTests):
     """The Qwen4Exp checkpoint stored as NVIDIA's NVFP4 Flash-Next stores its own: the hashed n-gram table as E4M3
     codes with one BF16 multiplier for the table (weight_scale), the draft layer's routed experts a matrix each in
     FP8 with a multiplier a 32 x 32 block (weight_scale_inv). The table's values are E4M3 values times a power of two,
-    so the BF16 model transformers runs holds them exactly, and every comparison of StreamsTests holds as it does for
+    so the BF16 model transformers runs holds them exactly, and every comparison of q4.StreamsTests holds as it does for
     the BF16 table, on the device and off it. The draft layer's experts are re-encoded to the format the experts slot
     holds the decoder's in (BF16 here) and draft the plain greedy replies."""
     TABLE_SCALE = 0.125
@@ -869,7 +651,7 @@ class PublishedStreamsTests(StreamsTests):
 
 
 @unittest.skipIf(torch is None, "torch")
-class EchoDraftTests(StreamsTests):
+class EchoDraftTests(q4.StreamsTests):
     """A draft layer whose drafts are known. transformers runs no draft layer for this architecture, so a random one
     only shows that drafts are verified. This one passes the target's streams on: fc_hidden is the identity,
     fc_embedding zero, the feature's norm weight zero, its attention's and experts' output maps zero, its last mix
@@ -924,81 +706,13 @@ class EchoDraftTests(StreamsTests):
 
 
 @unittest.skipIf(torch is None, "torch")
-class SandwichTests(t.Layout):
-    """The sandwich layout: a Gemma 4 checkpoint with its mixture-of-experts block (each block between two plain
-    RMSNorms and a scalar a layer, sliding-window layers beside a full layer of another head shape whose values are
-    its key projection's rows and whose rotary table turns a quarter of each head, value norms, a GELU-gated MLP
-    beside GELU-gated experts routed from the residual stream, scaled embeddings, capped logits), its BF16 weights
-    computed by transformers in FP32. The window is shorter than the prompts."""
-    library = t.BASE + ["topk-router", "experts-reference", "expert-tensors"]
-    use = {**t.USE, **MOE}
-    plugin_options = {"topk-router": {"score_before_selection": True, "renormalize": True}}
-    reference_fp32 = on_average = True
-    flips = 0.02   # two experts' scores may tie within BF16's step: a route flips (transformers' own BF16 does it)
-
-    @classmethod
-    def checkpoint(cls, root):
-        if not hasattr(transformers, "Gemma4ForCausalLM"):
-            return None
-        config = transformers.Gemma4TextConfig(
-            vocab_size=256, vocab_size_per_layer_input=256, hidden_size=128, intermediate_size=256,
-            num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2, head_dim=32, global_head_dim=64,
-            num_global_key_value_heads=1, attention_k_eq_v=True, sliding_window=24,
-            layer_types=["sliding_attention", "full_attention", "sliding_attention", "full_attention"],
-            enable_moe_block=True, num_experts=8, top_k_experts=2, moe_intermediate_size=64,
-            hidden_size_per_layer_input=0, max_position_embeddings=2048, rms_norm_eps=1e-6,
-            tie_word_embeddings=False, final_logit_softcapping=30.0, pad_token_id=0, eos_token_id=1, bos_token_id=2,
-            rope_parameters={"full_attention": {"partial_rotary_factor": 0.25, "rope_theta": 1000000.0,
-                                                "rope_type": "proportional"},
-                             "sliding_attention": {"rope_theta": 10000.0, "rope_type": "default"}})
-        model = transformers.Gemma4ForCausalLM(config)
-        g = torch.Generator().manual_seed(5)
-        with torch.no_grad():
-            for name, parameter in model.named_parameters():
-                if name.endswith(("experts.gate_up_proj", "experts.down_proj")):
-                    parameter.copy_(torch.randn(parameter.shape, generator=g) * 0.08)
-                elif name.endswith("router.proj.weight"):
-                    parameter.copy_(torch.randn(parameter.shape, generator=g) * 2.0)   # routes no rounding flips
-                elif name.endswith(("q_norm.weight", "k_norm.weight")):
-                    # Normed queries and keys at scale 1: weights of 1 would make scores as large as the head is
-                    # wide, which BF16 rounds by more than a softmax forgives.
-                    parameter.copy_(0.35 + torch.randn(parameter.shape, generator=g) * 0.03)
-                elif "post_" in name and name.endswith(".weight"):
-                    # A block's output leaves its norm at the norm's weight whatever the block computed: weights
-                    # of 1 would add a stream's own size a block, and BF16's rounding of one layer would be the
-                    # next layer's input error in full (transformers' own BF16 then leaves its FP32 as far).
-                    parameter.copy_(0.1 + torch.randn(parameter.shape, generator=g) * 0.02)
-                elif name.endswith(("router.scale", "router.per_expert_scale")) or (
-                        "norm" in name and name.endswith(".weight")):
-                    parameter.copy_(1.0 + torch.randn(parameter.shape, generator=g) * 0.1)   # not all ones
-            for name, buffer in model.named_buffers():
-                if name.endswith("layer_scalar"):
-                    buffer.fill_(0.5 + 0.25 * int(name.split(".")[-2]))   # a scalar a layer
-        return cls.save(model, root)
-
-    def test_the_layout_composes_two_head_shapes_and_experts_beside_the_mlp(self):
-        model = self.engine.model
-        self.assertEqual(model.facts()["layout"], "sandwich")
-        self.assertEqual((model.activation, model.residual.name), ("gelu_tanh", "sandwich"))
-        shapes = [(layer.mixer.kv_heads, layer.mixer.head_dim, layer.mixer.window) for layer in model.decoder]
-        self.assertEqual(shapes, [(2, 32, 24), (1, 64, 0), (2, 32, 24), (1, 64, 0)])
-        self.assertEqual([layer.mixer.shared_values for layer in model.decoder], [False, True, False, True])
-        self.assertEqual(sorted(str(key) for key in model.kv_keys), ["('kv', 24)", "kv"])
-        self.assertEqual([type(layer.ffn).__name__ for layer in model.decoder], ["ParallelMoE"] * 4)
-        self.assertEqual([round(layer.res[4], 2) for layer in model.decoder], [0.5, 0.75, 1.0, 1.25])
-        # the full layer's table is as wide as its head and turns its first quarter
-        freqs = model.decoder[1].mixer.rope.freqs.tolist()
-        self.assertEqual((len(freqs), sum(1 for f in freqs if f > 0)), (32, 8))
-
-
-@unittest.skipIf(torch is None, "torch")
-class GgufSandwichTests(t.GgufEngines, SandwichTests):
+class GgufSandwichTests(t.GgufEngines, gemma.SandwichTests):
     """The Gemma 4 checkpoint written as GGUF (architecture gemma4): its norms renamed in pairs around each block, the
     scalar as layer_output_scale, the router's scale and each expert's scale as .scale tensors, the experts one gate-up
     stack beside the down stack, every matrix Q8_0."""
     arch = "gemma4"
-    library = SandwichTests.library + ["gguf-projections"]
-    use = {**SandwichTests.use, "projections": "gguf-projections"}
+    library = gemma.SandwichTests.library + ["gguf-projections"]
+    use = {**gemma.SandwichTests.use, "projections": "gguf-projections"}
     # A prompt row multiplies the Q8_0 matrices decoded to BF16 (gguf-projections' dequantize prompts), which rounds
     # each stored value d q once, where the reference reads it exact; Gemma 4's attention at scale 1 carries that
     # rounding further than the other layouts do: 0.21 nats a position on average here, where the same file written
@@ -1008,14 +722,14 @@ class GgufSandwichTests(t.GgufEngines, SandwichTests):
 
 
 @unittest.skipIf(torch is None, "torch")
-class SandwichHostTierTests(SandwichTests):
+class SandwichHostTierTests(gemma.SandwichTests):
     """The same engine with its GELU-gated experts in host memory behind a device cache that holds half of them
     (expert-offload's ram tier: BF16 bundles through the grouped-experts kernel's GELU gate), its prompts run layer
     by layer because the experts plugin stages them."""
     library = t.BASE + ["topk-router", "expert-offload", "expert-tensors"]
-    use = {**t.USE, **MOE, "experts": "expert-offload"}
+    use = {**t.USE, **t.MOE, "experts": "expert-offload"}
     devices = ("cuda",)
-    plugin_options = {**SandwichTests.plugin_options,
+    plugin_options = {**gemma.SandwichTests.plugin_options,
                       "expert-offload": {"tier": "ram", "misses": "link", "settings": "offload.json"}}
 
     @classmethod
@@ -1032,87 +746,124 @@ class SandwichHostTierTests(SandwichTests):
         self.assertTrue(self.engine.model.facts()["passes"]["on"])
 
 
-LOOPED = dict(vocab_size=288, unpadded_vocab_size=272, hidden_size=64, num_hidden_layers=6, num_attention_heads=4,
-              num_key_value_heads=2, head_dim=16, swa_num_attention_heads=4, swa_num_key_value_heads=2, swa_head_dim=16,
-              sliding_window_size=8, d_rel=4, rel_extent=8, log_scaling_n_floor=4, qk_l2_clip_threshold=2.0,
-              rel_l2_clip_threshold=1.0, n_layers_per_attn_res_block=2, moe_intermediate_size=64, n_routed_experts=8,
-              num_experts_per_tok=2, loop_layer_index_start=2, loop_layer_index_end=4, loop_num_passes=3,
-              loop_gate_rank=8, eos_token_id=2, pad_token_id=0,
-              layer_types=["hybrid_sliding", "hybrid", "hybrid_sliding", "hybrid", "hybrid_sliding", "hybrid"])
+@unittest.skipIf(torch is None, "torch")
+class LoopedGroupedTests(inkling.LoopedTests):
+    """The looped engine with grouped-experts in the experts slot: its kernel's capped SwiGLU over the BF16 experts."""
+    library = t.BASE + ["sequential-recurrence", "topk-router", "grouped-experts", "expert-tensors"]
+    use = {**inkling.LoopedTests.use, "experts": "grouped-experts"}
+    devices = ("cuda",)
 
 
 @unittest.skipIf(torch is None, "torch")
-class LoopedTests(t.Layout):
-    """The looped-blocks layout: an Inkling 2 loop checkpoint (its middle span of layers run three times, the later
-    passes taking messages from the pass before; attention residuals over blocks of two layers; sliding and full layers
-    of relative attention with learned sinks a token, short convolutions over keys and values, dynamic ones in the full
-    layers, and after the attention and the FFN; experts routed by sigmoid scores with a correction bias, gated by a
-    capped SwiGLU; a head of fewer rows than the vocabulary), its BF16 weights computed by transformers in FP32. The
-    window and the bias's reach are 8 positions and the log scaling starts at position 4, so the prompts here cross
-    all three."""
-    library = t.BASE + ["sequential-recurrence", "topk-router", "experts-reference", "expert-tensors"]
-    use = {**t.USE, **MOE, "recurrence": "sequential-recurrence"}
-    plugin_options = {"topk-router": {"scoring": "sigmoid", "score_before_selection": True, "renormalize": True,
-                                      "scaling": 8.0}}
-    reference_fp32 = on_average = sharp_routes = True
-    flips = 0.02   # sigmoid scores near 1 under the sharpened router may tie within BF16's step: a route flips
+class LoopedDraftTests(inkling.LoopedTests):
+    """The looped engine drafting from a block drafter stored beside the checkpoint (mtp.safetensors, the config's
+    mtp_config: three bidirectional layers, its own cache, a recurrent head; random weights): greedy drafted replies are
+    the plain engine's at every width, one block pass a round."""
+    library = LoopedGroupedTests.library + ["greedy-head-drafter", "quantized-projections"]
+    use = LoopedGroupedTests.use
+    devices = ("cuda",)   # drafting runs in captured rounds
 
     @classmethod
     def checkpoint(cls, root):
-        try:
-            from transformers.models.inkling2_loop.configuration_inkling2_loop import Inkling2LoopTextConfig
-            from transformers.models.inkling2_loop.modeling_inkling2_loop import Inkling2LoopForCausalLM
-        except ImportError:
+        path = super().checkpoint(root)
+        if path is None:
             return None
-        model = Inkling2LoopForCausalLM(Inkling2LoopTextConfig(**LOOPED))
-        with torch.no_grad():   # the parts the reference starts at zero or one, random so each one counts
-            for name, parameter in model.named_parameters():
-                if name.endswith((".query", "static_weight", "e_score_correction_bias")):
-                    parameter.normal_(0.0, 0.5)
-                elif name.endswith(".scale"):
-                    parameter.copy_(1.0 + 0.3 * torch.randn_like(parameter))
-                elif "conv" in name and name.endswith("conv1d.weight"):
-                    parameter.normal_(0.0, 0.3)
-            for name, buffer in model.named_buffers():
-                if name.endswith("e_score_correction_bias"):
-                    buffer.normal_(0.0, 0.05)
-        return cls.save(model, root)
+        from safetensors.torch import save_file
+        h, heads, kv, d, f, r, block = 64, 4, 2, 16, 96, 8, 4
+        cfg = dict(hidden_size=h, num_hidden_layers=3, num_attention_heads=heads, num_key_value_heads=kv, head_dim=d,
+                   intermediate_size=f, rms_norm_eps=1e-6, rope_theta=1e6, local_layer_ids=[0, 2],
+                   sliding_window_size=6, block_size=block, markov_rank=r, markov_head_type="rnn_hidden",
+                   target_layer_ids=[1, 4, 7, 10])   # entries of layer applications 1, 4, 7, then the final row
+        g = torch.Generator().manual_seed(11)
 
-    def test_each_pass_of_a_looped_layer_keeps_its_own_kv_and_windows_and_shares_its_weights(self):
-        model = self.engine.model
-        self.assertEqual(model.facts()["layout"], "looped-blocks")
-        self.assertEqual(model.sources, (0, 1, 2, 3, 2, 3, 2, 3, 4, 5))
-        self.assertEqual(model.layers, 10)
-        first, again = model.decoder[2].mixer, model.decoder[4].mixer
-        self.assertIs(first.query_rows[0], again.query_rows[0])   # one checkpoint layer's matrices, loaded once
-        self.assertEqual(sorted(model.pools[("kv", 8)].layers), [0, 2, 4, 6, 8])
-        self.assertEqual(sorted(model.pools["kv"].layers), [1, 3, 5, 7, 9])
-        self.assertEqual(model.expert_ids[2], model.expert_ids[4])
+        def rnd(*shape, scale=None):
+            return (torch.randn(*shape, generator=g) * (scale or shape[-1] ** -0.5)).to(torch.bfloat16)
+
+        def norm(n):
+            return (1.0 + 0.2 * torch.randn(n, generator=g)).to(torch.bfloat16)
+
+        tensors = {"fuse_weight": rnd(4, 4, scale=1.0), "mask_embed": rnd(h, scale=1.0), "norm.weight": norm(h)}
+        for i in range(3):
+            p = f"layers.{i}."
+            for n in ("dflare_norm", "input_layernorm", "post_attention_layernorm"):
+                tensors[p + n + ".weight"] = norm(h)
+            for n, rows in (("q_proj", heads * d), ("k_proj", kv * d), ("v_proj", kv * d), ("k_proj_ctx", kv * d),
+                            ("v_proj_ctx", kv * d)):
+                tensors[p + f"self_attn.{n}.weight"] = rnd(rows, h)
+            tensors[p + "self_attn.o_proj.weight"] = rnd(h, heads * d)
+            for n in ("q_norm", "k_norm", "k_norm_ctx"):
+                tensors[p + f"self_attn.{n}.weight"] = norm(d)
+            tensors[p + "mlp.gate_proj.weight"], tensors[p + "mlp.up_proj.weight"] = rnd(f, h), rnd(f, h)
+            tensors[p + "mlp.down_proj.weight"] = rnd(h, f)
+        m = "markov_head."
+        tensors.update({m + "dflare_norm.weight": norm(h),
+                        m + "markov_w1.weight": rnd(inkling.LOOPED["vocab_size"], r, scale=1.0),
+                        m + "rnn_proj.weight": rnd(3 * r, 2 * r + 2 * h), m + "rnn_proj.bias": rnd(3 * r, scale=0.5),
+                        m + "hidden_out.weight": rnd(h, r), m + "hidden_out.bias": rnd(h, scale=0.1)})
+        save_file(tensors, str(path / "mtp.safetensors"), metadata={"format": "pt"})
+        config = json.loads((path / "config.json").read_text(encoding="utf-8"))
+        config["mtp_config"] = cfg
+        (path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+        return path
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.drafting = cls.load(use={"drafter": "greedy-head-drafter"}, mtp=True, width=3, widths="1,2,3")
+
+    def test_drafted_greedy_replies_are_the_plain_ones(self):
+        model = self.drafting.model
+        self.assertIsNotNone(model.feature_head)   # the block-drafter technique's head
+        self.assertEqual(model.info().get("speculative"), True)
+        self.assertEqual(model.taps, (1, 4, 7))
+        self.assertEqual(model.facts()["rounds"]["problems"], [])
+        prompts = self.prompts(3, 13)
+        plain = [self.engine.generate(p, 24, stop_tokens=[], sampling=GREEDY)[0] for p in prompts]
+        found = [self.drafting.generate(p, 24, stop_tokens=[], sampling=GREEDY) for p in prompts]
+        self.assertEqual([tokens for tokens, _ in found], plain)
+        for tokens, result in found:
+            self.assertEqual(sum(result["accepted"]) + result["rounds"], len(tokens) - 1)
+        with ThreadPoolExecutor(2) as pool:   # two round slots: each row's drafter cache its own
+            together = list(pool.map(lambda p: self.drafting.generate(p, 24, stop_tokens=[], sampling=GREEDY)[0],
+                                     prompts[:2]))
+        self.assertEqual(together, plain[:2])
+
+    def test_drafting_over_captured_prompt_chunks_gives_the_plain_replies(self):
+        # a captured chunk gives the drafter's feature rows (its taps, then the head's rows), which its prompt rows read;
+        # over quantized-projections, whose prompt form captures (projections-dense's runs every chunk eager)
+        engine = self.load(use={"drafter": "greedy-head-drafter", "projections": "quantized-projections"}, mtp=True,
+                           width=3, widths="1,2,3", prompt_buckets="16,64")
+        prompts = self.prompts(3, 13)
+        plain = [self.engine.generate(p, 24, stop_tokens=[], sampling=GREEDY)[0] for p in prompts]
+        self.assertEqual([engine.generate(p, 24, stop_tokens=[], sampling=GREEDY)[0] for p in prompts], plain)
+        graphs = engine.model.prompts
+        self.assertEqual((engine.model.prompts_refused, graphs.problems, sorted(graphs.graphs)), (None, [], [16, 64]))
+        self.assertGreater(graphs.counts["graph_chunks"], 0)
+        engine.close()
+        self.engines.remove(engine)
 
 
 @unittest.skipIf(torch is None, "torch")
-class LoopedGroupedTests(LoopedTests):
-    """The looped engine with grouped-experts in the experts slot: its kernel's capped SwiGLU over the BF16 experts."""
-    library = t.BASE + ["sequential-recurrence", "topk-router", "grouped-experts", "expert-tensors"]
-    use = {**LoopedTests.use, "experts": "grouped-experts"}
-    devices = ("cuda",)
+class TransformersSpellingDraftTests(t.Respelled, LoopedDraftTests):
+    """The drafting engine over the target's tensors under transformers' own module names (the looped plugin's
+    TRANSFORMERS_NAMES, its drafter beside them as stored): drafted greedy replies are the plain engine's."""
+    spelling, files, every_rule = inkling.TRANSFORMERS_NAMES, "model*.safetensors", False
 
 
-@unittest.skipIf(torch is None, "torch")
-class LoopedOffloadTests(LoopedTests):
+class LoopedOffloadTests(inkling.LoopedTests):
     """The looped engine with expert-offload in the experts slot, every expert on the device: each pass of a looped
     layer reads the same layer's experts (one experts slot a checkpoint layer)."""
     library = t.BASE + ["sequential-recurrence", "topk-router", "expert-offload", "expert-tensors"]
-    use = {**LoopedTests.use, "experts": "expert-offload"}
+    use = {**inkling.LoopedTests.use, "experts": "expert-offload"}
     devices = ("cuda",)
-    plugin_options = {**LoopedTests.plugin_options, "expert-offload": {"tier": "device", "misses": "link"}}
+    plugin_options = {**inkling.LoopedTests.plugin_options, "expert-offload": {"tier": "device", "misses": "link"}}
 
 
 @unittest.skipIf(torch is None, "torch")
 class LoopedHostTierTests(LoopedOffloadTests):
     """The looped engine with its experts in host memory behind a device cache of half of them: a looped layer's
     passes come back to experts the cache may have let go (24 slots of the 48 experts)."""
-    plugin_options = {**LoopedTests.plugin_options,
+    plugin_options = {**inkling.LoopedTests.plugin_options,
                       "expert-offload": {"tier": "ram", "misses": "link", "settings": "offload.json"}}
 
     @classmethod

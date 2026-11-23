@@ -102,6 +102,7 @@ class PromptTests(unittest.TestCase):
 
 
 class CompletionFixture(ServeFixture):
+    shared_engine = True   # its tests leave the served engine as they found it, or get a new one (ServeFixture)
     stream = True
     extra_capabilities = ("completion-v1", "chat-logprobs-v1", "chat-score-v1")
     adapter_suffix = COMPLETION_ADAPTER

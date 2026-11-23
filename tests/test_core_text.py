@@ -16,7 +16,7 @@ import tokenizers
 import tokenizers.decoders
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "api", "../crit-eval", "kernels", "cli"): sys.path.insert(0, str(ROOT / _folder))
+for _folder in ("inference/core/python", "api", "../crit-eval", "kernels", "cli"): sys.path.insert(0, str(ROOT / _folder))
 
 import core_text_fixtures as fx  # noqa: E402
 from crit_core.files import CallableFiles, DirectoryFiles, MappingFiles  # noqa: E402
@@ -100,7 +100,7 @@ class LazyImportTests(unittest.TestCase):
                 "from crit_core.text import StopMatcher, TextError, openai_messages, GenerationConfig; "
                 "StopMatcher(['x']).push('abc'); "
                 "print(sorted(name for name in ('tokenizers', 'jinja2') if name in sys.modules))")
-        result = subprocess.run([sys.executable, "-B", "-c", code, str(ROOT / "core/python")],
+        result = subprocess.run([sys.executable, "-B", "-c", code, str(ROOT / "inference/core/python")],
                                 capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "[]")

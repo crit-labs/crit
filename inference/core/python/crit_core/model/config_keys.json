@@ -1,0 +1,27 @@
+{
+  "about": "Which config.json keys spell each of Core's fields, in the order they are tried; crit_core.model.config loads it. text_sections: the sections a multimodal wrapper keeps its text model in. layer_count_from: per-layer lists whose length is the layer count when num_hidden_layers is absent. A mechanism's keys are crit_models' (models/core/python/crit_models/config_keys.json).",
+  "text_sections": [
+    "text_config",
+    "llm_config"
+  ],
+  "position_lengths": [
+    "max_position_embeddings",
+    "n_positions",
+    "max_seq_len",
+    "seq_length",
+    "max_sequence_length",
+    "model_max_length"
+  ],
+  "norm_eps": [
+    "rms_norm_eps",
+    "layer_norm_eps",
+    "layer_norm_epsilon"
+  ],
+  "dtype": [
+    "dtype",
+    "torch_dtype"
+  ],
+  "layer_count_from": [
+    "layers_block_type"
+  ]
+}

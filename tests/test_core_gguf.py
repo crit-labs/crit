@@ -7,7 +7,9 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "tests"): sys.path.insert(0, str(ROOT / _folder))
+for _folder in ("inference/core/python", "tests"): sys.path.insert(0, str(ROOT / _folder))
+sys.path.insert(0, str(ROOT / "models" / "core" / "python"))
+import crit_models  # noqa: E402,F401 - its GGUF checks (attention by layer kind, experts, rotary base) join Core's
 from crit_core.model import (GgufError, check_gguf_folder, find_gguf, inspect_gguf, inspect_gguf_model,  # noqa: E402
                              load_model_config)
 from gguf_writer import ARRAY, BOOL, FLOAT64, INT8, STRING, UINT8, gguf_bytes, tensor_bytes  # noqa: E402

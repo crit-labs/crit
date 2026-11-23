@@ -130,10 +130,11 @@ class Rows(_Bench):
         return _within("rms-norm", got, want[0])
 
     def yardstick(self, s):
-        """FlashInfer's Gemma-style norms (the weight stored as weight - 1, as offset=1.0 reads it): with a residual
-        gemma_fused_add_rmsnorm, in place, which keeps the residual in the rows' dtype, so it runs on a BF16 copy of
-        the FP32 residual (it reads and writes 2 bytes a residual value instead of 4); without one gemma_rmsnorm on the
-        rows as [tokens x heads, D]. The weight is rounded to BF16 once (FlashInfer takes it in the rows' dtype)."""
+        """FlashInfer's offset norms (the weight stored as weight - 1, as offset=1.0 reads it): with a residual
+        fi.gemma_fused_add_rmsnorm, in place, which keeps the residual in the rows' dtype, so it runs on a BF16 copy
+        of the FP32 residual (it reads and writes 2 bytes a residual value instead of 4); without one fi.gemma_rmsnorm
+        on the rows as [tokens x heads, D]. The weight is rounded to BF16 once (FlashInfer takes it in the rows'
+        dtype)."""
         fi = _flashinfer()
         if fi is None:
             return None
@@ -243,10 +244,10 @@ class Rope(_Bench):
         return torch.cat([out[0][0].flatten(), out[1][0].flatten()])
 
     def yardstick(self, s):
-        """FlashInfer's calls for the same work: gemma_rmsnorm of the queries and of the keys (as [tokens x heads, D])
-        and apply_rope_pos_ids_inplace on both (half pairs over the first R values, the same theta; FlashInfer makes
-        the inverse frequencies itself), three launches; apply_rope_pos_ids alone without the norms. No FlashInfer
-        call fuses a head norm with 1-D rotary positions."""
+        """FlashInfer's calls for the same work: fi.gemma_rmsnorm of the queries and of the keys (as [tokens x
+        heads, D]) and apply_rope_pos_ids_inplace on both (half pairs over the first R values, the same theta;
+        FlashInfer makes the inverse frequencies itself), three launches; apply_rope_pos_ids alone without the norms.
+        No FlashInfer call fuses a head norm with 1-D rotary positions."""
         fi = _flashinfer()
         if fi is None:
             return None

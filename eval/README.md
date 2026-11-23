@@ -7,7 +7,7 @@ crit installs it as a dependency and runs it as `crit eval` (`crit-eval` on its 
 crit-eval beside crit and install both editable:
 
 ```sh
-python -m pip install -e core/python -e ../crit-eval -e .
+python -m pip install -e inference/core/python -e models/core/python -e ../crit-eval -e .
 ```
 
 - [What crit-eval measures](https://github.com/crit-labs/crit-eval#what-eval-measures)

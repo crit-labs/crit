@@ -12,7 +12,7 @@ import unittest
 import weakref
 
 ROOT = Path(__file__).resolve().parents[1]
-CODE = ROOT / "inference" / "checkpoint-storage" / "code"
+CODE = ROOT / "inference" / "techniques" / "memory" / "checkpoint-storage" / "code"
 
 
 def load(name):

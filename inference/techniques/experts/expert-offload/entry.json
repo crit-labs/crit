@@ -1,0 +1,101 @@
+{
+  "id": "expert-offload",
+  "category": "experts",
+  "summary": "One plugin for a mixture of experts larger than the device: it decides where the routed experts live (device, host memory, a file), keeps those routed last in a device cache that takes every byte the device has free while the engine serves, computes misses on the CPU while the link copies them in beside the round, and runs a routed layer in one call",
+  "implementation_status": "native_source",
+  "implementation_scope": "ExpertOffload (code/offload.py): the decision tree (choose_tier, cache_slots, choose_misses), FileStore for the disk tier, the one-call forward over device-expert-cache's ExpertCache under recent residency, expert-tensors' BundleStore, host-expert-tier's CpuTier behind heterogeneous-expert-dispatch's DeviceDispatch and grouped-experts' kernel (KernelRoutes); the cache's memory through the device's memory (crit_plugins.memory: the cache is an elastic range and a giver, filled once Core says the load is over) and the device's step frames (Core's: the device keeps the run's headroom and gives a prompt step the room its chunk was measured to take, the cache giving and growing back) or a KV pool's spare bytes and idle pages; route recording, routing profiles and a one-line diagnosis. code/bench.py runs the plugin alone on a store file and a recorded trace. No arithmetic of its own: every row is grouped-experts' kernel or the CPU tier's declared order.",
+  "agent_guidance": {
+    "use_when": "The routed experts do not all fit on the device beside the model's weights and the KV cache at the required context (recon's placement scenario sparse_device_host or sparse_device_host_disk), or the engine should not care whether they fit: it places them by itself",
+    "avoid_when": "A model without routed experts; an engine that must place experts by a rule of its own the decision tree does not take (pin it with the tier and misses options first)",
+    "provides": [
+      "begin() decides the tier from the experts' bytes, the device's free memory less the model's own needs, and host memory",
+      "open() makes the device expert cache in the free memory past reserve_mib (or in a KV pool's spare bytes and idle pages) and builds the CPU tier, or copies every miss over the link",
+      "Recent residency beside the CPU tier: a missed expert is computed by the CPU now, copied in beside the round and served from the next round, in the slot of the expert routed longest ago",
+      "An elastic cache, a giver of the device's memory: every free byte the device does not keep (the run's VRAM headroom, Core's) after the warm requests; a prompt step gets the room a chunk of its size was measured to take, from the blocks torch's allocator kept of earlier prompts first, and the cache grows back after the prompt's last step",
+      "forward(layer, x, ids, weights, rows, prompt) per routed layer: decode plans, CPU posts and joins, prompt staging, captured rounds",
+      "Facts that say what it decided and why, telemetry with a one-line diagnosis, recorded routes for crit plugins offload --trace and for bench.py, which times the plugin alone on the engine's store"
+    ],
+    "engine_supplies": [
+      "begin(layers, experts, format, hidden, inter, device_bytes) before the loads, with the device bytes its pools still take",
+      "load() of every expert's stored tensors, as for experts that fit (skipped when a store file is complete)",
+      "open() after its pools; a KV pool allocated for the whole context lends its memory: made with spare=experts.spare_bytes(pool_bytes) and passed as open(lend=pool)"
+    ],
+    "preserve": [
+      "One arithmetic per path: the CPU tier's declared order on the device wherever the CPU computes misses, the kernel's tensor arithmetic where it does not",
+      "Every byte the model does not use for the cache, and never one it was not shown to be free: under WDDM an allocation past the device's memory moves to system memory instead of failing",
+      "Copies beside the round, never on a layer's path: the CPU tier computes the miss its layer needs"
+    ],
+    "adapt": [
+      "tier, misses and policy to pin a decision; reserve_mib is what a load's graphs and first prompts take (the run's VRAM headroom is the device's, Core's)",
+      "swaps and fill_blocks from a recorded trace: crit plugins offload --trace replays residency in seconds, bench.py times the plugin alone on the real experts in minutes",
+      "prompt_arithmetic tensor for a speed engine whose prefill the declared order bounds"
+    ]
+  },
+  "path": "inference/techniques/experts/expert-offload/README.md",
+  "code_path": "inference/techniques/experts/expert-offload/code",
+  "code_files": [
+    {
+      "path": "inference/techniques/experts/expert-offload/code/offload.py",
+      "purpose": "ExpertOffload, the decision tree, the cache's memory through Core's step frames, FileStore and the diagnosis"
+    },
+    {
+      "path": "inference/techniques/experts/expert-offload/code/bench.py",
+      "purpose": "The plugin alone on a bundle store file and a recorded routing trace: a captured graph a round as an engine runs it, the round's time, the CPU tier's share and time per missed expert, hits, misses and copies a round, for the options and each variant"
+    },
+    {
+      "path": "inference/techniques/experts/expert-offload/code/gguf_experts.py",
+      "purpose": "Experts a GGUF checkpoint stores (format gguf): the slot layout of each layer's formats (wider layers in pieces, kept whole on the device), the bundles, gguf-rows over the slots (GgufRoutes, prompt chunks on its grouped GEMM) and the CPU tier in its declared order (GgufCpuTier)"
+    }
+  ],
+  "requires": {
+    "hardware": "A CUDA GPU grouped-experts builds for; for the CPU path, the native CPU tier (host-expert-arithmetic's integer rows) and mapped pinned host memory",
+    "model": "Expert-routed models with SwiGLU experts in any format grouped-experts computes; the CPU path for NVFP4 (W4A4) and INT4 experts (native) and GGUF experts (in torch, gguf-rows' declared order)",
+    "workload": "Decode and verify rounds and prompt chunks through experts that do not all fit on the device"
+  },
+  "contract": {
+    "input": "The experts' geometry at begin(), each expert's stored tensors at load(), per routed layer the token rows, router ids and weights (ids -1 skipped)",
+    "output": "Each token's routed SwiGLU sum, FP32 [tokens][hidden], the bits of every expert on the device in the path's arithmetic",
+    "ownership": "The plugin owns the store, the cache, the CPU tier and the kernel workspaces; the model owns its pools (a KV pool it lends)",
+    "failure": "No grouped-experts kernel, experts that do not fit the chosen tier, a load after open() or of another format raise; a CPU tier that does not build falls back to link copies, recorded in the facts",
+    "core_boundary": "A plugin of the experts slot. Core tells it of the steps it ends (end_step) and frames every step with the device's memory and its captured rounds find it in its slot; the cache is an elastic range and a giver of the device's memory (crit_plugins.memory), which Core tells when the load is over"
+  },
+  "dependencies": [
+    "device-expert-cache",
+    "expert-tensors' BundleStore",
+    "host-expert-tier",
+    "heterogeneous-expert-dispatch",
+    "grouped-experts kernel",
+    "expert-streamed-prefill's reference block"
+  ],
+  "symbols": [
+    "ExpertOffload",
+    "choose_tier",
+    "cache_slots",
+    "choose_misses",
+    "prompt_bytes",
+    "diagnosis",
+    "FileStore",
+    "bench.open_offload",
+    "bench.decode",
+    "bench.prompt"
+  ],
+  "interactions": [
+    "device-expert-cache",
+    "host-expert-tier",
+    "heterogeneous-expert-dispatch",
+    "grouped-experts",
+    "ssd-expert-materialization",
+    "expert-streamed-prefill"
+  ],
+  "techniques": [
+    "expert-offload",
+    "device-expert-cache",
+    "host-expert-tier",
+    "heterogeneous-expert-dispatch"
+  ],
+  "validation": {
+    "host": "Plugin tests: the host form is the reference bit for bit; the decision tree's tier, slots and miss path on given sizes; what a prompt step's memory follows; the diagnosis",
+    "native": "CUDA tests (tests/test_device.py, run on an RTX 5090): link misses give the all-device bits for decode and prompt chunks, CPU misses and the experts copied in beside the rounds the declared all-device bits, the disk tier reads its file, recorded routes",
+    "performance": "Qwen3.8-Flash-Next FP4-Local on one RTX 5090 and a Ryzen 5 9600 (WSL2). The plugin alone on 1,232 recorded rounds: 15.4 ms a round at 94% hits (ranked residency: 40.5 ms at 85%). In an engine, ten fresh prompts: 53.5 tok/s sampled and 60.0 greedy beside elastic KV pools, against 24.8 and 32.5 for the run engine whose experts it replaced"
+  }
+}

@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 
 GIB = 1 << 30
-INFERENCE = Path(__file__).resolve().parents[2] / "inference"
+INFERENCE = Path(__file__).resolve().parents[2] / "inference" / "techniques"
 CPU_FORMATS = ("nvfp4", "int4")   # the formats the CPU expert tier computes in the device's bits
 SIZES = (0.75, 1.0, 1.25)         # cache sizes replayed, as fractions of the planned slots
 SWAPS = (64, 128, 256)            # copies a round replayed (expert-offload's swaps)
@@ -44,7 +44,7 @@ def expert_shape(config):
     hidden, layers = text.get("hidden_size"), text.get("num_hidden_layers")
     if not (experts and top and inter and hidden and layers):
         return None
-    from crit_core.model import routed_layers
+    from crit_models.config import routed_layers
     return len(routed_layers(text)), int(experts), int(top), int(hidden), int(inter)
 
 
@@ -65,7 +65,7 @@ def expert_format(config):
 
 def bundle_bytes(format, hidden, inter):
     """One expert's bundle in the experts:bundles layout (grouped-experts' bundles, the CPU tier's for its formats)."""
-    bundles = _load(INFERENCE / "grouped-experts" / "code" / "bundles.py", "crit_offload_bundles")
+    bundles = _load(INFERENCE / "experts" / "grouped-experts" / "code" / "bundles.py", "crit_offload_bundles")
     return int(bundles.layout(format, hidden, inter)["bundle_bytes"])
 
 
@@ -77,7 +77,7 @@ def _trace_replay():
     name = "crit_offload_cache"
     if name not in sys.modules:
         package = types.ModuleType(name)
-        package.__path__ = [str(INFERENCE / "device-expert-cache" / "code")]
+        package.__path__ = [str(INFERENCE / "experts" / "device-expert-cache" / "code")]
         sys.modules[name] = package
     return importlib.import_module(name + ".trace_replay")
 

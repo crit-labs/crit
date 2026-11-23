@@ -9,7 +9,7 @@ import sys
 import tempfile
 import time
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "core" / "python"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "inference" / "core" / "python"))
 from crit_core.constraints import ByteGrammar, PreparationService, matches  # noqa: E402
 
 

@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "core" / "python"))
+sys.path.insert(0, str(ROOT / "inference" / "core" / "python"))
 from crit_core import registry  # noqa: E402
 from crit_core.registry import RegistryError  # noqa: E402
 

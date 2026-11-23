@@ -108,7 +108,7 @@ reference scores its text.
 A failed `decode_matches_prefill` or `decode_long` says how far decoding moved from prefilling, not why: decode runs
 other arithmetic than prefill (GEMV against GEMM), so a gap can be rounding as well as a fault in what the two paths
 share. On an engine whose facts say `decode_via_prompt` (its model plugin honours the hook, as
-[model-template](../inference/model-template/README.md) does), the test decodes the failed comparison's tokens once more
+[model-template](../models/core/model-template/README.md) does), the test decodes the failed comparison's tokens once more
 with the score request's debug option `decode_via_prompt` (`POST /v1/crit/score`, [serving](../docs/SERVING.md)): the
 same prefill, KV cache and positions, each decode row computed as a one-token prompt chunk, the prompt rows'
 arithmetic. The failed item then names a verdict:

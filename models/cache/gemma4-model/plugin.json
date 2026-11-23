@@ -1,0 +1,41 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "gemma4-model",
+  "title": "The model plugin of Gemma 4 checkpoints",
+  "description": "A decoder whose blocks sit between two RMSNorms each (plain weights), its attention with query, key and value norms at scale 1, sliding-window layers beside full ones of another head shape and rotary table (the full layers' values the key projection's rows where the checkpoint stores no value projection), a GELU-gated MLP, and where the config routes experts a mixture of experts beside the MLP with a router that scores the residual stream; embeddings scaled by the square root of the hidden width, logits capped by a tanh. A finished model plugin: its layout (layout.json) composed by the models core it extends (model-template: the serving contracts, the options) from model techniques.",
+  "fills": [
+    "model"
+  ],
+  "needs": [
+    [
+      "model_type:gemma4",
+      "model_type:gemma4_text"
+    ]
+  ],
+  "requires": [
+    "norms",
+    "embeddings"
+  ],
+  "devices": [
+    "cuda",
+    "cpu"
+  ],
+  "sources": {
+    "core": "../../core/model-template"
+  },
+  "extends": "core",
+  "test_with": [
+    "attention-state",
+    "device-placement",
+    "expert-tensors",
+    "experts-reference",
+    "fused-norms",
+    "memory-table-rows",
+    "projections-dense",
+    "softmax-attention",
+    "token-sampling",
+    "topk-router",
+    "torch-norms"
+  ],
+  "entry": "plugin.py:create"
+}

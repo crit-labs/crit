@@ -122,7 +122,7 @@ class RunMeasureTests(MeasureFixture, unittest.TestCase):
         self.assertEqual(record["metrics"]["accepted_tokens_per_round"]["samples"], [128 / 43] * 3)
         self.assertEqual(record["extensions"], {"measured_by": "crit run measure", "served_by": "crit serve",
                                                 "attempt_id": "attempt-0001", "output_tokens": [128] * 3,
-                                                "sampling": {"temperature": 0}})
+                                                "sampling": {"temperature": 1.0}})
         for key in ("peak_vram_bytes", "minimum_free_vram_bytes", "peak_ram_bytes", "minimum_free_ram_bytes"):
             self.assertTrue(key in record["metrics"] or key in record["missing_metrics"], key)
         if sys.platform.startswith("linux") or os.name == "nt":
@@ -151,6 +151,27 @@ class RunMeasureTests(MeasureFixture, unittest.TestCase):
         self.assertEqual(record["extensions"]["sampling"], {"temperature": 0.7, "top_p": 0.9, "seed": 3})
         self.assertEqual(json.loads((self.root / "sampling.json").read_text()),
                          {"temperature": 0.7, "top_p": 0.9, "seed": 3})
+
+    def test_a_request_without_sampling_decodes_at_the_runs_eval_sampling(self):
+        # Decode speed is sampled decode: a captured request that names no temperature takes the sampled suite's
+        # sampling recon.json records for the run, never temperature 0.
+        self.assertEqual(measure.run_sampling(self.directory), {"temperature": 1.0})   # no recon.json
+        candidate = self.served(capabilities=SERVED + ["chat-sampling-top-p-v1"])
+        with patch.object(measure, "read_json", side_effect=lambda path, **kw: (
+                {"gathered": {"eval_sampling": {"settings": {"temperature": 0.6, "top_p": 0.95}}}}
+                if Path(path).name == "recon.json" else read_json(path, **kw))):
+            (record,) = measure.measure(self.store, self.run_id, candidate)
+        self.assertEqual(record["extensions"]["sampling"], {"temperature": 0.6, "top_p": 0.95})
+        self.assertNotIn("comparison_only", record["extensions"])
+
+    def test_a_greedy_captured_request_is_recorded_comparison_only(self):
+        self.case.update(temperature=0)
+        candidate = self.served()
+        (record,) = measure.measure(self.store, self.run_id, candidate)
+        self.assertEqual(record["extensions"]["sampling"], {"temperature": 0})
+        self.assertEqual(record["extensions"]["comparison_only"], measure.GREEDY_COMPARISON_ONLY)
+        logged = (self.directory / self.attempt()["logs"][0]["path"]).read_text()
+        self.assertIn("recorded comparison-only", logged)
 
     def test_a_captured_requests_template_variables_are_sent_and_recorded(self):
         self.case.update(chat_template_kwargs={"enable_thinking": True})
@@ -182,7 +203,7 @@ class RunMeasureTests(MeasureFixture, unittest.TestCase):
         candidate = self.served()
         with patch.dict(os.environ, {"CRIT_ENGINE_LOCK": str(self.root / "engine.lock"),
                                      "CRIT_ENGINE_LEASE": "off", "CRIT_ENGINE_LOCK_HELD": ""}):
-            holder = subprocess.Popen([sys.executable, "-B", "-c", HOLD, "3", str(ROOT / "core/python")],
+            holder = subprocess.Popen([sys.executable, "-B", "-c", HOLD, "3", str(ROOT / "inference/core/python")],
                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
             try:
                 self.assertEqual(holder.stdout.readline().strip(), "held")

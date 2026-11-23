@@ -86,7 +86,7 @@ def parser():
     sub = subs.add_parser("recon", help="Gather the model's sampling, stop tokens, chat template and config into work/recon.json")
     sub.add_argument("--force", action="store_true", help="Gather again over an existing work/recon.json")
     sub.add_argument("--drafter", type=Path, action="append", metavar="PATH", help="A companion drafter to record "
-                     "(EAGLE-3, DFlash, DSpark or crit models drafter output); repeatable")
+                     "(EAGLE-3, DFlash or DSpark); repeatable")
     sub.add_argument("--data", type=Path, metavar="DATA", help="crit Eval's prepared data for the run's model with "
                      "its reference scores (crit eval reference): record smoke's reference from them, which crit "
                      "smoke's quality limits are relative to (on an existing recon.json, only that)")

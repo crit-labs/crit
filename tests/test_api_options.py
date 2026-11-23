@@ -118,7 +118,7 @@ class SamplingValidationTests(unittest.TestCase):
             reply(response, request)
 
 
-class RequestOptionsTests(test_api.ApiTests):
+class RequestOptionsTests(test_api.ApiCases, unittest.TestCase):
     request_options = True
 
     def test_sampling_reaches_adapter_and_does_not_leak_to_next_turn_or_switch(self):
@@ -230,7 +230,7 @@ class RequestOptionsTests(test_api.ApiTests):
             self.assertEqual(response.status, 400, data)
 
 
-class LegacyOptionsTests(test_api.ApiTests):
+class LegacyOptionsTests(test_api.ApiCases, unittest.TestCase):
     """An engine crit serve offers no sampling fields for (as for a package sealed before Core served them all)."""
     temperature = False
 

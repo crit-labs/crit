@@ -792,7 +792,8 @@ CUDA_BLOCK = 32           # positions a step of its online softmax over 8-bit pa
 CUDA_RAMP_SPLITS = 16     # splits a band of a ramp (cuda_ramp)
 CUDA_WIDTHS = (64, 128, 256)
 CUDA_FLAGS = {"counts": 1, "offsets": 2, "tree": 4, "lse": 8, "fresh": 16, "one_row": 32, "pos_t": 64, "first_t": 128,
-              "dev_chunk": 256, "one_split": 512, "par64": 1024, "sinks": 2048, "state_out": 4096, "state_in": 8192}
+              "dev_chunk": 256, "one_split": 512, "par64": 1024, "sinks": 2048, "state_out": 4096, "state_in": 8192,
+              "bias": 16384}
 FUSED_GROUP = 16                  # splits a fused tile's program folds at once at most (scheduling only, never a bit)
 FUSED_WORKSPACE = 64 << 20        # bytes a fused launch's ring of states may take before its groups shrink
 FUSED_PARTIALS = 128 << 20        # workspace bytes (workspace_floats) a fused launch may take as a window launch
@@ -807,12 +808,13 @@ class _Params(ctypes.Structure):
     """cuda_window.cu's Params, field for field."""
     _fields_ = ([(n, ctypes.c_void_p) for n in ("q", "kp", "vp", "ks", "vs", "tables", "rows", "starts", "counts",
                                                 "firsts", "parents", "offsets", "po", "pm", "pl", "out", "lse", "fk",
-                                                "fv", "fshift", "ffirst", "run", "sync", "sinks", "state")]
+                                                "fv", "fshift", "ffirst", "run", "sync", "sinks", "state", "bias")]
                 + [(n, ctypes.c_longlong) for n in ("stride_qt", "stride_qh", "stride_ot", "stride_oh", "stride_fk",
                                                     "stride_fv", "first0", "ffirst0")]
                 + [(n, ctypes.c_int) for n in ("stride_fr", "tab_stride", "tab_width", "hq", "hkv", "g", "page",
                                                "n_parts", "chunk", "cols", "flags", "page_shift", "block", "group",
-                                               "tiles", "merge", "ring", "ramp", "ramp_k", "window", "state_part")]
+                                               "tiles", "merge", "ring", "ramp", "ramp_k", "window", "state_part",
+                                               "extent")]
                 + [(n, ctypes.c_float) for n in ("qk_scale", "k_mult", "v_mult", "pad2")])
 
 
@@ -820,13 +822,14 @@ _cuda_libs = {}
 _fused_workspaces = {}
 
 
-def _cuda_lib(device, **variant):
+def _cuda_lib(device, B=0, **variant):
     """The CUDA flash tile's library for a variant (query dtype T, page kind, head widths, the caller's warps W, stages
-    S and value split VS or 0), compiled by the build for this GPU on first use."""
-    key = (str(device), tuple(sorted(variant.items())))
+    S and value split VS or 0, B 1 for launches that add a distance bias), compiled by the build for this GPU on first
+    use."""
+    key = (str(device), tuple(sorted(dict(variant, B=B).items())))
     lib = _cuda_libs.get(key)
     if lib is None:
-        lib = _crit_cuda.library(device, **variant)
+        lib = _crit_cuda.library(device, B=B, **variant)
         lib.crit_cw_plan.argtypes = [ctypes.c_int, ctypes.c_longlong, ctypes.c_longlong, ctypes.c_longlong,
                                      ctypes.c_int, ctypes.c_int, ctypes.c_longlong, ctypes.POINTER(ctypes.c_int)]
         lib.crit_cw_plan.restype = ctypes.c_int
@@ -1226,7 +1229,7 @@ def _attend_cuda(q, key_pages, value_pages, kind, k_kind, tables, rows, starts, 
 
 
 def _prefill_cuda(q, kp, vp, kind, k_kind, table, position, page, ks, vs, multipliers, scale, out, lse, fresh, first,
-                  sinks=None, sliding=0, splits=None, workspace=None):
+                  sinks=None, sliding=0, splits=None, workspace=None, bias=None):
     """prefill(..., flash="cuda"): the chunk as one row of T columns through the CUDA flash tile, its positions split on
     the device over SPLITS programs a tile (merged), or with one split read in one range and written directly."""
     T, hq, d = q.shape
@@ -1242,7 +1245,8 @@ def _prefill_cuda(q, kp, vp, kind, k_kind, table, position, page, ks, vs, multip
     _cuda_rows_ok(q, out)
     tuned = _knobs("cuda-prefill", {"D": d, "HQ": hq, "HKV": hkv, "PAGE": int(page), "KIND": k_kind, "INT8": 0}, T)
     sms = _capability(device)[1]
-    lib = _cuda_lib(device, T=t_kind, KIND=k_kind, D=d, DV=d, W=0, S=0, VS=0)
+    biased = int(bias is not None)
+    lib = _cuda_lib(device, T=t_kind, KIND=k_kind, D=d, DV=d, W=0, S=0, VS=0, B=biased)
     entry, warps, _, block, _ = _cuda_plan(lib, _CUDA_PREFILL, hq, hkv, page, T, fresh=fresh is not None)
     tiles = -(-T * g // (16 * warps))
     splits = int(splits if splits is not None else tuned["SPLITS"])
@@ -1265,6 +1269,9 @@ def _prefill_cuda(q, kp, vp, kind, k_kind, table, position, page, ks, vs, multip
         flags |= CUDA_FLAGS["sinks"]
         P.sinks = sinks.data_ptr()
     P.window = sliding
+    if bias is not None:
+        flags |= CUDA_FLAGS["bias"]
+        P.bias, P.extent = bias.data_ptr(), int(bias.shape[2])
     if fresh is not None:
         fk, fv = fresh[:2]
         if fk.dtype != q.dtype or fv.dtype != q.dtype or not _aligned16(fk, fv) or fk.stride(0) % 8 or \
@@ -1289,7 +1296,7 @@ def _prefill_cuda(q, kp, vp, kind, k_kind, table, position, page, ks, vs, multip
         # takes the one range's arithmetic (a code converted exactly to 16 bits times its scale; a fresh row times
         # the softmax scale alone), in its order: the same bits.
         plain = _cuda_converts(lib, _CUDA_PREFILL, hq, hkv, page, T, fresh=False)
-        lib16 = _cuda_lib(device, T=t_kind, KIND=0, D=d, DV=d, W=0, S=0, VS=0)
+        lib16 = _cuda_lib(device, T=t_kind, KIND=0, D=d, DV=d, W=0, S=0, VS=0, B=biased)
         rows16 = _cuda_converts(lib16, _CUDA_PREFILL, hq, hkv, page, T, fresh=True)
         if plain is not None and plain[2] and plain[:2] == (warps, block) and rows16 is not None and \
                 rows16[:2] == (warps, block):
@@ -1320,7 +1327,7 @@ def _prefill_cuda(q, kp, vp, kind, k_kind, table, position, page, ks, vs, multip
 
 def prefill(q, key_pages, value_pages, kind, table, position, page, *, key_scales=None, value_scales=None,
             multipliers=(1.0, 1.0), scale=None, out=None, lse=None, int8_qk=False, fresh=None, flash=False,
-            sinks=None, sliding=0, splits=None, workspace=None, derive=None):
+            sinks=None, sliding=0, splits=None, workspace=None, derive=None, bias=None):
     """A prompt chunk of one sequence: q [T][heads][dim] at positions position.. (their keys and values written),
     table [pages] int32 -> out [T][heads][dim] in q's dtype (and lse [T][heads] FP32 when given), causal. position: an
     int, or a one-element int64 device tensor read on the device (one launch for every position: a captured graph of
@@ -1344,7 +1351,17 @@ def prefill(q, key_pages, value_pages, kind, table, position, page, *, key_scale
     own buffer.
 
     derive: a Derive (or its tuple), as attend() takes it: the keys derived from the value pages (and from the fresh
-    values: fresh (None, values) or (None, values, first)); key_pages and key_scales None; not with int8_qk or flash."""
+    values: fresh (None, values) or (None, values, first)); key_pages and key_scales None; not with int8_qk or flash.
+
+    bias (flash "cuda"): FP32 [T][heads][extent], contiguous: each token's scores for the positions 0 .. extent - 1
+    behind its own (a distance bias, as attend() takes it), added after the scale."""
+    if bias is not None:
+        if flash != "cuda" or int8_qk or derive is not None:
+            raise ValueError("a prompt chunk's distance bias reads the CUDA flash tile (flash \"cuda\"), without "
+                             "int8_qk or derived keys")
+        if bias.dtype != torch.float32 or bias.dim() != 3 or tuple(bias.shape[:2]) != tuple(q.shape[:2]) or \
+                not bias.is_contiguous() or bias.device != q.device or not bias.shape[2]:
+            raise ValueError(f"bias is contiguous FP32 [{q.shape[0]}][{q.shape[1]}][extent] on q's device")
     if derive is not None:
         _refuse_flash_derive(derive, flash)
         if int8_qk:
@@ -1384,7 +1401,7 @@ def prefill(q, key_pages, value_pages, kind, table, position, page, *, key_scale
         fk = fv = q
     if flash == "cuda" and not int8_qk:
         return _prefill_cuda(q, kp, vp, kind, k_kind, table, position, page, ks, vs, multipliers, scale, out, lse,
-                             fresh, first, sinks, sliding, splits, workspace)
+                             fresh, first, sinks, sliding, splits, workspace, bias)
     if flash:
         return _prefill_flash(q, kp, vp, kind, k_kind, table, position, page, ks, vs, multipliers, scale, out, lse,
                               int8_qk, fresh, first, sinks, sliding)
@@ -1449,7 +1466,8 @@ def prefill_rows(q, key_pages, value_pages, kind, tables, starts, counts, positi
     if value_pages.shape[-1] != d:
         raise ValueError("prompt chunks read keys and values of one width")
     starts, counts, positions = [int(s) for s in starts], [int(c) for c in counts], [int(p) for p in positions]
-    if not (len(starts) == len(counts) == len(positions) == tables.shape[0]) or tables.dim() != 2 or             tables.dtype != torch.int32 or tables.stride(1) != 1:
+    if not (len(starts) == len(counts) == len(positions) == tables.shape[0]) or tables.dim() != 2 or \
+            tables.dtype != torch.int32 or tables.stride(1) != 1:
         raise ValueError("tables are int32 [rows][width], one row a chunk, as many as starts, counts and positions")
     if any(s < 0 or n < 1 or s + n > T for s, n in zip(starts, counts)):
         raise ValueError("each row's tokens lie in q")
@@ -1460,7 +1478,8 @@ def prefill_rows(q, key_pages, value_pages, kind, tables, starts, counts, positi
     vs = value_scales if value_scales is not None else ks
     if fresh is not None:
         fk, fv = fresh[:2]
-        if fk.shape != (T, hkv, d) or fv.shape != (T, hkv, d) or fk.stride(-1) != 1 or fv.stride(-1) != 1 or                 fk.stride(1) != d or fv.stride(1) != d:
+        if fk.shape != (T, hkv, d) or fv.shape != (T, hkv, d) or fk.stride(-1) != 1 or fv.stride(-1) != 1 or \
+                fk.stride(1) != d or fv.stride(1) != d:
             raise ValueError(f"fresh keys and values are [{T}][{hkv}][{d}], each head row contiguous")
     else:
         fk = fv = q

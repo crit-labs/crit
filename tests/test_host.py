@@ -9,7 +9,7 @@ import time
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core" / "python"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "inference" / "core" / "python"))
 
 from crit_plugins import native  # noqa: E402
 from crit_plugins.host import Host, current, memory_bytes  # noqa: E402

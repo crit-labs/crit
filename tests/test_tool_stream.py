@@ -160,7 +160,7 @@ def create_engine(context):
 '''
 
 
-class AdvancedToolTests(test_api.ApiTests):
+class AdvancedToolTests(test_api.ApiCases, unittest.TestCase):
     request_options = strict_tools = tool_stream = True
     adapter_suffix = ADAPTER
 

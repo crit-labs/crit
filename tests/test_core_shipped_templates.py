@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "tests"): sys.path.insert(0, str(ROOT / _folder))
+for _folder in ("inference/core/python", "tests"): sys.path.insert(0, str(ROOT / _folder))
 
 import core_text_fixtures as fx  # noqa: E402
 from crit_core import registry  # noqa: E402

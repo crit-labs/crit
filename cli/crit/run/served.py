@@ -197,7 +197,8 @@ def serve(store, run_id, candidate_id, host="127.0.0.1", port=8000, seconds=None
     and at a quarter of it, in a minute or two each. With `data` too (crit-eval's prepared data for the run's model), the report adds crit-eval's gate pre-check
     (crit_eval.run.precheck): honesty of short replies and of one long reply, the request history around them, the
     device memory after the load and the speed cases at the lower context, the gates whole Eval rounds most often
-    fail on, in minutes.
+    fail on, in minutes: hints, as crit-eval states them (reported, marked, never failing the check; the Eval's
+    gates judge them), unless the pre-check cannot run.
     An external candidate (crit.run.external) is started from its launch command instead, in its own process tree,
     and has no plugin tests; every other check is the same.
     Settles the attempt and returns its result; crit serve serves the candidate once it is sealed."""
@@ -388,10 +389,10 @@ def _precheck(served, run, root, data, port, log):
     headroom = run["spec"]["hardware_constraints"]["vram_headroom_bytes"]   # every run records it (records.request_spec)
     latest = max(p.stem for p in (root / "segments").glob("segment-*.json"))
     budget = quality_terms(run["spec"]["correctness"], amendments(root, latest))[0]
-    try:
-        return run_precheck(Reopening(served, load_json(data / PREPARED), port), run["spec"]["model_path"], data,
-                            served.kv_tokens, quality_mode(run["spec"]["correctness"]), log=log,
-                            vram_headroom_bytes=headroom, quality_budget=budget)
+    try:   # its verdicts are hints (crit_eval.run.precheck), never a gate: reported, the status left alone
+        return [{**item, "hint": True} for item in run_precheck(
+            Reopening(served, load_json(data / PREPARED), port), run["spec"]["model_path"], data, served.kv_tokens,
+            quality_mode(run["spec"]["correctness"]), log=log, vram_headroom_bytes=headroom, quality_budget=budget)]
     except Exception as error:   # a pre-check that cannot run is a failed check, the report says why
         return [{"name": "precheck", "state": "failed", "detail": f"{type(error).__name__}: {error}"[:2000]}]
 

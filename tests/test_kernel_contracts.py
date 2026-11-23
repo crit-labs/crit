@@ -5,7 +5,7 @@ import sys
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "cli", "kernels"):   # crit_kernels reads crit's records
+for _folder in ("inference/core/python", "cli", "kernels"):   # crit_kernels reads crit's records
     sys.path.insert(0, str(ROOT / _folder))
 from crit_kernels import contracts  # noqa: E402
 

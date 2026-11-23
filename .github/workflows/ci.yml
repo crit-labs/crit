@@ -16,23 +16,57 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  times:
+    # The unit times main's last run recorded (the durations job keeps them in a cache), handed to every shard as one
+    # artifact: the shards split the units by the same times, so each unit runs in exactly one of them, and a unit
+    # added or grown since tests/durations.json was committed counts at its own time. One unit that file did not hold
+    # (it took 7 to 12 minutes, counted as 20 s) had one shard of each platform run two to three times as long as the
+    # others. Without a cache the file is empty and the shards fill by tests/durations.json alone.
+    name: Unit times
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        continue-on-error: true
+        with:
+          path: test-durations.json
+          key: test-durations-${{ github.run_id }}
+          restore-keys: test-durations-
+      - run: test -s test-durations.json || echo '{}' > test-durations.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unit-times
+          path: test-durations.json
+
   host:
     # The host tests in shards, each its own runner: a shard's units are filled by their recorded times
     # (tests/durations.json), so the shards of a platform end together. Windows runs them about twice as slow.
     name: ${{ matrix.os }} / Python ${{ matrix.python }} / shard ${{ matrix.shard }}
+    needs: times
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, windows-2022]
-        python: ['3.11', '3.14']
+        # A pull request runs the oldest supported Python on Linux only (the include below): its four Windows shards
+        # were a third of a run's runner time. A push to main runs it on both, so a break of Python 3.11 on Windows
+        # alone shows there, after the merge.
+        python: ${{ fromJSON(github.event_name == 'pull_request' && '["3.14"]' || '["3.11", "3.14"]') }}
         shard: [1, 2, 3, 4]
         exclude:
           - os: ubuntu-24.04
             shard: 3
           - os: ubuntu-24.04
             shard: 4
+        include:
+          # On a push these are combinations the matrix already holds; on a pull request they add Linux's two.
+          - os: ubuntu-24.04
+            python: '3.11'
+            shard: 1
+          - os: ubuntu-24.04
+            python: '3.11'
+            shard: 2
     defaults:
       run:
         shell: bash
@@ -50,23 +84,27 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        # Core's step runtime is C++ alone: one build serves every Python and shard until core/ changes.
+        # Core's step runtime is C++ alone: one build serves every Python and shard until inference/core/ changes.
         id: core-steps
         with:
           path: build/core-steps
-          key: core-steps-${{ runner.os }}-${{ hashFiles('core/**') }}
+          key: core-steps-${{ runner.os }}-${{ hashFiles('inference/core/**') }}
       - name: Build Core's step runtime
         # Core's loader runs every engine on crit_core_steps: the host tests load the toy engine's plugin package on it.
         run: |
           if [ "${{ steps.core-steps.outputs.cache-hit }}" != true ]; then
-            cmake -S core -B build/core-steps -DCMAKE_BUILD_TYPE=Release
+            cmake -S inference/core -B build/core-steps -DCMAKE_BUILD_TYPE=Release
             cmake --build build/core-steps --config Release --target crit_core_steps --parallel 4
           fi
           library=$(find build/core-steps \( -name 'libcrit_core_steps.so' -o -name 'crit_core_steps.dll' \) | head -n 1)
           echo "CRIT_CORE_STEP_LIBRARY=$(python -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve())' "$library")" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: unit-times
+          path: ${{ runner.temp }}/unit-times
       - name: Host contracts and chat processes
         # One process per test module or recorded class, four at a time: most tests wait on served engines' processes.
-        run: python -B tests/run_parallel.py --jobs 4 --shard ${{ matrix.shard }}/$SHARDS --record "$RUNNER_TEMP/durations.json"
+        run: python -B tests/run_parallel.py --jobs 4 --shard ${{ matrix.shard }}/$SHARDS --times "$RUNNER_TEMP/unit-times/test-durations.json" --record "$RUNNER_TEMP/durations.json"
       - name: Keep the units' times
         # main's runs record what each unit took, failed or not; the durations job folds them into tests/durations.json.
         if: github.event_name == 'push' && !cancelled()
@@ -82,7 +120,8 @@ jobs:
           mkdir -p build/package-source
           git archive HEAD | tar -x -C build/package-source
           python -B -c "import os; from setuptools.build_meta import build_sdist, build_wheel; os.chdir('build/package-source'); build_sdist('../dist'); build_wheel('../dist')"
-          (cd build/package-source/core/python && python -B -c "from setuptools.build_meta import build_wheel; build_wheel('../../../dist')")
+          (cd build/package-source/inference/core/python && python -B -c "from setuptools.build_meta import build_wheel; build_wheel('../../../../dist')")
+          (cd build/package-source/models/core/python && python -B -c "from setuptools.build_meta import build_wheel; build_wheel('../../../../dist')")
           python -m pip install --no-deps build/dist/*.whl
           cd build/ci-temp
           crit --version
@@ -114,6 +153,12 @@ jobs:
         with:
           name: test-durations
           path: tests/durations.json
+      - run: cp tests/durations.json test-durations.json
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        # What the times job of later runs restores (pull requests read main's caches).
+        with:
+          path: test-durations.json
+          key: test-durations-${{ github.run_id }}
 
   lint:
     name: Lint
@@ -130,6 +175,12 @@ jobs:
         run: |
           python -m pip install ruff==0.16.9
           ruff check .
+      - name: Shared code names no model (docs/CONTRIBUTION_CRITERIA.md, model-neutral code)
+        # Model names, model types and one checkpoint's tensor spellings stay in models/cache and test fixtures, and
+        # each shared model technique is composed and engine-tested by two layouts.
+        run: python -B tests/test_model_neutral.py
+      - name: Each model technique's entry declares what its code reads (tests/test_technique_reads.py)
+        run: python -B tests/test_technique_reads.py
 
   install:
     # The install AGENTS.md and Contributing give, in a fresh environment: the checkout's Core with its CLI, Core's
@@ -159,7 +210,7 @@ jobs:
           python -m venv "$RUNNER_TEMP/venv"
           if [ -x "$RUNNER_TEMP/venv/Scripts/python.exe" ]; then bin="$RUNNER_TEMP/venv/Scripts"; else bin="$RUNNER_TEMP/venv/bin"; fi
           echo "$bin" >> "$GITHUB_PATH"
-          "$bin/python" -m pip install -e core/python -e .
+          "$bin/python" -m pip install -e inference/core/python -e models/core/python -e .
       - name: crit core build, then the library on the checkout's Core
         run: |
           crit --version
@@ -202,7 +253,7 @@ jobs:
           python-version: '3.14'
       - name: Build native host SDK
         run: |
-          cmake -S core -B build/core -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release \
+          cmake -S inference/core -B build/core -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release \
             ${{ matrix.compiler == 'clang' && '-DCMAKE_CXX_COMPILER=clang++' || '' }}
           cmake --build build/core --config Release --parallel 4
           ctest --test-dir build/core -C Release --output-on-failure

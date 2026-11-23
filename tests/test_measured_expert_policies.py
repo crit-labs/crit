@@ -12,7 +12,7 @@ d = load("heterogeneous-expert-dispatch", "measured_dispatch.py")
 r = load("heterogeneous-expert-dispatch")
 c = load("device-expert-cache", "replay.py")
 native_reference = load("device-expert-cache", "device_cache.py")
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core" / "python"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "inference" / "core" / "python"))
 from crit_plugins.host import memory as m  # noqa: E402 - Core's host memory admission
 
 

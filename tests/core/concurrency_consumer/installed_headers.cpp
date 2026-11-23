@@ -2,7 +2,7 @@
 // component, so a header missing from install(FILES ...), an installed header that includes one that is not
 // installed, or a strict warning inside an installed header fails this build. CMakeLists.txt checks that the
 // includes below name every installed crit/*.h and crit/core/*.h header and that those are exactly the checkout's
-// core/include/crit headers (the cuda*.h headers are covered by the CUDA SDK consumer).
+// inference/core/include/crit headers (the cuda*.h headers are covered by the CUDA SDK consumer).
 #include <crit/constraints.h>
 #include <crit/core.h>
 #include <crit/core/scheduling.h>

@@ -11,8 +11,9 @@ import unittest
 
 from test_techniques import load
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core" / "python"))
-from crit_core.model.config import parse_model_config  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "inference" / "core" / "python"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "models" / "core" / "python"))
+from crit_models.config import architecture  # noqa: E402
 
 r = load("heterogeneous-expert-dispatch", "routing.py")
 HAS_TRANSFORMERS = all(importlib.util.find_spec(name) for name in ("torch", "transformers"))
@@ -206,7 +207,7 @@ class ConfigRoutingTests(unittest.TestCase):
     base = {"hidden_size": 64, "num_hidden_layers": 2, "num_attention_heads": 4, "vocab_size": 32}
 
     def moe(self, **fields):
-        return parse_model_config({**self.base, **fields}).moe
+        return architecture({**self.base, **fields}).moe
 
     def test_deepseek_v3_config(self):
         moe = self.moe(n_routed_experts=256, num_experts_per_tok=8, n_group=8, topk_group=4, topk_method="noaux_tc",

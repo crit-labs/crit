@@ -1,0 +1,86 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "experts-reference",
+  "title": "The FP64 routed SwiGLU block (expert-streamed-prefill)",
+  "description": "expert-streamed-prefill's moe_block: each token's routes in order, SwiGLU between each expert's gate/up and down matrices, the outputs summed with the routing weights. Slow and exact: the reference every experts plugin is compared with, on the weights of the expert_source slot. Its device form runs the same block in torch over the experts' matrices loaded on the device, its products in FP64, each token's routes summed in route order; capture-safe at a fixed token count (rounds:experts) and inside a captured prompt chunk, whose padding's routes (ids -1) add nothing (prompts:experts).",
+  "fills": [
+    "experts"
+  ],
+  "devices": [
+    "cuda",
+    "cpu"
+  ],
+  "needs": [
+    "experts:source"
+  ],
+  "provides": [
+    "rounds:experts",
+    "prompts:experts",
+    "experts:activations"
+  ],
+  "test_with": [
+    "expert-tensors"
+  ],
+  "sources": {
+    "prefill": "../expert-streamed-prefill/code"
+  },
+  "entry": "plugin.py:create",
+  "defines": {
+    "slots": {
+      "experts": {
+        "about": "routed experts: their execution and dispatch",
+        "host": {
+          "run": "run(layer, x, ids, weights) -> rows: a routed SwiGLU block's output per token row of x, each token's routes ids[t] with weights[t] (id -1 skipped), weights from the expert_source slot"
+        },
+        "device": {
+          "load": "load(layer, expert, gate_up, down, format='bf16'): an expert's [2 * inter][hidden] gate/up and [hidden][inter] down matrices on the device, each a bfloat16 tensor (format bf16) or, as projections' load takes them, its stored tensors {weight, scale, global_scale, input_scale} in `format` (fp8:channel, fp8:block, nvfp4, int4, mxfp4); a plugin refuses a format it does not compute",
+          "forward": "forward(layer, x, ids, weights) -> out: the routed SwiGLU block of each token row of x ([tokens][hidden]) over its routes (ids and weights [tokens][top] as the router's, id -1 skipped) and the layer's loaded experts, out [tokens][hidden] FP32; a token's result independent of the rows beside it (a store of bundles goes through experts:bundles' forward_bundles)"
+        },
+        "cases": "cases.py:experts"
+      }
+    },
+    "facts": {
+      "rounds:experts": {
+        "methods": {}
+      },
+      "prompts:experts": {
+        "methods": {}
+      },
+      "experts:bundles": {
+        "methods": {
+          "layout": "layout(format, hidden, inter) -> {bundle_bytes, format, hidden, inter, components: {name: (offset, dtype, shape)}}: one expert's gate/up and down matrices in `format` as one contiguous block, components 16-byte aligned, matrices row major as stored (the plugin documents each component)",
+          "pack": "pack(gate_up, down, format, layer=None) -> uint8 tensor [bundle_bytes]: an expert's bundle (load()'s arguments), refused as load() refuses it; with layer, the bundle declares that layer's activations as a load does, and the stores forward_bundles reads for the layer must match",
+          "forward_bundles": "forward_bundles(layer, x, ids, weights, store, slots, format) -> out: forward() over bundles: store a uint8 device tensor [S][bundle_bytes] of `format` bundles, slots an int32 device tensor [experts] naming each expert's slot (>= 0; -2 another tier's, skipped; -1 not routed) or None (expert e in slot e); capture-safe on a fixed token count"
+        },
+        "about": "Experts as bundles in a slot store (a device expert cache's slots, a host or file store). The plugin's layout() is the one definition of a bundle: store builders and the CPU expert tier call it, none keeps a copy."
+      },
+      "experts:routes": {
+        "methods": {
+          "route_outputs": "route_outputs(layer, x, ids, store, slots, format) -> y: each route's unweighted output row ([tokens * top][hidden] FP32, route t * top + j), the rows of routes with id -1 or a negative slot left as they were; a workspace, valid until the next call of the shape",
+          "combine": "combine(y, ids, weights, slots=None) -> out: [tokens][hidden] FP32, each token's sum = fmaf(weight, row, sum) over its routes in route order with id >= 0 (and a slot >= 0 when slots are given); forward_bundles is combine(route_outputs(...), ids, weights, slots)"
+        },
+        "about": "A layer's routes as rows, so another tier's rows join a token's sum in route order (a CPU tier's routes get the same bits as the device's whatever the split)."
+      },
+      "experts:offload": {
+        "methods": {
+          "begin": "begin(layers, experts, format, hidden, inter, device_bytes=0, identity=None, device='cuda', formats=None) -> tier: the routed experts' geometry before the first load() (every layer whose experts load, a draft layer's included), the device bytes the model still allocates after the loads (KV, state, prompt pools); format gguf (a plugin that provides experts:gguf) takes each layer's formats, {layer: (gate_up type, down type)}; returns device, ram or disk",
+          "open": "open(lend=None): after the model's pools, the cache in the free memory past its reserve (or in a KV pool's spare bytes and idle pages) and the CPU tier; forward() opens it at its first call otherwise (outside capture)",
+          "end_step": "end_step(prompts_open=False): a step that ran prompt chunks ended. Core calls it (STEP_FRAMES); a model served outside Core calls it itself (the next decode plan ends the step too). While a prompt goes on (prompts_open) what it staged for the layer under way stays staged",
+          "stages_prompts": "stages_prompts() -> bool, after open(): a prompt chunk brings its layers' experts to the device (experts kept off it), and a layer staged for one chunk serves the chunks that read it next. A model plugin then runs a prompt's spans layer by layer, every chunk through one layer before the next layer, so a layer's experts are staged once a span",
+          "routes": "routes() -> [(layer, [experts])]: the recorded decode routes (record_routes option), the trace crit plugins offload --trace replays"
+        },
+        "about": "Routed experts of any size against the device in the experts slot (expert-offload): the plugin decides where they live and who computes each miss; the model calls it as for experts that fit, with begin() before the loads and open() after its own pools."
+      },
+      "experts:mxfp8": {
+        "methods": {},
+        "about": "MXFP8 experts (E4M3 codes, an E8M0 exponent a 32) taken as stored: load(..., \"mxfp8\") with {weight, scale}."
+      },
+      "experts:activations": {
+        "methods": {
+          "activate": "activate(name, caps=None): the gate of the blocks' product, act(gate) * up, for every layer the plugin computes: silu (SwiGLU, the default), gelu_tanh (GELU in its tanh form) or softcapped_silu with caps (gate, up): cap_g * tanh(gate / cap_g) * sigmoid(gate) times cap_u * tanh(up / cap_u); before the first forward (an offload plugin: before open()); a plugin refuses a name it does not compute. A model plugin calls it where the checkpoint's activation is not SiLU"
+        },
+        "about": "Routed blocks gated otherwise than by SiLU, in the experts slot."
+      }
+    }
+  }
+}

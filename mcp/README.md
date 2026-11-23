@@ -50,7 +50,7 @@ writes, so it runs `crit plugins list|add|test` and `crit smoke --url` in its ow
 | `crit_eval_*` | crit Eval: probe, prepare, reference, run, status, kernels, workbench, compare, ab, ... |
 | `crit_pull`, `crit_serve` | Install a crit-hub engine; serve sealed candidates or an installed engine |
 | `crit_kernels_*` | List, build and sweep crit's kernel templates on this device; scaffold a workbench for a kernel the engine writes |
-| `crit_models_*` | Plan, quantize and verify a weight transform, bind its Eval; distill a drafter (only on the user's word: a run never trains one) |
+| `crit_models_*` | List the model techniques and finished model plugins, inspect a checkpoint, make a tiny random checkpoint, diff a model plugin against its reference, keep a built model plugin |
 | `crit_inference_*` | List, search, show and check the Inference techniques |
 | `crit_serve_status` | A running `crit serve`'s `/health` and `/v1/models`; its `api_key` goes only to this machine or a private network address |
 | `crit_job_wait`, `crit_job_output`, `crit_job_stop`, `crit_jobs` | Follow the commands' jobs |

@@ -89,12 +89,13 @@ check --candidate ID --record check.json
 ```
 
 The library's plugins are meant to give a fast engine from candidate 1 with no model code at all for a checkpoint
-[model-template](../inference/model-template/README.md)'s layouts cover, and a model plugin composed from its blocks for
+a finished model plugin serves ([models/cache](../models/cache/README.md)), and a model plugin composed from the
+[model techniques](../models/techniques/README.md) on the [models core](../models/core/model-template/README.md) for
 another ([the model plugin](PLUGINS.md#the-model-plugin)): decode rounds captured through Core's round driver,
 short prompt chunks through Core's prompt graphs, the drafter over the model's device draft head, and the KV pool,
 attention, projections, recurrence and experts plugins each in its stored format with crit's kernel (built for the
 GPU, tuned by `crit kernels sweep`) or its torch fallback. A mixture of experts larger than the device needs no engine
-code for its experts: [expert-offload](../inference/expert-offload/README.md) in the experts slot takes the same calls as
+code for its experts: [expert-offload](../inference/techniques/experts/expert-offload/README.md) in the experts slot takes the same calls as
 experts that fit (begin(), load(), open() after the model's pools, forward()) and decides by itself where the experts
 live (device, host memory, a file), keeps those routed last in a device expert cache that takes every byte the device
 has free past the run's VRAM headroom while the engine serves (the device keeps the headroom and a prompt step's
@@ -147,17 +148,17 @@ comes after `check --from-eval`: a benchmark qualifies only on the checks record
 ### Serve concurrent requests
 
 Every engine serves several requests at once; one request at a time is a batch of one. With
-[mixed batches](../core/src/runtime/README.md#mixed-token-work-batches) (`max_batch_tokens`) one step runs every
+[mixed batches](../inference/core/src/runtime/README.md#mixed-token-work-batches) (`max_batch_tokens`) one step runs every
 scheduled request's decode rows and prompt chunks and reads each weight once. Core supplies what every batched engine
 needs:
 
 | Need | Core |
 | --- | --- |
-| A step's row layout and logits rows; a scheduled row's rows | [Batched steps](../core/python/crit_core/batch.md): `StepLayout`, `step_item` |
+| A step's row layout and logits rows; a scheduled row's rows | [Batched steps](../inference/core/python/crit_core/batch.md): `StepLayout`, `step_item` |
 | Admission that keeps every admitted request able to finish | `PageReservations` |
-| Batched rows that keep their serial bits | The [batch invariance rules](../core/python/crit_core/batch.md#batch-invariance) |
-| KV pages, copy-on-write forks, round slots | The [attention-state](../inference/attention-state/README.md#on-the-device) plugin's paged pool |
-| Serving | Core's loader runs the model plugin on its [step engine](../core/src/runtime/README.md#step-engines); crit serve serves it as `chat-concurrent-v1` |
+| Batched rows that keep their serial bits | The [batch invariance rules](../inference/core/python/crit_core/batch.md#batch-invariance) |
+| KV pages, copy-on-write forks, round slots | The [attention-state](../inference/techniques/attention/attention-state/README.md#on-the-device) plugin's paged pool |
+| Serving | Core's loader runs the model plugin on its [step engine](../inference/core/src/runtime/README.md#step-engines); crit serve serves it as `chat-concurrent-v1` |
 
 A request's tokens must not depend on the requests sharing its steps: every kernel on the step path follows the
 invariance rules. Measure concurrency as a workload of its own (a case with `workload.concurrency` N) and through

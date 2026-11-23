@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "core" / "python"))
+sys.path.insert(0, str(ROOT / "inference" / "core" / "python"))
 sys.path.insert(0, str(ROOT / "cli"))
 
 from crit_core import native  # noqa: E402
@@ -29,7 +29,7 @@ class CoreOfTheCheckoutTests(unittest.TestCase):
             result = self.run_crit(folder, "plugins", "list")
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn("runs on its own Core", result.stderr)
-            self.assertIn("pip install -e " + str((ROOT / "core" / "python").resolve()), result.stderr)
+            self.assertIn("pip install -e " + str((ROOT / "inference" / "core" / "python").resolve()), result.stderr)
             self.assertEqual(self.run_crit(folder, "--version").returncode, 0)
 
     def test_the_checkouts_own_core_runs(self):
@@ -60,8 +60,8 @@ class StepLibraryTests(unittest.TestCase):
         # A checkout two OSes share (Windows and WSL) holds both builds; each loader takes only the file it can open.
         with tempfile.TemporaryDirectory() as folder:
             checkout = Path(folder)
-            (checkout / "core" / "include" / "crit").mkdir(parents=True)
-            (checkout / "core" / "include" / "crit" / "core.h").write_text("")
+            (checkout / "inference" / "core" / "include" / "crit").mkdir(parents=True)
+            (checkout / "inference" / "core" / "include" / "crit" / "core.h").write_text("")
             names = ("libcrit_core_steps.so", "crit_core_steps.dll", "libcrit_core_steps.dylib")
             for platform in ("linux", "win32", "darwin"):
                 for sub in (f"build/core-steps/{platform}", f"build/core-steps/{platform}/Release"):
@@ -70,7 +70,7 @@ class StepLibraryTests(unittest.TestCase):
                         (checkout / sub / name).write_text("")
             environment = {k: v for k, v in os.environ.items() if k != native.STEP_LIBRARY}
             with patch.dict(os.environ, environment, clear=True), \
-                    patch.object(native, "__file__", str(checkout / "core" / "python" / "crit_core" / "native.py")):
+                    patch.object(native, "__file__", str(checkout / "inference" / "core" / "python" / "crit_core" / "native.py")):
                 found = Path(native.step_library())
         self.assertEqual(found.name, native.STEP_LIBRARY_FILE)
         self.assertEqual(found.parent, checkout / native.STEP_BUILD)
@@ -79,7 +79,7 @@ class StepLibraryTests(unittest.TestCase):
         environment = {k: v for k, v in os.environ.items() if k != native.STEP_LIBRARY}
         result = subprocess.run([sys.executable, "-B", "-c", "import sys; sys.path[:0] = [sys.argv[1], sys.argv[2]]; "
                                  "from crit.core import main; raise SystemExit(main(['where']))",
-                                 str(ROOT / "core" / "python"), str(ROOT / "cli")],
+                                 str(ROOT / "inference" / "core" / "python"), str(ROOT / "cli")],
                                 capture_output=True, text=True, timeout=60, env=environment)
         if result.returncode:
             self.assertIn("crit core build", result.stderr)

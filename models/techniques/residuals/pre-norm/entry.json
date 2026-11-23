@@ -1,0 +1,41 @@
+{
+  "schema": "crit-model-technique-v1",
+  "id": "pre-norm",
+  "category": "residuals",
+  "summary": "One residual stream: an RMSNorm before each block, its output added, a final norm",
+  "provides": {
+    "residuals": [
+      "pre-norm"
+    ]
+  },
+  "source": "pre_norm",
+  "needs_sources": [
+    "template"
+  ],
+  "path": "models/techniques/residuals/pre-norm/README.md",
+  "code_path": "models/techniques/residuals/pre-norm/code",
+  "code_files": [
+    {
+      "path": "models/techniques/residuals/pre-norm/code/pre_norm.py",
+      "purpose": "The residual class and its registry (RESIDUALS)"
+    }
+  ],
+  "reads": {
+    "tensors": [
+      "fc",
+      "fc.weight",
+      "input_layernorm.weight",
+      "layers.N.input_layernorm.weight",
+      "layers.N.post_attention_layernorm.weight",
+      "norm.weight",
+      "post_attention_layernorm.weight",
+      "pre_fc_norm_embedding.weight",
+      "pre_fc_norm_hidden.weight"
+    ],
+    "config": [],
+    "layout": [
+      "post_norm",
+      "pre_norm"
+    ]
+  }
+}

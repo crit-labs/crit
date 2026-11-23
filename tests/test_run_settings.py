@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "api", "../crit-eval", "kernels", "cli"): sys.path.insert(0, str(ROOT / _folder))
+for _folder in ("inference/core/python", "api", "../crit-eval", "kernels", "cli"): sys.path.insert(0, str(ROOT / _folder))
 from crit import cli
 from crit.cli import PROJECT_VARIABLE
 from crit.pull.bench import main as bench_main
@@ -24,7 +24,7 @@ class RunSettingsTest(unittest.TestCase):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.project = Path(temp.name).resolve()
-        marker = self.project / "core/include/crit/core.h"
+        marker = self.project / "inference/core/include/crit/core.h"
         marker.parent.mkdir(parents=True)
         marker.write_text("// project marker\n", encoding="utf-8")
         model = self.project / "model.fixture"
@@ -61,7 +61,8 @@ class RunSettingsTest(unittest.TestCase):
     def test_create_says_when_eval_cannot_score_the_model(self):
         for refusal, says in (("GGUF architecture 'x' has no layout rules", True), (None, False)):
             err, out = io.StringIO(), io.StringIO()
-            with patch("crit_eval.quality.checkpoints.scoring_refusal", return_value=refusal) as check,                     contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            with patch("crit_eval.quality.checkpoints.scoring_refusal", return_value=refusal) as check, \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                 code = main(["--project", str(self.project), "create", "--record", str(self.request)])
             self.assertEqual(code, 0)   # the run is created either way
             self.assertEqual(check.call_args.args, (str(self.project / "model.fixture"),))

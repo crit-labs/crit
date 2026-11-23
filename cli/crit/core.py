@@ -23,15 +23,15 @@ def library(folder):
 def source():
     """(Core's source folder, the build folder): this checkout's, else the installed release's in Core's cache,
     fetched with git at the release's tag when it is not there yet."""
-    if (ROOT / "core" / "CMakeLists.txt").is_file():
+    if (ROOT / "inference" / "core" / "CMakeLists.txt").is_file():
         from crit_core.native import STEP_BUILD
-        return ROOT / "core", ROOT / STEP_BUILD
+        return ROOT / "inference" / "core", ROOT / STEP_BUILD
     from crit_core.native import step_cache
     from . import __version__
     from .cli import REPOSITORY
     cache = step_cache()
     checkout = cache / "source"
-    if not (checkout / "core" / "CMakeLists.txt").is_file():
+    if not (checkout / "inference" / "core" / "CMakeLists.txt").is_file():
         git = shutil.which("git")
         if git is None:
             raise ValueError("crit core build fetches Core's source with git, which is not on PATH")
@@ -40,7 +40,7 @@ def source():
         if subprocess.run([git, "clone", "--quiet", "--depth", "1", "--branch", f"v{__version__}", "--",
                            REPOSITORY, str(checkout)]).returncode:
             raise ValueError(f"could not fetch {REPOSITORY} at v{__version__}")
-    return checkout / "core", cache / "build"
+    return checkout / "inference" / "core", cache / "build"
 
 
 def build(build_type="Release", jobs=None):
@@ -77,7 +77,7 @@ def main(argv=None):
     try:
         import crit_core  # noqa: F401
     except ImportError:
-        sys.path.insert(0, str(ROOT / "core" / "python"))
+        sys.path.insert(0, str(ROOT / "inference" / "core" / "python"))
     if args.command == "where":
         from crit_core.native import step_library
         found = step_library()

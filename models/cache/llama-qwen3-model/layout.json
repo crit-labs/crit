@@ -1,0 +1,16 @@
+{
+  "schema": "crit-model-layout-v1",
+  "gguf": {
+    "llama": {"transforms": {"permuted-rotary": {"self_attn.q_proj": "num_attention_heads",
+                                                 "self_attn.k_proj": ["num_key_value_heads", "num_attention_heads"]}}},
+    "qwen2": {}, "qwen3": {},
+    "qwen2moe": {"transforms": {"squeezed": {"mlp.shared_expert_gate.weight": {"axis": 0, "rank": 2}}}},
+    "qwen3moe": {}
+  },
+  "norm_offset": 0.0,
+  "mixers": {
+    "full_attention": {"block": "attention", "prefix": "self_attn."},
+    "sliding_attention": {"block": "attention", "prefix": "self_attn."}
+  },
+  "ffn": {"block": "auto", "prefix": "mlp."}
+}

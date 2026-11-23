@@ -23,14 +23,15 @@ dev = torch.device("cuda")
 BF16 = torch.bfloat16
 EPS = 1e-6
 
-# name: hidden, q heads, kv heads, head dim, rotary dim, norm offset, intermediate, value heads x dim of a gated norm
+# shape: hidden, q heads, kv heads, head dim, rotary dim, norm offset, intermediate, value heads x dim of a gated norm
+# (the README's measured models' shapes, named by what they hold)
 MODELS = {
-    "qwen3.8-27b": dict(hidden=5120, q=24, kv=4, dim=256, rotary=64, offset=1.0, inter=17408, gated=(48, 128),
-                        gate=True, qk_norm=True),
-    "nanbeige4.3-33b": dict(hidden=7168, q=56, kv=8, dim=128, rotary=128, offset=0.0, inter=22016, gated=None,
-                            gate=False, qk_norm=False),
-    "qwen3.8-flash-next": dict(hidden=2560, q=24, kv=2, dim=256, rotary=64, offset=1.0, inter=640, gated=(48, 128),
-                               gate=True, qk_norm=True, streams=4),
+    "dense-5120-gated": dict(hidden=5120, q=24, kv=4, dim=256, rotary=64, offset=1.0, inter=17408, gated=(48, 128),
+                             gate=True, qk_norm=True),
+    "dense-7168": dict(hidden=7168, q=56, kv=8, dim=128, rotary=128, offset=0.0, inter=22016, gated=None, gate=False,
+                       qk_norm=False),
+    "moe-2560-streams": dict(hidden=2560, q=24, kv=2, dim=256, rotary=64, offset=1.0, inter=640, gated=(48, 128),
+                             gate=True, qk_norm=True, streams=4),
 }
 
 

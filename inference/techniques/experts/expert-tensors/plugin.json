@@ -1,0 +1,73 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "expert-tensors",
+  "title": "Expert weights held as given, in memory",
+  "description": "The plain expert_source: each expert's gate/up and down matrices kept as added. Every experts plugin is compared on it, and an engine whose experts fit in memory needs nothing else. Its bundle store (experts:store): open_store(layout, layers, experts, device, path=None) -> device-expert-cache's BundleStore: every expert's bundle (the experts plugin's layout() and pack()) in host memory of its own that the device reads, built by put() and, with a file (`path`, or the store_path option), written there too; a complete file with the same layout is read into that memory without puts (direct reads at a queue depth), and the memory is registered: region() gives the host bytes and a device view a cache fills its slots from, address() a bundle's device address, read() copies bundles out. With kept= (the key of what the bundles hold) the store is kept for the next engine built for the model in the host (the context's keep(): crit serve's model pool, crit eval's process), which gets it back sealed and leaves its closing to the keeper.",
+  "fills": [
+    "expert_source"
+  ],
+  "devices": [
+    "host"
+  ],
+  "provides": [
+    "experts:source",
+    "experts:store"
+  ],
+  "options": {
+    "store_path": {
+      "type": "str",
+      "default": "",
+      "description": "the file of the bundle store (built once, reopened while its layout holds); empty: anonymous host memory"
+    },
+    "csf_scales": {
+      "type": "str",
+      "default": "",
+      "description": "scale components of the experts plugin's slot layout the store keeps CSF-compressed, with the exception words each bundle holds for each (\"gate_up_scale:256,down_scale:128\"; ModelOpt's encoding, about half the bytes of E4M3 scales): put() encodes them from the slot-layout bundle or takes the checkpoint's (compressed=), the device expert cache rebuilds the slot layout as it fills slots (no CPU tier over such a store); empty: the slot layout as it is"
+    }
+  },
+  "sources": {
+    "cache": "../device-expert-cache/code"
+  },
+  "entry": "plugin.py:create",
+  "defines": {
+    "slots": {
+      "expert_source": {
+        "about": "where a routed expert's weights come from when they are not resident: host memory, files",
+        "host": {
+          "add": "add(layer, expert, gate_up, down): an expert's [2 * inter][hidden] gate/up and [hidden][inter] down",
+          "matrices": "matrices(layer, expert) -> (gate_up, down)"
+        },
+        "policy": true
+      },
+      "expert_residency": {
+        "about": "which routed experts are resident on the device and how a miss is admitted",
+        "host": {
+          "plan": "plan(layer, experts) -> [resident]: for each of one group's distinct routed experts, whether its weights are on the device once the plan's admissions are made",
+          "resident": "resident(layer) -> set of resident experts"
+        },
+        "policy": true
+      }
+    },
+    "facts": {
+      "experts:cache": {
+        "methods": {
+          "cache": "cache(layers, experts, layout, slots, device, source, lend=None) -> ExpertCache: store (uint8 [S][bundle_bytes] slot memory), plan(layer, ids, rows=None, decided=None) -> slots ([experts] int32: admits the routed misses by its policy and fills them from the source, capture-safe), prompt(layer, ids) -> (store, slots) for prompt chunks (streamed, never admits) and end_prompt() after a prompt step, start_round(view) and count_round(view) for captured rounds (crit_plugins.rounds), telemetry() -> {slots, resident, lent, reads, hits, fills, fill_bytes} without waiting for the device"
+        },
+        "about": "A device expert cache in the expert_residency slot."
+      },
+      "experts:rows": {
+        "methods": {
+          "row_store": "row_store(groups, keys, row_bytes, device, rows, path=None, identity=None) -> a store of groups x keys rows of row_bytes bytes (any count) in the caller's own layout, from rows ([groups * keys][row_bytes] uint8, in key order: key = group * keys + key)",
+          "row_cache": "row_cache(groups, keys, row_bytes, slots, device, source, lend=None) -> the experts:cache ExpertCache over those rows (plan(group, ids), prompt(group, ids), the round hooks, telemetry as cache()'s), with rows() -> [S][row_bytes] uint8, the slots' rows without their padding"
+        },
+        "about": "The device expert cache over opaque byte rows of the caller's own layout, in the expert_residency slot."
+      },
+      "experts:store": {
+        "methods": {
+          "open_store": "open_store(layout, layers, experts, device, path=None, identity=None, kept=None) -> a store of the experts plugin's slot layout with layout, keys, bundle_bytes, mapped and compressed: put(layer, expert, bundle, compressed=None) of a slot-layout bundle, read(keys, into); a mapped store also region() -> (host tensor, device tensor over its device address) and address(layer, expert); a store file at path is bound to the checkpoint's identity. The plugin's csf_scales option keeps scale components CSF-compressed: store.layout is then the store's own (a fill program the expert cache runs to rebuild the slot layout), store.compressed names them, and put() encodes them from the bundle or takes the checkpoint's as compressed {component: (fixed, exceptions), or a list of such parts stacked by rows}. kept: the key of what the bundles hold beyond the arguments; the store is then kept for the next engine built for the model (LoadContext.keep), comes back sealed (store.sealed) and is closed by its keeper (store.kept), never by the engine"
+        },
+        "about": "Bundles in host memory or files, which a device expert cache fills its slots from."
+      }
+    }
+  }
+}

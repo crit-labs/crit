@@ -36,8 +36,19 @@ the parts through shared memory; prompt items run the parts one after another in
 The split spreads a decode pass's few row tiles over more warps (one token's grid is small): at one token on 2048 x 768
 a layer went from 37.2 to 33.9 us, the BF16 path's speed, and FP8 from 68.8 to 48.4 us, while FP4 prompts lost 12-16%
 to the second accumulator (Measured speed). Decode items (8 routes, operands from global memory,
-`fp4-decode`) and prompt items (32 or 64, codes and scales staged a chunk at a time, `fp4-prompt`) give a route the same
-bits, another arithmetic than `tensor`'s W4A4 (the tensor core's own sums of the same operands). A block holding a NaN
+`fp4-decode`), prompt items of 32 (codes and scales staged a chunk at a time, `fp4-prompt`) and of 64 (`fp4-tile`, below)
+give a route the same bits, another arithmetic than `tensor`'s W4A4 (the tensor core's own sums of the same operands).
+`fp4-tile` runs FP4 items of 64 routes a call asks it for (`Workspace(width=64, tile=True)`; without `tile` they run
+`fp4-prompt`'s 64-route form, and the grouped-experts plugin picks between `fp4-prompt` and `fp4-tile` from the
+engine's sweep report on its device, `prompt_items`) through a block tile:
+WM x WN warps, warp (wm, wn) TILES row tiles of row group wm for 8 / WN of the item's n-tiles, the block's weight rows (a
+128-k step's codes and scales) staged with the item's routes a step at a time through a STAGES-deep cp.async ring, so
+a weight fragment leaves global memory once a block and feeds WN warps and no weight waits in registers (`fp4-prompt`'s
+warps each read their rows from global memory into a ring of registers: 241 registers a thread, two blocks of 4 warps
+an SM on an RTX 5090, latency-bound there). The chains, parts and part-order sums are `fp4-prompt`'s, so the bits are
+too. Evidence, one GPU and shape (RTX 5090, 128 experts of 2,304 x 1,152, top 8, 4,096 tokens): gate/up 1.51 -> 1.14
+ms, a layer's fp4-row experts 2.59 -> 2.13 ms, its sweep a further 8-13%, the tile L2-bound there (70-90% of its
+throughput); another GPU or shape may take `fp4-prompt`, which stays beside it for the sweep and the plugin to choose. A block holding a NaN
 or an infinity gets the format's NaN scale, so its route carries NaN.
 `fp8` (fp8:channel and fp8:block bundles, hidden and inter multiples of 128, 8.9 on): W8A8 on the E4M3 tensor cores
 (mma.sync e4m3 m16n8k32; kind::mxf8f6f4 with unit scales on the sm_120 family), the same mainloop (`mma_experts.cu`) with
@@ -101,12 +112,15 @@ the call's token count:
 | `prompt-wide` | 64 routes (`Workspace(width=64)`) | 1,024, 4,096 | 2, 4, 8 (4) | 1, 2, 4 (1) | 0-4 (0) | 64, 128 (128) | |
 | `fp4-decode` | 8 routes, FP4 MMA, operands from global memory | 1, 2, 4, 8, 32 | 2, 4, 8 (4) | 1, 2, 4 (1; gate/up 2) | 1-4, 6 (3) | | FETCH 0, 1 (1 at one token, else 0) |
 | `fp4-prompt` | 32 or 64 routes, FP4 MMA, staged by cp.async | 256, 1,024, 4,096 | 2, 4, 8 (4) | 1, 2, 4 (2) | 1-4 (2) | 128, 256, 512 (256) | |
+| `fp4-tile` | 64 routes a call asks it for (tile), FP4 MMA, weights and routes staged by cp.async (WM, WN, STAGES below) | 2,048, 4,096, 8,192 | | 2, 4 (2) | | | |
 | `fp8-decode` | 8 routes, E4M3 MMA, operands from global memory | 1, 2, 4, 8, 32 | 2, 4, 8 (4) | 1, 2, 4 (1) | 1-4, 6 (4) | | FETCH 0, 1 (1 at one token, else 0) |
 | `fp8-prompt` | 32 or 64 routes, E4M3 MMA, staged by cp.async | 256, 1,024, 4,096 | 2, 4, 8 (8) | 1, 2, 4 (4) | 1-4 (1) | 128, 256, 512 (128) | |
 | `declared` | the integer block order | | | | | | |
 | `plan-combine` | grouping and the route-order sum | | | | | | |
 
-WARPS: warps a block (fp4-decode, fp8-decode: WARPS / k_parts(K) row-tile groups, at least one, of k_parts(K) warps
+fp4-tile: WM (1, 2, 4; 4) warps along the block's matrix rows, WN (1, 2, 4; 2) along the item's routes, STAGES
+(2, 3, 4; 2) 128-k steps in its ring; its defaults (TILES 2, STAGES 2: 36 KiB a block) fit every GPU's shared memory
+without opting in, and the sweep tunes the rest per GPU and shape. WARPS: warps a block (fp4-decode, fp8-decode: WARPS / k_parts(K) row-tile groups, at least one, of k_parts(K) warps
 each, one a K part, so a pass of 2,048 k at WARPS 2 runs 4 warps a block); TILES: MMA row tiles a warp owns (gate/up 8 inter rows each, down 16 output rows), sharing each
 B fragment (fp4 gate/up at least 2: a warp holds the intermediate's 16-row blocks); DEPTH: 64-k blocks of weights in
 flight a warp (0 is the format's own depth, 2 to 6; fp4: 128-k steps, fp8: 64-k steps); CHUNK: k values of the
@@ -118,7 +132,9 @@ fragment words; 1, it loads its four fragment words directly, the same registers
 of 2048 x 768: FP4 1.34x, FP8 1.17x a layer before K was split; level or slower from 2 tokens, fetch_ab in the
 evidence). Defaults in parentheses: the launches the kernel had before it had knobs, but for READ, which before was 1. No
 knob changes a route's MMA chain or any other operation (no order knob), so every configuration gives the same bits; the sweep keeps one only when every route equals the untuned build's. `declared` and `plan-combine` have
-no knobs. Which width a call takes stays the caller's (`width_for`, or `Workspace(width=...)`).
+no knobs. Which width a call takes stays the caller's (`width_for`: 32 from 8 routes an expert, else 8; or
+`Workspace(width=..., tile=...)`); the grouped-experts plugin's `prompt_items` chooses an FP4 prompt call's from the
+engine's sweep report on its device.
 
 ## Build, test, tune
 

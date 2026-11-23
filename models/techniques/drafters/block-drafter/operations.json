@@ -1,0 +1,16 @@
+{
+  "kind": "crit-technique-operations",
+  "technique": "block-drafter",
+  "operations": [
+    {
+      "id": "span-attention",
+      "what": "each row's queries over a span first .. last of its cached positions, every query seeing the whole span (no causal mask), scaled by the head width's inverse square root",
+      "reference": {
+        "path": "models/techniques/drafters/block-drafter/code/reference.py",
+        "symbol": "span_attention"
+      },
+      "verify": "on the target against the FP64 reference: within 8e-3 absolute plus 2e-2 relative (BF16 probabilities times BF16 values, FP32 sums, one rounding of the output)",
+      "invariance": "a row's bits independent of the rows beside it and of the row count"
+    }
+  ]
+}

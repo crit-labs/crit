@@ -13,7 +13,7 @@ import types
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "core" / "python"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "inference" / "core" / "python"))
 
 from crit_core.batch import DECODE, PREFILL, PageReservations, StepLayout, step_item  # noqa: E402
 from crit_core.native import (NativeError, NativeRounds, Scores, StepEngine,  # noqa: E402

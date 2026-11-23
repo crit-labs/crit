@@ -13,7 +13,7 @@ def load():
     name = "crit_test_token_law_sampling"
     if name in sys.modules:
         return sys.modules[name]
-    spec = importlib.util.spec_from_file_location(name, ROOT / "inference" / "token-sampling" / "code" / "sampling.py")
+    spec = importlib.util.spec_from_file_location(name, ROOT / "inference" / "techniques" / "sampling" / "token-sampling" / "code" / "sampling.py")
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)

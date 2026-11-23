@@ -42,7 +42,7 @@ import time
 import traceback
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "cli", "smoke", "tests", "../crit-eval"):
+for _folder in ("inference/core/python", "models/core/python", "cli", "smoke", "tests", "../crit-eval"):
     if str(ROOT / _folder) not in sys.path:
         sys.path.insert(0, str(ROOT / _folder))
 
@@ -108,7 +108,7 @@ def git(folder, *args):
 
 
 # What a stress run builds from: a change outside these (this harness, the docs, the tests) keeps the cache.
-BUILT = ("core", "inference", "cli", "api", "smoke", "models", "kernels", "pyproject.toml")
+BUILT = ("inference", "cli", "api", "smoke", "kernels", "pyproject.toml")
 
 
 def commit_key():
@@ -143,7 +143,7 @@ class Cache:
             began = time.perf_counter()
             log("building Core's step library")
             build = self.commit / "core-build"
-            subprocess.run(["cmake", "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release", "-S", str(ROOT / "core"), "-B",
+            subprocess.run(["cmake", "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release", "-S", str(ROOT / "inference" / "core"), "-B",
                             str(build)], check=True, capture_output=True)
             subprocess.run(["cmake", "--build", str(build), "--target", "crit_core_steps"], check=True,
                            capture_output=True)
@@ -207,17 +207,20 @@ class Cache:
         return store, run_id, candidate_id
 
 
+MODEL = "qwen4-exp-model"   # the finished model plugin of the checkpoints stressed here (models/cache)
+
+
 def selection(model):
     """The library's plugins for a Qwen3.8-Flash-Next-like checkpoint whose experts may live off the device, at their
     defaults: what an engine build's first candidate starts from. The router's options are the checkpoint's rule
-    (model-template refuses another), the lookup tables are placed off the device (the n-gram table is larger than
+    (the model plugin refuses another), the lookup tables are placed off the device (the n-gram table is larger than
     the device), and the drafter is the draft layer's chain."""
-    use = {"model": "model-template", "placement": "device-placement", "projections": "quantized-projections",
+    use = {"model": MODEL, "placement": "device-placement", "projections": "quantized-projections",
            "attention": "partitioned-attention", "kv_cache": "attention-state", "sampler": "token-constraints",
            "norms": "fused-norms", "embeddings": "lookup-table-rows", "recurrence": "sequential-recurrence",
            "router": "topk-router", "experts": "expert-offload", "expert_source": "expert-tensors",
            "drafter": "greedy-head-drafter"}
-    options = {"model-template": {"mtp": True},
+    options = {MODEL: {"mtp": True},
                "topk-router": {"score_before_selection": True, "renormalize": True},
                "device-placement": {"off_device": "tables."},
                # what crit plugins offload gives every engine whose experts exceed the device (AGENTS.md): the KV
@@ -226,7 +229,7 @@ def selection(model):
     return {"use": use, "options": options}
 
 
-PLUGINS = ["model-template", "device-placement", "quantized-projections", "partitioned-attention", "attention-state",
+PLUGINS = [MODEL, "device-placement", "quantized-projections", "partitioned-attention", "attention-state",
            "token-constraints", "fused-norms", "lookup-table-rows", "sequential-recurrence", "topk-router",
            "expert-offload", "expert-tensors", "greedy-head-drafter", "mtp-decode"]
 
@@ -700,15 +703,17 @@ def write_report(report, out, started, cache):
 
 def environment_for(cache_root, shared):
     """The Python environment the stress test runs in, made once a checkout: a venv whose third-party packages are
-    those of `shared` (a venv with torch and crit's dependencies, read through a .pth) and whose crit, crit-core and
-    crit-eval are this checkout's and the crit-eval beside it, installed editable. crit serve starts its engine host
-    with the running interpreter, so the host imports this checkout's code too, never another install's."""
+    those of `shared` (a venv with torch and crit's dependencies, read through a .pth) and whose crit, crit-core,
+    crit-models and crit-eval are this checkout's and the crit-eval beside it, installed editable. crit serve starts
+    its engine host with the running interpreter, so the host imports this checkout's code too, never another
+    install's."""
     import crit_eval
     key = hashlib.sha256(str(ROOT).encode()).hexdigest()[:12]
     venv = Path(cache_root) / "venvs" / key
     python = venv / "bin" / "python"
     eval_root = Path(crit_eval.__file__).resolve().parents[1]
-    want = {"crit": str(ROOT), "crit-eval": str(eval_root), "shared": str(shared)}
+    want = {"crit": str(ROOT), "crit-models": str(ROOT / "models" / "core" / "python"), "crit-eval": str(eval_root),
+            "shared": str(shared)}
     marker = venv / "stress.json"
     if marker.is_file() and json.loads(marker.read_text(encoding="utf-8")) == want:
         return python
@@ -720,7 +725,8 @@ def environment_for(cache_root, shared):
     shared_site = next(Path(shared).glob("lib/python3*/site-packages"))
     (site / "shared.pth").write_text(str(shared_site) + chr(10), encoding="utf-8")
     subprocess.run([str(python), "-m", "pip", "install", "-q", "--no-deps", "--no-build-isolation", "-e",
-                    str(ROOT / "core" / "python"), "-e", str(ROOT), "-e", str(eval_root)], check=True)
+                    str(ROOT / "inference" / "core" / "python"), "-e", str(ROOT / "models" / "core" / "python"),
+                    "-e", str(ROOT), "-e", str(eval_root)], check=True)
     marker.write_text(json.dumps(want), encoding="utf-8")
     return python
 

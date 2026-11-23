@@ -22,7 +22,7 @@ import venv
 
 ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = ROOT / "tests" / "run_crit.py"
-PLUGIN = "projections-dense"   # a base plugin on torch's CPU tensors, whose tests take seconds
+PLUGIN = "projections-dense"   # a plain plugin on torch's CPU tensors, whose tests take seconds
 BUILD = "import sys; from setuptools.build_meta import build_wheel; build_wheel(sys.argv[1])"
 # This process's variables less the ones that would put this checkout's sources first, with CUDA hidden.
 ENVIRONMENT = {**{name: value for name, value in os.environ.items() if name not in {"PYTHONPATH", "PYTHONHOME"}},
@@ -53,7 +53,8 @@ class WheelInstallTests(unittest.TestCase):
         cls.source, dist, cls.prefix = cls.work / "source", cls.work / "dist", cls.work / "venv"
         cls.snapshot()
         cls.build(cls.source, dist)
-        cls.build(cls.source / "core" / "python", dist)
+        cls.build(cls.source / "inference" / "core" / "python", dist)
+        cls.build(cls.source / "models" / "core" / "python", dist)
         cls.install(sorted(dist.glob("*.whl")))
 
     @classmethod
@@ -123,11 +124,11 @@ class WheelInstallTests(unittest.TestCase):
         self.assertEqual(probe.returncode, 0, probe.stderr)
         package, library, plugins = (Path(line).resolve() for line in probe.stdout.splitlines())
         self.assertEqual(package.parent, self.purelib / "crit")
-        self.assertEqual(library, self.purelib / "crit" / "library" / "inference")
+        self.assertEqual(library, self.purelib / "crit" / "library" / "inference" / "techniques")
         self.assertEqual(plugins.parent, self.purelib / "crit_plugins")
-        # Every file of the library ships but Inference's native build entry and walkthrough (pyproject.toml).
-        checkout, shipped = files(self.source / "inference"), files(library)
-        self.assertEqual(checkout - shipped, {"CMakeLists.txt"} | {p for p in checkout if p.startswith("examples/")})
+        # Every file of the library ships (pyproject.toml).
+        checkout, shipped = files(self.source / "inference" / "techniques"), files(library)
+        self.assertEqual(checkout - shipped, set())
         self.assertEqual(shipped - checkout, set())
 
     def test_an_installed_crit_mcp_serves_every_guide(self):
@@ -150,7 +151,7 @@ class WheelInstallTests(unittest.TestCase):
             server.wait(timeout=60)
             server.stdout.close()
         shipped = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-        guides = shipped["tool"]["setuptools"]["package-data"]["crit.library.guides"] + ["inference/README.md"]
+        guides = shipped["tool"]["setuptools"]["package-data"]["crit.library.guides"]
         listed = [resource["uri"] for resource in answers[2]["resources"]]
         self.assertEqual(listed[0], "crit://AGENTS.md")
         self.assertEqual(sorted(listed), sorted("crit://" + guide for guide in guides))
@@ -170,7 +171,7 @@ class WheelInstallTests(unittest.TestCase):
                                 text=True, encoding="utf-8", timeout=120)
         self.assertEqual(source.returncode, 0, source.stderr)
         self.assertEqual(listed, source.stdout)   # the checkout's library, plugin for plugin
-        self.assertRegex(listed, rf"(?m)^{PLUGIN} +base +projections ")
+        self.assertRegex(listed, rf"(?m)^{PLUGIN} +plain +projections ")
         self.assertIn("crit Inference passed", self.crit_("inference", "check"))
 
     def test_a_library_plugin_s_tests_pass_in_the_installed_crit_on_the_cpu(self):
@@ -183,8 +184,8 @@ class WheelInstallTests(unittest.TestCase):
     def test_crit_plugins_add_copies_a_plugin_out_of_the_installed_crit(self):
         engine = self.work / "engine" / "plugins"
         self.assertRegex(self.crit_("plugins", "add", str(engine), PLUGIN), rf"added +{PLUGIN} ")
-        self.assertEqual(files(engine / "base" / PLUGIN), files(self.source / "inference" / "base" / PLUGIN))
-        self.assertEqual(list((engine / "base" / PLUGIN).rglob("__pycache__")), [])
+        self.assertEqual(files(engine / "projections" / PLUGIN), files(self.source / "inference" / "techniques" / "projections" / PLUGIN))
+        self.assertEqual(list((engine / "projections" / PLUGIN).rglob("__pycache__")), [])
 
     def test_crit_run_keeps_a_run_of_the_toy_engine_without_a_checkout(self):
         """The folder crit run runs in is its project, holding settings.toml and runs/; the run's brief names the

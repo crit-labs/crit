@@ -13,15 +13,16 @@ scratch for one LLM on one machine, to test every change in a correct, repeatabl
 physical limits, and to serve the result. It is built for agents: building an engine by hand is not a supported
 path.
 
-It has four parts and one front door:
+It has five parts and one front door:
 
 | Part | What it is |
 | --- | --- |
-| [Core](../core/README.md) | The plumbing every engine needs and none should rebuild: requests, sessions, admission, the concurrent step scheduler, stop rules, sampling control, chat templates, state-cache bookkeeping, the ledger of a device's memory, the host's cores with their one worker pool and the device-to-host handoff, native code built at load, model files, and the contracts crit serve and Eval speak with an engine. It knows no model and no device beyond a backend's runtime services. |
+| [Core](../inference/core/README.md) | The plumbing every engine needs and none should rebuild: requests, sessions, admission, the concurrent step scheduler, stop rules, sampling control, chat templates, state-cache bookkeeping, the ledger of a device's memory, the host's cores with their one worker pool and the device-to-host handoff, native code built at load, model files, and the contracts crit serve and Eval speak with an engine. It knows no model and no device beyond a backend's runtime services. |
 | [Inference](../inference/README.md) | A curated library of techniques distilled from established engines, each a documented mechanism with code, a contract and, where it fills a slot, a plugin with a host reference and tests. |
 | [Kernels](../kernels/README.md) | A kernel core of building blocks (format decoders, tensor-core multiplies per GPU generation, pipelines, reductions) and kernel techniques composed from them, as crit has Core and Inference: each technique has knobs an engine sweeps and tunes on its own device and shapes, timed beside the vendor and open libraries it is measured against, and a workbench to check and time a kernel. Engineered kernels are mined for mechanisms that become core blocks or new structures. |
+| [Models](../models/README.md) | Model plugins: a models core every model plugin extends (`model-template`: the step model and the serving contracts), model techniques (the attention kinds, recurrences, FFNs, experts and residual schemes an architecture is composed of, each with what it reads) and a cache of finished model plugins (one an architecture), with `crit models` to inspect a checkpoint against them, check a new model plugin on a tiny random checkpoint against its reference and keep it, so an architecture is built once. |
 | [Eval](https://github.com/crit-labs/crit-eval) | `crit-eval`, a separate package: one fixed suite that measures speed and quality through the same API a client uses, every score next to its physical limit on the device it ran on. |
-| [CLI](../cli/README.md) | `crit`: `crit run` keeps a run's records (recon, plans, candidates, builds, checks, Evals, ablations, stop, cost), `crit serve` serves an engine, `crit core` builds Core's runtime, `crit smoke`, `crit plugins`, `crit kernels`, `crit models`, `crit inference`, `crit pull`, `crit bench`, `crit hub`. `crit mcp` offers `crit run`, `crit eval`, `crit kernels`, `crit models`, `crit inference`, `crit pull` and `crit serve` as MCP tools ([MCP](../mcp/README.md)). |
+| [CLI](../cli/README.md) | `crit`: `crit run` keeps a run's records (recon, plans, candidates, builds, checks, Evals, ablations, stop, cost), `crit serve` serves an engine, `crit core` builds Core's runtime, `crit smoke`, `crit plugins`, `crit kernels`, `crit inference`, `crit pull`, `crit bench`, `crit hub`. `crit mcp` offers `crit run`, `crit eval`, `crit kernels`, `crit inference`, `crit pull` and `crit serve` as MCP tools ([MCP](../mcp/README.md)). |
 
 An engine is Core plus a selection of plugins, one per slot (`model`, `placement`, `projections`, `attention`,
 `kv_cache`, `sampler`, and every slot the model plugin requires), and nothing else. A candidate is a sealed plugin
@@ -48,8 +49,8 @@ crit-kernels, which was to publish crit-labs kernels to the Hugging Face Kernel 
   engine builds and tunes for its device; the rest of the arithmetic comes from vendor and open libraries or the engine.
 - **Not a benchmark that ranks.** Eval reports facts and limits; it does not grade speed, rank engines or prescribe a
   build order. crit-hub lists engines, it does not rank them.
-- **Not a training tool.** Runs never train or fine-tune a drafter or the target. Weight transforms (PTQ,
-  re-encoding) happen only where the run's `weights_policy` allows them, through `crit models`.
+- **Not a training tool.** Runs never train or fine-tune a drafter or the target. Weight transforms
+  (re-encoding at load) happen only where the run's `weights_policy` allows them.
 - **Not a kit for building engines by hand.** crit is an agent toolkit. Its records, checks and guides are written
   for an agent driving `crit run`; a person building an engine by hand is not a supported path.
 - **Not tied to one vendor.** crit aims at every backend. CUDA is the one built today.
@@ -100,7 +101,7 @@ What a run takes. Each one is the user's; crit freezes it at `crit run create` a
 | Sampling | The model's `generation_config.json`; only the user overrides it (`eval_sampling`) | the model's |
 | Workload and cases | Prompt and output sizes, concurrency, repetitions, mode | 512 / 128, concurrency 1 |
 | Candidate budget | Candidates on the [candidate ladder](RUN_RECORDS.md#the-candidate-ladder) | 5 |
-| Companion drafters | Up to 8 published drafter folders, or one the user produced with `crit models drafter` | none |
+| Companion drafters | Up to 8 published drafter folders | none |
 | Jump-off engine | A crit-built engine from crit-hub (`create --from-engine`), or the user's external engine, served behind an OpenAI-compatible API and recorded as an [external candidate](RUN_RECORDS.md#external-engines) with its launch command | none |
 | Machine settings | `settings.toml`: memory headroom, `wsl_run_root`, defaults above | `settings.example.toml` |
 
@@ -133,7 +134,7 @@ Rules hold for every run, every model and every machine. Where crit enforces one
 1. **Core is model- and hardware-agnostic.** No layer arithmetic, no kernels beyond the backends' runtime services,
    no number or rule true only for one model family, dtype, GPU or backend. What engines share enters Core as
    bookkeeping. Core and the plugin contract stay backend-neutral, so every backend can be added. What decides how
-   an engine computes and schedules on the device is Core's, defined once ([what Core decides](../core/README.md#what-core-decides)).
+   an engine computes and schedules on the device is Core's, defined once ([what Core decides](../inference/core/README.md#what-core-decides)).
 2. **Every engine crit builds is Core plus plugins; plugins are the truth.** One plugin per slot, every need met, no conflict, one
    memory budget; a slot's arithmetic lives in that slot's plugin, never inline in the model plugin. Core's loader
    checks this. There is no other engine shape: a doc, example or engine that describes one is out of date and gets
@@ -207,8 +208,8 @@ Things no run, agent or contribution may do. Most are enforced by crit; the rest
   acceptance thresholds, routing) chosen by its Eval score or built from Eval's prompts or look-alike text; no special
   cases for Eval's token ids, lengths or cases. A content-dependent choice needs a general corpus unrelated to Eval and a
   held-out check in several languages. Eval's held-out prompts and drawn lengths exist to catch this.
-- **Never train or fine-tune a drafter.** Use the checkpoint's, a published companion as released, or one the user
-  produced with `crit models drafter`; the stored target verifies every token.
+- **Never train or fine-tune a drafter.** Use the checkpoint's, or a published companion as released; the stored
+  target verifies every token.
 - **Never change the model's sampling.** Not even to a model card's recommendation; only the user overrides it.
 - **Never invent measurements.** Without the target hardware, results are labelled unmeasured. Never claim a server
   was started on the user's machine.

@@ -1,6 +1,6 @@
 """Core's engine loader (crit_core.engine): a package is its plugins and the configuration that selects them, and an
 engine is Core running what the selection assembles. The loader refuses a package that is not a whole engine and a
-model plugin that cannot batch or serve the contract, runs the toy package (inference/examples/plugin-engine/plugins) on Core's concurrent
+model plugin that cannot batch or serve the contract, runs the toy package (inference/starters/plugin-engine/plugins) on Core's concurrent
 runtime, and Core's eval-v1 and chat-resident-v1 adapters serve it with its plugins in their facts."""
 import json
 from concurrent.futures import ThreadPoolExecutor
@@ -13,7 +13,7 @@ import types
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "tests"):
+for _folder in ("inference/core/python", "tests"):
     sys.path.insert(0, str(ROOT / _folder))
 
 from core_text_fixtures import llama_files, write_files  # noqa: E402
@@ -94,9 +94,8 @@ class PackageCheckTests(PackageFixture, unittest.TestCase):
         # exactness asks the mode's levels, and one that names a phase takes the mode's for the other.
         sys.path.insert(0, str(ROOT / "kernels"))
         from crit_core.engine import exactness_levels
-        exact = {"decode": "row-exact", "prompt": "exact"}
-        self.assertEqual(exactness_levels({"quality_mode": "speed"}), exact)
-        self.assertEqual(exactness_levels({"quality_mode": "preserve"}), exact)
+        self.assertEqual(exactness_levels({"quality_mode": "speed"}), {"decode": "row-exact", "prompt": "row-exact"})
+        self.assertEqual(exactness_levels({"quality_mode": "preserve"}), {"decode": "row-exact", "prompt": "exact"})
         self.assertEqual(exactness_levels({"quality_mode": "speed", "exactness": {"prompt": "repeatable"}}),
                          {"decode": "row-exact", "prompt": "repeatable"})
         with self.assertRaisesRegex(PluginError, 'configuration "quality_mode"'):
@@ -570,6 +569,15 @@ class LoadTests(PackageFixture, unittest.TestCase):
             self.assertEqual(row["tokens"], oracle(prompt, 4, stops=()))
             self.assertEqual((row["prompt_tokens"], row["completion_tokens"], row["errors"]), (len(prompt), 4, []))
             self.assertTrue(row["started"] <= row["first"] <= row["last"] <= row["finished"] <= found["seconds"])
+        # A sampled cohort (crit-eval's concurrency speed run): each request at its own sampling, as generate_sampled
+        # decodes it alone.
+        sampling = [[{"temperature": 1.0, "seed": 10 * c + r, "presence_penalty": 0.0} for r in range(len(row))]
+                    for c, row in enumerate(clients)]
+        drawn = evaluated.cohort(clients, 4, sampling)
+        for row in drawn["requests"]:
+            prompt, chosen = clients[row["client"]][row["index"]], sampling[row["client"]][row["index"]]
+            alone = evaluated.generate_sampled(prompt, 4, lambda tokens: None, chosen)
+            self.assertEqual(row["tokens"], alone["tokens"])
 
     def test_a_drafting_engine_decodes_plainly_on_request_and_eval_s_plain_engine_drafts_nothing(self):
         drafting = write_package(self.root / "drafting", drafting=True)
@@ -611,7 +619,8 @@ class LoadTests(PackageFixture, unittest.TestCase):
         seen = []
         begin, end = device.begin_step, device.end_step
         with mock.patch.object(device, "begin_step", lambda tokens, score=False: (seen.append(("begin", tokens)),
-                                                                                  begin(tokens, score))),                 mock.patch.object(device, "end_step", lambda open_=False: (seen.append(("end", open_)), end(open_))):
+                                                                                  begin(tokens, score))), \
+                mock.patch.object(device, "end_step", lambda open_=False: (seen.append(("end", open_)), end(open_))):
             engine = load(self.package, self.model, {**self.configuration(), "vram_headroom_bytes": 3 << 28},
                           device="cpu")
             try:
@@ -910,10 +919,12 @@ class PackageExactnessTests(PackageFixture, unittest.TestCase):
         self.assertEqual(core_engine.package_exactness({"exactness": {"decode": "row-exact", "prompt": "repeatable"}}),
                          {"decode": "row-exact", "prompt": "repeatable"})
         self.assertEqual(self.kernels.asks("prompt"), "repeatable")
-        # a quality mode alone asks its levels (exact in both modes), as crit run completes a candidate
+        # a quality mode alone asks its levels (row-exact in speed, exact in preserve), as crit run completes a candidate
         self.assertEqual(core_engine.package_exactness({"quality_mode": "speed"}),
+                         {"decode": "row-exact", "prompt": "row-exact"})
+        self.assertEqual(self.kernels.asks("prompt"), "row-exact")
+        self.assertEqual(core_engine.package_exactness({"quality_mode": "preserve"}),
                          {"decode": "row-exact", "prompt": "exact"})
-        self.assertEqual(self.kernels.asks("prompt"), "exact")
         self.assertIsNone(core_engine.package_exactness({}))
         self.assertIsNone(self.kernels.exactness())
 

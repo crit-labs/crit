@@ -73,7 +73,7 @@ plugins/
 
 | Field | Meaning |
 | --- | --- |
-| `fills` | The slots it fills. Two plugins in one slot exclude each other; a fused plugin fills several |
+| `fills` | The slots it fills. Two plugins in one slot exclude each other; a fused plugin fills several. A plugin that fills none is a core other plugins extend (`extends`): no engine selects it, and it has no `entry` |
 | `needs` | Facts the rest of the engine must provide: another plugin's `provides` or the engine's own facts (its GPU, its model's layout). An item that is a list is met by any one of its facts |
 | `provides` | Facts it gives the plugins that need them. Two plugins never provide the same fact |
 | `needs_when` | Needs that hold only where a fact does: `{"stored:nvfp4": ["cuda:fp4"]}` for a plugin that decodes NVFP4 only on FP4 tensor cores |
@@ -113,10 +113,15 @@ creation: it closes the device memory it made (an elastic range stays in the dev
 closed, and an engine opened next in the process would start without it); one with `facts()` adds the engine facts it knows of its own work, and one with `telemetry()` reports its
 work so far ([facts and telemetry](#facts-and-telemetry)).
 
-[crit's slot names](../core/python/crit_plugins/manifest.py) (`SLOTS`) give plugins of different engines one
-meaning per slot: `model`, `placement`, `attention`, `kv_cache`, `projections`, `experts`, `expert_residency`,
-`expert_source`, `router`, `recurrence`, `norms`, `drafter`, `verifier`, `sampler`, `graphs`, `embeddings`. An
-engine may name others; `crit plugins list` shows the ones crit does not. Scheduling is no slot: Core's concurrent
+Slot names give plugins of different engines one meaning per slot. Core names the engine's own
+([manifest.py](../inference/core/python/crit_plugins/manifest.py), `SLOTS`): `model`, `placement`, `kv_cache`,
+`drafter`, `verifier`, `sampler`. A layer part's slot is defined by its base plugin, in its manifest's `defines`
+([contracts.py](../inference/core/python/crit_plugins/contracts.py)): `attention` (softmax-attention), `projections`
+(projections-dense), `experts` (experts-reference), `expert_residency` and `expert_source` (expert-tensors), `router`
+(topk-router), `recurrence` (sequential-recurrence), `norms` (torch-norms), `embeddings` (memory-table-rows), each
+with its host interface, its device form, its comparison cases and its facts, so a new layer part or a new variant of
+one is a definition its technique adds, not a change to Core. An engine may name others; `crit plugins list` shows the
+ones nothing defines. Scheduling is no slot: Core's concurrent
 runtime schedules every engine's steps (mixed prefill and decode, admission, the prefill chunk and batch tokens the
 model's info sets), since every engine batches. `graphs` is a slot the model plugin calls: it asks the graphs plugin
 which capture to run for a step's shape (the [captured prompt chunks](#captured-prompt-chunks) it runs through
@@ -154,7 +159,7 @@ over the base router's rule, a device form beside another plugin's host form. It
 and, to take its options, in `extends`:
 
 ```json
-"sources": {"base": "../base/topk-router"},
+"sources": {"base": "../experts/topk-router"},
 "extends": "base"
 ```
 
@@ -170,8 +175,8 @@ selection bit for bit topk-router's.
 
 ### Slot interfaces
 
-Each slot crit names has an interface in
-[crit_plugins/slots.py](../core/python/crit_plugins/slots.py) (`INTERFACES`), the methods the engine calls on the
+Each slot has an interface, Core's slots in [crit_plugins/slots.py](../inference/core/python/crit_plugins/slots.py)
+(`INTERFACES`) and a defined slot's in its definition (`defines.slots.SLOT.host`): the methods the engine calls on the
 slot's plugin, with their arguments and what they return:
 
 | Slot | Methods |
@@ -203,7 +208,8 @@ vocabulary), `taps:hidden-states`.
 ### Device form
 
 A plugin that runs on a device (`cuda`, `rocm`, `metal`, `vulkan` or `cpu`) adds its slot's device form
-([crit_plugins/device.py](../core/python/crit_plugins/device.py), `DEVICE_INTERFACES`) to the host form: the methods
+(Core's slots: [crit_plugins/device.py](../inference/core/python/crit_plugins/device.py), `DEVICE_INTERFACES`; a defined
+slot's: `defines.slots.SLOT.device`) to the host form: the methods
 the model plugin calls inside its batched step, with torch tensors on the engine's device. Both forms run the same
 arithmetic, so the plugin's tests compare its host form with the slot's host reference on crit's cases and its device
 form with its host form, and `assertImplements` checks it has both. Assembling an engine refuses a plugin without its
@@ -249,7 +255,7 @@ ways by timing both as it loads (who computes a missed expert, how a layer's wor
 differently in the next process, and where the two ways give other bits the same request gets another text there:
 no repeat check inside one process sees it. A choice that only changes speed (a spin time, a thread count) is free.
 One that can change a bit is a decision, settled through
-[crit_plugins.decisions](../core/python/crit_plugins/decisions.py):
+[crit_plugins.decisions](../inference/core/python/crit_plugins/decisions.py):
 
 ```python
 from crit_plugins import decisions
@@ -280,11 +286,13 @@ requests fix (a round's end, a count of rounds), never when a copy or a timer ha
 ### Device extensions
 
 A plugin may offer device forms beyond its slot's, each named by the fact it provides
-([crit_plugins/device.py](../core/python/crit_plugins/device.py), `DEVICE_EXTENSIONS`). A plugin that provides one
-of these facts has its methods (`assertImplements` checks them, and Core's loader refuses a plugin that provides the
-fact without them), and a plugin that needs the fact may call them. The methods of a pool's facts (`POOL_EXTENSIONS`:
-`rounds:kv_cache`, `rounds:recurrence`, `prompts:kv_cache`, `prompts:recurrence`, `kv:scales`, `kv:keys`, `kv:sliding`) live on the
-pool the slot's device form returns, the others on the plugin.
+(Core's: [crit_plugins/device.py](../inference/core/python/crit_plugins/device.py), `DEVICE_EXTENSIONS`; a layer part's:
+its base plugin's `defines.facts`, such as softmax-attention's `attention:sinks` and `attention:distance-bias` or
+experts-reference's `experts:activations`). A plugin that provides one of these facts has its methods
+(`assertImplements` checks them, and Core's loader refuses a plugin that provides the fact without them), and a plugin
+that needs the fact may call them. The methods of a pool's facts (Core's `POOL_EXTENSIONS`: `rounds:kv_cache`,
+`prompts:kv_cache`, `kv:scales`, `kv:keys`, `kv:sliding`; a defined fact's `pool`: `rounds:recurrence`,
+`prompts:recurrence`) live on the pool the slot's device form returns, the others on the plugin.
 
 | Fact | Methods | What it says |
 | --- | --- | --- |
@@ -409,16 +417,19 @@ their own (a pinned GEMM beside a decode GEMV, the split reader's prompt launch)
 
 An engine whose configuration states a quality mode always asks: the levels resolve in one place
 (`crit_core.engine.exactness_levels`), the configuration's own for a phase it names and the
-[quality mode's](RUN_RECORDS.md#quality-modes) level for a phase it leaves out (`exact` in `preserve` and in
-`speed`). `crit run ... candidate` writes what it gives into every candidate's configuration, and Core's loader asks
-the same wherever a package loads (crit serve, Eval, a package made outside a run), so no load takes every plugin's
-least exact way because a file left the levels out. Both modes start exact because the serving
-checks compare a prefix with its prompt and decoding with prefilling: an engine whose rows multiply quantized
-activations turns an order's last bit into tenths of a nat, so below `exact` its sound rows and a broken path's read
-alike (a Qwen3.8-Flash-Next engine at `repeatable` failed `causal` at 0.38 nats, at `row-exact`
-`decode_matches_prefill` at 0.57, and at `exact` measured 0.0000, its prefill and its decode 2 to 3% slower
-than at `repeatable`). A speed
-engine lowers a phase's level where an ablation measures the gain and `serve --check` still passes.
+[quality mode's](RUN_RECORDS.md#quality-modes) level for a phase it leaves out (`exact` in `preserve`, `row-exact`
+in `speed`). `crit run ... candidate` writes what it gives into every candidate's configuration, and Core's loader
+asks the same wherever a package loads (crit serve, Eval, a package made outside a run), so no load takes every
+plugin's least exact way because a file left the levels out. `preserve` starts exact because the serving checks then
+compare a prefix with its prompt and decoding with prefilling without a tolerance. `speed` starts at `row-exact`, so
+every plugin takes its faster prompt path (a pinned GEMM, the split reader's prompt launch, FP4 experts at each
+route's own scale: a 4,096-token prefill of an NVFP4 MoE 671 -> 562 ms on an RTX 5090): a prefix is still judged
+against its prompt without a tolerance, decoding against prefilling by the drift quantized arithmetic rounds by
+(crit smoke's decode tolerance). An engine whose rows multiply quantized activations can pass that drift there (a
+Qwen3.8-Flash-Next engine at `row-exact` failed `decode_matches_prefill` at 0.57 nats; at `exact` it measured 0.0000,
+its prefill and decode 2 to 3% slower than at `repeatable`): such an engine asks `exact` prompt rows. `repeatable` is
+a lever an engine takes where an ablation measures the gain and `serve --check` still passes (the same engine failed
+`causal` there at 0.38 nats).
 
 <a id="precision"></a>
 
@@ -454,7 +465,13 @@ activations than its plan declared. An ablation's variants ask none: they measur
 | Plugin | Option | `speed` | `preserve`, or no mode stated |
 |---|---|---|---|
 | quantized-projections | `head` | `fp8` | `stored` |
+| quantized-projections | `trunk` (every other target matrix stored in 16 bits) | `fp8` | `stored` |
 | quantized-projections | `mxfp8_activations` | `mxfp8` (W8A8, the checkpoint's own activations) | `bf16` (W8A16) |
+| model-template | `kv` (without the checkpoint's static KV scales) | `fp8:row` | `bf16` |
+| model-template | `mtp_encode`, `mtp_kv` (the MTP layer, draft-only) | `nvfp4`, `fp8:row` | `bf16`, `bf16` |
+| grouped-experts | `activations` | `nvfp4` (W4A4 where the experts carry input scales) | `bf16` (W4A16) |
+| grouped-experts | `arithmetic` | each layer on its format's own tensor cores (`fp4`, `fp8`) where it takes them, else `tensor` | `tensor` |
+| expert-offload | its device rows (no option) | as grouped-experts' `arithmetic` | `tensor` |
 
 (`mxfp8_activations` `auto` takes the configuration's asked activation for `mxfp8` before either mode's: `stored` is
 `mxfp8`, `bf16` is `bf16`.)
@@ -471,6 +488,18 @@ counts the head at the bytes it is held in. Three things to know:
 - A model whose embeddings share the head's tensor keeps its 16-bit table for the lookup beside the FP8 head, so
   there the option saves time and no memory.
 - A model plugin with a head option of its own drops it: the library's option does the same with the FP64 encoder.
+
+The other target matrices stored in 16 bits (attention, dense and shared-expert projections a model plugin loads with
+a role other than `head`) follow `trunk` the same way: in `speed` re-encoded to FP8 rows at load, half the bytes
+every decode step reads of them and W8A8 prompt rows at the FP8 rate; recorded under `trunk_encoding`. The roles
+`trunk_keep` names stay as stored (by default `router`, `shared_gate`, `index_qk`: small matrices whose outputs pick an
+expert or a key), and so does a matrix whose shape cuBLASLt's FP8 does not take (`trunk_kept`). Like the head these
+are target weights: where `weights_policy` is `as_stored`, set `trunk` to `stored` too.
+
+The KV pages follow the mode where the checkpoint gives no static scales (`kv: auto`: FP8 with them in both modes,
+else `fp8:row` in `speed`), and so does the MTP layer, which only drafts: the target verifies every draft, so its
+precision changes no published token, only how many drafts are accepted. NVFP4 and FP8 experts run their stored
+activations and their own tensor cores in `speed`.
 
 In `preserve` an FP8 head is a precision change like any other: set `head` to `fp8` and measure it.
 
@@ -499,12 +528,14 @@ class FusedTests(PluginTestCase):
 
 ## The engine
 
-An engine package is a folder of two things: `plugins/` (its plugins, the plain ones in `plugins/base/`) and
+An engine package is a folder of two things: `plugins/` (its plugins: its own at `plugins/ID`, a copy of a library
+plugin where `crit plugins add` puts it, `plugins/CATEGORY/ID`, with `plugins/plugins.json` marking the folder) and
 `configuration.json`, whose `plugins` names the plugin of every slot:
 
 ```text
 package/
   plugins/
+    plugins.json
     qwen3_5-model/            fills model, requires recurrence
     fp8-paged-attention/      fills attention
     fp8-pages/                fills kv_cache
@@ -512,7 +543,7 @@ package/
     gated-delta-scan/         fills recurrence
     device-sampler/           fills sampler
     eagle3-drafter/           fills drafter
-    base/device-placement/    fills placement
+    memory/device-placement/  fills placement
   configuration.json
 ```
 
@@ -555,7 +586,7 @@ engine runs:
    checkpoint and reopen at the next load (expert-offload's bundle store): the `CRIT_PLUGIN_CACHE` environment
    variable's, which crit run sets to `.plugin-cache` in the run's folder unless it is set already (empty: none);
    `crit run stop` removes that folder. It is None where no host gave one, and a plugin then keeps nothing between
-   loads. `context.policy` is the engine's policy ([crit_plugins.policy](../core/python/crit_plugins/policy.py)):
+   loads. `context.policy` is the engine's policy ([crit_plugins.policy](../inference/core/python/crit_plugins/policy.py)):
    what its configuration asks of its plugins (the kernel tuning, the decisions record, the exactness, the quality
    mode, the prompt activations) and the cache folder. The functions plugins call (`crit_plugins.kernels.asks`,
    `allows`, `quality_mode`, `activation`, `tuning_file`, `load_kernel`, `crit_plugins.decisions.settle`) answer
@@ -603,8 +634,8 @@ too. `crit run candidate` and `crit run package` check every source and package 
 record it, without running any of its code, and refuse anything else.
 
 crit serve's `/v1/models` card carries the facts in `engine_facts`, and the ablation checks them to know the engine
-runs the variant it was given. A package keeps its plugins in `plugins/` and its base plugins in `plugins/base/`, as
-crit's library does: they are part of its bytes, like the rest of its source, so a plugin from another engine or
+runs the variant it was given. A package keeps its plugins in `plugins/`, grouped by category as
+crit's library groups them (`plugins/attention/softmax-attention`): they are part of its bytes, like the rest of its source, so a plugin from another engine or
 from crit-hub is copied in.
 
 ### Memory
@@ -840,7 +871,7 @@ as a device's memory is: `crit_plugins.host.current()`, which every plugin also 
   busy and nothing is held twice. The threads wait in the kernel and compute nothing, so they are no workers of the
   pool; the report lists each open file's reads, bytes and whether they are direct.
 - **Handoffs.** Work the device decides and the host does inside one CUDA stream, captured graphs included
-  ([the handoffs' protocol](../core/python/crit_plugins/host/README.md)): `handoff(device, owner, name,
+  ([the handoffs' protocol](../inference/core/python/crit_plugins/host/README.md)): `handoff(device, owner, name,
   slots, payload_bytes, serve, context)` gives slots in mapped pinned memory; a plugin's kernel writes a job into a
   slot's payload and raises its doorbell (`handoff_device.cuh`, with the slot's device addresses `words(slot)`), the
   service thread runs the handler (a C function of the plugin's host library) and answers, and `join(slot)` makes
@@ -925,14 +956,14 @@ Raising is allowed.
 ### Step settings: Core decides, the model plugin states its limits
 
 How many requests an engine steps at once, how long a prompt step may take and when cached device memory goes back
-decide the schedule crit serve and Eval get, so they are Core's (core/README.md#what-core-decides): the engine's step
+decide the schedule crit serve and Eval get, so they are Core's (inference/core/README.md#what-core-decides): the engine's step
 plan, `LoadContext.steps` (`crit_plugins.steps.Steps`, step contract `CONTRACT` 2, which a model plugin states as
 `step_contract` in its info). The model plugin states what is true of it and asks the plan for the rest:
 
 | Setting | Whose | How |
 | --- | --- | --- |
 | Lanes (`max_concurrency`) | Core's | `steps.lanes(bound)`: `LANES` (4), at most the model's bound (the most it takes) and the caller's cap on the requests Core holds (crit serve's `--max-concurrency`, at least 2 since every engine batches). The model sizes what a lane holds (recurrent states, a captured round's rows, draft buffers) for the answer, and its info reports it. |
-| Waiting places (`max_pending`) | Core's | `steps.pending(bound, lanes)`: `PENDING` (2), at most the model's bound, within the cap less the lanes. Core's runtime orders them by [priority](../core/src/runtime/README.md#request-priority). |
+| Waiting places (`max_pending`) | Core's | `steps.pending(bound, lanes)`: `PENDING` (2), at most the model's bound, within the cap less the lanes. Core's runtime orders them by [priority](../inference/core/src/runtime/README.md#request-priority). |
 | The prompt spans | Core's | `steps.calibrated(plugin, chunk, key=, measure=, ...)`: Core settles the model's three timed prompt steps as the plugin's decision `spans` (recorded like any other), fits them (`fit`) and gives the budget; a step's bound is `steps.seconds(bound)`, at most `SECONDS` (three quarters of the cancel grace), the model's tighter where it names one. |
 | The activation reserve | Core's | Planned before load from the model's need (`steps.activations(need)`, `ACTIVATIONS` without one); once the warm requests ran Core keeps its measured step arena free and the givers take the rest. |
 | The release threshold | Core's | `steps.release()` at a prompt's or a request's end, below `steps.threshold()`: the configuration's `release_below_mib` (0: never), else the device's headroom and the step arena, what the next step needs free. A model plugin releases through it and keeps no threshold of its own. |
@@ -969,7 +1000,7 @@ to the sampler with the row's params, the sampler masks every other token before
 the row produced: one outside the mask, or more than one, fails that request. Where the sampler's captured rounds mask
 (token-constraints' `stage_mask`, the round driver's `Rounds.masks`), a model plugin binds a greedy constrained
 request to a round slot at width 0 like any other, and Core stages its allowed set for the slot between two rounds
-([native decode rounds](../core/src/runtime/README.md#native-decode-rounds)), so it shares the rounds.
+([native decode rounds](../inference/core/src/runtime/README.md#native-decode-rounds)), so it shares the rounds.
 
 #### Decode through the prompt path
 
@@ -981,7 +1012,7 @@ only where the paths share something wrong, so crit smoke decodes a failed decod
 reports `rounding` when the gap vanishes and `fault` when it stays ([rounding or
 fault](../smoke/README.md#rounding-or-fault)); a served score asks for it with `"decode_via_prompt": true`
 ([fixed-text scores](SERVING.md#fixed-text-scores)), which Core refuses on a model that does not say it. The hook is
-the model plugin's opt-in: [model-template](../inference/model-template/README.md) honours it. The attention plugin
+the model plugin's opt-in: [model-template](../models/core/model-template/README.md) honours it. The attention plugin
 reads a one-token row as it reads any row of that length, so the hook leaves its reader as it is.
 
 #### The prompt cache
@@ -1234,7 +1265,7 @@ again; `--no-cache` runs every plugin's tests. `PluginTestCase` gives a test:
 | `device()` | The device its tests run on, from the manifest's `devices` (a test of a CUDA-only plugin skips without CUDA) |
 | `core_runtime()` | The `crit_core_steps` library a test that runs the engine on Core's runtime loads, found as Core's loader finds it (`CRIT_CORE_STEP_LIBRARY`, else the checkout's build, else what `crit core build` built); the test skips unchecked, saying to run `crit core build`, when there is none. Gate on it, never on the environment variable alone; `crit_plugins.testing.core_runtime()` is the same for `setUpClass` |
 | `skipUnchecked(reason)` | Skips the test as one that leaves the plugin's correctness unchecked, which fails the plugin (below); `raise crit_plugins.testing.unchecked(reason)` does the same in `setUpClass` |
-| `assertMatchesReference(use, options, atol=, rtol=, cases=)` | It and its reference give the same values on crit's cases for its slots (`CASES` in [slots.py](../core/python/crit_plugins/slots.py)): token ids and counts exactly, numbers within `atol + rtol * abs(expected)`. `cases` names other slots whose cases see it, as the `experts` cases see an `expert_source` |
+| `assertMatchesReference(use, options, atol=, rtol=, cases=)` | It and its reference give the same values on crit's cases for its slots (Core's slots' `CASES` in [slots.py](../inference/core/python/crit_plugins/slots.py), a defined slot's the `cases` its definition names, such as softmax-attention's cases.py; `crit_plugins.testing.cases_for(__file__)` gives a test both): token ids and counts exactly, numbers within `atol + rtol * abs(expected)`. `cases` names other slots whose cases see it, as the `experts` cases see an `expert_source` |
 | `assertClose(actual, expected)` | Numbers, or nested lists of them, within a tolerance |
 
 A skipped test is one of two kinds, and the test says which. A skip because no device the plugin runs on is here
@@ -1244,7 +1275,7 @@ does not cover it. A skip that leaves the plugin's correctness unchecked where i
 model plugin's comparison with its reference not run, or Core's runtime missing (`core_runtime()`). Its reason
 carries `unchecked: ` (`skipUnchecked`, `unchecked()`), and `crit plugins test` fails a plugin whose tests skip so,
 even when every test that ran passed; `crit run serve --check` fails its `plugin_test_ID`, and no such result is
-cached. model-template's engines skip unchecked without Core's runtime or transformers, and plainly where their
+cached. A model plugin's engines (crit_models.testing) skip unchecked without Core's runtime or transformers, and plainly where their
 plugins do not run on the machine's device. Every other `skipTest` stays the machine's: mark a skip unchecked when the
 plugin runs here and only something it could have had (a build, a reference package) is missing.
 
@@ -1267,15 +1298,19 @@ another technique's `"../ID/code"` when it combines two), with tests against the
 technique's exact reference: one that names its `devices` adds its slot's device form and serves there, one that
 names none is a host reference, the oracle that device plugins are tested against.
 
-The base plugins in `inference/base/` are the plain plugin of each slot: what a technique is tested against and what
-a selection's `base` falls back to. They are no technique, so they have no entry of their own; some are built on a
+The library is grouped by category, as kernels' and models' techniques are: `inference/techniques/CATEGORY/ID`
+(attention, experts, memory, norms, projections, recurrence, sampling, speculation). Each slot's plain plugin sits
+in its category beside the techniques (softmax-attention, projections-dense, topk-router, experts-reference,
+expert-tensors, sequential-recurrence, torch-norms, memory-table-rows, device-placement, chain-verifier,
+greedy-head-drafter): what a technique is tested against and what a selection's `base` falls back to. A plain
+plugin is no technique, so it has no entry of its own; some are built on a
 technique's code (`softmax-attention` reads attention-state's rows). `crit plugins list` and `crit plugins test`
 without a folder act on the whole library, and `crit inference show ID` lists the technique's plugin and the plugins
 that use its code.
 
 | Slot | Base plugin | Techniques (the plugin each is compared with) |
 | --- | --- | --- |
-| `model` | | `model-template` (composed from blocks by a layout per architecture family, against transformers on a small checkpoint of each) |
+| `model` | | The finished model plugins of [models/cache](../models/cache/README.md) (`llama-qwen3-model`, `qwen3-5-model`, `qwen4-exp-model`, `deepseek-v3-model`, `gemma4-model`, `inkling2-loop-model`): each a layout composed from blocks by the models core it extends, `model-template`, against transformers on a small checkpoint |
 | `placement` | `device-placement` (every tensor on the device, runs on the host) | |
 | `attention` | `softmax-attention` | `partitioned-attention` (against `softmax-attention`) |
 | `kv_cache` | | `attention-state` |
@@ -1299,17 +1334,18 @@ device-speculative-round, since a model plugin calls them and no slot holds them
 (scheduling, the host's handoffs, host memory admission, recorded decisions, the captured prompt chunks' buckets) is
 Core's, with no entry ([inference](../inference/README.md)).
 The plugin system itself is Core's, since an engine loads with it: `crit_plugins` in
-[core/python](../core/python/README.md) holds the manifest, the assembly, the slot interfaces and device forms, the
+[core/python](../inference/core/python/README.md) holds the manifest, the assembly, the slot interfaces and device forms, the
 kernel loader, Core's round driver, prompt graphs and general capture helper, the composition helpers, the test
 helpers and the ablation's variants, and holds no technique. The library and `crit plugins` are crit's command line
 ([cli/crit/plugins.py](../cli/crit/plugins.py)).
 
 `crit plugins add ENGINE/plugins ID...` copies library plugins into an engine with their `reference` and
 `test_with` plugins, so their tests run there. Each plugin's folder is copied whole to its place in the library: a
-technique to `ENGINE/plugins/ID/` with its README, code and operations.json, a base plugin to `ENGINE/plugins/base/ID/`.
+plugin to `ENGINE/plugins/CATEGORY/ID/`, a technique with its README, code and operations.json, and
+`ENGINE/plugins/plugins.json` marks the folder of plugins.
 Code a plugin imports from another plugin of the engine is that plugin's copy, as in the library; the code of a
 technique that is no plugin of the engine goes to `ENGINE/plugins/_sources/` at its path in Inference
-(`_sources/expert-streamed-prefill/code`), and the copied manifest points there. A plugin the engine has already is
+(`_sources/experts/expert-streamed-prefill/code`), and the copied manifest points there. A plugin the engine has already is
 kept as the engine's own, and so is a source it has a copy of already; naming a plugin the engine has is refused,
 unless `--update` asks to replace the engine's copy with the library's current one (where `crit plugins add` put
 it; the engine's own plugins that read it or name it as their reference stay as they are). The command lists the
@@ -1349,17 +1385,20 @@ where none does, each with its torch fallback ([kernels and plugins](#kernels-an
 | `placement` | `device-placement` (base), `dense-layer-offload` | Every tensor on the device (`reserve_mib` kept free beside the plan), or with `off_device` the groups of those name prefixes (routed experts' bundles, lookup tables) in host memory, then files, and `slots()` to size a device expert cache; whole layers on the device while they fit and the rest in host memory, by dense-layer-offload's planner over measured rates (host policy code) |
 | `drafter`, `verifier` | `greedy-head-drafter`, `chain-verifier` (base); `mtp-decode`, `hidden-state-drafters`, `draft-vocabulary-subset`, `draft-trees` | Host policy over the engine's draft head (`draft:head`), and inside captured rounds `draft:device` / `verify:device`: the chain over the model's device draft head, copies from device token histories (mtp-decode, `override` putting long copies over the head's chain), d2t mapping and the confidence cut on the device, subset rows chosen again on the device, trees; the chain accept and the tree walk on the device |
 
-The library's model plugin is [model-template](../inference/model-template/README.md): the architecture as blocks
-(grouped-query and gated softmax attention, block-sparse attention with an indexer, latent attention, gated
-delta-rule layers, hashed n-gram table rows, SwiGLU MLPs, mixtures of experts over any experts plugin, the checkpoint's MTP layer as the device
-draft head) over one pre-norm residual stream or several mixed streams, composed by a layout, data for each architecture family
-the layer kinds of several families share ([What belongs in crit](CONTRIBUTION_CRITERIA.md)), on the serving contracts
+The library's model plugins are built on one core, [model-template](../models/core/model-template/README.md): the
+architecture as [model techniques](../models/techniques/README.md) (grouped-query and gated softmax attention, block-sparse attention
+with an indexer, latent attention, relative attention, gated delta-rule layers, hashed n-gram table rows, SwiGLU MLPs,
+mixtures of experts over any experts plugin, residual schemes; the checkpoint's MTP layer as the device draft head)
+composed by a layout, data that each finished model plugin keeps beside its manifest
+([models/cache](../models/cache/README.md): one plugin an architecture family, extending the core) over
+the layer kinds several families share ([What belongs in crit](CONTRIBUTION_CRITERIA.md)), on the serving contracts
 every model plugin keeps: exact rows, prompt spans timed at load within crit serve's cancel grace and the device's
 room, a placement plan of every device tensor, captured rounds and prompt chunks, the prompt cache, fixed-text scores
-in the prompt's spans. An engine whose checkpoint a layout covers starts from it with no model code of its own; one
-whose architecture none covers composes its model plugin from the same code, with a layout file and block classes of
-its own (`compose(context, options, parts, layout=, blocks=)`), and writes a model plugin from scratch only where the
-layer loop itself differs. Each layout is tested as a whole engine through Core's loader against transformers on a
+in the prompt's spans. An engine whose checkpoint a finished model plugin serves starts from it with no model code
+of its own; one whose architecture none serves builds its model plugin on the same core, with a layout file and block
+classes of its own (`model_plugin(folder, blocks=)`), keeps it (`crit models cache add`) so it is built once, and
+writes a model plugin from scratch only where the layer loop itself differs. Each finished model plugin is tested as
+a whole engine through Core's loader against transformers on a
 small random checkpoint. [test_device_engine.py](../tests/test_device_engine.py) shows a hand-written model plugin
 whole, as Core's tests use one: the KV pool, attention,
 projections, sampling, fused-norms and placement plugins copied with `crit plugins add` beside a Llama-layout model

@@ -1,0 +1,68 @@
+{
+  "schema": "crit-model-layout-v1",
+  "gguf": {
+    "qwen35": {
+      "parts": {"attn_qkv": "linear_attn.in_proj_qkv", "attn_gate": "linear_attn.in_proj_z",
+                "ssm_alpha": "linear_attn.in_proj_a", "ssm_beta": "linear_attn.in_proj_b", "ssm_a": "linear_attn.A_log",
+                "ssm_conv1d": "linear_attn.conv1d", "ssm_dt.bias": "linear_attn.dt_bias",
+                "ssm_dt": "linear_attn.dt_bias", "ssm_norm": "linear_attn.norm", "ssm_out": "linear_attn.out_proj"},
+      "draft": {"nextn.eh_proj": "fc", "nextn.enorm": "pre_fc_norm_embedding", "nextn.hnorm": "pre_fc_norm_hidden",
+                "nextn.shared_head_norm": "norm"},
+      "transforms": {
+        "zero-centred": {"ends": ["norm.weight", ".pre_fc_norm_embedding.weight", ".pre_fc_norm_hidden.weight"],
+                         "except": ["linear_attn.norm.weight"]},
+        "negated-exp": ["linear_attn.A_log"],
+        "squeezed": {"conv1d.weight": {"axis": 1, "rank": 3}},
+        "tiled-heads": {"heads": "linear_num_value_heads", "groups": "linear_num_key_heads", "tensors": {
+          "linear_attn.in_proj_qkv.weight": {"unit": "linear_value_head_dim",
+                                             "before": [["linear_num_key_heads", "linear_key_head_dim", 2]]},
+          "linear_attn.conv1d.weight": {"unit": "linear_value_head_dim",
+                                        "before": [["linear_num_key_heads", "linear_key_head_dim", 2]]},
+          "linear_attn.in_proj_z.weight": {"unit": "linear_value_head_dim"},
+          "linear_attn.in_proj_a.weight": {}, "linear_attn.in_proj_b.weight": {}, "linear_attn.A_log": {},
+          "linear_attn.dt_bias": {},
+          "linear_attn.out_proj.weight": {"unit": "linear_value_head_dim", "along": "inputs"}}},
+        "joined-rows": {
+          "attn_qkv_gate": {"names": ["linear_attn.in_proj_qkv", "linear_attn.in_proj_z"],
+                            "rows": [["linear_num_key_heads", "linear_key_head_dim", 2],
+                                     ["linear_num_value_heads", "linear_value_head_dim"]]},
+          "ssm_beta_alpha": {"names": ["linear_attn.in_proj_b", "linear_attn.in_proj_a"],
+                             "rows": "linear_num_value_heads"}}}},
+    "qwen35moe": {
+      "parts": {"attn_qkv": "linear_attn.in_proj_qkv", "attn_gate": "linear_attn.in_proj_z",
+                "ssm_alpha": "linear_attn.in_proj_a", "ssm_beta": "linear_attn.in_proj_b", "ssm_a": "linear_attn.A_log",
+                "ssm_conv1d": "linear_attn.conv1d", "ssm_dt.bias": "linear_attn.dt_bias",
+                "ssm_dt": "linear_attn.dt_bias", "ssm_norm": "linear_attn.norm", "ssm_out": "linear_attn.out_proj"},
+      "draft": {"nextn.eh_proj": "fc", "nextn.enorm": "pre_fc_norm_embedding", "nextn.hnorm": "pre_fc_norm_hidden",
+                "nextn.shared_head_norm": "norm"},
+      "transforms": {
+        "zero-centred": {"ends": ["norm.weight", ".pre_fc_norm_embedding.weight", ".pre_fc_norm_hidden.weight"],
+                         "except": ["linear_attn.norm.weight"]},
+        "negated-exp": ["linear_attn.A_log"],
+        "squeezed": {"conv1d.weight": {"axis": 1, "rank": 3},
+                     "mlp.shared_expert_gate.weight": {"axis": 0, "rank": 2}},
+        "tiled-heads": {"heads": "linear_num_value_heads", "groups": "linear_num_key_heads", "tensors": {
+          "linear_attn.in_proj_qkv.weight": {"unit": "linear_value_head_dim",
+                                             "before": [["linear_num_key_heads", "linear_key_head_dim", 2]]},
+          "linear_attn.conv1d.weight": {"unit": "linear_value_head_dim",
+                                        "before": [["linear_num_key_heads", "linear_key_head_dim", 2]]},
+          "linear_attn.in_proj_z.weight": {"unit": "linear_value_head_dim"},
+          "linear_attn.in_proj_a.weight": {}, "linear_attn.in_proj_b.weight": {}, "linear_attn.A_log": {},
+          "linear_attn.dt_bias": {},
+          "linear_attn.out_proj.weight": {"unit": "linear_value_head_dim", "along": "inputs"}}},
+        "joined-rows": {
+          "attn_qkv_gate": {"names": ["linear_attn.in_proj_qkv", "linear_attn.in_proj_z"],
+                            "rows": [["linear_num_key_heads", "linear_key_head_dim", 2],
+                                     ["linear_num_value_heads", "linear_value_head_dim"]]},
+          "ssm_beta_alpha": {"names": ["linear_attn.in_proj_b", "linear_attn.in_proj_a"],
+                             "rows": "linear_num_value_heads"}}}}
+  },
+  "norm_offset": 1.0,
+  "defaults": {"norm_topk_prob": true},
+  "mixers": {
+    "full_attention": {"block": "attention", "prefix": "self_attn.", "output_gate": "sigmoid"},
+    "linear_attention": {"block": "gated-delta", "prefix": "linear_attn."}
+  },
+  "ffn": {"block": "auto", "prefix": "mlp."},
+  "draft": {"block": "mtp", "prefix": "mtp."}
+}

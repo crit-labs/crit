@@ -1,0 +1,128 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "sequential-recurrence",
+  "title": "The token-by-token gated-delta recurrence (recurrent-state-recovery)",
+  "description": "recurrent-state-recovery's FP64 recurrence, one token after another: the state decays, takes the beta-weighted delta of each token's value against its prediction, and gives the token's output. The reference every recurrence plugin is compared with. On the device it keeps every sequence's state and causal-convolution window in a pool (code/device_states.py) and runs the same formula over a step's rows and a captured round's: decode tokens and verify windows through one column scan over FP32 state, each row's bits its own, with the accepted prefix committed on the device (deferred, from per-column checkpoints, or recomputed); prompt chunks through the same scan up to exact_rows tokens (the configuration's, default 512) and through crit's recurrent-scans chunked prefill past it (option prefill; option fla, off by default, a yardstick: fla's chunked gated-delta kernel where installed, each of its Triton kernels on a stated tile, not the one fla's autotune times best). The scan is crit's kernel recurrent-scans (built for the engine's device, with the engine's tuned knobs or its defaults) where it builds, a torch formula otherwise.",
+  "fills": [
+    "recurrence"
+  ],
+  "provides": [
+    "rounds:recurrence",
+    "prompts:recurrence"
+  ],
+  "devices": [
+    "cuda",
+    "cpu"
+  ],
+  "options": {
+    "prompt_rows": {
+      "type": "choice",
+      "default": "auto",
+      "choices": [
+        "auto",
+        "chunked",
+        "scan"
+      ],
+      "description": "which prompt rows run the exact column scan: auto (the default), the faster way that keeps the level the engine's configuration asks of its prompt rows (exactness, docs/PLUGINS.md#exactness): chunked where it asks repeatable or nothing, scan where it asks row-exact, exact or declared; chunked, rows of up to exact_rows tokens the scan and longer ones the chunked kernel (a long row's bits follow the prompt's length and chunking); scan, every prompt row the scan whatever its length (the bits of decoding its tokens one by one, the slowest prefill); with fla set, auto keeps fla's chunked kernel"
+    },
+    "exact_rows": {
+      "type": "int",
+      "default": 512,
+      "min": 0,
+      "max": 4096,
+      "description": "prompt rows of at most this many tokens run the exact column scan (one launch a layer, the bits of decoding the tokens one by one), longer ones the chunked kernel (fla's where installed, another summation order), in an eager call and in a captured prompt bucket alike; 0: every prompt row the chunked kernel. The two give other bits, so the configuration states the value and nothing measures it at load. The default, 512, is the largest of crit_plugins.prompt_graphs' default buckets: a captured bucket has the bits of the eager chunk of the same tokens, and a prompt cut into chunks of 1,024 tokens or more runs its last chunk as the full ones when that chunk is longer than 512 tokens. A model whose prompt chunks are at most this long runs every prompt row through the scan (a prefix's rows equal the whole prompt's). device_states.scan_rows() measures where the chunked kernel gets faster on a shape and device, to recommend a value"
+    },
+    "chunk_fp32": {
+      "type": "bool",
+      "default": true,
+      "description": "long rows reach fla's chunked kernel in FP32: closer to the exact recurrence where strong decays leave outputs small, at twice the kernel's time"
+    },
+    "prefill": {
+      "type": "choice",
+      "default": "tensor_cores",
+      "choices": [
+        "tensor_cores",
+        "fp32"
+      ],
+      "description": "recurrent-scans' chunked prefill for prompt rows past exact_rows where fla is not installed: tensor_cores (structure delta-prefill-tc, the chunked WY form with FP16 operands rounded once a chunk and FP32 accumulation and state, dk 64 or 128 and dv a multiple of 16; several times faster than fp32, numbers in recurrent-scans' README) or fp32 (delta-prefill-rb, the two-pass prefill in FP32 on CUDA cores, dv a multiple of 64). Both are another summation order than the scan, within the chunked tolerance, so a prompt row's bits follow the prompt's length and chunking either way (facts: recurrence_prompts)"
+    },
+    "scan": {
+      "type": "choice",
+      "default": "pool-delta-pipe",
+      "choices": [
+        "pool-delta-pipe",
+        "pool-delta"
+      ],
+      "description": "recurrent-scans' structure for the decode, verify and scanned prompt rows: pool-delta-pipe (each slot's state tile and first tokens staged in shared memory by cp.async, whole 128-byte rows, ahead of the slot a block runs; as fast or faster than pool-delta on decode and verify rows from 1 to 32 sequences, tuned or not, numbers in recurrent-scans' README) or pool-delta (the state tile loaded into registers, the structure before). The same bits either way for every row, commit and pending count, so a pool may switch between them (facts: recurrence_prompts' scan)"
+    },
+    "commit": {
+      "type": "choice",
+      "default": "deferred",
+      "choices": [
+        "deferred",
+        "checkpoints",
+        "recompute"
+      ],
+      "description": "how a captured round keeps its accepted prefix: deferred (record the count; the next row replays it from a stash), checkpoints (the state after every column, one selected) or recompute (the start state kept, the prefix replayed at commit)"
+    },
+    "kernels": {
+      "type": "bool",
+      "default": true,
+      "description": "run decode and verify rows through crit's kernel recurrent-scans where it builds on this GPU; false: the torch formula"
+    },
+    "fla": {
+      "type": "bool",
+      "default": false,
+      "description": "prompt rows past exact_rows through fla's chunked gated-delta kernel (where fla is installed) instead of recurrent-scans' chunked prefill: a library's kernel, a yardstick only"
+    },
+    "elastic": {
+      "type": "bool",
+      "default": false,
+      "description": "device form: what the pools keep per sequence (states, stash, convolution window and stash) in a paged range of the device's memory (crit_plugins.memory): a sequence's entries of every layer are backed when the sequence opens and goes back once the sequences past it closed, the device's givers (expert-offload's cache) holding the rest meanwhile. A pool sized for every sequence an engine may serve at once then takes device memory for those that are open"
+    }
+  },
+  "kernels": [
+    {
+      "name": "recurrent-scans",
+      "fallback": "the column scan, its commit replay and the causal convolution in torch (code/device_states.py), capture-safe, a row at a time"
+    }
+  ],
+  "sources": {
+    "recurrence": "../recurrent-state-recovery/code"
+  },
+  "entry": "plugin.py:create",
+  "defines": {
+    "slots": {
+      "recurrence": {
+        "about": "linear-attention or SSM state and its scan kernels",
+        "host": {
+          "prefill": "prefill(state, steps, geometry) -> (outputs, state): a gated-delta state ([keys][values] flattened) over steps {query, key, value, log_decay, beta}; geometry {keys, values, epsilon, query_scale, normalize_keys, normalize_queries}"
+        },
+        "device": {
+          "pool": "pool(layers, heads, keys, values, device, sequences=None, widest=0, conv=None, key_heads=None, rows=None) -> StatePool: each sequence's state per layer (heads value heads of [keys][values]) and, with conv=(channels, kernel) or (channels, kernel, dilation), the window of its causal depthwise convolution (the last (kernel - 1) * dilation inputs), with open(sequence), close(sequence), fork(sequence, new), accept(sequence, count) (the state and window after the first count tokens of the sequence's row in the last step: any prefix of a row of up to widest + 1 tokens, all or none of a longer one), and the rounds:recurrence methods where the plugin provides them; state(layer, sequence) and window(layer, sequence) (the committed state [heads][keys][values] and window [channels][(kernel - 1) * dilation]) and flush(sequence=None), which apply a deferred commit and make it final; key_heads: the heads of queries and keys (heads by default, value head h reading key head h // (heads / key_heads)); rows: round slots (sequences by default)",
+          "forward": "forward(layer, query, key, value, log_decay, beta, pool, batch, geometry, out=None) -> out: each row of a StepBatch or RoundBatch continues its sequence's committed state over its tokens (query/key [tokens][key heads][keys], value [tokens][heads][values], log_decay and beta [tokens][heads]); out [tokens][heads][values] FP32 (given, or allocated); geometry as the host form's; a decode or verify row's bits its own, whatever rows share the call; a round row of an unbound slot outputs zeros",
+          "convolve": "convolve(layer, x, weight, bias, pool, batch, activation='silu', out=None) -> y: the causal depthwise convolution of each row of x ([tokens][channels]) over its sequence's window at the pool's dilation, y[t] = act(bias + sum_i weight[:, i] x[t - (kernel - 1 - i) * dilation]) (weight [channels][kernel], bias [channels] or None, act silu or None), y in x's dtype (out, when given, is not x); the row's inputs join the window when accept or commit_round keeps them"
+        },
+        "cases": "cases.py:recurrence"
+      }
+    },
+    "facts": {
+      "rounds:recurrence": {
+        "methods": {
+          "bind": "bind(slot, sequence): round slot `slot` holds `sequence`'s state",
+          "unbind": "unbind(slot): the slot holds no sequence",
+          "move": "move(source, target): the sequence of round slot `source` moves to slot `target`",
+          "commit_round": "commit_round(view): each slot's state after column view.n_emitted - 1 of the round (its conv window too), selected on the device; again with smaller counts before the rows' next round (a truncation) and before a flush (flush, state, window, fork), which makes a deferred commit final"
+        },
+        "pool": "recurrence"
+      },
+      "prompts:recurrence": {
+        "methods": {
+          "stage_prompt": "stage_prompt(batch): the sequence's state row in the pool's fixed prompt buffers (scratch for None), so the chunk's forward reads and writes it on the device; before each replay",
+          "commit_prompt": "commit_prompt(batch): the sequence's state now covers batch.frontier + batch.count positions (its conv window the last real inputs); after the replay"
+        },
+        "pool": "recurrence"
+      }
+    }
+  }
+}

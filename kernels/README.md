@@ -1,7 +1,7 @@
 # crit Kernels
 
 Kernels is built like crit itself: a **kernel core** of building blocks and **kernel techniques** made of them, the
-way [Core](../core/README.md) holds what every engine needs and [Inference](../inference/README.md) the techniques.
+way [Core](../inference/core/README.md) holds what every engine needs and [Inference](../inference/README.md) the techniques.
 
 | Layer | What it holds | Where |
 | --- | --- | --- |
@@ -27,7 +27,7 @@ measured there. Each template is checked against its operation's reference and m
 or open library at the same arithmetic (its README names the library; in a run, `crit eval status --kernels`). An
 external engine takes a template into its own code: `crit kernels build ID --tuning FILE` builds it and prints the
 package, which it loads with `crit_kernels.build.load`, and `crit kernels sweep` tunes it without any plugin. The
-rest of an engine's arithmetic comes from the [libraries](#libraries) below or from the engine. [Core](../core/README.md) supplies the runtime, [Inference](../inference/README.md) the techniques and
+rest of an engine's arithmetic comes from the [libraries](#libraries) below or from the engine. [Core](../inference/core/README.md) supplies the runtime, [Inference](../inference/README.md) the techniques and
 [Eval](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md) the common checks for the integrated engine.
 
 <a id="levels"></a>
@@ -53,7 +53,7 @@ level 1 for every engine.
 | `attention` | [paged-kv-attention](techniques/attention/paged-kv-attention/README.md), [latent-attention](techniques/attention/latent-attention/README.md) (latent (MLA) decode and verify windows over a paged cache of compressed rows), [sparse-indexer](techniques/attention/sparse-indexer/README.md) (a sparse attention's key selection: index heads' weighted ReLU scores, top k by radix select) |
 | `recurrence` | [recurrent-scans](techniques/recurrence/recurrent-scans/README.md) |
 | `experts` | [grouped-experts](techniques/experts/grouped-experts/README.md), [int-block-experts](techniques/experts/int-block-experts/README.md), [topk-routing](techniques/experts/topk-routing/README.md) |
-| `norms` | [fused-norms](techniques/norms/fused-norms/README.md) |
+| `norms` | [fused-norms](techniques/norms/fused-norms/README.md), [row-ops](techniques/norms/row-ops/README.md) (the row operations between a model technique's products: head clips, small products, sink-gated outputs, summary mixes, gated joins, span attention) |
 | `starters` | [workbench-starter](starters/workbench-starter/README.md) (the workbench's starter matmul) |
 
 ```sh

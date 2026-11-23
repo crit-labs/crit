@@ -6,7 +6,7 @@ import sys
 import unittest
 from test_techniques import load
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core/python"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "inference/core/python"))
 
 
 class ChoiceTests(unittest.TestCase):

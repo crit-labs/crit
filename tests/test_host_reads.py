@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "core/python"))
+sys.path.insert(0, str(ROOT / "inference/core/python"))
 
 from crit_plugins.host import Host  # noqa: E402
 

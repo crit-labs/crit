@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core" / "python"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "inference" / "core" / "python"))
 
 from crit_plugins import native  # noqa: E402
 

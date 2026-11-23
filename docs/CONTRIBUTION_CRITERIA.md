@@ -60,12 +60,59 @@ Knowledge that is shared across model families is fine to put in crit. Examples 
 published checkpoint formats (NVFP4 in ModelOpt or compressed-tensors layout), config
 conventions used by several model families, tool syntaxes several families write, and
 layer kinds such as Mamba-2 state or sliding-window attention that several
-architectures use. Such layer kinds are blocks of the library's model plugin
-([model-template](../inference/model-template/README.md)), and a family's arrangement of them is
-one of its layouts: a JSON file, not a code path. A block one family alone uses stays in that
-family's engine, passed to the template's compose(). Keep that knowledge in data, such as tables, declared formats and
+architectures use. Such layer kinds are [model techniques](../models/techniques/README.md), which the models core
+([model-template](../models/core/model-template/README.md)) composes, and a family's arrangement of them is the layout
+of its [finished model plugin](../models/cache/README.md): a JSON file, not a code path. A technique names no model;
+the model plugins' model_types, what the checkpoints' configs say, are the only names. Keep that knowledge in data,
+such as tables, declared formats and
 registries, rather than in branches spread through the code, and keep one copy of it.
 When Python and C++ both need the same table, they read one source.
+
+## Model-neutral code
+
+crit's shared code names no model. Shared code is everything but the finished model plugins in
+[models/cache](../models/cache/README.md): Core and the Inference techniques, Kernels, the models core, the model
+techniques, the CLI, the API, Eval, the MCP server, smoke and tools, every text file there whatever its suffix
+(`.py`, `.cu`, `.inc`, `.in`, `.toml`, a file with none) but Markdown. A model name, a model type or one checkpoint's
+tensor spelling may appear only as data, in a model plugin's `plugin.json` and `layout.json` (and its README and
+tests), and in test fixtures: the files of a `tests/` folder, and the modules of `crit_models.testing` that only tests
+import (a module of it that runtime code imports is read like any other). Comments are code: evidence that names a
+model goes in a doc or a run record, and a comment describes the shape or kind instead (a multimodal wrapper's
+language-model section, the wavelength-banded rope type).
+
+- **No model name.** No family name and no model_type in shared code, its comments included. A family's name counts
+  at the start of a word whatever follows, in any case: `LlamaForCausalLM`, `deepseekv3`, `isQwen` and `ChatGLM` each
+  name one. The only exception is an identifier a published format or a library defines and crit does not choose (a
+  config value such as a rope type, a GGUF metadata value, a library function's name), listed in
+  [model_neutral.json](../tests/support/model_neutral.json) with the field it is a value of and the definitions that
+  hold it (the table or the function that reads the field). It is allowed only there and only as written: the whole
+  of a string literal (`"llama3"`), or a library's function as that library's attribute (`fi.gemma_rmsnorm`). The
+  same word elsewhere in the file, in a comment or a comparison outside those definitions, is a hit.
+- **No checkpoint's own spelling.** A technique's tensor vocabulary is the transformers spelling of its layer kind
+  where one exists (its own where none does), whichever family brought it. A checkpoint that spells it otherwise gets
+  `names` rules in its layout; the technique never learns that spelling. Its `entry.json` declares what its code
+  reads (`reads`: tensor names, config keys, layout fields), which
+  [test_technique_reads.py](../tests/test_technique_reads.py) holds to the code. The guard below finds a spelling a
+  layout renames in shared code, not a technique that took one model's names where transformers spells the layer kind
+  otherwise: that is checked when the technique is added
+  ([tensor vocabulary](../models/techniques/README.md#tensor-vocabulary), which lists the techniques not held to it
+  yet).
+- **Built for any model.** A technique (a model technique, an Inference technique, a kernel template) may serve one
+  model today: what matters is that it is built so another model can use it unchanged. It names no model, reads its
+  tensors and config keys under its own names through the layout (prefixes, `names` rules, the keys a layout maps),
+  takes its kernels from tunable templates, and is tested on tiny random checkpoints.
+- **Two checkpoint layouts.** Each finished model plugin declares in `tests/checkpoints.json` the checkpoint layouts
+  its engine tests serve against the reference, at least two, one of them the model under another spelling that names
+  rules map back (`crit_models.testing.Respelled`: another decoder prefix, other part names, layers numbered
+  otherwise; the same model written as GGUF counts beside it, not instead, since the GGUF reader hands the
+  techniques their own names), and every model technique is composed by such a plugin's layout. Reading the same
+  model through a second spelling is what shows a technique takes its names from the layout.
+- **Kernels the same way.** A fused kernel a technique needs is a kernel template with its knobs and its torch
+  fallback ([Kernels are templates](#interfaces-not-instances)), never a kernel with one model's block sizes in the
+  technique.
+
+[test_model_neutral.py](../tests/test_model_neutral.py) holds these rules in crit's CI (the lint job, and the host
+tests) and as a fast CPU test: `python tests/test_model_neutral.py`.
 
 ## Hardware
 
@@ -114,8 +161,10 @@ declares and the official code ignores).
   measurement, reproduced bug)?
 - Would a model of a different architecture, a different GPU and a different backend use
   this unchanged or be unaffected by it?
-- Is anything named after one model, checkpoint or GPU? If so, is that only an
-  example, or does the behavior depend on it?
+- Is anything named after one model, checkpoint or GPU? In code it may not be, comments included
+  ([model-neutral code](#model-neutral-code)); in a doc only as an example or as a measurement's source.
+- For a model technique: does it read only the names its entry declares, through the layout, so another model's
+  layout could compose it? Is it engine-tested on tiny random checkpoints in two checkpoint layouts?
 - For a kernel: is every speed-only constant a knob and every device limit read from
   the device; is a new instruction behind a feature check with the other GPUs' path
   beside it and tested on the reference GPU; does a new structure sit beside the one
@@ -124,9 +173,9 @@ declares and the official code ignores).
   interface?
 - Does the change add a second copy of something crit already has?
 - Does it decide how an engine computes or schedules on the device (a level, a default, a budget, the order of
-  requests)? Then it is Core's ([what Core decides](../core/README.md#what-core-decides)), and every other place
+  requests)? Then it is Core's ([what Core decides](../inference/core/README.md#what-core-decides)), and every other place
   reads Core's answer.
-- Do the host suite and, for native code, the CMake suite pass?
+- Do the host suite (`tests/test_model_neutral.py` among it) and, for native code, the CMake suite pass?
 
 When the answer to any of these is unclear, keep the change in the engine and record
 it as toolkit feedback in the run's `summary.md`. It can move into crit once a second

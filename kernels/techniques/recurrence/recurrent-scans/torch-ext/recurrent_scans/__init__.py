@@ -1,5 +1,5 @@
 """Recurrent layers of hybrid models on CUDA: a short causal depthwise convolution with its carried window, gated
-delta attention (Qwen3-Next / Qwen3.5 gated DeltaNet) and Mamba-2's state-space recurrence. Each has a chunked
+delta attention (gated DeltaNet) and Mamba-2's state-space recurrence. Each has a chunked
 two-pass prefill for prompts and a token-by-token scan for decode and speculative verify; the scan is column
 invariant (a token decoded alone equals the same token inside a multi-token verify, bit for bit) and can write the
 state after every token. All tensors are float32 on the GPU; the state is updated in place."""
