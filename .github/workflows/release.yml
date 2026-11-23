@@ -119,6 +119,8 @@ jobs:
         uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with:
           packages-dir: core-dist/
+          # A run again after a failed upload skips the files PyPI already holds, which it would refuse.
+          skip-existing: true
       - name: Publish crit
         uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with:
