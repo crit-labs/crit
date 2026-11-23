@@ -1,0 +1,44 @@
+{
+  "kind": "crit.native-core.contract-documentation",
+  "version": "0.23.0",
+  "interface": "inference/core/include/crit/core.h",
+  "component_interfaces": [
+    "inference/core/include/crit/sampling.h",
+    "inference/core/include/crit/step_engine.h",
+    "inference/core/include/crit/json.h",
+    "inference/core/include/crit/file.h",
+    "inference/core/include/crit/constraints.h"
+  ],
+  "scope": "Common request/resource/lifetime contracts for token-generation and scoring consumers through Model/Session, and the component libraries engines call from their sessions (the sampling draw, files). Execution strategies and backend-specific techniques are opt-in.",
+  "factory": "Static Factory returns a Model through public crit interfaces.",
+  "resources": "Core owns reservations, budgets and physical lifetimes; consumers declare extents, representations and reuse plans.",
+  "requests": "Bounded keyed requests with request/lane-generation identity, scheduled together on one worker.",
+  "request_options": "Value-owned sampling options (temperature, top_p, top_k, seed, min_p, penalties, logit_bias, min_tokens), stop-token overrides and logprobs, plus immutable shared host extension parameters. Per-field capability and range checks precede admission and name the field; logit_bias ids must be below the valid vocabulary. The runtime passes sampling values through; sessions apply them after reading their logits by Core's sampling rules (core/src/sampling/README.md), and draws depend only on seed, position and stream. Option payload charges and owners last until the request's wait returns.",
+  "scoring": "Declared scoring uses an exclusive FIFO barrier after all earlier generation retirement. Queued scores share allowance/deadlines; a score cancelled while it runs publishes nothing. Public result capacity is reserved separately from model-owned scratch. Declared query scoring returns per target a log-probability, caller-chosen query log-probabilities (finite or negative infinity), an optional argmax and, with top_k (at most max_top_logprobs), ranked alternatives, on a named score path when requested; per_target zero with no ids scores the targets alone. Query ids and targets must be below the valid vocabulary (targets are rejected at submission); results are validated for count, value class, ranking and vocabulary before publication.",
+  "progress": "A callback returns with its work done; Core copies and charges borrowed token rows, and model commit precedes publication.",
+  "logprobs": "Declared token_logprobs returns per generated token its log-probability under the raw logits of the pass that produced it, normalized over the valid vocabulary, and up to max_top_logprobs (at most top_logprobs_limit, 64) ranked alternatives. Core checks counts, value class (never NaN or positive infinity, at most 1e-3 above zero) and distinct valid ids in non-increasing order before commit, trims rows with their tokens and publishes them under the request lock; a violation is a model contract failure. Ids at or above valid_vocabulary never appear as generated tokens, alternatives, argmax or logit_bias entries.",
+  "output_events": "Handle::wait_output calls its sink once per published token, in order, on the waiting thread and outside the request lock, with the token's log-probability and alternatives; spans are valid only during the call. Whatever leaves the sink cancels the request, which is waited for and released before the exit propagates unchanged.",
+  "group_failure": "A failed group commit or a row that breaks the progress contract fails the engine: none of that group is published, earlier committed output is preserved, every session is destroyed and every request completes with the error.",
+  "retirement": "A request that ends is retired in the step that ended it: Model::retire, then its session is destroyed, then its waiter sees the result.",
+  "request_release": "When wait()/wait_output() returns or rethrows, or a handle is destroyed without a wait, every host charge of the request has been released on that thread.",
+  "streams": "When a backend uses asynchronous queues, submit accesses to explicit services and order cross-queue dependencies.",
+  "consumer_duties": [
+    "artifact_encoding",
+    "model_semantics",
+    "tensor_state_layout",
+    "kernels"
+  ],
+  "qualification": "Source contracts and host references are separate from native/GPU/model/performance acceptance.",
+  "transfer_readiness": "Order operation-specific worker/copy completion. An earlier completed event or enqueue success cannot publish new content. Retain source and destination owners through actual settlement.",
+  "optional_integrations": {
+    "scope": "Expert caching is a consumer-selected Inference technique, not a core integration requirement. Each selected technique owns its representation-specific correctness contract and optional optimization candidates.",
+    "guide": "inference/techniques/experts/expert-residency/README.md"
+  },
+  "mixed_batches": "Optional Profile.max_batch_tokens with ModelInfo.mixed_batches enables execute() groups. BatchPolicy.fair rotates minimum grants before expansion; decode_first prioritizes decoders and reserves one unit for the oldest prefill after prefill_starvation_steps waiting groups. Grants sum to the quota. Progress reports actual target/draft/padded work. Membership, commit, cancellation and retirement invariants apply; per-lane steps remain ordered and kernels are engine supplied.",
+  "admission": "Up to max_request_concurrency (4096) lanes subject to profile, model declaration and engine memory admission. Admission is first in, first out: a deferred head holds the requests behind it, and a score is a barrier. No implicit eviction or recomputation. Linear lane-indexed group identity validation. Lane/control metadata is outside payload reservations.",
+  "sampling": "crit/sampling.h is the draw, header-only, and core/src/sampling/README.md the rules a sampler follows after reading logits; the runtime never samples. Draws are a pure function of (seed, position, stream, purpose), so trimming, rollback and redo need no generator state, and device code can reproduce them. A constraint's allowed set masks every other id before the rules.",
+  "constraints": "Optional structured-output service: crit/constraints.h matchers (finite choices, JSON objects, compiled byte grammars) are request-private, fork/rewind with the model's accepted output and never return an empty allowed set (dead ends and exhausted limits throw; no unconstrained fallback). Vocabularies and grammars are immutable and shared. allowed() walks the vocabulary's piece trie and caches sets by exact matcher state (AllowedCache); the result equals the full-vocabulary scan, chart exhaustion included. crit_core.constraints compiles the documented JSON schema/regex/EBNF subsets into tokenizer-independent artifacts, rejects unsupported constructs, prepares them on bounded workers and derives the tokenizer byte table. The runtime never applies constraints.",
+  "batched_steps": "crit_core.batch is host bookkeeping for a step model's batched rows; the runtime never calls it. StepLayout places decode items first, then prefill items, each phase in input order, and lists the step row of every logits row (each decode and verify row, the last row of a chunk that ends its prompt). step_item derives an item from a scheduled row within its grants. PageReservations reserves every row a request can stage (prompt, output, verify columns, at most max_tokens) without credit for shared prefix pages; reservations hold when released pages retire before the next round. Kernels and state bytes stay the model's.",
+  "step_engines": "crit/step_engine.h makes a Model of C callbacks (admission, open, step, commit, retire, release, score, error) for engines in other languages; crit_core_steps exports the engine ABI plus crit_engine_open_steps. Core keeps scheduling, admission, options, stop tokens, output limits, cancellation, retirement and the scoring barrier. Callbacks run on the one engine worker and return their work done; a nonzero return fails the engine with the callback's error message. Sessions are released through release() when Core destroys them.",
+  "model_files": "crit/json.h and file.h read files without interpreting them. JSON is strict, and typed fields refuse non-finite values and integers beyond 64 bits. Readers verify that a file did not change while they read it, and check limits before reserving memory. Model files (config.json, safetensors, GGUF) are read by crit_core.model; weight encodings and loading remain the engine's."
+}

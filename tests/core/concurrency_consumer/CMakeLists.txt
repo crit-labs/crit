@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.28)
 project(crit_concurrency_consumer LANGUAGES CXX)
-find_package(critCore 0.22.0 EXACT CONFIG REQUIRED)
+find_package(critCore 0.23.0 EXACT CONFIG REQUIRED)
 add_executable(crit_concurrency_consumer main.cpp)
 target_link_libraries(crit_concurrency_consumer PRIVATE crit::core)
 if(MSVC)
@@ -11,10 +11,10 @@ endif()
 add_executable(crit_options_consumer ../request_options_tests.cpp)
 target_link_libraries(crit_options_consumer PRIVATE crit::core)
 # Every installed header, compiled as ordinary (not system) includes under strict warnings, with one call per
-# component. The checkout's core/include/crit headers, the installed crit headers and the includes in
+# component. The checkout's inference/core/include/crit headers, the installed crit headers and the includes in
 # installed_headers.cpp must be the same set, so a public header missing from Core's install(FILES ...), or one
 # installed without updating this consumer, fails here. gpu_runtime.h needs a device runtime's headers and is left out.
-get_filename_component(_crit_public_dir "${CMAKE_CURRENT_SOURCE_DIR}/../../../core/include/crit" ABSOLUTE)
+get_filename_component(_crit_public_dir "${CMAKE_CURRENT_SOURCE_DIR}/../../../inference/core/include/crit" ABSOLUTE)
 if(NOT IS_DIRECTORY "${_crit_public_dir}")
   message(FATAL_ERROR "this consumer builds from a crit checkout: ${_crit_public_dir} is missing")
 endif()
@@ -34,11 +34,11 @@ list(SORT _crit_included)
 set(_crit_not_installed ${_crit_public})
 list(REMOVE_ITEM _crit_not_installed ${_crit_installed})
 if(_crit_not_installed)
-  message(FATAL_ERROR "core/include/crit headers missing from Core's install(FILES ...): ${_crit_not_installed}")
+  message(FATAL_ERROR "inference/core/include/crit headers missing from Core's install(FILES ...): ${_crit_not_installed}")
 endif()
 if(NOT _crit_installed STREQUAL _crit_public)
-  message(FATAL_ERROR "installed crit headers differ from core/include/crit (stale install prefix?): "
-    "installed [${_crit_installed}], core/include/crit [${_crit_public}]")
+  message(FATAL_ERROR "installed crit headers differ from inference/core/include/crit (stale install prefix?): "
+    "installed [${_crit_installed}], inference/core/include/crit [${_crit_public}]")
 endif()
 if(NOT _crit_installed STREQUAL _crit_included)
   message(FATAL_ERROR "installed_headers.cpp must include every installed crit header: "

@@ -1,0 +1,73 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "torch-norms",
+  "title": "Normalization, rotary positions and gated products in plain torch ops",
+  "description": "The plain norms plugin: fused-norms' host form (rows of numbers in FP64, the slot's oracle) and its device form in torch ops (fused-norms' code/torch_norms.py): RMSNorm with an offset weight, a residual added in place and a chosen output dtype, query/key head norms, the head norm with rotary positions, gated RMSNorm, rotary positions (half or interleaved pairs, partial, inverse frequencies or a cos|sin table), SiLU, GELU and sigmoid products, L2 norms, the sum of several residual streams (gated, weighted or plain) and one row added into every stream, a norm weight per stream or head. FP32 inside, one rounding; every reduction through torch's fused rms_norm, so each row's bits are independent of the rows beside it; capture-safe. A chain of small torch kernels per operation: the reference fused-norms is compared with, and what an engine falls back to. The fused forms (norms:fused) are the separate calls in sequence, softplus_decay torch's softplus and sigmoid.",
+  "fills": [
+    "norms"
+  ],
+  "provides": [
+    "rounds:norms",
+    "prompts:norms",
+    "norms:fused"
+  ],
+  "devices": [
+    "cuda",
+    "cpu"
+  ],
+  "sources": {
+    "norms": "../fused-norms/code"
+  },
+  "entry": "plugin.py:create",
+  "defines": {
+    "slots": {
+      "norms": {
+        "about": "normalization, rope and other elementwise work around the matmuls",
+        "host": {
+          "rms_norm_rows": "rms_norm_rows(rows, weight, eps, offset=0.0, residual=None) -> rows, or (rows, sums) with residual rows: y = x / sqrt(mean(x^2) + eps) * (offset + weight) for each row x, or for x = residual + row (sums: those x); weight one row, G rows (row i takes weight row i % G: G heads or streams a token, each its own weight) or None; offset 1 for a weight stored as weight - 1",
+          "gated_rms_norm_rows": "gated_rms_norm_rows(rows, gates, weight, eps, offset=0.0, activation='silu') -> rows: rms_norm_rows times activation(gate) element by element (silu or sigmoid)",
+          "rope_rows": "rope_rows(rows, positions, freqs, rotary_dim=None, style='half', scale=1.0) -> rows: each row (one head) rotated at its position in pairs on its first rotary_dim values, the rest passed through; freqs rotary_dim / 2 inverse frequencies (the angle of pair j fp32(fp32(position) x fp32(freqs[j]))) or a table of [cos of every pair, sin of every pair] rows by position; style half pairs (j, j + rotary_dim / 2), interleaved (2j, 2j + 1); scale multiplies cos and sin",
+          "act_mul_rows": "act_mul_rows(gates, values, activation) -> rows: activation(gate) * value element by element; activation silu, gelu (erf), gelu_tanh or sigmoid",
+          "l2_norm_rows": "l2_norm_rows(rows, eps=1e-6) -> rows: x / sqrt(sum(x^2) + eps)",
+          "stream_sum_rows": "stream_sum_rows(streams, gates=None, activation='none', scale=1.0) -> rows: per token (streams[t], its S stream rows) scale * the sum in stream order of activation(gate) * row; gates[t] S rows (one gate per value) or S numbers (one per stream) or None (the plain sum); activation none (the gate itself) or act_mul_rows' (several residual streams mixed into one row)",
+          "stream_add_rows": "stream_add_rows(streams, rows, weights=None) -> streams: per token every stream row plus weights[t][s] * rows[t] (1 without weights): one row added into every residual stream",
+          "softplus_decay_rows": "softplus_decay_rows(rows, bias, rate, gates=None) -> rows, or (rows, sigmoid rows) with gates: -rate[i] * softplus(x[i] + bias[i]) for each value of each row (softplus(v) = log(1 + exp(v))): the log-decay a gated delta or state-space layer discretizes (rate exp(A_log)), and sigmoid(gate) of its beta gates"
+        },
+        "host_about": "The elementwise work around the matmuls, each row on its own: a row is a token's hidden row or one head of one token. In FP64 from the inputs as given (the oracle of every device form).",
+        "device": {
+          "rms_norm": "rms_norm(x, weight, eps, offset=0.0, residual=None, out_dtype=None, out=None) -> y, or (y, residual) with a residual: y = x / sqrt(mean(x^2) + eps) * (offset + weight) per last-dimension row (weight [dim], [groups][dim] for x [..., groups, dim]: each head or residual stream its own weight, or None); with residual (x's shape, its own dtype: an FP32 residual stream beside BF16 rows) the residual becomes residual + x in place, rounded to its dtype, and those rows are normalized (y's default dtype then the residual's); the caller owns the residual, which the call advances",
+          "rms_norm_heads": "rms_norm_heads(x, weight, eps, offset=0.0, out_dtype=None, out=None) -> y: rms_norm of each head of x [tokens][heads][dim] (query/key norms), weight [dim] or [heads][dim]",
+          "rms_norm_rope": "rms_norm_rope(x, weight, eps, positions, freqs, offset=0.0, rotary_dim=None, style='half', scale=1.0, out_dtype=None, out=None) -> y: rms_norm_heads then rope, in FP32 between them",
+          "gated_rms_norm": "gated_rms_norm(x, z, weight, eps, offset=0.0, activation='silu', out_dtype=None, out=None) -> y: rms_norm of each last-dimension row of x times activation(z) element by element (silu or sigmoid; z x's shape), as gated linear-attention outputs are",
+          "rope": "rope(x, positions, freqs, rotary_dim=None, style='half', scale=1.0, out_dtype=None, out=None) -> y: each token's heads (x [tokens][heads][dim] or [tokens][dim]) rotated at its position (positions [tokens] int64, a StepBatch's or RoundBatch's positions_t) on their first rotary_dim values, the rest passed through; freqs [rotary_dim / 2] FP32 inverse frequencies (angle fp32(position) x freq in FP32) or a [positions][rotary_dim] FP32 table (cos of every pair, then sin); style half (pairs j, j + rotary_dim / 2) or interleaved (2j, 2j + 1); scale multiplies cos and sin; out may be x (in place)",
+          "silu_mul": "silu_mul(x, up=None, layout='halves', out_dtype=None, out=None) -> y: silu(gate) * up element by element: x the gates and up the values, or x [..., 2n] both (layout halves [gate | up], interleaved gate at even and up at odd columns) and y [..., n]",
+          "gelu_mul": "gelu_mul(x, up=None, layout='halves', approximate='none', out_dtype=None, out=None) -> y: as silu_mul with gelu (approximate none: erf; tanh)",
+          "sigmoid_mul": "sigmoid_mul(x, gate, out_dtype=None, out=None) -> y: x * sigmoid(gate) element by element",
+          "l2_norm": "l2_norm(x, eps=1e-6, out_dtype=None, out=None) -> y: x / sqrt(sum(x^2) + eps) per last-dimension row (each head of a query or key)",
+          "stream_sum": "stream_sum(x, gate=None, activation='none', scale=1.0, out_dtype=None, out=None) -> y: y[t] = scale * the sum over streams in stream order of activation(gate[t][s]) * x[t][s], x [tokens][streams][dim], gate x's shape (one per value) or [tokens][streams] (one per stream) or None (the plain sum; scale 1 / streams for their mean), activation none (the gate itself), silu, gelu, gelu_tanh or sigmoid; y [tokens][dim]: several residual streams mixed into one row (a per-token streams-to-streams mix, S rows from S streams, is S calls, each into its stream's out= view)",
+          "stream_add": "stream_add(streams, x, weights=None) -> streams: streams[t][s] += weights[t][s] * x[t] for every stream, in place in the streams' dtype (streams [tokens][streams][dim], x [tokens][dim], weights [tokens][streams] or None for 1): one row added into every residual stream",
+          "softplus_decay": "softplus_decay(x, bias, rate, gate=None, out_dtype=None, out=None, gate_out=None) -> decay, or (decay, beta) with gate: decay = -rate * softplus(x + bias) (x [tokens][n], any row stride: a slice of a projection's output; bias and rate [n]), the log-decay a gated delta or state-space layer discretizes (rate exp(A_log)); beta = sigmoid(gate) (x's shape); out_dtype FP32 by default"
+        },
+        "device_about": "Every norms method: inputs BF16, FP16 or FP32 (each in its own dtype), FP32 math inside, one rounding to out_dtype (bf16, fp16 or fp32 torch dtypes; by default the dtype of the tensor normalized or gated); the last dimension contiguous, the others of any strides (views of a fused projection's output); each row's bits independent of the rows beside it, whatever the row count (decode, verify and prompt rows agree); capture-safe (no host synchronization; allocations only from torch's caching allocator, which a CUDA graph captures: the result, unless `out` is given, whose last dimension is contiguous too, and any copies a layout needs); every tensor of a call on one device; a new result tensor in the input's shape otherwise.",
+        "cases": "cases.py:norms"
+      }
+    },
+    "facts": {
+      "rounds:norms": {
+        "methods": {},
+        "about": "The norms device form inside a captured round: every method capture-safe on fixed shapes (positions_t of a RoundBatch at its fixed address); a shape's first call may compile, so the model calls each shape before it captures."
+      },
+      "norms:fused": {
+        "methods": {
+          "rms_norm_rope_pair": "rms_norm_rope_pair(q, k, q_weight, k_weight, eps, positions, freqs, offset=0.0, rotary_dim=None, style='half', scale=1.0, out_dtype=None, q_out=None, k_out=None) -> (q, k): rms_norm_rope of a layer's queries [tokens][q_heads][dim] and keys [tokens][k_heads][dim] (each its own weight, both or neither) at the same positions",
+          "rope_pair": "rope_pair(q, k, positions, freqs, rotary_dim=None, style='half', scale=1.0, out_dtype=None, q_out=None, k_out=None) -> (q, k): rope of a layer's queries and keys at the same positions",
+          "stream_add_norm": "stream_add_norm(streams, x, weights, weight, eps, offset=0.0, out_dtype=None, out=None) -> (y, streams): stream_add(streams, x, weights), then rms_norm of every stream as stored (weight [dim], [streams][dim] or None; y [tokens][streams][dim], the streams' dtype by default)"
+        },
+        "about": "Fused forms of the norms slot's own calls where a layer runs them back to back: one launch where the calls take two or more, each output the values the separate calls give (the norms slot's conformance checks they agree)."
+      },
+      "prompts:norms": {
+        "methods": {}
+      }
+    }
+  }
+}

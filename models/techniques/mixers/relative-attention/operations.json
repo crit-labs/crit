@@ -1,0 +1,46 @@
+{
+  "kind": "crit-technique-operations",
+  "technique": "relative-attention",
+  "operations": [
+    {
+      "id": "head-clip",
+      "what": "each head vector of a token, times its learned scale where one is given, shortened to an L2 length where its norm + 1e-6 is longer; optionally rounded to BF16 and times a per-token factor",
+      "reference": {
+        "path": "models/techniques/mixers/relative-attention/code/reference.py",
+        "symbol": "head_clip"
+      },
+      "verify": "on the target against the FP64 reference: within FP32 arithmetic plus one rounding of a 16-bit output (2^-8 of a value and 1% of a step of the largest)",
+      "invariance": "a row's bits independent of the rows beside it and of the row count"
+    },
+    {
+      "id": "small-product",
+      "what": "each row's few values rounded to BF16 times a small FP32 matrix [R][E], the result rounded to BF16: a bias a token computes for the positions behind it",
+      "reference": {
+        "path": "models/techniques/mixers/relative-attention/code/reference.py",
+        "symbol": "small_product"
+      },
+      "verify": "on the target against the FP64 reference: within FP32 arithmetic plus one rounding of a 16-bit output (2^-8 of a value and 1% of a step of the largest)",
+      "invariance": "a row's bits independent of the rows beside it and of the row count"
+    },
+    {
+      "id": "sink-gate",
+      "what": "an attention's rows times sigmoid(lse - sink) (a learned sink logit with no value) and times the sigmoid of an output gate, BF16 out",
+      "reference": {
+        "path": "models/techniques/mixers/relative-attention/code/reference.py",
+        "symbol": "sink_gate"
+      },
+      "verify": "on the target against the FP64 reference: within FP32 arithmetic plus one rounding of a 16-bit output (2^-8 of a value and 1% of a step of the largest)",
+      "invariance": "a row's bits independent of the rows beside it and of the row count"
+    },
+    {
+      "id": "scaled-add",
+      "what": "(y + x) * scale of two rows of one shape, in the output's dtype: a convolution's output joined to its input",
+      "reference": {
+        "path": "models/techniques/mixers/relative-attention/code/reference.py",
+        "symbol": "scaled_add"
+      },
+      "verify": "on the target against the FP64 reference: within FP32 arithmetic plus one rounding of a 16-bit output (2^-8 of a value and 1% of a step of the largest)",
+      "invariance": "a row's bits independent of the rows beside it and of the row count"
+    }
+  ]
+}

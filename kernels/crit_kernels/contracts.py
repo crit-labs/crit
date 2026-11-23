@@ -1,6 +1,6 @@
-"""The operation contract, executable: each operation of crit's Inference techniques (their operations.json) has here
-the FP64 reference a kernel's result is compared with and the tolerance it keeps, one definition that the kernels'
-benches (so the sweep and the gates) and their tests call:
+"""The operation contract, executable: each operation of crit's Inference and model techniques (their operations.json)
+has here the FP64 reference a kernel's result is compared with and the tolerance it keeps, one definition that the
+kernels' benches (so the sweep and the gates) and their tests call:
 
     from crit_kernels import contracts
     want = contracts.reference("paged-attention")(q, keys, values, seen, scale)    # FP64
@@ -275,9 +275,9 @@ CONTRACTS = {c.id: c for c in (
     Contract("paged-attention", attention, _ATTENTION, "q, keys and values as the pages decode them",
              (("int8-queries", Close(7e-2, 2e-2)),)),
     Contract("partial-attention-merge", merge, Close(1e-6, 1e-5), "the merged rows before their output rounding"),
-    Contract("latent-attention", _from_file("inference/attention-state/code/latent_attention.py", "latent_attention"),
+    Contract("latent-attention", _from_file("inference/techniques/attention/attention-state/code/latent_attention.py", "latent_attention"),
              Close(8e-3, 0.0, 2e-2), "the latent part of each cached row both key (with the rotary part) and value"),
-    Contract("sparse-index", _from_file("inference/attention-state/code/sparse_index.py", "sparse_scores"),
+    Contract("sparse-index", _from_file("inference/techniques/attention/attention-state/code/sparse_index.py", "sparse_scores"),
              Close(1e-5, 0.0, 1e-3), "scores; the picks those of sparse_index or within the scores' error"),
     Contract("kv-page-write", None, Bits("the page kind's encoder (paged-kv-attention's module docstring)"),
              "codes and scales of the encoding rule, checked against its torch form in the kernel's tests"),
@@ -286,23 +286,23 @@ CONTRACTS = {c.id: c for c in (
     Contract("integer-block-rows", None, Bits("the declared integer block order (host_int.cpp)"),
              "the CPU tier's bits; its sums within Sums() of projection()"),
     Contract("expert-routing", routing, Close(2e-6, 0.0), "ids exactly the reference's, weights within FP32 rounding"),
-    Contract("rms-norm", _from_file("inference/fused-norms/code/rows.py", "rms_norm_rows"), _NORMS, "", _NORM_VARIANTS),
-    Contract("rotary-positions", _from_file("inference/fused-norms/code/rows.py", "rope_rows"), _NORMS, "", _NORM_VARIANTS),
-    Contract("gated-products", _from_file("inference/fused-norms/code/rows.py", "act_mul_rows"), _NORMS, "", _NORM_VARIANTS),
-    Contract("stream-mixes", _from_file("inference/fused-norms/code/rows.py", "stream_sum_rows"), _NORMS, "", _NORM_VARIANTS),
-    Contract("softplus-decay", _from_file("inference/fused-norms/code/rows.py", "softplus_decay_rows"), _NORMS, "", _NORM_VARIANTS),
-    Contract("rms-norm-quantize", _from_file("inference/fused-norms/code/rows.py", "rms_norm_rows"), _NORMS,
+    Contract("rms-norm", _from_file("inference/techniques/norms/fused-norms/code/rows.py", "rms_norm_rows"), _NORMS, "", _NORM_VARIANTS),
+    Contract("rotary-positions", _from_file("inference/techniques/norms/fused-norms/code/rows.py", "rope_rows"), _NORMS, "", _NORM_VARIANTS),
+    Contract("gated-products", _from_file("inference/techniques/norms/fused-norms/code/rows.py", "act_mul_rows"), _NORMS, "", _NORM_VARIANTS),
+    Contract("stream-mixes", _from_file("inference/techniques/norms/fused-norms/code/rows.py", "stream_sum_rows"), _NORMS, "", _NORM_VARIANTS),
+    Contract("softplus-decay", _from_file("inference/techniques/norms/fused-norms/code/rows.py", "softplus_decay_rows"), _NORMS, "", _NORM_VARIANTS),
+    Contract("rms-norm-quantize", _from_file("inference/techniques/norms/fused-norms/code/rows.py", "rms_norm_rows"), _NORMS,
              "the norm's rows before they are quantized; the quantized codes those of the format's quantizer",
              _NORM_VARIANTS),
     Contract("nvfp4-projection", projection, _PROJECTION),
-    Contract("nvfp4-activation-quantization", _from_file("inference/quantized-projections/code/nvfp4.py",
+    Contract("nvfp4-activation-quantization", _from_file("inference/techniques/projections/quantized-projections/code/nvfp4.py",
                                                          "quantize_row"), Bits("crit's declared NVFP4 quantizer")),
     Contract("fp8-row-projection", projection, _PROJECTION),
     Contract("mxfp8-projection", projection, _PROJECTION),
     Contract("fp8-matched-pair", None, Bits("the declared FP8 block order (fp8_block.h)"),
              "its sums within Sums() of projection()"),
     Contract("int4-group-projection", projection, _PROJECTION, "(code - zero) x scale a group, exact in FP32"),
-    Contract("gguf-projection", _from_file("inference/gguf-projections/code/host.py", "project_rows"), _PROJECTION),
+    Contract("gguf-projection", _from_file("inference/techniques/projections/gguf-projections/code/host.py", "project_rows"), _PROJECTION),
     Contract("exl3-projection", projection, Sums(rel=2e-3),
              "the trellis codes' decoded weights; FP16 rotated rows (2^-11 of the magnitudes)"),
     Contract("gated-delta", gated_delta, Close(1e-3, 1e-3),
@@ -310,10 +310,26 @@ CONTRACTS = {c.id: c for c in (
              (("token-by-token", Close(1e-5, 1e-4)),)),
     Contract("ssd-scan", ssd, Close(1e-3, 1e-3)),
     Contract("causal-conv", causal_conv, Close(1e-4, 1e-4), "FP32 products and sums, the SiLU's expf"),
-    Contract("sampling", _from_file("inference/token-sampling/code/sampling.py", "law"),
+    Contract("sampling", _from_file("inference/techniques/sampling/token-sampling/code/sampling.py", "law"),
              Bits("the sampling law's draws (sampling.py law, select)")),
     Contract("cpu-route-handoff", None, Bits("heterogeneous-expert-dispatch's host path (DeviceDispatch, ext None)"),
              "the CPU routes, payloads and combined rows bit for bit, checked in the plugin's device tests"),
+    Contract("head-clip", _from_file("models/techniques/mixers/relative-attention/code/reference.py", "head_clip"),
+             _NORMS, "", _NORM_VARIANTS),
+    Contract("small-product", _from_file("models/techniques/mixers/relative-attention/code/reference.py",
+                                         "small_product"), _NORMS, "the product before its BF16 rounding"),
+    Contract("sink-gate", _from_file("models/techniques/mixers/relative-attention/code/reference.py", "sink_gate"),
+             _NORMS),
+    Contract("scaled-add", _from_file("models/techniques/mixers/relative-attention/code/reference.py", "scaled_add"),
+             _NORMS, "", _NORM_VARIANTS),
+    Contract("summary-mix", _from_file("models/techniques/residuals/block-attention/code/reference.py", "summary_mix"),
+             Close(2e-5, 2e-5)),
+    Contract("pair-norm", _from_file("models/techniques/residuals/block-attention/code/reference.py", "pair_norm"),
+             _NORMS),
+    Contract("gated-join", _from_file("models/techniques/residuals/block-attention/code/reference.py", "gated_join"),
+             Close(1e-4, 1e-4), "f and a given", (("low-rank", Close(0.0, 0.0, 2e-2)),)),
+    Contract("span-attention", _from_file("models/techniques/drafters/block-drafter/code/reference.py",
+                                          "span_attention"), _ATTENTION, "the span's keys and values as stored (BF16)"),
     Contract("expert-residency", None, Bits("device_cache.LayerDirectory's plans (device-expert-cache)"),
              "the slot tables, copies and counters plan for plan, the slots' bundles byte for byte, checked against "
              "the host twin in device-expert-cache's tests"),
@@ -356,7 +372,8 @@ def catalog(root=None):
     """Every operation of crit's techniques: id -> (technique, its operations.json entry)."""
     root = Path(root) if root else _root()
     found = {}
-    for path in sorted((root / "inference").glob("*/operations.json")):
+    for path in sorted(p for pillar in ("inference", "models") for p in (root / pillar / "techniques").glob(
+            "*/*/operations.json")):
         data = json.loads(path.read_text(encoding="utf-8"))
         for op in data.get("operations", []):
             found[op["id"]] = (data.get("technique"), op)

@@ -1,7 +1,8 @@
-"""model-template's load over a checkpoint manifest: every tensor the composed model reads, planned and loaded the way
+"""A model plugin's load over a checkpoint manifest: every tensor the composed model reads, planned and loaded the way
 a real load does it, without the weights or a GPU.
 
-plan(manifest, placement) runs model-template's ComposedModel itself over a ManifestCheckpoint (the manifest's
+plan(manifest, placement) runs the ComposedModel of the finished model plugin that serves the manifest's model_type
+(models/cache; the models core's compose() over the plugin's layout) itself over a ManifestCheckpoint (the manifest's
 headers: tensors_dtype, shape and size) on the CPU, with the slots filled by stand-ins that take what the real plugins
 take and refuse the rest as they would:
 
@@ -29,7 +30,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[2]
-for _folder in ("core/python", "cli"):
+for _folder in ("inference/core/python", "cli"):
     if str(ROOT / _folder) not in sys.path:
         sys.path.insert(0, str(ROOT / _folder))
 
@@ -54,13 +55,14 @@ def _module(name, path):
 
 
 def template():
-    """model-template's compose module, imported as the plugin's package lays its sources out (plugin.json's
-    `sources`: its code as `template`, attention-state's rope code as `rope`)."""
+    """The models core's compose module, imported as the core's package lays its sources out (model-template's
+    plugin.json `sources`: its code as `template`, each model technique's under its key, attention-state's rope code
+    as `rope`)."""
     if "dry_template" not in sys.modules:
-        plugin = ROOT / "inference" / "model-template"
+        plugin = ROOT / "models" / "core" / "model-template"
         sources = json.loads((plugin / "plugin.json").read_text(encoding="utf-8"))["sources"]
         package = types.ModuleType("dry_template")
-        package.__path__ = []
+        package.__path__ = [str(plugin)]   # the plugin's folder, whose plugin.json names the techniques it mounts
         sys.modules["dry_template"] = package
         for name, folder in sources.items():
             sub = types.ModuleType(f"dry_template.{name}")
@@ -80,13 +82,13 @@ def _constants(path, *names):
     return found
 
 
-PROJECTION = _constants(ROOT / "inference/quantized-projections/code/device_matrices.py", "FORMATS", "ENCODINGS")
-EXPERT_FORMATS = tuple(_constants(ROOT / "inference/grouped-experts/code/bundles.py", "_KINDS")["_KINDS"]) + ("bf16",)
-TABLE_FORMATS = _constants(ROOT / "inference/lookup-table-rows/code/device_rows.py", "FORMATS")["FORMATS"]
+PROJECTION = _constants(ROOT / "inference/techniques/projections/quantized-projections/code/device_matrices.py", "FORMATS", "ENCODINGS")
+EXPERT_FORMATS = tuple(_constants(ROOT / "inference/techniques/experts/grouped-experts/code/bundles.py", "_KINDS")["_KINDS"]) + ("bf16",)
+TABLE_FORMATS = _constants(ROOT / "inference/techniques/memory/lookup-table-rows/code/device_rows.py", "FORMATS")["FORMATS"]
 
 
 class ManifestCheckpoint:
-    """model-template's Checkpoint over a manifest: its headers, and tensors without bytes."""
+    """The models core's Checkpoint over a manifest: its headers, and tensors without bytes."""
 
     def __init__(self, manifest, folder):
         import torch
@@ -268,7 +270,7 @@ class Drafter:
 class Parts:
     """The slots as a model plugin's factory sees them, filled by the stand-ins."""
 
-    PLUGINS = {"model": "model-template", "projections": "quantized-projections", "attention": "partitioned-attention",
+    PLUGINS = {"projections": "quantized-projections", "attention": "partitioned-attention",
                "kv_cache": "attention-state", "sampler": "token-sampling", "norms": "fused-norms",
                "embeddings": "lookup-table-rows", "recurrence": "sequential-recurrence", "router": "topk-router",
                "experts": "expert-offload", "drafter": "greedy-head-drafter", "placement": "device-placement"}
@@ -293,7 +295,7 @@ class Parts:
 
 
 def _facts(plugin):
-    path = next(ROOT.glob(f"inference/**/{plugin}/plugin.json"), None)
+    path = next(iter(ROOT.glob(f"inference/**/{plugin}/plugin.json")), None)
     return json.loads(path.read_text(encoding="utf-8")).get("provides", []) if path else []
 
 
@@ -321,20 +323,37 @@ def _shapes_only(real):
     return encode
 
 
+def _csf_shapes_only(real):
+    """crit_plugins.device.csf_decode over meta tensors: the decoded scales' dtype and shape, no values (its arithmetic
+    is tested on real values, device-expert-cache's tests/test_csf.py). The decode's dozen tensor operations cost
+    3 ms a call on meta tensors, and a checkpoint with CSF scales decodes one per expert matrix: 74,000 calls, 110 s
+    of the 112 s its plan took."""
+    def decode(fixed, exceptions=None):
+        import torch
+        if fixed.device.type != "meta":
+            return real(fixed, exceptions)
+        slabs, width = tuple(fixed.shape[-2:])
+        if width % 16 or width < 32:
+            raise ValueError("CSF fixed rows are 16 * (1 + groups / 2) bytes")
+        return torch.empty(*fixed.shape[:-2], slabs * 16, (width // 16 - 1) * 2, dtype=torch.uint8, device="meta")
+    return decode
+
+
 def plan(manifest, placement="tables-on", options=None):
-    """{model_type, layout, read, unread, formats, error, experts} of model-template's load over `manifest` (experts:
+    """{model_type, plugin, read, unread, formats, error, experts} of the load of the model plugin that serves
+    `manifest` (plugin: its id, None where no finished model plugin serves the model_type; experts:
     what expert-offload's begin() was given and each layer's W4A4 or not), with the first
     attention plugin of ATTENTION whose facts the layout's blocks accept."""
-    from crit_plugins import encodings
-    real = encodings.encode
-    encodings.encode = _shapes_only(real)
+    from crit_plugins import device, encodings
+    real, real_csf = encodings.encode, device.csf_decode
+    encodings.encode, device.csf_decode = _shapes_only(real), _csf_shapes_only(real_csf)
     try:
         for attention in ATTENTION:
             report = _plan(manifest, placement, options, attention)
             if "the attention plugin does not provide" not in (report["error"] or ""):
                 break
     finally:
-        encodings.encode = real
+        encodings.encode, device.csf_decode = real, real_csf
     return report
 
 
@@ -343,15 +362,17 @@ def _plan(manifest, placement, options, attention):
     torch.set_default_device(None)
     config = manifest["configs"].get("config.json") or {}
     report = {"name": manifest["name"], "model_type": config.get("model_type"), "placement": placement,
-              "layout": None, "error": None, "formats": {}, "read": 0, "unread": []}
+              "plugin": None, "error": None, "formats": {}, "read": 0, "unread": []}
     compose = template()
-    try:
-        layout = compose.layout_for(config)
-    except ValueError as error:
-        report["error"] = str(error)
+    from crit.models import plugin_for
+    types = [t for t in ((config.get("text_config") or {}).get("model_type"), config.get("model_type")) if t]
+    found = plugin_for(types)
+    if found is None:
+        report["error"] = f"no finished model plugin serves model_type {config.get('model_type')!r}"
         report["covered"] = False
         return report
-    report["covered"], report["layout"] = True, layout.get("name")
+    layout = compose.read(found["folder"] / compose.LAYOUT)
+    report["covered"], report["plugin"] = True, found["id"]
     rec = Recorder()
     with tempfile.TemporaryDirectory() as folder:
         for name, data in manifest["configs"].items():
@@ -366,17 +387,17 @@ def _plan(manifest, placement, options, attention):
                      "experts": Experts(rec), "placement": Placement(placement == "tables-off")}
         if has_draft:
             instances["drafter"] = Drafter()
-        from crit_core.model import parse_model_config
-        if not parse_model_config(config).routed_layers():   # a dense model's selection has no router or experts
+        from crit_models.config import architecture
+        if not architecture(config).routed_layers():   # a dense model's selection has no router or experts
             del instances["router"], instances["experts"]
-        plugins = {**Parts.PLUGINS, "attention": attention}
+        plugins = {**Parts.PLUGINS, "model": found["id"], "attention": attention}
         facts = {slot: _facts(plugins[slot]) for slot in instances}
         parts = Parts(instances, facts, context, plugins)
         report["plugins"] = {slot: plugins[slot] for slot in instances}
         chosen = {"rounds": False, "prompt_buckets": "", "span_seconds": 0.0, "prompt_cache": 0, "passes": "off",
                   "mtp": has_draft, **(options or {})}
         try:
-            compose.compose(context, chosen, parts)
+            compose.compose(context, chosen, parts, folder=found["folder"])
         except Exception as error:   # the load's own refusal: the report names it and where it was raised
             frames = traceback.extract_tb(error.__traceback__)
             where = next((f"{Path(f.filename).name}:{f.lineno}" for f in reversed(frames)
@@ -395,7 +416,7 @@ def _plan(manifest, placement, options, attention):
 
 def main(argv=None):
     import argparse
-    parser = argparse.ArgumentParser(description="Plan model-template's load over checkpoint manifests")
+    parser = argparse.ArgumentParser(description="Plan the model plugins' loads over checkpoint manifests")
     parser.add_argument("names", nargs="*", help="manifest names (default: every manifest in tests/manifests)")
     parser.add_argument("--placement", default="tables-on", choices=("tables-on", "tables-off"))
     args = parser.parse_args(argv)

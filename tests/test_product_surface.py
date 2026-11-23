@@ -15,17 +15,17 @@ sys.path.insert(0, str(ROOT / "cli"))
 sys.path.insert(0, str(ROOT / "mcp"))
 from crit import inference as store
 LAUNCHER = str(ROOT / "tests/run_crit.py")
-PRODUCT_FOLDERS = ("core", "inference", "kernels", "models", "eval", "api", "mcp", "smoke", "tests", "docs", "cli",
+PRODUCT_FOLDERS = ("inference", "kernels", "eval", "api", "mcp", "smoke", "tests", "docs", "cli",
                    ".github")
 
 
 class ProductTests(unittest.TestCase):
     def fixture(self, root):
         entry = copy.deepcopy(store.load()["entries"][0])
-        entry.update(id="example", path="inference/example/README.md", code_path="inference/example/code",
+        entry.update(id="example", category="attention", path="inference/techniques/attention/example/README.md", code_path="inference/techniques/attention/example/code",
                      summary="Generic contract </script><img src=x>",
-                     code_files=[{"path": "inference/example/code/implementation.py", "purpose": "Never executed by navigation"}])
-        feature = root / "inference/example"
+                     code_files=[{"path": "inference/techniques/attention/example/code/implementation.py", "purpose": "Never executed by navigation"}])
+        feature = root / "inference/techniques/attention/example"
         (feature / "code").mkdir(parents=True)
         (feature / "entry.json").write_text(json.dumps(entry), encoding="utf-8")
         (feature / "README.md").write_text("# Scoped contract\n", encoding="utf-8")
@@ -47,7 +47,7 @@ class ProductTests(unittest.TestCase):
             entry = self.fixture(root)
             self.assertEqual(store.load(root)["entries"][0]["summary"], entry["summary"])
             entry["summary"] = "Newly authored search guidance"
-            (root / "inference/example/entry.json").write_text(json.dumps(entry), encoding="utf-8")
+            (root / "inference/techniques/attention/example/entry.json").write_text(json.dumps(entry), encoding="utf-8")
             self.assertEqual(store.load(root)["entries"][0]["summary"], entry["summary"])
             self.assertEqual(store.check(root), [])
 
@@ -68,10 +68,10 @@ class ProductTests(unittest.TestCase):
                 with self.subTest(field=field):
                     entry = copy.deepcopy(original)
                     entry["agent_guidance"][field] = value
-                    (root / "inference/example/entry.json").write_text(json.dumps(entry), encoding="utf-8")
+                    (root / "inference/techniques/attention/example/entry.json").write_text(json.dumps(entry), encoding="utf-8")
                     self.assertTrue(any("agent_guidance." + field in error for error in store.check(root)))
             entry.pop("agent_guidance")
-            (root / "inference/example/entry.json").write_text(json.dumps(entry), encoding="utf-8")
+            (root / "inference/techniques/attention/example/entry.json").write_text(json.dumps(entry), encoding="utf-8")
             self.assertTrue(any("agent selection" in error for error in store.check(root)))
 
     def test_category_is_required_from_the_fixed_set(self):
@@ -85,7 +85,7 @@ class ProductTests(unittest.TestCase):
                         entry.pop("category")
                     else:
                         entry["category"] = value
-                    (root / "inference/example/entry.json").write_text(json.dumps(entry), encoding="utf-8")
+                    (root / "inference/techniques/attention/example/entry.json").write_text(json.dumps(entry), encoding="utf-8")
                     self.assertTrue(any("category must be one of" in error for error in store.check(root)))
 
     def test_list_groups_entries_by_category(self):
@@ -110,7 +110,7 @@ class ProductTests(unittest.TestCase):
             entry = self.fixture(root)
             entry["donors"] = ["external-source"]
             entry["code_files"][0]["path"] = "research/implementation.py"
-            (root / "inference/example/entry.json").write_text(json.dumps(entry), encoding="utf-8")
+            (root / "inference/techniques/attention/example/entry.json").write_text(json.dumps(entry), encoding="utf-8")
             errors = store.check(root)
             self.assertTrue(any("source-bundle" in error for error in errors))
             self.assertTrue(any("inside the feature" in error for error in errors))
@@ -124,7 +124,7 @@ class ProductTests(unittest.TestCase):
 
 
     def test_whole_folders_include_unknown_extensions_and_exclude_local_roots(self):
-        allowed = ["README.md", "CLAUDE.md", "inference/example/code/new.extension", "core/deep/data.json",
+        allowed = ["README.md", "CLAUDE.md", "inference/example/code/new.extension", "inference/core/deep/data.json",
                    "tests/fixture.raw", "docs/new.record", "cli/new.extension", "api/new.extension", "mcp/new.extension", "kernels/new.extension", "models/new.extension", ".github/workflows/ci.yml"]
         ignored = ["scratch.txt", "tools/deep/source.anything", "private/source.py", "archive/history.json", "evidence/result.json", "build/output.cpp",
                    "dist/package.json", "runs/ledger.json", ".idea/workspace.xml", "research/source.cpp",
@@ -143,11 +143,11 @@ class ProductTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self.fixture(root)
-            (root / "inference/example/code/reference.py").write_text("def ref():\n    return 0\n", encoding="utf-8")
+            (root / "inference/techniques/attention/example/code/reference.py").write_text("def ref():\n    return 0\n", encoding="utf-8")
             good = {"kind": "crit-technique-operations", "technique": "example",
                     "operations": [{"id": "op", "what": "an operation", "verify": "against ref on the target, within 1e-5",
                                     "invariance": "a row's bits independent of the rows beside it",
-                                    "reference": {"path": "inference/example/code/reference.py", "symbol": "ref"}}]}
+                                    "reference": {"path": "inference/techniques/attention/example/code/reference.py", "symbol": "ref"}}]}
             self.assertEqual(store.check_operations(root, "example", good), [])
             qualified = copy.deepcopy(good)
             qualified["operations"][0]["reference"]["symbol"] = "example::ref (exact), code.ref"
@@ -169,18 +169,18 @@ class ProductTests(unittest.TestCase):
                 with self.subTest(expected=expected):
                     self.assertTrue(any(expected in e for e in store.check_operations(root, "example", bad)),
                                     store.check_operations(root, "example", bad))
-            (root / "inference/example/kernels.json").write_text("{}", encoding="utf-8")
+            (root / "inference/techniques/attention/example/kernels.json").write_text("{}", encoding="utf-8")
             self.assertTrue(any("keeps no kernel lists" in e for e in store.check(root)), store.check(root))
-            (root / "inference/example/kernels.json").unlink()
-            (root / "inference/base/dense").mkdir(parents=True)
-            (root / "inference/base/dense/kernels.json").write_text("{}", encoding="utf-8")
-            self.assertTrue(any(e.startswith("base/dense/kernels.json: a plugin keeps no kernel lists")
+            (root / "inference/techniques/attention/example/kernels.json").unlink()
+            (root / "inference/techniques/attention/dense").mkdir(parents=True)
+            (root / "inference/techniques/attention/dense/kernels.json").write_text("{}", encoding="utf-8")
+            self.assertTrue(any(e.startswith("attention/dense/kernels.json: a plugin keeps no kernel lists")
                                 for e in store.check(root)), store.check(root))
 
     def test_real_inference_entries_are_generic_local_implementations(self):
         self.assertEqual(store.check(), [])
         entries = store.load()["entries"]
-        self.assertEqual(len(entries), 29)
+        self.assertEqual(len(entries), 28)
         for entry in entries:
             self.assertNotIn("donors", entry)
             self.assertNotIn("code_locations", entry)
@@ -206,7 +206,7 @@ class ProductTests(unittest.TestCase):
         self.assertIn("mtp-decode", [item["id"] for item in json.loads(searched.stdout)])
         contracts = subprocess.run([sys.executable, "-B", LAUNCHER, "contracts"],
                                    capture_output=True, timeout=20, check=True)
-        self.assertIn(b"core/include/crit/core.h", contracts.stdout)
+        self.assertIn(b"inference/core/include/crit/core.h", contracts.stdout)
         with tempfile.TemporaryDirectory() as directory:
             kernels = subprocess.run([sys.executable, "-B", "-S", LAUNCHER, "kernels"],
                                    cwd=directory, capture_output=True, text=True, timeout=10, check=True)
@@ -215,48 +215,49 @@ class ProductTests(unittest.TestCase):
             self.assertEqual(list(Path(directory).iterdir()), [])
 
     def test_native_build_source_and_test_paths_exist(self):
-        cmake = (ROOT / "core/CMakeLists.txt").read_text(encoding="utf-8")
+        cmake = (ROOT / "inference/core/CMakeLists.txt").read_text(encoding="utf-8")
         for path in ("src/runtime/engine.cpp", "src/memory/resources.cpp", "src/backends/cuda/driver_rounds.cpp",
-                     "../tests/core/request_options_tests.cpp", "../tests/core/concurrency_tests.cpp"):
+                     "../../tests/core/request_options_tests.cpp", "../../tests/core/concurrency_tests.cpp"):
             self.assertIn(path, cmake)
-            self.assertTrue((ROOT / "core" / path).is_file())
+            self.assertTrue((ROOT / "inference" / "core" / path).is_file())
 
     def test_core_never_builds_or_includes_inference_code(self):
-        for path in (ROOT / "core").rglob("*"):
+        for path in (ROOT / "inference" / "core").rglob("*"):
             if path.is_file() and path.suffix in {".txt", ".cmake", ".in", ".h", ".hpp", ".cpp", ".cu", ".py"}:
-                self.assertNotRegex(path.read_text(encoding="utf-8").lower(), r"inference/|crit_inference|crit::inference", path)
+                self.assertNotRegex(path.read_text(encoding="utf-8").lower(), r"inference/techniques|crit_inference|crit::inference", path)
         for path in (ROOT / "tests/core").rglob("*"):
             if path.is_file() and "__pycache__" not in path.parts:   # bytecode the suites leave
-                self.assertNotIn("inference/", path.read_text(encoding="utf-8"), path)
+                self.assertNotIn("inference/techniques", path.read_text(encoding="utf-8"), path)
         cmake = (ROOT / "inference/CMakeLists.txt").read_text(encoding="utf-8")
-        self.assertIn('add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../core"', cmake)
+        self.assertIn('add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/core"', cmake)
         for source in re.findall(r"\$\{FIXTURES\}/([\w./]+)", cmake):
             self.assertTrue((ROOT / "tests/inference" / source).is_file(), source)
 
     def test_cli_only_package_has_one_entrypoint_and_no_browser_sources(self):
         package = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         self.assertEqual(package["project"]["scripts"], {"crit": "crit.cli:main"})
-        # The wheel holds every package of the code folders and the plugin library, inference/, as package data.
+        # The wheel holds every package of the code folders and the plugin library, inference/techniques/, as package data.
         setuptools = package["tool"]["setuptools"]
         folders = {name: ROOT / path for name, path in setuptools["package-dir"].items()}
-        self.assertEqual(folders.pop("crit.library.inference"), ROOT / "inference")
+        self.assertEqual(folders.pop("crit.library.inference.techniques"), ROOT / "inference" / "techniques")
+        # Model support, models/ as package data of crit.library.models (crit.plugins.Library).
+        self.assertEqual(folders.pop("crit.library.models"), ROOT / "models")
         # crit's kernel templates, kernels/ as package data of crit.library.kernels (crit_kernels.build.library).
         self.assertEqual(folders.pop("crit.library.kernels"), ROOT / "kernels")
-        # crit mcp's guides, from the checkout's root as crit.library.guides' package data: exactly its GUIDES but the
-        # library's own inference/README.md.
+        # crit mcp's guides, from the checkout's root as crit.library.guides' package data: exactly its GUIDES.
         self.assertEqual(folders.pop("crit.library.guides"), ROOT)
         # Read from server.py's source, as this test runs without crit_core, which importing the server needs.
         server = ast.parse((ROOT / "mcp/crit_mcp/server.py").read_text(encoding="utf-8"))
         GUIDES = next(ast.literal_eval(node.value) for node in server.body if isinstance(node, ast.Assign)
                       and [target.id for target in node.targets if isinstance(target, ast.Name)] == ["GUIDES"])
         self.assertEqual(setuptools["package-data"]["crit.library.guides"],
-                         [guide for guide in GUIDES if guide != "inference/README.md"])
+                         list(GUIDES))
         self.assertEqual(sorted(folder.parent.name for folder in folders.values()),
-                         sorted(["cli", "api", "kernels", "models", "mcp", "smoke"]))
+                         sorted(["cli", "api", "kernels", "mcp", "smoke"]))
         found = {".".join((name, *init.parent.relative_to(folder).parts))
                  for name, folder in folders.items() for init in folder.rglob("__init__.py")}
         self.assertEqual(sorted(setuptools["packages"]),
-                         sorted(found | {"crit.library.inference", "crit.library.kernels", "crit.library.guides"}))
+                         sorted(found | {"crit.library.inference.techniques", "crit.library.models", "crit.library.kernels", "crit.library.guides"}))
         self.assertEqual({p.name for p in (ROOT / "cli").iterdir() if p.is_dir()}, {"crit"})
         self.assertEqual({p.name for p in (ROOT / "api").iterdir() if p.is_dir()}, {"crit_api"})
         self.assertEqual({p.name for p in (ROOT / "mcp").iterdir() if p.is_dir()}, {"crit_mcp"})
@@ -264,9 +265,8 @@ class ProductTests(unittest.TestCase):
                          {"crit_kernels", "core", "techniques", "starters"})
         self.assertEqual({p.name for p in (ROOT / "kernels/techniques").iterdir() if p.is_dir()},
                          {"attention", "experts", "norms", "projections", "recurrence", "sampling"})
-        self.assertEqual({p.name for p in (ROOT / "models").iterdir() if p.is_dir()}, {"crit_models"})
         self.assertEqual({p.name for p in (ROOT / "smoke").iterdir() if p.is_dir()}, {"crit_smoke"})
-        self.assertEqual({p.name for p in (ROOT / "core/python").iterdir()
+        self.assertEqual({p.name for p in (ROOT / "inference/core/python").iterdir()
                           if p.is_dir() and not p.name.endswith(".egg-info")}, {"crit_core", "crit_plugins"})
         assets = [p for folder in PRODUCT_FOLDERS for p in (ROOT / folder).rglob("*")
                   if p.is_file() and p.suffix in {".html", ".css", ".js"}]
@@ -276,7 +276,7 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(rejected.returncode, 2)
 
     def test_core_python_package_ships_the_root_license(self):
-        self.assertEqual((ROOT / "core/python/LICENSE").read_bytes(), (ROOT / "LICENSE").read_bytes())
+        self.assertEqual((ROOT / "inference/core/python/LICENSE").read_bytes(), (ROOT / "LICENSE").read_bytes())
 
 if __name__ == "__main__":
     unittest.main()

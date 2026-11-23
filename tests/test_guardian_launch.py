@@ -11,7 +11,7 @@ import io
 from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "api", "../crit-eval", "kernels", "cli"): sys.path.insert(0, str(ROOT / _folder))
+for _folder in ("inference/core/python", "api", "../crit-eval", "kernels", "cli"): sys.path.insert(0, str(ROOT / _folder))
 from crit.process.ownership import process_identity
 from crit.process.tree import ProcessTree
 from crit.process import guardian
@@ -125,7 +125,7 @@ finally:
 '''
             # crit as installed: the CLI package with Core's Python package (a dependency of crit) beside it.
             completed = subprocess.run([str(python), "-B", "-c", client,
-                                        os.pathsep.join((str(ROOT / "cli"), str(ROOT / "core" / "python"))), str(root)],
+                                        os.pathsep.join((str(ROOT / "cli"), str(ROOT / "inference" / "core" / "python"))), str(root)],
                 capture_output=True, text=True, timeout=25)
             self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr +
                              (root / "engine.log").read_text(encoding="utf-8"))
@@ -243,7 +243,7 @@ print(json.dumps(report))
 '''
             # The supervisor runs in the venv too, as an installed crit does: its guardian is the base interpreter.
             completed = subprocess.run([str(venv_python), "-B", "-c", client,
-                                        os.pathsep.join((str(ROOT / "cli"), str(ROOT / "core" / "python"))),
+                                        os.pathsep.join((str(ROOT / "cli"), str(ROOT / "inference" / "core" / "python"))),
                                         str(root), str(venv_python)],
                                        capture_output=True, text=True, timeout=90, stdin=subprocess.DEVNULL)
             log = (root / "engine.log").read_text(encoding="utf-8", errors="replace") \

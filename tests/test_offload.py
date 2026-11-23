@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "cli"): sys.path.insert(0, str(ROOT / _folder))
+for _folder in ("inference/core/python", "cli"): sys.path.insert(0, str(ROOT / _folder))
 from crit import offload  # noqa: E402
 
 CONFIG = {"architectures": ["Qwen4ExpForConditionalGeneration"],

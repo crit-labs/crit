@@ -99,6 +99,7 @@ class LogprobRecordTests(unittest.TestCase):
 
 
 class LogprobApiTests(ServeFixture, unittest.TestCase):
+    shared_engine = True   # its tests leave the served engine as they found it, or get a new one (ServeFixture)
     extra_capabilities = ("chat-logprobs-v1",)
     adapter_suffix = LOGPROB_ADAPTER
     stream = True
@@ -159,6 +160,7 @@ class LogprobApiTests(ServeFixture, unittest.TestCase):
 
 class ApiChatLogprobTests(ServeFixture, unittest.TestCase):
     """logprobs and top_logprobs on /api/chat and /api/generate."""
+    shared_engine = True   # its tests leave the served engine as they found it, or get a new one (ServeFixture)
     extra_capabilities = ("chat-logprobs-v1",)
     adapter_suffix = LOGPROB_ADAPTER
     stream = True

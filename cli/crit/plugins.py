@@ -1,12 +1,14 @@
-"""crit plugins: list, check and test an engine's plugins (by default crit's library, its Inference folder: every
-technique that fills a slot is one plugin, inference/ID, beside the base plugins, inference/base/ID), copy library
-plugins into an engine (add), say how an engine's copies stand to the library since (status), bring the ones the
-engine did not change up to it (update), and show the variants an ablation serves. The plugin contract itself, which an engine
-loads with, is Core's crit_plugins (docs/PLUGINS.md)."""
+"""crit plugins: list, check and test an engine's plugins (by default crit's library: every Inference technique that
+fills a slot is one plugin, inference/techniques/CATEGORY/ID, beside the plain plugin of each slot in the same
+categories, the finished model plugins of models/cache and the models core they extend, models/core), copy library
+plugins into an engine (add; a model plugin of the user's own cache too), say how an engine's copies stand to the
+library since (status), bring the ones the engine did not change up to it (update), and show the variants an ablation
+serves. The plugin contract itself, which an engine loads with, is Core's crit_plugins (docs/PLUGINS.md)."""
 import argparse
 import hashlib
 import json
 import os
+import posixpath
 from pathlib import Path
 import shutil
 import subprocess
@@ -15,13 +17,13 @@ import sys
 try:
     import crit_plugins  # noqa: F401 - Core's, from crit-core
 except ImportError:   # a checkout whose crit-core was installed before Core held crit_plugins
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "core" / "python"))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "inference" / "core" / "python"))
 from crit_plugins.ablation import variants  # noqa: E402
-from crit_plugins.assemble import BASE, Registry, check, fitting  # noqa: E402
-from crit_plugins.manifest import MANIFEST, POLICY_SLOTS, REQUIRED_SLOTS, SLOTS, PluginError  # noqa: E402
+from crit_plugins.assemble import TOGETHER, Registry, check, fitting, together  # noqa: E402
+from crit_plugins.manifest import MANIFEST, REQUIRED_SLOTS, PluginError  # noqa: E402
 from crit_plugins.testing import run_tests  # noqa: E402
 
-# crit's library: the checkout's inference/, or the copy crit's wheel ships
+# crit's library: the checkout's inference/techniques/ and models/, or the copies crit's wheel ships
 from .inference import LIBRARY as INFERENCE, missing  # noqa: E402
 SOURCES = "_sources"   # an engine's copies of code its plugins import that none of its plugins holds
 IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc")
@@ -39,20 +41,98 @@ ENGINE_SERVICES = {
 }
 
 
+MODELS = "models"   # the folder beside inference/ whose plugins (models/core, models/cache) the library holds too
+
+
+class Library:
+    """crit's plugin library as folders of plugins: the Inference techniques folder (inference/techniques, its plugins
+    grouped by category) and, beside its inference/ folder, models/core (the models core, model-template) and
+    models/cache (the finished model plugins, each extending that core). A plugin is copied into an engine at its
+    place there: CATEGORY/ID, or ID for a plugin of models/. Code a plugin imports that no plugin holds goes to the
+    engine's _sources at its path in the techniques folder, or at models/PATH for code in models/ (a model
+    technique's)."""
+
+    def __init__(self, inference=INFERENCE):
+        self.inference = Path(inference).resolve()
+        self.roots = together(self.inference)   # its plugins.json names models/core, which names models/cache
+        self.models = next((root.parent for root in self.roots if root.parent.name == MODELS), None)
+
+    def registry(self):
+        return Registry.discover(*self.roots)
+
+    def place(self, manifest):
+        """Where crit plugins add puts a library plugin in an engine's plugins folder."""
+        folder = Path(manifest["folder"]).resolve()
+        root = next(root for root in self.roots if folder.is_relative_to(root))
+        return folder.relative_to(root)
+
+    def relative(self, folder):
+        """A folder of code's path under an engine's _sources, or None for a folder outside the library."""
+        folder = Path(folder).resolve()
+        if folder.is_relative_to(self.inference):
+            return folder.relative_to(self.inference)
+        if self.models and folder.is_relative_to(self.models):
+            return Path(MODELS) / folder.relative_to(self.models)
+        return None
+
+    def folder(self, relative):
+        """The library folder of a path under _sources (relative()'s inverse)."""
+        relative = Path(relative)
+        if self.models and relative.parts[:1] == (MODELS,):
+            return self.models / Path(*relative.parts[1:])
+        return self.inference / relative
+
+
 def library(inference=INFERENCE):
-    """The library's registry: the plugin of every Inference technique that fills a slot, and the base plugins. crit's
-    own library is a checkout's inference/ or the copy its wheel ships (crit.inference.LIBRARY): without it, the install
-    is broken."""
+    """The library's registry: the plugin of every Inference technique that fills a slot, each slot's plain plugin,
+    the finished model plugins of models/cache and the models core. crit's own library is a checkout's or the copy its wheel ships (crit.inference.LIBRARY):
+    without it, the install is broken."""
     inference = Path(inference)
     if inference == INFERENCE and not inference.is_dir():
         raise PluginError(missing(inference))
-    return Registry.discover(inference)
+    return Library(inference).registry()
 
 
-def closure(registry, ids):
-    """[(id, why)]: the plugins `ids`, then transitively their references, the plugins their tests use and the plugins
-    they extend."""
-    out, seen, queue = [], set(), [(plugin_id, "named") for plugin_id in ids]
+def user_models():
+    """{id: folder} of the model plugins in the user's cache (crit_core.cache_home("models")): the ones built on this
+    machine and kept with crit models cache add, each as it lay in the engine that built it (ENGINE/plugins/ID)."""
+    from crit_core import cache_home
+    root = Path(cache_home("models"))
+    return {path.parent.name: path.parent for path in sorted(root.glob(f"*/{MANIFEST}"))} if root.is_dir() else {}
+
+
+def cached_needs(folder, places, registry):
+    """What a model plugin of the user's cache takes from the library in an engine: (ids of library plugins: the
+    one it extends, those whose code it imports, those its tests use; paths under _sources of other code it
+    imports). Its manifest is the one it had at ENGINE/plugins/ID, so its sources say where crit plugins add puts
+    the library's plugins and code in any engine."""
+    data = json.loads((Path(folder) / MANIFEST).read_text(encoding="utf-8"))
+    ident = Path(folder).name
+    place = {places.place(manifest).as_posix(): manifest["id"] for manifest in registry}
+    ids, lent = set(data.get("test_with", [])) | set(data.get("reference") or []), []
+    for name, source in data.get("sources", {}).items():
+        path = posixpath.normpath(posixpath.join(ident, source))   # from the engine's plugins folder
+        if path == ident or path.startswith(ident + "/"):
+            continue   # its own code
+        if path.startswith(SOURCES + "/"):
+            lent.append(Path(path[len(SOURCES) + 1:]))
+            continue
+        owner = next((other for where, other in place.items() if path == where or path.startswith(where + "/")), None)
+        if owner is None:
+            raise PluginError(f"{ident} (your cache of model plugins): source {name} is {source}, which is no place "
+                              "crit plugins add puts a library plugin or its code")
+        ids.add(owner)
+    unknown = sorted(ids - {manifest["id"] for manifest in registry})
+    if unknown:
+        raise PluginError(f"{ident} (your cache of model plugins) uses {', '.join(unknown)}, which the library does "
+                          "not hold")
+    return sorted(ids), lent
+
+
+def closure(registry, ids, why=None):
+    """[(id, why)]: the plugins `ids` (each named, or for the reason `why` gives it), then transitively their
+    references, the plugins their tests use and the plugins they extend."""
+    out, seen, queue = [], set(), [(plugin_id, (why or {}).get(plugin_id, "named")) for plugin_id in ids]
     while queue:
         plugin_id, why = queue.pop(0)
         if plugin_id in seen:
@@ -73,24 +153,36 @@ def add(dest, ids, inference=INFERENCE, update=False):
     naming one is refused, unless `update` asks to replace the engine's copy of it with the library's current one (at
     the place crit plugins add put it; reported as `replaced`, and the dest/_sources code the added plugins import is
     copied again from the library). Each plugin's folder is copied whole to its place in
-    the library (dest/ID, a base plugin dest/base/ID): a technique brings its README, code and operations.json. Code a
+    the library (dest/CATEGORY/ID; dest/plugins.json marks dest as the folder of plugins): a technique brings its
+    README, code and operations.json. Code a
     plugin imports from another plugin of
     the engine is that plugin's copy, as in the library; other code it imports (a technique that only lends code) is
-    copied to dest/_sources at its path in the Inference folder, and the copied manifest points there. Returns
+    copied to dest/_sources at its path in the Inference folder, and the copied manifest points there. An id the
+    library does not hold names a model plugin of the user's cache (user_models): it is copied to dest/ID as it is,
+    with the library plugins and code it uses (cached_needs). Returns
     {added: [(id, why)], kept: [(id, why)], sources: [path], unmet: {need: [library plugins providing it]}}, unmet being
     the needs no plugin of the engine provides (the engine's own facts, or a plugin still to choose)."""
     dest, inference = Path(dest), Path(inference).resolve()
-    registry = library(inference)
+    registry, places = library(inference), Library(inference)
     if not ids:
         raise PluginError("name the library plugins to add (crit plugins list shows them)")
     engine = Registry.discover(dest) if dest.is_dir() else Registry([])
-    present = [plugin_id for plugin_id in ids if plugin_id in engine]
+    kept_models = {plugin_id: folder for plugin_id, folder in user_models().items() if plugin_id not in registry}
+    cached = [plugin_id for plugin_id in ids if plugin_id in kept_models]   # the user's own model plugins
+    ids, why, lent = [plugin_id for plugin_id in ids if plugin_id not in kept_models], {}, {}
+    for plugin_id in cached:
+        used, lent[plugin_id] = cached_needs(kept_models[plugin_id], places, registry)
+        for other in used:
+            if other not in ids and other not in engine:
+                ids.append(other)
+                why[other] = f"{plugin_id} uses it"
+    present = [plugin_id for plugin_id in ids + cached if plugin_id in engine and plugin_id not in why]
     if present and not update:
         raise PluginError(f"the engine has {', '.join(present)} already: remove its folder to add the library's again, "
                           "or add --update to replace its copy")
     replaced = []
     if present:
-        library_place = {m["id"]: Path(m["folder"]).resolve().relative_to(inference) for m in registry}
+        library_place = {**{m["id"]: places.place(m) for m in registry}, **{i: Path(i) for i in cached}}
         for plugin_id in present:
             if plugin_id not in library_place:
                 raise PluginError(f"{plugin_id} is the engine's own plugin, no library plugin: --update replaces "
@@ -102,11 +194,11 @@ def add(dest, ids, inference=INFERENCE, update=False):
             shutil.rmtree(Path(engine[plugin_id]["folder"]))
             replaced.append(plugin_id)
         engine = {m["id"]: m for m in engine if m["id"] not in present}   # the rest: its references are rechecked last
-    wanted = closure(registry, ids)
+    wanted = closure(registry, ids, why)
     added = [(plugin_id, why) for plugin_id, why in wanted if plugin_id not in engine]
     kept = [(plugin_id, why) for plugin_id, why in wanted if plugin_id in engine]
     library_folder = {m["id"]: Path(m["folder"]).resolve() for m in registry}
-    place = {plugin_id: library_folder[plugin_id].relative_to(inference) for plugin_id, _ in added}
+    place = {plugin_id: places.place(registry[plugin_id]) for plugin_id, _ in added}
     taken = [place[plugin_id].as_posix() for plugin_id, _ in added if (dest / place[plugin_id]).exists()]
     if taken:
         raise PluginError(f"{dest} holds {', '.join(taken)}, which is no plugin: move it first")
@@ -124,14 +216,16 @@ def add(dest, ids, inference=INFERENCE, update=False):
                            and (other in place or (there[other] / folder.relative_to(library_folder[other])).is_dir())),
                           None)
             if target is None:
-                if not folder.is_relative_to(inference):
-                    raise PluginError(f"{plugin_id}: source {name} lies outside {inference}, so crit plugins add "
-                                      "cannot place its copy")
-                relative = folder.relative_to(inference)
+                relative = places.relative(folder)
+                if relative is None:
+                    raise PluginError(f"{plugin_id}: source {name} lies outside the library ({inference}), so crit "
+                                      "plugins add cannot place its copy")
                 target = dest / SOURCES / relative
                 copies.setdefault(relative, folder)
             plans.append((plugin_id, name, target))
     dest.mkdir(parents=True, exist_ok=True)
+    if not (dest / TOGETHER).is_file():   # the folder of plugins, which a plugin in a group finds its registry by
+        (dest / TOGETHER).write_bytes(b"{}\n")
     sources = []
     for relative, folder in copies.items():
         target = dest / SOURCES / relative
@@ -148,11 +242,25 @@ def add(dest, ids, inference=INFERENCE, update=False):
             if owner == plugin_id:
                 data["sources"][name] = Path(os.path.relpath(target, dest / place[plugin_id])).as_posix()
         path.write_bytes((json.dumps(data, indent=2) + "\n").encode("utf-8"))   # the same bytes on every OS
+    for plugin_id in cached:   # the user's own model plugins, as their engines held them
+        if (dest / plugin_id).exists():
+            raise PluginError(f"{dest} holds {plugin_id}, which is no plugin: move it first")
+        for relative in lent[plugin_id]:
+            target = dest / SOURCES / relative
+            if not places.folder(relative).is_dir():
+                raise PluginError(f"{plugin_id} imports {SOURCES}/{relative.as_posix()}, code the library holds no more")
+            if not target.exists():
+                shutil.copytree(places.folder(relative), target, ignore=IGNORE)
+                sources.append(f"{SOURCES}/{relative.as_posix()}")
+        shutil.copytree(kept_models[plugin_id], dest / plugin_id, ignore=IGNORE)
+        added.append((plugin_id, "named, from your cache of model plugins"))
     engine = Registry.discover(dest)
     provided = {fact for manifest in engine for fact in manifest["provides"]}
     unmet = {}
     for plugin_id, _ in added:
         for alternatives in engine[plugin_id]["needs"]:
+            if all(fact.startswith("model_type:") for fact in alternatives):
+                continue   # the checkpoint's, which the engine gives when it loads
             if not provided & set(alternatives):
                 need = " or ".join(alternatives)
                 unmet[need] = sorted(m["id"] for m in registry if set(m["provides"]) & set(alternatives))
@@ -189,23 +297,20 @@ def _git(folder, *args):
 
 
 def _checkout(inference):
-    """(the git checkout holding the library, the library's path in it), or None for a library that is no checkout
-    (the copy crit's wheel ships), whose history cannot say where a copy came from."""
+    """The git checkout holding the library, or None for a library that is no checkout (the copy crit's wheel
+    ships), whose history cannot say where a copy came from."""
     top = _git(inference, "rev-parse", "--show-toplevel")
     if not top:
         return None
     root = Path(top.decode("utf-8").strip()).resolve()
-    try:
-        return root, Path(inference).resolve().relative_to(root).as_posix()
-    except ValueError:
-        return None
+    return root if Path(inference).resolve().is_relative_to(root) else None
 
 
-def _version(checkout, relative, mine, limit):
-    """The library's newest version of `relative` that the engine's files `mine` are a copy of: {commit, date,
-    changes} with the library commits that changed it since, or None when none of its last `limit` versions is."""
-    root, prefix = checkout
-    path = f"{prefix}/{relative}".strip("/")
+def _version(root, folder, mine, limit):
+    """The library's newest version of its folder `folder` that the engine's files `mine` are a copy of: {commit,
+    date, changes} with the library commits that changed it since, or None when none of its last `limit` versions
+    is."""
+    path = Path(folder).resolve().relative_to(root).as_posix()
     log = _git(root, "log", f"-{limit}", "--format=%H %cs", "--", path)
     if not log:
         return None
@@ -246,17 +351,17 @@ def status(dest, inference=INFERENCE, limit=500):
     two it is; `own`: no library plugin; `gone`: code the library holds no more. files: the paths that differ from
     the library now."""
     dest, inference = Path(dest), Path(inference).resolve()
-    registry, engine = library(inference), Registry.discover(dest)
+    registry, engine, places = library(inference), Registry.discover(dest), Library(inference)
     checkout = _checkout(inference)
     place = {m["id"]: Path(m["folder"]).resolve() for m in registry}
 
-    def compare(name, folder, theirs, relative):
+    def compare(name, folder, theirs):
         mine, current = _tree(folder), _tree(theirs)
         files = sorted(path for path in set(mine) | set(current)
                        if path not in mine or path not in current or not _same(path, mine[path], current[path]))
         if not files:
             return {"name": name, "state": "current", "files": []}
-        found = _version(checkout, relative, mine, limit) if checkout else None
+        found = _version(checkout, theirs, mine, limit) if checkout else None
         if found:
             return {"name": name, "state": "behind", "files": files, **found}
         return {"name": name, "state": "changed" if checkout else "differs", "files": files}
@@ -267,13 +372,18 @@ def status(dest, inference=INFERENCE, limit=500):
         if plugin_id not in place:
             rows.append({"name": plugin_id, "state": "own", "files": []})
             continue
-        rows.append(compare(plugin_id, manifest["folder"], place[plugin_id],
-                            place[plugin_id].relative_to(inference).as_posix()))
+        rows.append(compare(plugin_id, manifest["folder"], place[plugin_id]))
     sources = dest / SOURCES
-    for folder in sorted(path for path in sources.glob("*/*") if path.is_dir()) if sources.is_dir() else ():
-        relative = folder.relative_to(sources).as_posix()
-        name = f"{SOURCES}/{relative}"
-        rows.append(compare(name, folder, inference / relative, relative) if (inference / relative).is_dir()
+    # the source folders: those the engine's plugins import from _sources, and any other code folder left there
+    found = {Path(source["folder"]).resolve().relative_to(sources.resolve()) for manifest in engine
+             for source in manifest["sources"].values()
+             if sources.is_dir() and Path(source["folder"]).resolve().is_relative_to(sources.resolve())}
+    found |= {folder.relative_to(sources) for folder in (sources.rglob("code") if sources.is_dir() else ())
+              if folder.is_dir() and not any(folder.relative_to(sources).is_relative_to(other) for other in found)}
+    for relative in sorted(found):
+        name = f"{SOURCES}/{relative.as_posix()}"
+        theirs = places.folder(relative)
+        rows.append(compare(name, sources / relative, theirs) if theirs.is_dir()
                     else {"name": name, "state": "gone", "files": []})
     return rows
 
@@ -287,7 +397,7 @@ def update(dest, inference=INFERENCE, dry_run=False):
     the replacement would overwrite. Returns {updated: [name], kept: [(name, why)], added: [(id, why)]}; with
     dry_run nothing is written and `updated` says what would be."""
     dest, inference = Path(dest), Path(inference).resolve()
-    registry = library(inference)
+    registry, places = library(inference), Library(inference)
     rows = {row["name"]: row for row in status(dest, inference)}
     behind = [name for name, row in rows.items() if row["state"] == "behind"]
     kept = [(name, "the engine changed it") for name, row in rows.items() if row["state"] == "changed"]
@@ -299,7 +409,7 @@ def update(dest, inference=INFERENCE, dry_run=False):
             continue
         # The code under _sources the library's plugin imports, which its replacement copies again.
         folder = Path(registry[name]["folder"]).resolve()
-        imports = {f"{SOURCES}/{Path(source['folder']).resolve().relative_to(inference).as_posix()}"
+        imports = {f"{SOURCES}/{places.relative(source['folder']).as_posix()}"
                    for source in registry[name]["sources"].values()
                    if not Path(source["folder"]).resolve().is_relative_to(folder)}
         changed = sorted(other for other in imports if rows.get(other, {}).get("state") in ("changed", "differs"))
@@ -319,7 +429,7 @@ def update(dest, inference=INFERENCE, dry_run=False):
         relative = name[len(SOURCES) + 1:]
         target = dest / SOURCES / relative
         shutil.rmtree(target)
-        shutil.copytree(inference / relative, target, ignore=IGNORE)
+        shutil.copytree(places.folder(relative), target, ignore=IGNORE)
     return {"updated": plugins + sources, "kept": kept, "added": added}
 
 
@@ -365,14 +475,24 @@ def _list_fitting(registry, args):
     facts = architecture_facts(args.model) + machine_facts(args.device, probe)
     print("facts: " + ", ".join(facts))
     unfilled = []
+    # the user's own model plugins (crit plugins add takes them by id): {id: needs} of those the library lacks
+    kept_models = {} if args.folder is not None else {
+        plugin_id: json.loads((folder / MANIFEST).read_text(encoding="utf-8")).get("needs", [])
+        for plugin_id, folder in user_models().items() if plugin_id not in registry}
+    kept_models = {plugin_id: [[need] if isinstance(need, str) else need for need in needs]
+                   for plugin_id, needs in kept_models.items()}
     for slot, plugins in fitting(registry, facts, args.device).items():
         fits = [(plugin_id, reasons) for plugin_id, reasons in plugins if not reasons]
-        kind = "required" if slot in REQUIRED_SLOTS else "policy" if slot in POLICY_SLOTS else "optional"
+        kind = ("required" if slot in REQUIRED_SLOTS else "policy" if registry.contracts.is_policy(slot)
+                else "optional")
         if not plugins:
             if slot in REQUIRED_SLOTS:
                 unfilled.append(slot)
             continue
-        print(f"{slot} ({kind}): " + (", ".join(plugin_id for plugin_id, _ in fits) if fits else "nothing fits"))
+        kept = [f"{plugin_id} (your cache of model plugins)" for plugin_id in sorted(kept_models)
+                if slot == "model" and all(set(alternatives) & set(facts) for alternatives in kept_models[plugin_id])]
+        named = [plugin_id for plugin_id, _ in fits] + kept
+        print(f"{slot} ({kind}): " + (", ".join(named) if named else "nothing fits"))
         for plugin_id, _ in fits:
             needs = [" or ".join(alternatives) for alternatives in registry[plugin_id]["needs"]
                      if not any(need in facts for need in alternatives)]
@@ -381,7 +501,7 @@ def _list_fitting(registry, args):
         for plugin_id, reasons in plugins if args.all else ():
             if reasons:
                 print(f"    not {plugin_id}: {'; '.join(reasons)}")
-        if slot in REQUIRED_SLOTS and not fits:
+        if slot in REQUIRED_SLOTS and not named:
             unfilled.append(slot)
     if unfilled:
         print("nothing fits " + ", ".join(unfilled) + ": write that plugin (docs/PLUGINS.md) before the engine loads")
@@ -392,8 +512,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog="crit plugins", description=(
         "An engine's plugins (docs/PLUGINS.md): each fills slots of the engine, says what it needs and provides, "
         "and carries its own tests; the engine assembles them when it loads. Without a folder, list, check and test "
-        "act on crit's library: every Inference technique that fills a slot is a plugin (inference/ID), beside the "
-        "base plugins, the plain plugin of each slot (inference/base/ID)."))
+        "act on crit's library: every Inference technique that fills a slot is a plugin "
+        "(inference/techniques/CATEGORY/ID), beside the plain plugin of each slot in the same categories and the "
+        "finished model plugins (models/cache/ID), which extend the models core."))
     subs = parser.add_subparsers(dest="action", required=True)
     listed = subs.add_parser("list", help="List the plugins in a folder of plugins and the slots crit names; with "
                                           "--model and --device, per slot the plugins that fit them")
@@ -421,7 +542,8 @@ def main(argv=None):
     shown.add_argument("--fact", action="append", default=[], help="A fact the engine provides (repeatable; default: "
                        "what the selection's plugins need and none of them provides)")
     added = subs.add_parser("add", help="Copy library plugins into an engine with their references, the plugins "
-                                        "their tests use and the code they import")
+                                        "their tests use, the plugins they extend and the code they import; a "
+                                        "model plugin of your own cache (crit models cache add) by its id too")
     added.add_argument("folder", type=Path, help="The engine's plugins folder")
     added.add_argument("ids", nargs="+", help="The library plugins to add")
     added.add_argument("--inference", type=Path, default=INFERENCE,
@@ -499,12 +621,19 @@ def main(argv=None):
             for manifest in registry:
                 fused = "fused; " if len(manifest["fills"]) > 1 else ""
                 reference = f" ({fused}reference {', '.join(manifest['reference'])})" if manifest["reference"] else ""
-                base = Path(manifest["folder"]).parent.name == BASE
-                kind = f"{'base' if base else 'technique' if args.folder is None else 'plugin':<10} "
-                print(f"{manifest['id']:<30} {kind}{', '.join(manifest['fills']):<18} {manifest['title']}{reference}")
-            unnamed = sorted({s for m in registry for s in m["fills"]} - set(SLOTS))
+                technique = (Path(manifest["folder"]) / "entry.json").is_file()
+                # else a core other plugins extend, a finished model plugin, or a slot's plain plugin
+                kind = ("technique" if technique else "core" if not manifest["fills"] else "plugin"
+                        if args.folder is not None else "model" if manifest["fills"] == ["model"] else "plain")
+                print(f"{manifest['id']:<30} {kind:<10} {', '.join(manifest['fills']) or '-':<18} "
+                      f"{manifest['title']}{reference}")
+            for plugin_id, folder in (user_models().items() if args.folder is None else ()):
+                if plugin_id not in registry:
+                    title = json.loads((folder / MANIFEST).read_text(encoding="utf-8")).get("title", "")
+                    print(f"{plugin_id:<30} {'cached':<10} {'model':<18} {title} (your cache: {folder})")
+            unnamed = sorted({s for m in registry for s in m["fills"]} - set(registry.contracts.slots))
             if unnamed:
-                print("slots crit does not name: " + ", ".join(unnamed))
+                print("slots neither Core nor a plugin defines: " + ", ".join(unnamed))
             return 0
         if args.action == "check":
             print(f"{len(registry)} plugins checked")

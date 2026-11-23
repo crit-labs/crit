@@ -1,0 +1,48 @@
+{
+  "schema": "crit-model-technique-v1",
+  "id": "attention",
+  "category": "mixers",
+  "summary": "Grouped-query softmax attention: a stacked q, k, v projection, biases, query/key norms, rotary positions (per layer type, partial rotation), sliding windows, sinks and a sigmoid output gate, through the attention slot",
+  "provides": {
+    "blocks": [
+      "attention"
+    ]
+  },
+  "source": "attention",
+  "needs_sources": [
+    "template"
+  ],
+  "path": "models/techniques/mixers/attention/README.md",
+  "code_path": "models/techniques/mixers/attention/code",
+  "code_files": [
+    {
+      "path": "models/techniques/mixers/attention/code/attention.py",
+      "purpose": "The block class and its registry (BLOCKS)"
+    }
+  ],
+  "reads": {
+    "tensors": [
+      "k_norm.weight",
+      "k_proj",
+      "k_scale",
+      "o_proj",
+      "q_norm.weight",
+      "q_proj",
+      "sinks",
+      "v_proj",
+      "v_scale"
+    ],
+    "config": [],
+    "layout": [
+      "head_dim",
+      "kv_heads",
+      "matrices",
+      "output",
+      "output_gate",
+      "pool",
+      "scale",
+      "value_norm",
+      "window"
+    ]
+  }
+}

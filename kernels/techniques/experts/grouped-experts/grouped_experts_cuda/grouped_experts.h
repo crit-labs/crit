@@ -124,9 +124,22 @@ cudaError_t enqueue_fp4_inputs(const __nv_bfloat16* x, int top, const std::uint8
                                const Items& items, std::uint8_t* codes, std::uint8_t* scales, cudaStream_t stream);
 cudaError_t enqueue_fp4_gate_up(const std::uint8_t* codes, const std::uint8_t* scales, const std::uint8_t* store,
                                 const Layout& layout, const Items& items, std::uint8_t* h_codes,
-                                std::uint8_t* h_scales, cudaStream_t stream, int tokens = 0);
+                                std::uint8_t* h_scales, cudaStream_t stream, int tokens = 0, int tile = 0);
 cudaError_t enqueue_fp4_down(const std::uint8_t* h_codes, const std::uint8_t* h_scales, const std::uint8_t* store,
-                             const Layout& layout, const Items& items, float* y, cudaStream_t stream, int tokens = 0);
+                             const Layout& layout, const Items& items, float* y, cudaStream_t stream, int tokens = 0, int tile = 0);
+// The same arithmetic at a scale of each route's own, no input scales needed (nvfp4 bundles without them): rows of K
+// values BF16 (route r reads row r / div) quantized at g = 6 * 448 / amax(row) into `terms` FP4 terms (2: the first
+// term's remainder too, at the same g, about 8 bits a value), codes [routes][terms * K / 2], scales [routes][terms *
+// K / 16], rcp [routes] = 1 / g; the gate/up rows into h [routes][inter] BF16 (the same quantizer reads it next) and the
+// down rows into y, each MMA chain over every term's k in order.
+cudaError_t enqueue_fp4_rows(const __nv_bfloat16* rows, int div, int K, const Items& items, int terms,
+                             std::uint8_t* codes, std::uint8_t* scales, float* rcp, cudaStream_t stream);
+cudaError_t enqueue_fp4_gate_up_rows(const std::uint8_t* codes, const std::uint8_t* scales, const float* rcp, int terms,
+                                     const std::uint8_t* store, const Layout& layout, const Items& items,
+                                     __nv_bfloat16* h, cudaStream_t stream, int tokens = 0, int tile = 0);
+cudaError_t enqueue_fp4_down_rows(const std::uint8_t* h_codes, const std::uint8_t* h_scales, const float* rcp, int terms,
+                                  const std::uint8_t* store, const Layout& layout, const Items& items, float* y,
+                                  cudaStream_t stream, int tokens = 0, int tile = 0);
 // The FP8 tensor-core arithmetic (mma_experts.cu; fp8:channel and fp8:block bundles, hidden and inter multiples of
 // 128, sm_89 on), W8A8: rows of K values BF16 (route r reads row r / div) quantized by crit's declared group
 // quantizer, each 128 values in E4M3 at amax / 448: codes [routes][K], FP32 scales [routes][K / 128]; the gate/up and

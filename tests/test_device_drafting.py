@@ -10,7 +10,7 @@ import sys
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "core" / "python"))
+sys.path.insert(0, str(ROOT / "inference" / "core" / "python"))
 from crit_plugins.assemble import Registry, assemble, load_module  # noqa: E402
 
 try:
@@ -19,7 +19,7 @@ except ImportError:   # the device forms are torch's
     torch = None
 
 DEVICE = "cuda" if torch is not None and torch.cuda.is_available() else "cpu"
-LIBRARY = ROOT / "inference"
+LIBRARY = ROOT / "inference" / "techniques"
 HEAD = ["draft:head", "draft:head-device"]
 TREE_HEAD = [*HEAD, "draft:head-tree"]   # a device head that drafts a tree's frontier along its parents
 GRAPHS = (False, True) if DEVICE == "cuda" else (False,)

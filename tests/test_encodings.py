@@ -6,7 +6,7 @@ import sys
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "core" / "python"))
+sys.path.insert(0, str(ROOT / "inference" / "core" / "python"))
 
 try:
     import torch
@@ -15,7 +15,7 @@ except ImportError:   # pragma: no cover
 
 
 def _codec():
-    spec = importlib.util.spec_from_file_location("qp_nvfp4", ROOT / "inference/quantized-projections/code/nvfp4.py")
+    spec = importlib.util.spec_from_file_location("qp_nvfp4", ROOT / "inference/techniques/projections/quantized-projections/code/nvfp4.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

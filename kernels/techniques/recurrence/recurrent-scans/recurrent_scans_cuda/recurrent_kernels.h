@@ -1,5 +1,5 @@
 // CUDA kernels for the recurrent layers of hybrid models: a short causal depthwise convolution with its carried
-// window, gated-delta attention (Qwen3-Next / Qwen3.5-style gated DeltaNet, KDA-style per-head gates) and Mamba-2's
+// window, gated-delta attention (gated DeltaNet, KDA-style per-head gates) and Mamba-2's
 // state-space recurrence, each as a chunked two-pass prefill for prompts and a column scan for decode and speculative
 // verify. All values are FP32; projections, gates' activations, normalization and the output gate are the engine's.
 //

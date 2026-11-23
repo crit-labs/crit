@@ -1,0 +1,13 @@
+{
+  "schema": "crit-model-checkpoints-v1",
+  "layouts": {
+    "safetensors (the release's own names, as transformers saves them)": [
+      "models/cache/inkling2-loop-model/tests/test_device.py::LoopedTests",
+      "tests/test_model_template.py::LoopedDraftTests"
+    ],
+    "safetensors (transformers' module names)": [
+      "models/cache/inkling2-loop-model/tests/test_device.py::TransformersSpellingTests",
+      "tests/test_model_template.py::TransformersSpellingDraftTests"
+    ]
+  }
+}

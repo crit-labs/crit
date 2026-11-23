@@ -32,7 +32,7 @@ ROOT = Path(__file__).resolve().parents[3]
 # stop reason as the phase; get() reads those as building and stopped.
 PHASES = {"awaiting_agent", "running", "discovering", "building", "finished", "failed", "launch_failed", "expired",
           "stopped"}
-PUBLISHED = ("core", "inference", "kernels", "models", "tests", "docs", "eval", "cli", "api", "mcp", "smoke", ".github")
+PUBLISHED = ("inference", "kernels", "models", "tests", "docs", "eval", "cli", "api", "mcp", "smoke", ".github")
 PROTECTED = PUBLISHED + ("tools", "archive")
 
 
@@ -146,7 +146,8 @@ def _asked_rows(evidence):
 def with_exactness(configuration, mode):
     """A plugin package's configuration with the exactness of its rows stated in full, {"decode": level, "prompt":
     level} (crit_plugins.exactness): the levels the configuration asks, and for a phase it leaves out the level of
-    the run's quality mode (exact in both: a prompt row has the bits of the same token decoded). So every candidate
+    the run's quality mode (exact in preserve: a prompt row has the bits of the same token decoded; row-exact in
+    speed: a prompt row's bits its own at any prompt length). So every candidate
     says the level it was built and measured at, and Core holds the engine to it wherever it is served
     (docs/PLUGINS.md#exactness). It also states the run's quality mode, whatever it named itself (a run's mode is
     never changed): the plugins' precision options left to choose follow it (docs/PLUGINS.md#precision: in speed
@@ -1127,21 +1128,26 @@ class RunStore:
                 "so each prompt row has the bits of the same token decoded and every plugin takes its exact path. Ask "
                 "a lower level for a phase (\"prompt\": \"row-exact\" or \"repeatable\") only with its drift measured "
                 "inside the budget" if mode == "preserve" else
-                "so each prompt row has the bits of the same token decoded, which crit smoke judges without a "
-                "tolerance. A lower level for a phase (\"prompt\": \"row-exact\" or \"repeatable\") is a lever: take "
-                "it where an ablation measures its speed and serve --check still passes (an engine whose rows "
-                "multiply quantized activations fails causal or decode_matches_prefill below exact)") +
+                "so each prompt row's bits follow nothing but the row at any prompt length and every plugin takes "
+                "its faster prompt path; crit smoke judges a prefix against its prompt without a tolerance and "
+                "decoding against prefilling by the drift quantized arithmetic rounds by. Repeatable prompt rows "
+                "(\"prompt\": \"repeatable\") are a lever: take them where an ablation measures their speed and serve "
+                "--check still passes (an engine whose rows multiply quantized activations can fail causal there)") +
             ". crit writes the levels into the candidate's configuration, the engine's facts state what each plugin "
             "keeps, and Core refuses an engine that keeps less than it asks (docs/PLUGINS.md#exactness).",
             "- Precision (configuration.quality_mode, which crit writes into every candidate): load the output head "
-            "with role head and write no head option of your own. quantized-projections' head option, left on "
-            "auto, " + (
-                "keeps it as stored in this mode; set it to fp8 only with the drift measured inside the budget"
+            "with role head and write no precision option of your own. quantized-projections' head and trunk options "
+            "(the head; every other target matrix stored in 16 bits), left on auto, " + (
+                "keep them as stored in this mode, as the KV pages, the MTP layer and the experts' arithmetic stay; "
+                "set one lower only with the drift measured inside the budget"
                 if mode == "preserve" else
-                "holds it in FP8 in this mode (half the bytes every decode step reads)" + (
-                    "; set it to stored here, because an FP8 head re-encodes target weights and this run's weights "
-                    "policy is as_stored" if policy == "as_stored" else "")) +
-            ". Count the head in the memory plan at the bytes it is held in (docs/PLUGINS.md#precision).",
+                "hold them in FP8 in this mode (half the bytes every decode step reads of them, W8A8 prompt rows), "
+                "and the KV pages (fp8:row without static scales), the MTP layer (NVFP4, fp8:row pages) and the "
+                "experts (stored activations on their own tensor cores) follow the mode too" + (
+                    "; set head and trunk to stored here, because FP8 re-encodes target weights and this run's "
+                    "weights policy is as_stored" if policy == "as_stored" else
+                    "; 4-bit dense weights or KV are levers to measure")) +
+            ". Count each matrix in the memory plan at the bytes it is held in (docs/PLUGINS.md#precision).",
             f"- Context: every candidate serves {capacity:,} tokens of prompt plus output, {context}. Pass --context "
             f"{capacity} to the crit eval commands you run yourself.",
             "- Weights policy: " + ({"as_stored": "the target weights are used as stored; declare weights in every "

@@ -1,0 +1,56 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "llama-qwen3-model",
+  "title": "The model plugin of Llama, Qwen2 and Qwen3 checkpoints and their mixtures of experts",
+  "description": "A pre-norm decoder of grouped-query softmax attention (rotary positions, query/key norms and biases where stored, sliding-window layers where the config's layer_types name them) and a SwiGLU MLP, or a mixture of experts on the layers the config routes (a shared expert and its gate where stored). A finished model plugin: its layout (layout.json) composed by the models core it extends (model-template: the serving contracts, the options) from model techniques.",
+  "fills": [
+    "model"
+  ],
+  "needs": [
+    [
+      "model_type:llama",
+      "model_type:qwen2",
+      "model_type:qwen3",
+      "model_type:qwen2_moe",
+      "model_type:qwen3_moe"
+    ]
+  ],
+  "requires": [
+    "norms",
+    "embeddings"
+  ],
+  "requires_when": {
+    "model_type:qwen2_moe": [
+      "router",
+      "experts"
+    ],
+    "model_type:qwen3_moe": [
+      "router",
+      "experts"
+    ]
+  },
+  "devices": [
+    "cuda",
+    "cpu"
+  ],
+  "sources": {
+    "core": "../../core/model-template"
+  },
+  "extends": "core",
+  "test_with": [
+    "attention-state",
+    "device-placement",
+    "expert-tensors",
+    "experts-reference",
+    "fused-norms",
+    "gguf-projections",
+    "lookup-table-rows",
+    "memory-table-rows",
+    "projections-dense",
+    "softmax-attention",
+    "token-sampling",
+    "topk-router",
+    "torch-norms"
+  ],
+  "entry": "plugin.py:create"
+}

@@ -10,7 +10,7 @@ import tempfile
 import unittest
 import weakref
 
-CODE = Path(__file__).resolve().parents[1] / "inference" / "checkpoint-storage" / "code"
+CODE = Path(__file__).resolve().parents[1] / "inference" / "techniques" / "memory" / "checkpoint-storage" / "code"
 
 
 def load(name):

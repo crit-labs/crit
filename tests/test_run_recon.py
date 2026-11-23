@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "api", "../crit-eval", "../crit-eval/tests", "kernels", "cli", "tests"): sys.path.insert(0, str(ROOT / _folder))
+for _folder in ("inference/core/python", "api", "../crit-eval", "../crit-eval/tests", "kernels", "cli", "tests"): sys.path.insert(0, str(ROOT / _folder))
 from core_text_fixtures import llama_files, write_files
 from crit.run import recon
 from crit.run.cli import main
@@ -98,17 +98,18 @@ class ReconTests(unittest.TestCase):
             "transformer_layer_config": {"num_hidden_layers": 1},
             "speculators_config": {"proposal_methods": [{"speculative_tokens": 3}], "verifier": {"name_or_path": "fixture"}}}),
             encoding="utf-8")
-        mtp = self.root / "mtp"
+        mtp = self.root / "block"
         mtp.mkdir()
-        (mtp / "config.json").write_text(json.dumps({"num_hidden_layers": 1, "crit_drafter": {
-            "format": "crit-drafter-v1", "kind": "mtp-head", "target_layers": 2, "target": {"path": str(self.model)}}}),
+        (mtp / "config.json").write_text(json.dumps({"architectures": ["DFlashDraftModel"], "num_hidden_layers": 1,
+                                                     "dflash_config": {"target_layer_ids": [1], "block_size": 4,
+                                                                       "mask_token_id": 5}}),
             encoding="utf-8")
         value = self.store.recon(self.run_id, drafters=[eagle, mtp])
         first, second = value["gathered"]["drafters"]
         self.assertEqual((first["kind"], first["taps"], first["draft_vocab_size"], first["speculative_tokens"]),
                          ("eagle3", [0, 1, 2], 64, 3))
         self.assertEqual(first["config_sha256"], file_sha(eagle / "config.json"))
-        self.assertEqual((second["kind"], second["taps"], second["drafts_per_pass"]), ("mtp-head", [2], 1))
+        self.assertEqual((second["kind"], second["taps"], second["drafts_per_pass"]), ("block", [2], 3))
         notes = (self.directory / recon.RECON_MD).read_text(encoding="utf-8")
         self.assertIn(str(eagle), notes)
         self.assertIn("map through d2t", notes)
@@ -344,7 +345,8 @@ class ReconTests(unittest.TestCase):
                                "budget_minutes": 1, "kv_tokens": 8192})["run"]["run_id"]
         self.store, self.run_id, self.directory = store, run_id, store.directory(run_id)
         self.assertEqual(self.candidate({"batch": 1})["configuration"],
-                         {"batch": 1, "plugins": selection(), "exactness": {"decode": "row-exact", "prompt": "exact"},
+                         {"batch": 1, "plugins": selection(),
+                          "exactness": {"decode": "row-exact", "prompt": "row-exact"},
                           "quality_mode": "speed", "prompt_activations": "stored",
                           "vram_headroom_bytes": store.get(run_id)["run"]["spec"]["hardware_constraints"][
                               "vram_headroom_bytes"]})

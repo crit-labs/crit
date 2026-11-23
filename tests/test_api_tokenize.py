@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "api", "../crit-eval", "kernels", "cli", "tests"): sys.path.insert(0, str(ROOT / _folder))
+for _folder in ("inference/core/python", "api", "../crit-eval", "kernels", "cli", "tests"): sys.path.insert(0, str(ROOT / _folder))
 from support.serve import ServeFixture
 from crit_api.host import Cancellation, Host, Unloaded
 from crit_api.server import Api, Server
@@ -66,6 +66,7 @@ def rendered(messages, tools=()):
 
 
 class TokenizeFixture(ServeFixture):
+    shared_engine = True   # its tests leave the served engine as they found it, or get a new one (ServeFixture)
     def setUp(self):
         super().setUp()
         self.served = self.engine()

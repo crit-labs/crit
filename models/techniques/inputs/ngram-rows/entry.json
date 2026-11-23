@@ -1,0 +1,56 @@
+{
+  "schema": "crit-model-technique-v1",
+  "id": "ngram-rows",
+  "category": "inputs",
+  "summary": "Rows of a hashed n-gram table gated into the residual ahead of a layer, with a dilated causal convolution",
+  "provides": {
+    "blocks": [
+      "ngram-rows"
+    ]
+  },
+  "source": "ngram_rows",
+  "needs_sources": [
+    "template"
+  ],
+  "path": "models/techniques/inputs/ngram-rows/README.md",
+  "code_path": "models/techniques/inputs/ngram-rows/code",
+  "code_files": [
+    {
+      "path": "models/techniques/inputs/ngram-rows/code/ngram_rows.py",
+      "purpose": "The block class and its registry (BLOCKS)"
+    }
+  ],
+  "reads": {
+    "tensors": [
+      "conv1d.weight",
+      "key_proj",
+      "norm_conv.weight",
+      "norm_key.weight",
+      "norm_query.weight",
+      "ple_embedding.layer_multipliers",
+      "ple_embedding.ngram_embedding.shard_N.weight",
+      "ple_embedding.ngram_embedding.shard_N.weight_scale",
+      "ple_embedding.ngram_embedding.weight",
+      "ple_embedding.ngram_embedding.weight_scale",
+      "ple_embedding.ngram_embedding.weight_scale_2",
+      "ple_embedding.ngram_heads_offsets",
+      "ple_embedding.ngram_heads_vocab_sizes",
+      "value_proj"
+    ],
+    "config": [
+      "eos_token_id",
+      "heads_per_ngram",
+      "ngram_size",
+      "ngram_vocab_size_base",
+      "ple_conv_kernel_size",
+      "ple_embed_dim",
+      "ple_layer_ids",
+      "seed"
+    ],
+    "layout": [
+      "config",
+      "embedding",
+      "table"
+    ]
+  }
+}

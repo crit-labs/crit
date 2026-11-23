@@ -9,7 +9,7 @@ import threading
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "smoke"):   # the suite reads Core's exactness levels
+for _folder in ("inference/core/python", "smoke"):   # the suite reads Core's exactness levels
     sys.path.insert(0, str(ROOT / _folder))
 
 from crit_smoke import Client, run  # noqa: E402

@@ -1,11 +1,11 @@
-"""model-template's load planned over every real checkpoint crit targets, from their manifests (tests/manifests: the
-safetensors headers and configs, no weights; tests/support/manifests.py writes them), on the CPU.
+"""The model plugins' loads planned over every real checkpoint crit targets, from their manifests (tests/manifests:
+the safetensors headers and configs, no weights; tests/support/manifests.py writes them), on the CPU.
 
-Each checkpoint whose model_type a library layout covers loads through model-template's own code (tests/support/
-dry_plan.py: its ComposedModel over the manifest's headers, the slots filled by stand-ins that take the formats the
+Each checkpoint whose model_type a finished model plugin serves (models/cache) loads through that plugin's own code
+(tests/support/dry_plan.py: its ComposedModel over the manifest's headers, the slots filled by stand-ins that take the formats the
 library's plugins take), with its lookup tables on the device and off it, and must read every tensor of the
 checkpoint outside its vision and audio towers: a tensor no part of the model reads is one its load ignores (a
-table's scale left behind, a draft layer dropped). A checkpoint no layout covers is listed, not failed."""
+table's scale left behind, a draft layer dropped). A checkpoint no model plugin serves is listed, not failed."""
 from pathlib import Path
 import tempfile
 import unittest
@@ -113,6 +113,17 @@ class LayerCutTests(unittest.TestCase):
                              os.stat(Path(folder, "prefix", "table.safetensors")).st_ino)
 
 
+_PLANS = {}
+
+
+def planned(name, manifest, placement):
+    """dry_plan.plan's report of a checkpoint's load, planned once for the tests that read it (ten seconds for a
+    checkpoint of 375,000 tensors)."""
+    if (name, placement) not in _PLANS:
+        _PLANS[name, placement] = dry_plan.plan(manifest, placement)
+    return _PLANS[name, placement]
+
+
 @unittest.skipIf(torch is None, "torch")
 class ManifestPlanTests(unittest.TestCase):
     def test_every_covered_checkpoint_loads_and_reads_every_tensor(self):
@@ -123,7 +134,7 @@ class ManifestPlanTests(unittest.TestCase):
             manifest = manifests.load(path)
             for placement in ("tables-on", "tables-off"):
                 with self.subTest(checkpoint=name, placement=placement):
-                    report = dry_plan.plan(manifest, placement)
+                    report = planned(name, manifest, placement)
                     if not report["covered"]:
                         uncovered.append(f"{name} ({report['model_type']})")
                         break
@@ -131,7 +142,7 @@ class ManifestPlanTests(unittest.TestCase):
                     self.assertEqual(report["unread"][:10], [], f"{len(report['unread'])} tensors no part of the "
                                                                  "model read")
         if uncovered:
-            print("checkpoints no model-template layout covers: " + ", ".join(uncovered))
+            print("checkpoints no finished model plugin serves: " + ", ".join(uncovered))
 
     def test_a_draft_layers_link_reserve_counts_every_plan_of_a_captured_round(self):
         # FP4-Local Flash-Next stores its draft layer's experts W4A16 beside the decoder's W4A4: beside the CPU tier
@@ -143,12 +154,12 @@ class ManifestPlanTests(unittest.TestCase):
         name = "nvidia-Qwen3.8-Flash-Next-FP4-Local"
         if name not in found:
             self.skipTest(f"no {name} manifest")
-        report = dry_plan.plan(manifests.load(found[name]), "tables-on")
+        report = planned(name, manifests.load(found[name]), "tables-on")
         self.assertIsNone(report["error"], report["error"])
         begun = report["experts"]
         draft = begun["layers"] - 1
         self.assertEqual((begun["a4"][draft], {begun["a4"][layer] for layer in range(draft)}), (False, {True}))
-        concurrency, width = 4, 3   # model-template's defaults
+        concurrency, width = 4, 3   # the models core's defaults
         self.assertEqual((begun["decode_rows"], begun["top"]), (concurrency * (width + 1 + width - 1), 10))
         reserve = min(begun["experts"], begun["decode_rows"] * begun["top"])
         self.assertEqual((reserve, begun["experts"] + reserve + 1), (240, 753))

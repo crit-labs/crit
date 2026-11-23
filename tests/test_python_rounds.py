@@ -9,7 +9,7 @@ import sys
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core" / "python"))   # Core's runtime, for native rounds
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "inference" / "core" / "python"))   # Core's runtime, for native rounds
 from test_techniques import load  # noqa: E402
 from crit_plugins.rounds import SpeculativeRounds  # noqa: E402
 

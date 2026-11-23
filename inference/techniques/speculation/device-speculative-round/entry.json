@@ -1,0 +1,125 @@
+{
+  "id": "device-speculative-round",
+  "category": "speculation",
+  "summary": "GPU-resident speculative round: draft, verify, device accept and frontier advance in two CUDA graphs with one readback, for greedy requests and for sampled requests verified by rejection sampling",
+  "implementation_status": "reference",
+  "implementation_scope": "The rules of a device round and a Python round/step budget. Sampled requests reuse the greedy accept on predictions from token-sampling's verify (the target's own draws for greedy drafts, rejection sampling for sampled drafts, Core's counter-based draws). Engine draft, verify and state steps are the engine's; no tuned or model-specific kernels. Engines' rounds run on Core's round driver (crit_plugins.rounds: the same accept, truncation and pack over engine hooks or the library's device forms, one CUDA graph per row count, width and mode, replay and forced modes), with the technique's rejection-sampling predictions and copied drafts (python_round.py) and an adaptive width policy (width_policy.py).",
+  "agent_guidance": {
+    "use_when": "A synchronous speculative loop is correct but host round trips, per-token readbacks or host acceptance dominate the round, for greedy or sampled requests",
+    "avoid_when": "Verifying K+1 columns costs about K+1 ordinary steps, or the engine cannot keep per-column state for prefix selection; or routed experts stream from host memory, where every verify column adds its own expert misses",
+    "provides": [
+      "Sampled rounds: the same accept kernel on rejection-sampling predictions from token-sampling, with the history commit as the first Forward kernel",
+      "Device greedy acceptance by mtp-decode's rule: prefix match, correction or bonus, allowance bound and stop handling",
+      "Device-resident control block with frontier advance by n_emitted and pending-token update, without host writes during decoding, and the sampling history's pending count (commit_tokens) kept apart from the catch-up's n_emitted",
+      "A one-column seed (enqueue_seed) after a prefill that produced the first output itself, so a stateful drafter's first catch-up ingests it and the sampling history does not take it in twice",
+      "Device truncation for a smaller Core-accepted count, rerunning engine state selection",
+      "Draft widths chosen per round up to the configured widest over one set of buffers, with graphs per width captured on first use",
+      "One readback per round of the readback block (enqueue_pack: the packed {n_emitted, tokens[K+1]} result, n_matched, the frontier after the round and optional per-column log-probability rows)",
+      "Forced replay of a fixed continuation (crit Eval's replay, the score call) through the unchanged accept: a verify step writing predictions from the continuation at the device's committed output count",
+      "Zero-copy rounds: the allowance read in place by enqueue_set_budget and the readback block written to mapped pinned host memory, so a round has no copy; same tokens and state as copying rounds",
+      "Log-probabilities and ranked alternatives of the emitted tokens from rows the verify step writes, without a second copy",
+      "RoundBudget tokens per round, round/step ratio, implied speedup and pass/fail at a default 1.3 threshold",
+      "Fixed-width catch-up plan for stateful drafters, so the draft step's launch shape never depends on the device-held emitted count",
+      "A host check that a batched operator computes every column bitwise identically at any batch width, with fixed-order and width-dependent reference operators",
+      "Python engines: rounds on Core's round driver (crit_plugins.rounds, SpeculativeRounds over three hooks: draft with catch-up, verify writing predictions, commit from the round's start), greedy, sampled, replay and forced modes, one CUDA graph per (rows, width, mode) captured at load, rows that join, leave and move between rounds, truncation to Core's count and one pinned readback per round",
+      "rejection_predictions: per-column predictions under which the greedy accept rule is rejection sampling (accept with min(1, p/q), else draw from max(p - q, 0)), so a sampled verify needs no kernel of its own",
+      "WidthPolicy (width_policy.py): the draft width per round from each row's decayed per-depth acceptance over the fitted round cost, for the rows that decode together",
+      "Copied drafts for Python rounds: CopyDrafts stages a copy drafter's tokens and match lengths between rounds and override_drafts replaces a neural drafter's tokens where the match is long, with one-hot draft laws for sampled rows; capture-safe"
+    ],
+    "engine_supplies": [
+      "Capture-safe draft, verify and commit_state device steps for the actual model",
+      "Per-column provisional state (KV columns, recurrent checkpoints or saved inputs) sufficient to select any accepted prefix",
+      "Prefill and the memory for per-column state",
+      "Ordinary-step timing baseline and the decision to keep speculation from measured round cost",
+      "For the Python driver: capture-safe draft, verify and commit hooks over RoundView, with its decoding rows at the front of its own state as of the driver's"
+    ],
+    "preserve": [
+      "Acceptance stays on the device and uses the greedy prefix/correction/stop rule over argmax (greedy) or rejection-sampling (sampled) predictions",
+      "One readback per round (one device-to-host copy, or the block written in place with zero copy) and no host fence inside launch",
+      "Frontier advances by n_emitted and the accepted state is verify column n_emitted minus one",
+      "A Core truncation is applied to device state before the next round",
+      "The sampling history's commit takes control[commit_tokens] (n_emitted after an accept or truncation, 0 after start or a seed), never n_emitted",
+      "commit_state is idempotent from round-start state",
+      "A stateful drafter writes each position before reading it, so fixed-width catch-up junk is overwritten before any read",
+      "With widths chosen per round, the catch-up covers the widest K + 1 columns, since the previous round may have emitted more than a narrower round's K + 1",
+      "Verify and step kernels compute each column identically for any number of columns (fixed K split and reduction order)",
+      "Junk and padding columns of fixed-width graphs hold finite values, and valid token ids and positions where a step gathers or writes for them: a masked term has weight 0, and 0 x NaN poisons the real rows"
+    ],
+    "adapt": [
+      "Drafter, draft width and per-configuration graph slots; sweep the width on mixed text (prose, code, reasoning, another language) rather than one prompt, or choose it per round from recent acceptance",
+      "Drafter cost: a draft-only weight copy in a cheaper encoding or a draft vocabulary subset changes acceptance only, so it lets a wider draft pay",
+      "Provisional state strategy: checkpoints versus recomputation from saved inputs",
+      "Batching rows through the multi-row accept kernel and fusing accept into the verify epilogue"
+    ]
+  },
+  "path": "inference/techniques/speculation/device-speculative-round/README.md",
+  "code_path": "inference/techniques/speculation/device-speculative-round/code",
+  "code_files": [
+    {
+      "path": "inference/techniques/speculation/device-speculative-round/code/round_budget.py",
+      "purpose": "Python round/step budget reference and worked example"
+    },
+    {
+      "path": "inference/techniques/speculation/device-speculative-round/code/catch_up.py",
+      "purpose": "Fixed-width catch-up position plan for stateful drafters and a toy positional drafter"
+    },
+    {
+      "path": "inference/techniques/speculation/device-speculative-round/code/column_invariance.py",
+      "purpose": "Column-invariance check for batched operators with fixed-order and width-dependent reference dot products"
+    },
+    {
+      "path": "inference/techniques/speculation/device-speculative-round/code/python_round.py",
+      "purpose": "Rejection-sampling predictions and copied drafts for rounds on Core's round driver (crit_plugins.rounds)"
+    },
+    {
+      "path": "inference/techniques/speculation/device-speculative-round/code/width_policy.py",
+      "purpose": "Adaptive draft width per round from per-depth acceptance over the measured round cost"
+    }
+  ],
+  "requires": {
+    "hardware": "Python 3.11+ for the budget reference; PyTorch for the round driver (CUDA for its graphs)",
+    "model": "Greedy target with capture-safe draft and K+1-column verify steps and selectable per-column state",
+    "workload": "Greedy or sampled speculative decoding with draft widths up to a configured widest, one captured configuration per width"
+  },
+  "contract": {
+    "input": "Draft width, vocabulary, context capacity, stop IDs and engine draft/verify/commit_state steps; per round a positive output allowance",
+    "output": "Per round the device-chosen tokens (1..K+1), the accepted draft count, optionally their log-probabilities and ranked alternatives, and an advanced device frontier",
+    "ownership": "The round owns its control, draft, prediction and result buffers and its graphs; steps own their model state. A round's tokens are valid until its commit or the next launch",
+    "failure": "Reject out-of-vocabulary stops, rounds past context, invalid device counts or tokens and over-long commits. A failed truncation leaves device state undefined and the request must fail",
+    "core_boundary": "Core's round driver (crit_plugins.rounds) captures and launches the rounds, reads each round's block once and commits the count Core kept; this entry keeps the round's rules, the reference kernels and the pieces for sampled rounds, copied drafts and the width policy"
+  },
+  "dependencies": [
+    "Python standard library",
+    "PyTorch (python_round.py)"
+  ],
+  "symbols": [
+    "RoundBudget",
+    "catch_up_plan",
+    "PositionalDrafter",
+    "check",
+    "fixed_order_dot",
+    "width_split_dot",
+    "rejection_predictions",
+    "draw",
+    "WidthPolicy",
+    "override_drafts",
+    "CopyDrafts"
+  ],
+  "interactions": [
+    "token-sampling",
+    "mtp-decode",
+    "recurrent-state-recovery",
+    "attention-state"
+  ],
+  "techniques": [
+    "device-speculative-round",
+    "mtp-decode",
+    "recurrent-state-recovery",
+    "attention-state"
+  ],
+  "validation": {
+    "host": "RoundBudget ratio, speedup and threshold checks; fixed-width drafter catch-up equal to exact variable-width ingestion over 120 randomized rounds (draft widths 1, 3, 5) and over 80 rounds of widths chosen per round with the widest width + 1 columns; column-invariance check: a fixed summation order passes and a width-dependent split is detected; the worked example shows a masked non-finite junk column poisoning a weighted sum and a finite one not; the Python driver over a toy target with a stateful catch-up drafter and a stateless one decodes exactly plain greedy for four rows at fixed and varying widths, through stops, output limits, truncations to Core's count and rows moved between rounds; replay emits the continuation and forced rounds keep every column; rejection_predictions keeps the target's distribution over 60,000 rows; the width policy's per-depth acceptance, decay and fitted cost",
+    "native": "No native code; the Python driver's captured CUDA graphs (three rows, widths 0, 2 and 6) emit the eager rounds' tokens, which equal plain greedy decoding, on torch 2.9 and 2.14",
+    "performance": "No speed claim for the kernels; the reference kernels are not tuned and RoundBudget measures each engine's own round"
+  }
+}

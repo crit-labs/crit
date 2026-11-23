@@ -328,11 +328,16 @@ class _Fp4(_Bench):
     """The FP4 tensor-core arithmetic's passes (nvfp4 W4A4 shapes, hidden and inter multiples of 128): the routes'
     operands quantized once by the untuned build (fp4_inputs; the gate/up pass's intermediate for the down pass), then
     one pass timed."""
+    tile = False   # Workspace(tile=...): 64-route items through fp4-tile
     arithmetic = "nvfp4"
 
     def shapes(self, model):
-        return [dict(s) for s in expert_shapes(model) if int(s["a4"]) and int(s["hidden"]) % 128 == 0 and
-                int(s["inter"]) % 128 == 0]
+        # every nvfp4 shape: with input scales (fp4) or without (fp4-row: the same MMA at each route's own scale)
+        found = {}
+        for s in expert_shapes(model):
+            if NAMES[int(s["format"])] == "nvfp4" and int(s["hidden"]) % 128 == 0 and int(s["inter"]) % 128 == 0:
+                found[(s["gate_up"], s["hidden"], s["inter"], s["experts"], s["top"])] = dict(s, a4=1)
+        return list(found.values())
 
     def valid(self, knobs):
         return knobs["DEPTH"] * knobs["TILES"] <= 12
@@ -343,7 +348,8 @@ class _Fp4(_Bench):
         key = s["key"] + ("fp4",)
         if key not in self._plans:
             ws = self._plans[s["key"][:-1]][0]
-            fresh = gx.Workspace(rows, s["top_k"], ws.experts, s["hidden"], s["inter"], device, width=self.width)
+            fresh = gx.Workspace(rows, s["top_k"], ws.experts, s["hidden"], s["inter"], device, width=self.width,
+                                 tile=self.tile)
             x = self._x[(s["hidden"], rows)]
             gx.route_outputs(x, s["ids"], s["store"], None, s["layout"], fresh, True, "fp4")
             f = {k: v.clone() for k, v in fresh.fp4().items()}
@@ -361,9 +367,11 @@ class _Fp4(_Bench):
     def _call(self, module, s, out):
         f = s["fp4"]
         if s["gate_up"]:
-            module.ops.fp4_gate_up(f["x"], f["xs"], s["store"], s["layout"], *s["items"], out[0], out[1], s["tokens"])
+            module.ops.fp4_gate_up(f["x"], f["xs"], s["store"], s["layout"], *s["items"], out[0], out[1], s["tokens"],
+                                   int(self.tile))
         else:
-            module.ops.fp4_down(f["h"], f["hs"], s["store"], s["layout"], *s["items"], out, s["tokens"])
+            module.ops.fp4_down(f["h"], f["hs"], s["store"], s["layout"], *s["items"], out, s["tokens"],
+                                int(self.tile))
 
     def run(self, module, s):
         self._call(module, s, s["out"])
@@ -440,3 +448,17 @@ class Fp4Decode(_Fp4):
 class Fp4Prompt(_Fp4):
     structure = "fp4-prompt"
     width = 32
+
+
+class Fp4Tile(_Fp4):
+    """Items of 64 routes through the block tile (Workspace(tile=True)): a configuration within this GPU's shared
+    memory a block (STAGES steps of the routes' and the block's weight rows: gates.shared_memory_optin) whose WN
+    divides the item's 8 n-tiles."""
+    structure = "fp4-tile"
+    width = 64
+    tile = True
+
+    def valid(self, knobs):
+        from crit_kernels import gates
+        stage = 64 * (64 + 16) + 64 * (8 + 8) + knobs["WM"] * knobs["TILES"] * 16 * (64 + 16 + 8 + 8)
+        return 8 % knobs["WN"] == 0 and knobs["STAGES"] * stage <= gates.shared_memory_optin()

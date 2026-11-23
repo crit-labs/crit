@@ -1,5 +1,5 @@
 """Core schedules an engine's requests (crit_core.native.StepEngine over Core's runtime): waiting requests are
-admitted by priority, the oldest first among equals (next_request, the rule core/src/runtime/admission.cpp applies);
+admitted by priority, the oldest first among equals (next_request, the rule inference/core/src/runtime/admission.cpp applies);
 the cap on the requests the runtime holds at once is Core's setting (cap_concurrency), and so is how long a request
 may wait for a lane."""
 from pathlib import Path
@@ -8,7 +8,7 @@ import threading
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "tests"):
+for _folder in ("inference/core/python", "tests"):
     sys.path.insert(0, str(ROOT / _folder))
 
 from crit_core.native import NO_DEADLINE_MS, NativeError, StepEngine, StepResult, cap_concurrency, next_request  # noqa: E402

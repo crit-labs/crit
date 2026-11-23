@@ -9,7 +9,7 @@ import torch
 
 KEYS = 16384
 _spec = importlib.util.spec_from_file_location(
-    "sparse_reference", Path(__file__).resolve().parents[4] / "inference" / "attention-state" / "code" /
+    "sparse_reference", Path(__file__).resolve().parents[4] / "inference" / "techniques" / "attention" / "attention-state" / "code" /
     "sparse_index.py")
 ref = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ref)

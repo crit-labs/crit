@@ -1,7 +1,7 @@
 """crit run ... ablate end to end: a toy engine built from plugins, packaged as a run's candidate and served through
 crit serve, built again in the same resident host with each variant of its plugins, benched and smoke-tested; the
 report says which plugin pays and which one slows the engine. The package is a whole engine (the toy engine's
-plugins, inference/examples/plugin-engine/plugins, with the attention and drafter plugins below in their slots); its resident host runs
+plugins, inference/starters/plugin-engine/plugins, with the attention and drafter plugins below in their slots); its resident host runs
 the scripted ENGINE over the assembled plugins (support/serve.py's scripted serving)."""
 import json
 import os
@@ -16,7 +16,7 @@ from support.engines import USE
 from support.serve import RECIPE, scripted_package, scripted_serving
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "core" / "python"))
+sys.path.insert(0, str(ROOT / "inference" / "core" / "python"))
 from crit_plugins.ablation import describe as ablation_describe  # noqa: E402
 from crit_plugins.testing import run_tests  # noqa: E402
 
@@ -109,19 +109,19 @@ def create(context, options, parts):
     return Plugin(options)
 '''
 
-# An attention plugin that follows the level the engine asks of its prompt rows: its exact way is slower.
+# An attention plugin that follows the level the engine asks of its prompt rows: its row-exact and exact ways are slower.
 LEVEL_PLUGIN = '''
 from crit_plugins.kernels import asks
 
 
 class Plugin:
     def __init__(self, options):
-        self.exact = asks("prompt") == "exact"
-        self.seconds_per_token = 0.004 if self.exact else 0.0
+        self.level = asks("prompt") if asks("prompt") in ("exact", "row-exact") else "repeatable"
+        self.seconds_per_token = 0.004 if self.level != "repeatable" else 0.0
         self.tokens_per_round = 1
 
     def exactness(self):
-        return {"prompt": "exact" if self.exact else "repeatable"}
+        return {"prompt": self.level}
 
 
 def create(context, options, parts):
@@ -250,7 +250,7 @@ class AblateTests(run_measure.MeasureFixture, unittest.TestCase):
         selection = {"use": {**USE, "attention": "attn-level", "drafter": "draft-three"},
                      "base": {"attention": "attn-plain", "drafter": None}}
         candidate = self.plugin_package(engine=engine, selection=selection)
-        exact = {"decode": "row-exact", "prompt": "exact"}
+        exact = {"decode": "row-exact", "prompt": "row-exact"}   # the speed run's levels
         self.assertEqual(read_json(self.folder / "candidate.json")["configuration"]["exactness"], exact)
         result = ablate(self.store, self.run_id, candidate, repetitions=2, smoke=False, noise=0.10,
                         sets=["exactness.prompt=repeatable"])
@@ -258,8 +258,8 @@ class AblateTests(run_measure.MeasureFixture, unittest.TestCase):
         report = read_json(self.directory / result["report"])
         full, fast = report["variants"]
         self.assertEqual((full["state"], fast["state"]), ("measured", "measured"), report["variants"])
-        self.assertEqual(full["exactness"], {"asked": exact, "prompt": "exact",
-                                             "plugins": {"attn-level": {"prompt": "exact"}}})
+        self.assertEqual(full["exactness"], {"asked": exact, "prompt": "row-exact",
+                                             "plugins": {"attn-level": {"prompt": "row-exact"}}})
         self.assertEqual(fast["exactness"], {"asked": {"decode": "row-exact", "prompt": "repeatable"},
                                              "prompt": "repeatable",
                                              "plugins": {"attn-level": {"prompt": "repeatable"}}})

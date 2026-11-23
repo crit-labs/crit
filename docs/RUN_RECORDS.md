@@ -59,7 +59,7 @@ Eval reads the same `settings.toml` as the run.
 | `package` | `--candidate ID --source DIR --record recipe.json`; runnable files and manifest |
 | `check`, `benchmark` | `--candidate ID --record payload.json`; appends evidence. `check --candidate ID --from-eval [ATTEMPT]` instead records every case's arithmetic, functional and resources check from the candidate's retained Eval result (default its newest; [Check](#check)) |
 | `measure` | `--candidate ID [--seconds N] [--exploratory]`; after `check --from-eval`: reserves a benchmark attempt, serves the packaged candidate through `crit serve`, streams every resident case's chat request to it, settles it and records one benchmark per case ([measured benchmarks](#measured-benchmarks)). Refuses, before reserving, a candidate whose checks would leave its benchmarks exploratory; `--exploratory` measures it anyway |
-| `serve` | `--candidate ID [--host HOST] [--port 8000] [--seconds N] [--check [--data DATA]] [--no-smoke] [--no-plugin-tests]`; reserves a check attempt, serves the packaged, not yet sealed candidate through `crit serve` at `http://HOST:PORT/v1` until Ctrl+C or the reservation's deadline, for the checks a candidate passes before sealing, and settles the attempt (log `logs/serve-ATTEMPT.log`); with `--check` crit first runs the package's plugin tests (`crit plugins test`, cached; `--no-plugin-tests` leaves them out), then the standard serving checks itself (consecutive greedy requests, a system message, streaming, a stop string, a client cancelling, a tool call and its result, log-probabilities, a template switch, each where declared, the prompt activations the candidate's plan declared against the ones the engine's facts say it serves, and stopping the engine) and [crit smoke](../smoke/README.md) at the run's context and again with the engine reopened at a quarter of it (`--no-smoke` leaves it out), with `--data` crit-eval's gate pre-check, keeps their report as `logs/serve-check-ATTEMPT.json` and records a functional check per case: the one check before a candidate's Eval or seal; `crit serve` serves the candidate once it is sealed. An [external engine](#external-engines) is started from its launch command instead and has no plugin tests |
+| `serve` | `--candidate ID [--host HOST] [--port 8000] [--seconds N] [--check [--data DATA]] [--no-smoke] [--no-plugin-tests]`; reserves a check attempt, serves the packaged, not yet sealed candidate through `crit serve` at `http://HOST:PORT/v1` until Ctrl+C or the reservation's deadline, for the checks a candidate passes before sealing, and settles the attempt (log `logs/serve-ATTEMPT.log`); with `--check` crit first runs the package's plugin tests (`crit plugins test`, cached; `--no-plugin-tests` leaves them out), then the standard serving checks itself (consecutive greedy requests, a system message, streaming, a stop string, a client cancelling, a tool call and its result, log-probabilities, a template switch, each where declared, the prompt activations the candidate's plan declared against the ones the engine's facts say it serves, and stopping the engine) and [crit smoke](../smoke/README.md) at the run's context and again with the engine reopened at a quarter of it (`--no-smoke` leaves it out), with `--data` crit-eval's gate pre-check (its items hints, as crit-eval states them: reported and marked in the report, never failing the check, which the Eval's gates judge; a pre-check that cannot run fails it), keeps their report as `logs/serve-check-ATTEMPT.json` and records a functional check per case: the one check before a candidate's Eval or seal; `crit serve` serves the candidate once it is sealed. An [external engine](#external-engines) is started from its launch command instead and has no plugin tests |
 | `ablate` | `--candidate ID [--variant NAME ...] [--set ...] [--repetitions 3] [--rounds 1] [--no-smoke] [--smoke-test TEST ...] [--seconds N]`; reserves a check attempt, serves the packaged, not yet sealed candidate built from plugins through `crit serve`, builds it again in the same resident host with each variant of its plugins, benches the run's resident cases and runs crit smoke on each, and keeps the report as `logs/ablation-ATTEMPT.json` ([ablation](#ablation)); an [external engine](#external-engines) is served A/B on the options it declares only |
 | `kernels` | `--candidate ID [--nvcc PATH] [--seconds N]`; an [external engine](#external-engines) only: reserves a check attempt, starts it with crit-eval's CUPTI tracer in its environment, sends each resident case once to warm and once traced, and keeps the kernels per phase as `logs/kernels-ATTEMPT.json`; where tracing is not possible (not Linux, no CUDA toolkit with CUPTI, no kernel recorded) the report says why. A plugin package is traced in process with `crit eval kernels --package` |
 | `profile` | `--candidate ID [--case ID] [--tokens 32] [--families JSON] [--nvcc PATH] [--hipcc PATH] [--seconds N]`; where a served engine's time goes per token: reserves a check attempt, serves the packaged, not yet sealed candidate (a plugin package through `crit serve` or an [external engine](#external-engines)) with the kernel profiler the run's device has in its environment (crit-eval's tracer: CUPTI on `cuda`, rocprofiler-sdk on `hip`; Linux), sends one short request of the case (default the run's first resident case, at `--tokens` output tokens) once to warm and once traced, and prints per prompt token (up to the first reply piece, per prompt token computed) and per decode token the GPU time, share and launches by kernel family (`matmul` for GEMV and GEMM, `attention`, `recurrence`, `norms`, `elementwise`, `routing`, `copies`, `other`; the built-in names include crit's own kernels), and the decode step's time against recon's plain-pass floor (`work/recon.json`'s placement: the path past the device its experts take, else the device). Kernel time is exclusive; the device's memory copies join `copies` with the time it only copied, so the families sum to its busy time. The families come from names (`crit.run.profile.FAMILIES`), after the rules `--families` gives (`[{"match": NAME_PART, "family": FAMILY}]`, text or a file); every name none classes counts as `other` and is listed. Keeps `logs/profile-ATTEMPT.json`; records no check and no benchmark; where profiling is not possible (a device without a profiler, not Linux, no toolkit, no kernel recorded) the report says why |
@@ -119,22 +119,28 @@ activations ([Eval's quality](https://github.com/crit-labs/crit-eval/blob/main/d
 - `speed`, the default everywhere (new runs, `settings.toml`, crit eval): a budget that only keeps out a broken engine
   (perplexity ratio 1.4, mean KL 0.4, p99 KL 4.0), output differences that part at near-ties allowed, and prefill's
   limits priced at the fastest prompt activations the mode admits on the quantized matrices (the stored format's own,
-  FP8 or 16-bit) or a faster arithmetic quality shows passing. The stored format's activations on quantized matrices,
-  FP8 or 4-bit KV, an FP8 head and, where `weights_policy` allows, re-encoded dense weights are its starting
-  arithmetic, judged together by the candidate's Eval.
+  FP8 or 16-bit) or a faster arithmetic quality shows passing, and the 16-bit matrices at FP8 in prefill and decode
+  alike. The stored format's activations on quantized matrices, each format on its own tensor cores, FP8 KV, and,
+  where `weights_policy` allows, every 16-bit target matrix in FP8 (the head among them) are its starting arithmetic,
+  judged together by the candidate's Eval; 4-bit dense weights or KV are levers it measures.
 - `preserve`: a budget that keeps the output close to the checkpoint's (1.05, 0.05, 0.5), every precision change
   measured against it, and prefill's limits priced at 16-bit prompt activations.
 
 The mode also gives the exactness of the rows of an engine that asks for none
 ([exactness](PLUGINS.md#exactness)): crit completes every candidate's `configuration.exactness` to a level for the
 decode rows and one for the prompt rows, taking the configuration's own where it states one and the mode's otherwise.
-`preserve` asks `exact` (decode rows `row-exact`, each prompt row the bits of the same token decoded), `speed` asks
-`repeatable` (every plugin's fastest way). The package carries the completed configuration, so the engine is held to
-the level it was measured at wherever it is served.
+`preserve` asks `exact` (decode rows `row-exact`, each prompt row the bits of the same token decoded). `speed` asks
+`row-exact` for both (a prompt row's bits follow nothing but the row, at any prompt length, but may differ from the
+same token decoded), so every plugin takes its faster prompt path and crit smoke judges decoding against prefilling
+by the drift quantized arithmetic rounds by. `repeatable` is a lever an engine takes with its speed measured and its
+checks passed. The package carries the completed configuration, so the engine is held to the
+level it was measured at wherever it is served.
 
 It gives the precision the plugins start from as well ([precision](PLUGINS.md#precision)): crit writes the mode into
 every candidate's configuration as `quality_mode`, whatever the configuration named, and a plugin's precision option
-left on `auto` follows it. In `speed` quantized-projections holds the output head in FP8, in `preserve` as stored.
+left on `auto` follows it. In `speed` quantized-projections holds the output head and every other 16-bit target
+matrix in FP8, the KV pages and the MTP layer's are FP8 and its matrices NVFP4, and NVFP4 and FP8 experts run W4A4 and
+W8A8 on their own tensor cores; in `preserve` everything stays as stored.
 
 Every run record, Eval result and crit-hub result states its mode, and one that states none, or another (the speed
 mode's former name `as_quantized` among them), is refused. Results compare only within one mode. The mode is a choice
@@ -246,18 +252,16 @@ Provider spend limits are the caller's responsibility.
 | Package recipe | `build: {toolchain: {...}, dependencies: [...], command: [...]}`, nothing else: Core's loader runs the package and says what it serves |
 
 In an `as_stored` run, a candidate declaring `transformed` weights (requantized,
-pruned or changed) is measured but never eligible. In a `transformable` run, [Models](../models/README.md)
-produces transformed weights with a record of recipe, calibration data, seed, hashes and
-cost, or the engine re-encodes stored 16-bit matrices as it loads them (the route for an
-already-quantized checkpoint) and names the matrix groups and formats in
-`configuration.re_encoding`; the quality budget judges both. The coordinator cannot inspect
+pruned or changed) is measured but never eligible. In a `transformable` run, the engine re-encodes stored
+16-bit matrices as it loads them and names the matrix groups and formats in
+`configuration.re_encoding`; the quality budget judges them. The coordinator cannot inspect
 weights; declare honestly. `weights_policy` and `weights` cover the target weights that compute
 every published token, in every run, whatever its quality mode. They do not cover draft-only
 weights: whatever the run's `weights_policy`, a drafter (the checkpoint's draft layers,
 a companion drafter, a copy of the head it drafts through) may use any encoding, since the
 stored target weights verify every token; declare `weights` by the target weights alone and
-record the drafter encoding in the configuration. Drafter values come from the checkpoint, a
-published companion or `crit models drafter`, and are never trained or fine-tuned by the
+record the drafter encoding in the configuration. Drafter values come from the checkpoint or a
+published companion, and are never trained or fine-tuned by the
 agent. Nor do they cover runtime state (KV-cache and activation precision, judged by the
 quality gates).
 
@@ -635,6 +639,12 @@ checks would leave its benchmarks exploratory, and says why and what to do:
   memory fell below the run's headroom (or went unmeasured): no later record undoes it, so the candidate cannot
   become eligible, and the fix is a new candidate (its plan repairs a failed check with a requirement lever serving
   `check:GATE`, [plan checks](#checks)).
+
+Decode speed is sampled decode. A case's request decodes at the sampling its captured request names; one that names
+no temperature takes crit Eval's sampled-suite sampling for the run (recon.json's `gathered.eval_sampling`, else
+temperature 1.0), each measured repetition with its own seed where the engine takes one. `crit run ablate`,
+`profile` and `kernels` send the same requests. A captured request at temperature 0 is measured as captured and its
+benchmark carries `extensions.comparison_only`: a greedy decode compares texts and is never a speed.
 
 `--exploratory` measures such a candidate anyway, for telemetry or memory during development: its measurement log
 says why the benchmarks stay exploratory, the command warns as `benchmark` does, and the candidate is never

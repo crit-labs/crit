@@ -3,6 +3,7 @@ records executes. Every candidate's source and package is a plugin package, as c
 plugins (support/engines.py) beside the fixture's files. Importing it puts crit's packages, and crit Eval beside this
 checkout, on the path."""
 from datetime import datetime
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -10,10 +11,16 @@ import tempfile
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
-for _folder in ("core/python", "api", "../crit-eval", "kernels", "cli"): sys.path.insert(0, str(ROOT / _folder))
+for _folder in ("inference/core/python", "api", "../crit-eval", "kernels", "cli"): sys.path.insert(0, str(ROOT / _folder))
 from crit.run.records import GIB, digest, file_sha, now, read_json  # noqa: E402
 from crit.run.store import RunStore  # noqa: E402
 from .engines import TOY, selection  # noqa: E402
+
+
+# crit syncs every record it writes to the disk (crit.records.write_json), thousands of times in a test module: 40% of
+# the run store tests' time on Linux. No test can tell a synced file from a written one, so in the tests' own process
+# the sync returns at once; the crit processes the tests start sync as they do.
+os.fsync = lambda descriptor: None
 
 
 def with_plugins(folder):
@@ -35,6 +42,12 @@ class RunFixture:
     finish_recon = True
 
     def setUp(self):
+        self.patch_ladder()
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.create_run(Path(self.temp.name).resolve())
+
+    def patch_ladder(self):
         if not self.ladder_scopes:
             patched = patch("crit.run.ladder.scope_of", lambda *args, **kwargs: None)
             patched.start()
@@ -44,9 +57,10 @@ class RunFixture:
         refusal = patch("crit.run.ladder.eval_refusal", lambda model_path: None)
         refusal.start()
         self.addCleanup(refusal.stop)
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name).resolve()
+
+    def create_run(self, root):
+        """The fixture's model and a new run in a store, all under root."""
+        self.root = root
         if self.model_files:
             from core_text_fixtures import llama_files, write_files
             self.model = write_files(self.root / "model", llama_files(

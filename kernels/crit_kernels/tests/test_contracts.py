@@ -34,7 +34,7 @@ def test_problems_name_a_kernel_without_operations_and_an_undefined_one(tmp_path
     # A copy of the tree with one kernel naming none and one naming an undefined operation.
     import json
     import shutil
-    shutil.copytree(ROOT / "inference", tmp_path / "inference", ignore=shutil.ignore_patterns("*.py", "tests"))
+    shutil.copytree(ROOT / "inference" / "techniques", tmp_path / "inference" / "techniques", ignore=shutil.ignore_patterns("*.py", "tests"))
     shutil.copytree(ROOT / "kernels", tmp_path / "kernels", ignore=shutil.ignore_patterns("tests", "*.cu", "*.py",
                                                                                           "*.cuh", "*.md"))
     a = tmp_path / "kernels/techniques/experts/topk-routing/kernel.json"
@@ -94,7 +94,7 @@ def test_attention_is_the_softmax_definition_and_merges_to_itself():
 
 
 def test_experts_are_the_techniques_moe_block():
-    ref = _module("inference/expert-streamed-prefill/code/reference.py")
+    ref = _module("inference/techniques/experts/expert-streamed-prefill/code/reference.py")
     g = torch.Generator().manual_seed(2)
     E, H, I = 3, 8, 4
     gu = [torch.randn(2 * I, H, generator=g, dtype=torch.float64) for _ in range(E)]
@@ -112,7 +112,7 @@ def test_experts_are_the_techniques_moe_block():
 @pytest.mark.parametrize("softmax,before,renormalize,bias", [(True, False, False, False), (True, True, True, True),
                                                              (False, True, True, False), (False, False, False, True)])
 def test_routing_is_the_techniques_route(softmax, before, renormalize, bias):
-    ref = _module("inference/heterogeneous-expert-dispatch/code/routing.py")
+    ref = _module("inference/techniques/experts/heterogeneous-expert-dispatch/code/routing.py")
     g = torch.Generator().manual_seed(3)
     logits = torch.randn(5, 16, generator=g, dtype=torch.float64)
     logits[2, 3] = logits[2, 9]   # a tie: the lower id first
@@ -130,7 +130,7 @@ def test_routing_is_the_techniques_route(softmax, before, renormalize, bias):
 
 
 def test_gated_delta_is_the_techniques_sequential_recurrence():
-    ref = _module("inference/recurrent-state-recovery/code/chunked_prefill.py")
+    ref = _module("inference/techniques/recurrence/recurrent-state-recovery/code/chunked_prefill.py")
     g = torch.Generator().manual_seed(4)
     T, dk, dv = 6, 4, 3
     q = torch.nn.functional.normalize(torch.randn(T, 1, dk, generator=g, dtype=torch.float64), dim=-1)
@@ -149,7 +149,7 @@ def test_gated_delta_is_the_techniques_sequential_recurrence():
 
 
 def test_ssd_and_conv_are_the_techniques_host_forms():
-    ref = _module("inference/recurrent-state-recovery/code/reference.py")
+    ref = _module("inference/techniques/recurrence/recurrent-state-recovery/code/reference.py")
     g = torch.Generator().manual_seed(5)
     T, H, P, G, N = 5, 4, 3, 2, 6
     x = torch.randn(T, H, P, generator=g, dtype=torch.float64)

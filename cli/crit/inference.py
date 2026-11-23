@@ -4,12 +4,13 @@ import json
 from pathlib import Path, PurePosixPath
 import sys
 
-# crit's plugin library, LIBRARY (inference/), and ROOT, the folder holding it, which the entries' paths (inference/ID/...)
-# are relative to: the checkout's, beside the cli/ folder this crit runs from (installed editable or not), else the copy
-# crit's wheel ships as package data, crit/library/inference (pyproject.toml).
+# crit's plugin library, LIBRARY (inference/techniques/), and ROOT, the folder holding it, which the entries' paths
+# (inference/techniques/ID/...) are relative to: the checkout's, beside the cli/ folder this crit runs from (installed
+# editable or not), else the copy crit's wheel ships as package data, crit/library/inference/techniques (pyproject.toml).
+TECHNIQUES = "inference/techniques"
 CHECKOUT = Path(__file__).resolve().parents[2]
-ROOT = CHECKOUT if (CHECKOUT / "inference").is_dir() else Path(__file__).resolve().parent / "library"
-LIBRARY = ROOT / "inference"
+ROOT = CHECKOUT if (CHECKOUT / TECHNIQUES).is_dir() else Path(__file__).resolve().parent / "library"
+LIBRARY = ROOT / TECHNIQUES
 GUIDANCE_TEXT = ("use_when", "avoid_when")
 GUIDANCE_LISTS = ("provides", "engine_supplies", "preserve", "adapt")
 # A technique's operations.json: per operation it needs on a device, what it computes, its CPU reference and how a
@@ -19,9 +20,9 @@ OPERATIONS_KIND = "crit-technique-operations"
 OPERATIONS_FILE = "operations.json"
 OPERATION_TEXT = ("what", "verify")
 OPERATION_FIELDS = {"id", "what", "reference", "verify", "invariance"}
-# Navigation metadata, not folders: every entry names one category; `list` groups by it in this order.
-CATEGORIES = ("attention", "projections", "experts", "speculation", "sampling-and-constraints",
-              "execution", "memory-and-loading")
+# Every entry names its category, the folder it lies in (inference/techniques/CATEGORY/ID, as kernels' and models'
+# techniques); `list` groups by it in this order.
+CATEGORIES = ("attention", "projections", "experts", "recurrence", "norms", "speculation", "sampling", "memory")
 
 
 def under(root, relative):
@@ -36,21 +37,29 @@ def under(root, relative):
     return target
 
 
+def folder_of(root, ident):
+    """The technique's folder under the library (inference/techniques/CATEGORY/ID), as a path relative to `root`
+    (posix); where no category holds it, the path it would have without one."""
+    found = sorted((root / TECHNIQUES).glob(f"*/{ident}"))
+    return found[0].relative_to(root).as_posix() if found else f"{TECHNIQUES}/{ident}"
+
+
 def operations(root, ident):
     """The technique's operations.json, or None when it has none (no device arithmetic of its own)."""
-    path = root / "inference" / ident / OPERATIONS_FILE
+    path = root / folder_of(root, ident) / OPERATIONS_FILE
     return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
 
 
 def plugins(root, ident):
     """[(id, title, folder)] of the technique's own plugin (its plugin.json), then of the other plugins of crit's
     library that import its code (their manifests' sources: other techniques and base plugins), read as data."""
-    inference = root / "inference"
-    code = (inference / ident / "code").resolve()
+    inference = root / TECHNIQUES
+    own = root / folder_of(root, ident)
+    code = (own / "code").resolve()
     own, others = [], []
-    for path in sorted([*inference.glob("*/plugin.json"), *inference.glob("base/*/plugin.json")]):
+    for path in sorted(inference.glob("*/*/plugin.json")):
         manifest, folder = json.loads(path.read_text(encoding="utf-8")), path.parent.relative_to(root).as_posix()
-        if path.parent == inference / ident:
+        if path.parent == own:
             own.append((manifest["id"], manifest["title"], folder))
         elif any((path.parent / source).resolve() == code for source in manifest.get("sources", {}).values()):
             others.append((manifest["id"], manifest["title"], folder))
@@ -104,7 +113,7 @@ def check_operations(root, ident, found):
         else:
             try:
                 path = under(root, reference.get("path"))
-                if not path.is_file() or not path.is_relative_to(under(root, "inference/" + ident)):
+                if not path.is_file() or not path.is_relative_to(under(root, folder_of(root, ident))):
                     errors.append(f"{label}: reference must be a file of the technique")
                 else:
                     missing = reference_symbols_missing(path, reference["symbol"])
@@ -116,14 +125,17 @@ def check_operations(root, ident, found):
 
 
 def leftover_kernel_lists(root):
-    """Errors for a kernels.json left in a base plugin's folder (a technique's is checked with its entry)."""
-    return [f"{p.parent.relative_to(root / 'inference').as_posix()}/kernels.json: a plugin keeps no kernel lists; "
-            "the kernels it loads are its plugin.json's \"kernels\"" for p in sorted((root / "inference").glob("base/*/kernels.json"))]
+    """Errors for a kernels.json left in the folder of a plugin without an entry (a technique's is checked with its
+    entry)."""
+    return [f"{p.parent.relative_to(root / TECHNIQUES).as_posix()}/kernels.json: a plugin keeps no kernel lists; "
+            "the kernels it loads are its plugin.json's \"kernels\""
+            for p in sorted((root / TECHNIQUES).glob("*/*/kernels.json")) if not (p.parent / "entry.json").is_file()]
 
 
 def load(root=ROOT):
     """Read authored entries directly, without generated files or code imports."""
-    entries = [json.loads(p.read_text(encoding="utf-8")) for p in sorted((root / "inference").glob("*/entry.json"))]
+    entries = [json.loads(p.read_text(encoding="utf-8")) for p in sorted((root / TECHNIQUES).glob("*/*/entry.json"),
+                                                                            key=lambda p: p.parent.name)]
     return {"schema_version": 3, "collection_name": "crit Inference", "entries": entries}
 
 
@@ -135,14 +147,16 @@ def check(root=ROOT):
         errors.append("Inference contains no techniques")
     for entry in store["entries"]:
         ident = entry["id"]
-        under(root, "inference/" + ident)
+        if entry.get("category") not in CATEGORIES:   # the folder it lies in: without one, nothing else can be checked
+            errors.append(f"{ident}: category must be one of " + ", ".join(CATEGORIES))
+            continue
+        home = f"{TECHNIQUES}/{entry['category']}/{ident}"
+        under(root, home)
         if ident in ids:
             errors.append("duplicate technique ID")
         ids.add(ident)
         if any(field in entry for field in ("donors", "origin_path", "source_bundle_path", "code_locations")):
             errors.append(f"{ident}: external source-bundle metadata is not a crit technique")
-        if entry.get("category") not in CATEGORIES:
-            errors.append(f"{ident}: category must be one of " + ", ".join(CATEGORIES))
         if not entry["summary"] or not entry["implementation_scope"] or not entry["code_files"]:
             errors.append(f"{ident}: description and actual implementation required")
         if entry.get("implementation_status") not in {"reference", "native_source"}:
@@ -161,7 +175,7 @@ def check(root=ROOT):
                 value = guidance.get(field)
                 if not isinstance(value, list) or not value or any(not isinstance(item, str) or not item.strip() for item in value):
                     errors.append(f"{ident}: agent_guidance.{field} must list concrete responsibilities or choices")
-        if entry["code_path"] != f"inference/{ident}/code" or entry["path"] != f"inference/{ident}/README.md":
+        if entry["code_path"] != f"{home}/code" or entry["path"] != f"{home}/README.md":
             errors.append(f"{ident}: technique-local description/code required")
         if not under(root, entry["path"]).is_file():
             errors.append(f"{ident}: description missing")
@@ -185,7 +199,7 @@ def check(root=ROOT):
         for path in under(root, entry["code_path"]).rglob("*"):
             if path.is_file() and path.suffix in {".py", ".cpp", ".cu", ".h"} and path.resolve() not in listed:
                 errors.append(f"{ident}: implementation file missing from metadata")
-        if (root / "inference" / ident / "kernels.json").exists():
+        if (root / home / "kernels.json").exists():
             errors.append(f"{ident}/kernels.json: a technique keeps no kernel lists; its per-operation contracts go in "
                           f"{OPERATIONS_FILE}")
         try:
@@ -222,8 +236,8 @@ def main(argv=None, root=ROOT):
     command = parser()
     args = command.parse_args(argv)
     try:
-        if not (root / "inference").is_dir():
-            raise ValueError(missing(root / "inference"))
+        if not (root / TECHNIQUES).is_dir():
+            raise ValueError(missing(root / TECHNIQUES))
         if args.command == "check":
             errors = check(root)
             if errors:
@@ -269,11 +283,11 @@ def main(argv=None, root=ROOT):
                         if built:
                             print("Plugins (crit plugins add ENGINE/plugins ID copies one into an engine):")
                             for plugin_id, title, folder in built:
-                                where = "this technique" if folder == "inference/" + entry["id"] else folder
+                                where = "this technique" if folder == folder_of(root, entry["id"]) else folder
                                 print("  " + plugin_id + " (" + where + "): " + title)
                         found = operations(root, entry["id"])
                         if found:
-                            print("Operations (inference/" + entry["id"] + "/" + OPERATIONS_FILE + "; kernels for them: "
+                            print("Operations (" + folder_of(root, entry["id"]) + "/" + OPERATIONS_FILE + "; kernels for them: "
                                   "crit's kernel templates, crit kernels list, and kernels/README.md#libraries):")
                             for op in found["operations"]:
                                 print("  " + op["id"] + ": " + op["what"])

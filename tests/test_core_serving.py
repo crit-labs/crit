@@ -8,7 +8,7 @@ import types
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "api", "cli", "tests"): sys.path.insert(0, str(ROOT / _folder))
+for _folder in ("inference/core/python", "api", "cli", "tests"): sys.path.insert(0, str(ROOT / _folder))
 
 from core_text_fixtures import QWEN3, llama_files, write_files  # noqa: E402
 from test_core_markers import marked_tokenizer  # noqa: E402

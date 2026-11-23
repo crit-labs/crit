@@ -9,7 +9,7 @@ import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "core/python"))
+sys.path.insert(0, str(ROOT / "inference/core/python"))
 
 from crit_core import jsonfile  # noqa: E402
 from crit_core.files import (CallableFiles, DirectoryFiles, MappingFiles, ModelFiles, ModelFilesError,  # noqa: E402

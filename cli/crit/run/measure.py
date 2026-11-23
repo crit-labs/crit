@@ -2,7 +2,10 @@
 
 Under a benchmark reservation crit serve serves the candidate (its resident chat adapter, packaged and not yet
 sealed) at the run's context, and each case's chat request streams to it over the chat API at the sampling the
-captured request names (greedy when it names none), as a client of the server gets it. crit serve's usage must count the workload's prompt tokens. Every candidate decodes
+captured request names, as a client of the server gets it. A request that names no temperature decodes sampled, at
+crit Eval's sampled-suite sampling for the run (run_sampling), each measured repetition with its own seed: decode
+speed is sampled decode. A captured request at temperature 0 is measured as captured and recorded comparison-only
+(GREEDY_COMPARISON_ONLY): a greedy decode compares texts, it is never a speed. crit serve's usage must count the workload's prompt tokens. Every candidate decodes
 its own reply; one that ends before the workload's output length is measured on the tokens it has. Host and device
 memory are sampled on the resident host process during every request, and tokens per round comes from crit serve's
 telemetry. A case of concurrency N sends each repetition as N requests started together, one per client: every
@@ -35,6 +38,27 @@ PER_REQUEST = TIMED + ("accepted_tokens_per_round",)
 MEMORY = ("peak_ram_bytes", "minimum_free_ram_bytes", "peak_vram_bytes", "minimum_free_vram_bytes")
 
 
+# A greedy (temperature 0) request's timings: what a benchmark of one is labelled. Decode speed is sampled decode.
+GREEDY_COMPARISON_ONLY = "greedy decode: comparison only, never a speed"
+
+
+def run_sampling(root):
+    """The sampling a run's requests decode at when they name no temperature: crit Eval's sampled-suite settings that
+    recon.json records for the run (gathered.eval_sampling: the model's generation_config.json, the user's
+    eval_sampling override or the protocol default), else the protocol default, temperature 1.0 with no filters."""
+    try:
+        recon = read_json(safe_path(root, "work/recon.json"))
+    except (OSError, ValueError):
+        recon = {}
+    settings = (((recon or {}).get("gathered") or {}).get("eval_sampling") or {}).get("settings")
+    return dict(settings) if settings else {"temperature": 1.0}
+
+
+def greedy(body):
+    """Whether a chat request decodes greedily (temperature 0)."""
+    return float(body.get("temperature", 1.0)) <= 0
+
+
 # Sampling fields a captured chat request keeps, as crit serve takes them (crit_api.options).
 CAPTURED_SAMPLING = ("temperature", "top_p", "top_k", "min_p", "seed", "presence_penalty", "frequency_penalty",
                      "repetition_penalty")
@@ -43,7 +67,9 @@ CAPTURED_SAMPLING = ("temperature", "top_p", "top_k", "min_p", "seed", "presence
 def case_request(root, rows):
     """A case's chat request: its first retained JSON file holding {"messages": [...]}, with optional "tools", the
     sampling fields (CAPTURED_SAMPLING) it was sent with and "chat_template_kwargs", the chat-template variables it
-    renders with (for example a workload captured with thinking on, where the candidate serves it off by default)."""
+    renders with (for example a workload captured with thinking on, where the candidate serves it off by default).
+    A request that names no temperature takes the run's sampled-suite sampling (run_sampling), so it decodes sampled;
+    the fields it names are kept."""
     from crit_api.server import MAX_BODY
     for row in rows:
         path = safe_path(root, row["path"])
@@ -61,6 +87,8 @@ def case_request(root, rows):
             sampling = {key: value[key] for key in CAPTURED_SAMPLING if value.get(key) is not None}
             if any(type(v) not in (int, float) for v in sampling.values()):
                 raise ValueError(f"{row['path']}: sampling fields must be numbers")
+            if "temperature" not in sampling:
+                sampling = {**run_sampling(root), **sampling}
             variables = value.get("chat_template_kwargs")
             if variables is not None and not isinstance(variables, dict):
                 raise ValueError(f"{row['path']}: chat_template_kwargs must be an object")
@@ -192,6 +220,8 @@ def measure(store, run_id, candidate_id, seconds=None, exploratory=False):
                    "extensions": {"measured_by": "crit run measure", "served_by": served_by(root, candidate_id),
                                   "attempt_id": attempt.id,
                                   "output_tokens": result["output_tokens"], "sampling": result["sampling"],
+                                  **({"comparison_only": result["comparison_only"]}
+                                     if result.get("comparison_only") else {}),
                                   **({"chat_template_kwargs": result["template_kwargs"]}
                                      if result.get("template_kwargs") else {}),
                                   **({"concurrency": result["concurrency"]} if result.get("concurrency") else {})}}
@@ -228,8 +258,25 @@ def _measure(store, run_id, candidate_id, attempt, deadline_at, kv_tokens, cases
 
 def switches_cache(port):
     """Whether the engine served on `port` takes crit.prompt_cache false (chat-prompt-cache-v1 on its /v1/models
-    card: the default model's, else the first): a crit engine packaged since Core has a prompt cache. False for a
-    server that lists no such card, an external engine among them."""
+    card): a crit engine packaged since Core has a prompt cache. False for a server that lists no such card, an
+    external engine among them."""
+    return PROMPT_CACHE_CAPABILITY in (card_capabilities(port) or [])
+
+
+# A crit engine's card capability for a request's seed (crit_api.options.sampling_capability).
+SEED_CAPABILITY = "chat-sampling-seed-v1"
+
+
+def takes_seed(port):
+    """Whether the engine served on `port` applies a request's seed: a crit card that lists chat-sampling-seed-v1, or
+    a server that lists no crit card (an external engine's OpenAI-style API takes one)."""
+    capabilities = card_capabilities(port)
+    return capabilities is None or SEED_CAPABILITY in capabilities
+
+
+def card_capabilities(port):
+    """The capabilities of the /v1/models card of the engine served on `port` (the default model's, else the
+    first), or None for a server that lists no card with capabilities."""
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
     try:
         connection.request("GET", "/v1/models")
@@ -241,15 +288,16 @@ def switches_cache(port):
         connection.close()
     cards = [card for card in cards if isinstance(card, dict)]
     card = next((c for c in cards if c.get("default")), cards[0] if cards else {})
-    return PROMPT_CACHE_CAPABILITY in (card.get("capabilities") or [])
+    return card.get("capabilities")
 
 
 def case_body(case, port=None):
-    """The streamed chat request a case sends: greedy unless the captured request names its own sampling. port: the
+    """The streamed chat request a case sends, at its request's sampling (case_request: sampled unless the captured
+    request names temperature 0). port: the
     crit engine it goes to, which prefills every prompt token of a measured request where it has a prompt cache to
     turn off (switches_cache): a repetition is no cache hit of the one before it."""
     fresh = {"crit": {"prompt_cache": False}} if port is not None and switches_cache(port) else {}
-    return {"temperature": 0, **case["request"], "max_tokens": case["output_tokens"], "stream": True,
+    return {**case["request"], "max_tokens": case["output_tokens"], "stream": True,
             "stream_options": {"include_usage": True}, **fresh}
 
 
@@ -263,6 +311,13 @@ def _case(port, case, load_ms, sampler, timeout, log, capacity=None):
     samples = {name: [] for name in PER_REQUEST + MEMORY + (("aggregate_tps",) if clients > 1 else ())}
     outputs, peaks, begun = [], [], now()
     seeds = case.get("seeds")
+    if seeds is None and not greedy(body) and "seed" not in body and takes_seed(port):
+        # A sampled case without seeds: each measured repetition its own seed, so the repetitions are repeatable
+        # draws and their spread covers the texts sampling draws.
+        seeds = list(range(1, case["repetitions"] + 1))
+    if greedy(body):
+        log(f"{case['case_id']}: the captured request decodes at temperature 0; its timings are recorded "
+            f"comparison-only ({GREEDY_COMPARISON_ONLY})")
     for i in range(case["warmup_runs"] + case["repetitions"]):
         sampler.reset()
         # A case with seeds sends each measured repetition with its own seed (crit run ablate's Eval cases).
@@ -304,6 +359,7 @@ def _case(port, case, load_ms, sampler, timeout, log, capacity=None):
     missing = {name: reasons.get(name, "Not measurable on this host") for name in samples if name not in metrics}
     return {"metrics": metrics, "missing": missing, "output_tokens": outputs, "started_at": begun, "ended_at": now(),
             "sampling": {key: body[key] for key in CAPTURED_SAMPLING if key in body},
+            **({"comparison_only": GREEDY_COMPARISON_ONLY} if greedy(body) else {}),
             "template_kwargs": body.get("chat_template_kwargs"),
             # Per repetition, the requests in flight at once at the peak, and what the engine runs at once.
             "concurrency": {"clients": clients, "peak_concurrency": peaks, "max_concurrent_requests": capacity}

@@ -21,9 +21,25 @@ import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "api", "../crit-eval", "kernels", "cli"): sys.path.insert(0, str(ROOT / _folder))
+for _folder in ("inference/core/python", "models/core/python", "api", "../crit-eval", "kernels", "cli"):
+    sys.path.insert(0, str(ROOT / _folder))
 from crit_core.files import DirectoryFiles, MappingFiles
-from crit_core.model import config as mc
+from crit_core.model import config as _core_rules
+from crit_models import config as _mechanisms
+
+
+class _Rules:
+    """Core's config reader (crit_core.model.config) and crit Models' mechanisms over it (crit_models.config) as one
+    namespace: a parsed config is read with its mechanisms (architecture), as Eval and the model plugins read it."""
+
+    def __getattr__(self, name):
+        if name in ("parse_model_config", "load_model_config"):
+            read = getattr(_core_rules, name)
+            return lambda *args, **kwargs: _mechanisms.architecture(read(*args, **kwargs))
+        return getattr(_mechanisms if hasattr(_mechanisms, name) else _core_rules, name)
+
+
+mc = _Rules()
 from crit_core.model import safetensors as st
 import eval_v2_rules as v2   # crit-eval-v2's rules, the oracle Core's config rules were ported from
 from support.files import unreadable_open
@@ -2007,14 +2023,14 @@ class PackageTests(unittest.TestCase):
                 "loaded = {name.split('.')[0] for name in sys.modules}; "
                 "assert not loaded & {'tokenizers', 'jinja2', 'numpy', 'torch', 'safetensors'}, loaded; "
                 "assert 'crit_core.text' not in sys.modules")
-        result = subprocess.run([sys.executable, "-I", "-B", "-c", code, str(ROOT / "core/python")],
+        result = subprocess.run([sys.executable, "-I", "-B", "-c", code, str(ROOT / "inference/core/python")],
                                 capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_core_sources_never_name_the_technique_store(self):
-        for path in (ROOT / "core/python/crit_core/model").rglob("*"):
+        for path in (ROOT / "inference/core/python/crit_core/model").rglob("*"):
             if path.is_file() and "__pycache__" not in path.parts:
-                self.assertNotRegex(path.read_text(encoding="utf-8").lower(), r"inference/|crit_inference", path)
+                self.assertNotRegex(path.read_text(encoding="utf-8").lower(), r"inference/techniques|crit_inference", path)
 
 
 class TensorReaderTests(SafetensorsFixture):

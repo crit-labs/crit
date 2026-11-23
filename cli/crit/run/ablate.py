@@ -36,7 +36,7 @@ REPETITIONS = 3
 # Seeds of each Eval case (--data): a sampled reply's tokens per round move with what it samples, so a drafting
 # engine's decode on one seed moves by several percent between seeds.
 SEEDS = 3
-# An engine built again in the host runs its first requests cold: one variant of a Qwen3.8-27B engine (RTX 5090)
+# An engine built again in the host runs its first requests cold: one variant of a dense 27B engine (RTX 5090)
 # decoded at 91, 98 and 130 tok/s over its three repetitions after a single warmup. So a variant's warmup repeats each
 # case until two requests in a row take the same time per decode round, within STEADY, and stops at WARMUPS requests.
 STEADY, WARMUPS = 0.03, 8
@@ -47,7 +47,7 @@ def _import(name):
     try:
         return __import__(name, fromlist=["_"])
     except ImportError:   # a checkout installed before the folder existed
-        sys.path.insert(0, str(ROOT / {"crit_plugins": "core/python", "crit_smoke": "smoke"}[name.split(".")[0]]))
+        sys.path.insert(0, str(ROOT / {"crit_plugins": "inference/core/python", "crit_smoke": "smoke"}[name.split(".")[0]]))
         return __import__(name, fromlist=["_"])
 
 
@@ -59,7 +59,8 @@ def eval_cases(data, seeds=None):
     import json
     seeds = SEEDS if seeds is None else seeds
     prepared = json.loads((Path(data) / "prepared.json").read_text(encoding="utf-8"))
-    sampling = dict(prepared.get("sampling") or {"temperature": 0})
+    # Data prepared before crit-eval-v7 names no sampling: the protocol default (temperature 1.0), never greedy.
+    sampling = dict(prepared.get("sampling") or {"temperature": 1.0})
     out = []
     for prefix, rows in (("eval:", prepared.get("speed") or []), ("eval:heldout:", prepared.get("heldout") or [])):
         for row in rows:
@@ -68,7 +69,7 @@ def eval_cases(data, seeds=None):
             request = {"messages": row["messages"], **({"tools": row["tools"]} if row.get("tools") else {}), **sampling}
             # Warmed as the run's cases are (_warm): an engine's first requests of a prompt it has not served run
             # cold (expert residency follows the content), so unwarmed, the first seed of every case measured slow (in
-            # a Flash-Next build's ablations rep 1 decoded at 0.87 of its case's median, rep 3 at 1.11).
+            # an expert-offload build's ablations rep 1 decoded at 0.87 of its case's median, rep 3 at 1.11).
             out.append({"case_id": prefix + row["id"], "request": request, "prompt_tokens": None,
                         "output_tokens": int(row["output_tokens"]), "concurrency": 1, "warm": True,
                         "warmup_runs": 0, "repetitions": seeds, "seeds": list(range(1, seeds + 1))})

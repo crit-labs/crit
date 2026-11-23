@@ -1,0 +1,14 @@
+{
+  "schema": "crit-model-checkpoints-v1",
+  "layouts": {
+    "safetensors (transformers names)": [
+      "models/cache/qwen4-exp-model/tests/test_device.py::StreamsTests"
+    ],
+    "safetensors (a release's own tensor names, which names rules map back)": [
+      "models/cache/qwen4-exp-model/tests/test_device.py::RespelledStreamsTests"
+    ],
+    "GGUF": [
+      "tests/test_model_template.py::GgufStreamsTests"
+    ]
+  }
+}

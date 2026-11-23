@@ -51,10 +51,24 @@ void fp4_inputs(const torch::Tensor& x, int64_t top, const torch::Tensor& store,
                 torch::Tensor& codes, torch::Tensor& scales);
 void fp4_gate_up(const torch::Tensor& codes, const torch::Tensor& scales, const torch::Tensor& store,
                  c10::ArrayRef<int64_t> layout, const torch::Tensor& item_slot, const torch::Tensor& item_routes,
-                 const torch::Tensor& item_count, torch::Tensor& h_codes, torch::Tensor& h_scales, int64_t tokens);
+                 const torch::Tensor& item_count, torch::Tensor& h_codes, torch::Tensor& h_scales, int64_t tokens, int64_t tile);
 void fp4_down(const torch::Tensor& h_codes, const torch::Tensor& h_scales, const torch::Tensor& store,
               c10::ArrayRef<int64_t> layout, const torch::Tensor& item_slot, const torch::Tensor& item_routes,
-              const torch::Tensor& item_count, torch::Tensor& y, int64_t tokens);
+              const torch::Tensor& item_count, torch::Tensor& y, int64_t tokens, int64_t tile);
+// The FP4 arithmetic at row scales (grouped_experts.h): rows quantized into `terms` FP4 terms at each route's own
+// scale (codes [routes][terms * K / 2], scales [routes][terms * K / 16], rcp [routes]); the gate/up rows into h BF16;
+// the down rows into y.
+void fp4_rows(const torch::Tensor& rows, int64_t div, const torch::Tensor& item_slot, const torch::Tensor& item_routes,
+              const torch::Tensor& item_count, int64_t terms, torch::Tensor& codes, torch::Tensor& scales,
+              torch::Tensor& rcp);
+void fp4_gate_up_rows(const torch::Tensor& codes, const torch::Tensor& scales, const torch::Tensor& rcp, int64_t terms,
+                      const torch::Tensor& store, c10::ArrayRef<int64_t> layout, const torch::Tensor& item_slot,
+                      const torch::Tensor& item_routes, const torch::Tensor& item_count, torch::Tensor& h,
+                      int64_t tokens, int64_t tile);
+void fp4_down_rows(const torch::Tensor& h_codes, const torch::Tensor& h_scales, const torch::Tensor& rcp, int64_t terms,
+                   const torch::Tensor& store, c10::ArrayRef<int64_t> layout, const torch::Tensor& item_slot,
+                   const torch::Tensor& item_routes, const torch::Tensor& item_count, torch::Tensor& y,
+                   int64_t tokens, int64_t tile);
 // The FP8 tensor-core arithmetic (grouped_experts.h): whether this build has the E4M3 MMA for this device; rows quantized
 // per 128 values (codes [routes][K], FP32 scales [routes][K / 128]); the gate/up rows into h BF16; the down rows.
 bool fp8_available();

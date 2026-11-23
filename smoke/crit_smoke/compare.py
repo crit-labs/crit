@@ -15,9 +15,9 @@ TOLERANCES = {
     "loose": {"tie": 0.25, "mean": 0.15, "big": 1.0, "big_share": 0.02, "disagree_share": 0.05, "free": 1},
     "strict": {"tie": 0.02, "mean": 0.02, "big": 0.25, "big_share": 0.0, "disagree_share": 0.0, "free": 0},
 }
-# Decode against prefill. On a Qwen3.8-27B NVFP4 engine (W4A4, FP8 KV, RTX 5090) that is right, decoding scored the
+# Decode against prefill. On a dense 27B NVFP4 engine (W4A4, FP8 KV, RTX 5090) that is right, decoding scored the
 # same tokens 0.12 to 0.43 nats apart on average, with no row over 1 nat and at most 1 top-1 disagreement; one bf16
-# ulp moved at random in one of its GEMMs moved 4% of its prompt rows over 1 nat. A Qwen3.8-Flash-Next engine whose
+# ulp moved at random in one of its GEMMs moved 4% of its prompt rows over 1 nat. An expert-offload engine whose
 # prompt ring overwrote a staged layer measured 0.54 nats with 6 of 48 rows over 1 nat, and a mask leaking into decode
 # moves the toy engine's rows (tests/test_smoke.py) by 2.8 to 3.5 nats.
 DECODE = {

@@ -1,0 +1,54 @@
+{
+  "about": "Which config.json keys spell each mechanism field, in the order they are tried (crit_models.config loads it). A family that spells a field its own way adds its key here, never a branch in a reader. sliding_layer_ids: the layers that attend a sliding window (the layer kinds of a config without layer_types). sliding_window: the window's size. routed_scaling_factor: the factor the routed experts' weights are scaled by. layer_passes: objects naming a span of layers [start, end) that runs `passes` times in a row with the same weights, each pass with its own state (a looped decoder): the object's key (null: the keys are the config's own) and its keys of the three numbers. layer_type_names: a family's own names of the layer types in layer_types, read as the names they stand for. full_attention_*: the geometry of full-attention layers where it differs from the other attention layers' (num_key_value_heads, head_dim), and a flag that their keys and values are one cached tensor.",
+  "experts": [
+    "num_experts",
+    "num_local_experts",
+    "n_routed_experts"
+  ],
+  "experts_per_token": [
+    "num_experts_per_tok",
+    "top_k_experts"
+  ],
+  "full_attention_kv_heads": [
+    "num_global_key_value_heads"
+  ],
+  "full_attention_head_dim": [
+    "global_head_dim"
+  ],
+  "full_attention_keys_equal_values": [
+    "attention_k_eq_v"
+  ],
+  "layer_types": [
+    "layer_types",
+    "layers_block_type"
+  ],
+  "sliding_layer_ids": [
+    "local_layer_ids"
+  ],
+  "sliding_window": [
+    "sliding_window",
+    "sliding_window_size"
+  ],
+  "routed_scaling_factor": [
+    "routed_scaling_factor",
+    "route_scale"
+  ],
+  "layer_passes": [
+    {
+      "object": "loop_config",
+      "start": "core_start",
+      "end": "core_end",
+      "passes": "num_passes"
+    },
+    {
+      "object": null,
+      "start": "loop_layer_index_start",
+      "end": "loop_layer_index_end",
+      "passes": "loop_num_passes"
+    }
+  ],
+  "layer_type_names": {
+    "hybrid": "full_attention",
+    "hybrid_sliding": "sliding_attention"
+  }
+}

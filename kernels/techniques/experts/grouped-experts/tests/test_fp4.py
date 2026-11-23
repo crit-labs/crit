@@ -13,8 +13,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available() or not gx.fp4_avai
                                 reason="the FP4 tensor cores (the sm_120 family)")
 
 
-def fp4_rows(experts, x, ids, width=None, module=gx):
-    ws = module.Workspace(ids.shape[0], ids.shape[1], experts.E, experts.H, experts.I, dev, width)
+def fp4_rows(experts, x, ids, width=None, module=gx, tile=False):
+    ws = module.Workspace(ids.shape[0], ids.shape[1], experts.E, experts.H, experts.I, dev, width, tile=tile)
     return module.route_outputs(x, ids, experts.store, None, experts.layout, ws, True, "fp4").clone()
 
 
@@ -76,11 +76,11 @@ def test_a_fp4_route_keeps_its_bits_in_decode_and_prompt_items(H, I, T, top):
     full = fp4_rows(experts, x, ids)
     valid = (ids.reshape(-1) >= 0).cpu()
     assert bool(torch.isfinite(full[valid]).all())
-    for width in (8, 32, 64):
+    for width, tile in ((8, False), (32, False), (64, False), (64, True)):   # tile: fp4-tile
         for first, count in ((0, 1), (17, 1), (3, 7), (T // 3, T - T // 3)):
-            part = fp4_rows(experts, x[first:first + count].clone(), ids[first:first + count].clone(), width)
+            part = fp4_rows(experts, x[first:first + count].clone(), ids[first:first + count].clone(), width, tile=tile)
             sel = valid[first * top:(first + count) * top]
-            assert torch.equal(part[sel], full[first * top:(first + count) * top][sel]), (width, first, count)
+            assert torch.equal(part[sel], full[first * top:(first + count) * top][sel]), (width, tile, first, count)
     assert torch.equal(fp4_rows(experts, x, ids)[valid], full[valid])
 
 

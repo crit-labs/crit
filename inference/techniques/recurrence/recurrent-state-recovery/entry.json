@@ -1,0 +1,112 @@
+{
+  "id": "recurrent-state-recovery",
+  "category": "recurrence",
+  "summary": "Speculative recurrent-state recovery: output-only gated-delta verification, atomic accepted-prefix recovery, the device commit of a captured round's accepted prefix (deferred, checkpoints or recompute) and a pooled device form",
+  "implementation_status": "reference",
+  "implementation_scope": "Python formula with physical accepted-node mapping and after-token checkpoints; the recurrence slot's device form (device_states.py): a pool of every sequence's FP32 state and causal-convolution window, step rows with a host accept and captured-round rows with commit_round by strategy, over the pool kernels of crit's kernel recurrent-scans (built for the engine's device, tuned or default knobs) or a capture-safe torch formula; a pure-Python two-pass chunked prefill (chunk-parallel triangular solve, then a sequential matrix-product pass) checked against the token-by-token recurrence. The scans themselves (column scan, chunked prefill, convolution) are recurrent-scans', not this entry's",
+  "agent_guidance": {
+    "use_when": "A short speculative accepted prefix can be reconstructed more cheaply than retaining a full recurrent matrix after every proposed token",
+    "avoid_when": "Recovery work outweighs state-storage savings, recurrence/cast semantics differ, or complete continuation state cannot be restored",
+    "provides": [
+      "Finite bounded gated-delta arithmetic and output-only chain verification",
+      "Recovery from retained initial state and per-node inputs without per-token matrix snapshots",
+      "Absolute after-token checkpoint semantics and accepted ordinal to physical-node mapping",
+      "Single-use atomic partial/zero commit, private sibling hook, cancellation and standalone native example",
+      "Device commit from a device-held accepted count: select the state after the accepted columns from per-column checkpoints, or record the count for a deferred commit (one launch for many per-block counts)",
+      "A device state pool for the recurrence slot: decode and verify rows of many sequences, their causal-convolution windows, host accept for step rows and commit_round for captured rounds by strategy (deferred, checkpoints, recompute), capture-safe",
+      "Two-pass chunked prefill: state-independent T, W, Ub and decayed q.k per chunk in parallel, then a sequential pass of matrix products only"
+    ],
+    "engine_supplies": [
+      "Model projections, gates, head mappings, activation/state cast rules and sampler acceptance",
+      "Index, target/draft and other continuation siblings beyond the state and convolution window",
+      "The scan kernels (a provider's or crit's kernel recurrent-scans), source/destination reservations, producer ordering and failure settlement",
+      "Materialization of correction or bonus tokens and full-model qualification"
+    ],
+    "preserve": [
+      "State at boundary B is after B materialized tokens",
+      "Select checkpoint accepted ordinal B minus initial count minus one through the physical-node map",
+      "Recover the declared ordinary recurrence and every required sibling",
+      "Withhold publication and preserve committed state on any failure",
+      "On the device, select the accepted state from the device-held count without a host read; keep commit rerunnable with a smaller count (a separate round-start state, or a deferred count applied at the next verify)"
+    ],
+    "adapt": [
+      "Head batching, tensor layout, supported shapes, representations and recurrence kernels",
+      "Output-only verification versus full-state snapshots",
+      "Owned graph staging and side-stream recovery with explicit readiness joins",
+      "Device strategy: per-column checkpoints (memory per round row and column), recompute from the kept start state (one more state pass at commit) or deferred replay (no start copy, scalar commit, the replay folded into the next row)"
+    ]
+  },
+  "path": "inference/techniques/recurrence/recurrent-state-recovery/README.md",
+  "code_path": "inference/techniques/recurrence/recurrent-state-recovery/code",
+  "code_files": [
+    {
+      "path": "inference/techniques/recurrence/recurrent-state-recovery/code/reference.py",
+      "purpose": "Immutable FP64 formula and chain recovery worked example"
+    },
+    {
+      "path": "inference/techniques/recurrence/recurrent-state-recovery/code/chunked_prefill.py",
+      "purpose": "Two-pass chunked gated-delta prefill and the token-by-token recurrence for comparison"
+    },
+    {
+      "path": "inference/techniques/recurrence/recurrent-state-recovery/code/device_states.py",
+      "purpose": "The recurrence slot's device form: a pool of every sequence's state and convolution window, step and captured-round rows, host accept and commit_round by strategy, over recurrent-scans' pool kernels or a torch formula"
+    },
+    {
+      "path": "inference/techniques/recurrence/recurrent-state-recovery/code/slot.py",
+      "purpose": "RecurrenceSlot: the device form both gated-delta recurrence plugins (recurrent-state-recovery and sequential-recurrence) fill the recurrence slot with"
+    },
+    {
+      "path": "inference/techniques/recurrence/recurrent-state-recovery/code/chunk_states.py",
+      "purpose": "The decode option chunk: every row of a pool through recurrent-scans' chunk-aligned exact form (boundary states, the chunk's tokens, commits by device tensor work), so prompt rows have the bits of decoding their tokens"
+    }
+  ],
+  "requires": {
+    "hardware": "Python 3.11+ standard library for formula; torch for the device form (CUDA or CPU), optionally crit's kernel recurrent-scans (needs the CUDA toolkit to build) and fla",
+    "model": "Declared gated-delta recurrence with caller-supplied projected/gated step inputs and complete sibling restoration",
+    "workload": "One rooted verification chain per round; bounded physical nodes, outputs, state, siblings and positions"
+  },
+  "contract": {
+    "input": "Explicit geometry/limits, owned FP64 starting matrix at an absolute after-token count, topologically numbered nodes and a selected physical path",
+    "output": "Provisional verification outputs, then a complete accepted snapshot and optional exact boundary checkpoint; on the device, outputs plus a live state (and convolution window) selected or recorded from the accepted count",
+    "ownership": "The loop owns input copies and private snapshots; sibling callbacks touch private bytes and settle all work; accesses are serialized. The device commit borrows caller-owned start, live, checkpoint and count buffers on the caller stream; the pool owns its states, stashes, windows, counts and round scratch, allocated once",
+    "failure": "Reject invalid gates/layouts/paths/bounds and numerical overflow; failed/cancelled commit consumes its round while preserving committed state",
+    "core_boundary": "This entry keeps the after-token checkpoint selection, the recurrence arithmetic, the private recovery transaction, the state slots and the device kernels. Use Core resource/readiness/publication/lifetime contracts without model-specific Core semantics"
+  },
+  "dependencies": [
+    "Python standard library",
+    "torch for the device form; optionally crit's kernel recurrent-scans and fla"
+  ],
+  "symbols": [
+    "Geometry",
+    "Snapshot",
+    "Node",
+    "checkpoint_node",
+    "verify_chain",
+    "StatePool",
+    "forward",
+    "convolve",
+    "commit_round",
+    "prepare_chunk",
+    "apply_chunk",
+    "two_pass",
+    "sequential",
+    "ChunkState"
+  ],
+  "interactions": [
+    "mtp-decode",
+    "checkpoint-storage",
+    "attention-state",
+    "device-speculative-round"
+  ],
+  "techniques": [
+    "recurrent-state-recovery",
+    "mtp-decode",
+    "checkpoint-storage"
+  ],
+  "validation": {
+    "host": "Independent long-double matrix-transition oracle, all accepted lengths, absolute boundary/tree mapping, varied chunk decomposition and boundary-adjacent continuation, zero-step rounds after acceptance, exact sibling frontiers, private sibling failures, zero/partial/cancelled/stale commits and finite limits; two-pass chunked prefill equals the token-by-token recurrence for several chunk sizes, normalizations and partial last chunks",
+    "native": "No native code of its own; the scans are crit's kernel recurrent-scans, with their fixture",
+    "performance": "Unmeasured; retained state is bounded independently of speculative matrix snapshot count",
+    "device": "Device form (plugin tests, on CPU, on CUDA with recurrent-scans and with the torch formula): decode and verify rows against an FP64 recurrence within 1e-5 + 1e-4|x| over grouped keys and strong decays; a row's bits independent of the rows beside it; a verify window rolled back to every accepted count continues bit for bit as the serial decode, state and convolution window, by every strategy; a commit rerun with a smaller count equals the smaller commit; captured rounds replay as they run; prompt rows through fla or the two-pass prefill within 2e-3 + 2e-2|x|; with decode chunk (tests/test_chunk.py), prompt rows in any cut with the bits of decoding their tokens one by one, verify windows across a chunk's end kept at every accepted count, captured rounds eagerly and in a CUDA graph and captured prompt chunks with those bits, outputs within 2e-3 + 2e-2|x| of the FP64 recurrence"
+  }
+}

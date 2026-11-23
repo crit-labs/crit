@@ -1,5 +1,5 @@
 Top-k expert routing of mixture-of-experts router logits in one kernel, a warp per token row: crit's topk-router plugin
-(`inference/base/topk-router`) loads it, built for the engine's device with the engine's tuning or the default knobs, for its
+(`inference/techniques/experts/topk-router`) loads it, built for the engine's device with the engine's tuning or the default knobs, for its
 Routing description (heterogeneous-expert-dispatch's `routing.py`). Softmax or sigmoid scores before or after the selection, a per-expert correction bias that
 only changes the selection, renormalization (divide by max(sum + epsilon, floor)) and scaling.
 

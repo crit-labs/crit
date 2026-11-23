@@ -312,6 +312,15 @@ class PlanRecordTests(PlanFixture, unittest.TestCase):
         with self.assertRaisesRegex(ValueError, f"{second} is not on the candidate ladder yet"):
             self.store.plan(self.run_id, plan(second))
 
+    def test_a_parent_whose_eval_stopped_is_planned_from_once_sealed_eval_failed(self):
+        recorded = self.store.plan(self.run_id, plan(levers=[], forecast=None))
+        parent = self.candidate(plan_id=recorded["plan_id"])["candidate_id"]
+        self.evaluated(parent, status(), completed=False)   # on the ladder, its Eval stopped
+        with self.assertRaisesRegex(ValueError, f"{parent} has no completed Eval attempt"):
+            self.store.plan(self.run_id, plan(parent))
+        self.store.seal(self.run_id, parent, "eval_failed", {"message": "fixture: a request the engine refused"})
+        self.assertEqual(self.store.plan(self.run_id, plan(parent))["parent_candidate_id"], parent)
+
     def test_revisions_supersede_the_newest_plan_before_its_candidate(self):
         parent = self.first()["candidate_id"]
         old = self.store.plan(self.run_id, plan(parent))["plan_id"]

@@ -35,7 +35,7 @@ PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 # The guides an agent reads before driving a run, as crit://PATH resources.
 GUIDES = ("AGENTS.md", "docs/BUILDING_ENGINES.md", "docs/RUN_RECORDS.md", "docs/PLUGINS.md", "docs/SERVING.md",
           "docs/CONTRIBUTION_CRITERIA.md", "docs/CONTRIBUTING.md", "cli/README.md", "inference/README.md",
-          "kernels/README.md", "models/README.md", "smoke/README.md", "mcp/README.md")
+          "kernels/README.md", "smoke/README.md", "mcp/README.md")
 # Characters of a command's output and errors a result carries; the rest stays in the job's logs.
 OUTPUT_CHARACTERS = 60000
 ERROR_CHARACTERS = 8000
@@ -78,7 +78,7 @@ class Server:
             self.extra.pop(name, None)
         # Without --project the commands find their own, as on the command line: this checkout, else the folder
         # they run in.
-        checkout = ROOT if (ROOT / "core/include/crit/core.h").is_file() else None
+        checkout = ROOT if (ROOT / "inference/core/include/crit/core.h").is_file() else None
         self.project = Path(project).resolve() if project else checkout
         self.settings = {"project": self.project, "root": Path(root).resolve() if root else None}
         self.cwd = Path(cwd or os.getcwd()).resolve()
@@ -127,7 +127,7 @@ class Server:
 
     def guide(self, name):
         """A guide's file in the crit checkout the commands use, else in this one, else in what an installed crit
-        carries: inference/README.md in its plugin library, the other guides beside it in crit/library/guides."""
+        carries: crit/library/guides."""
         for folder in (self.project, ROOT, LIBRARY_ROOT, LIBRARY_ROOT / "guides"):
             if folder and (folder / name).is_file():
                 return folder / name

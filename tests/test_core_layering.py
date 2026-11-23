@@ -5,9 +5,10 @@ Three rules, read from the source tree (nothing is imported or built):
 1. Core's Python (crit_core, crit_plugins) imports the standard library, itself and the few libraries it is built
    on. Nothing above it: not the CLI, Eval, the API, the plugin library or a model package.
 2. Core's C++ includes its own headers and system headers only.
-3. Core names no plugin of the library and no model family. The names it holds today (examples in docstrings, one
-   message, the formats' own architecture names) are counted in support/core_layering_allowlist.json. The list may
-   only shrink: a new name fails, and so does an entry that no longer applies, so the entry leaves with its fix.
+3. Core names no plugin of the library. The names it holds today are counted in
+   support/core_layering_allowlist.json. The list may only shrink: a new name fails, and so does an entry that no
+   longer applies, so the entry leaves with its fix. That Core, like all of crit's shared code, names no model is
+   test_model_neutral.py's rule.
 """
 import ast
 import json
@@ -17,7 +18,7 @@ import sys
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-CORE = ROOT / "core"
+CORE = ROOT / "inference" / "core"
 PACKAGES = ("crit_core", "crit_plugins")
 ALLOWLIST = ROOT / "tests/support/core_layering_allowlist.json"
 
@@ -31,10 +32,8 @@ LIBRARIES = {
 SOURCE = {".py", ".h", ".cpp", ".cu", ".cuh", ".json", ".cmake", ".txt"}
 # Folder names of the library that are plain words, not plugin ids.
 PLAIN = {"base", "examples", "code", "tests"}
-# Headers Core's own build writes (core/CMakeLists.txt).
+# Headers Core's own build writes (inference/core/CMakeLists.txt).
 GENERATED = {"crit_step_settings.inc"}
-FAMILIES = ("qwen", "llama", "gemma", "deepseek", "glm", "mistral", "nanbeige", "minimax", "gpt", "granite", "kimi",
-            "hermes", "phi")
 
 
 def relative(path):
@@ -46,18 +45,16 @@ def core_files():
 
 
 def plugin_ids():
-    folders = [*(ROOT / "inference").iterdir(), *(ROOT / "inference/base").iterdir(),
+    folders = [*(ROOT / "inference/techniques").glob("*/*"),
                *(ROOT / "kernels/techniques").glob("*/*")]
     return sorted({f.name for f in folders if f.is_dir()} - PLAIN)
 
 
-def counts(words, pattern, lower=False):
+def counts(words, pattern):
     """{word: {file: occurrences}} of each word in Core's source."""
     found = {}
     for path in core_files():
         text = path.read_text(encoding="utf-8", errors="ignore")
-        if lower:
-            text = text.lower()
         for word in words:
             n = len(re.findall(pattern.format(re.escape(word)), text))
             if n:
@@ -66,8 +63,7 @@ def counts(words, pattern, lower=False):
 
 
 def measured():
-    return {"plugins": counts(plugin_ids(), r"(?<![\w-]){}(?![\w-])"),
-            "families": counts(FAMILIES, r"(?<![a-z0-9]){}(?![a-z])", lower=True)}
+    return {"plugins": counts(plugin_ids(), r"(?<![\w-]){}(?![\w-])")}
 
 
 class CoreLayering(unittest.TestCase):
@@ -103,7 +99,7 @@ class CoreLayering(unittest.TestCase):
                     foreign.append(f"{relative(path)} includes {header}")
         self.assertEqual(foreign, [], "Core's C++ includes a header outside Core")
 
-    def test_core_names_no_plugin_and_no_model_family(self):
+    def test_core_names_no_plugin(self):
         allowed = json.loads(ALLOWLIST.read_text(encoding="utf-8"))
         problems = []
         for kind, found in measured().items():
@@ -113,8 +109,7 @@ class CoreLayering(unittest.TestCase):
                 have = found.get(word, {}).get(path, 0)
                 may = allowed[kind].get(word, {}).get(path, 0)
                 if have > may:
-                    problems.append(f"{path} names {word!r} {have} times (allowed {may}): Core names no "
-                                    f"{'plugin' if kind == 'plugins' else 'model family'}")
+                    problems.append(f"{path} names {word!r} {have} times (allowed {may}): Core names no plugin")
                 elif have < may:
                     problems.append(f"{path} names {word!r} {have} times, the allowlist says {may}: lower the entry")
         self.assertEqual(problems, [])

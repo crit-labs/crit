@@ -12,7 +12,7 @@ from crit_kernels.build import load
 si = load("sparse-indexer")
 dev = torch.device("cuda")
 _spec = importlib.util.spec_from_file_location(
-    "sparse_reference", Path(__file__).resolve().parents[5] / "inference" / "attention-state" / "code" /
+    "sparse_reference", Path(__file__).resolve().parents[5] / "inference" / "techniques" / "attention" / "attention-state" / "code" /
     "sparse_index.py")
 ref = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ref)

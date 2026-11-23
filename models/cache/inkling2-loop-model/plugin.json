@@ -1,0 +1,51 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "inkling2-loop-model",
+  "title": "The model plugin of Inkling-2 looped checkpoints",
+  "description": "A decoder whose middle span of layers runs several times with the same weights (each pass its own KV and convolution windows, the later passes taking messages from the pass before), joined by attention residuals over blocks of layers; sliding-window and full layers of relative attention (a bias a token computes for the positions just behind it, learned sinks a token, short convolutions over the keys and values, L2-clipped queries and keys, a gated output) with short convolutions after the attention and after the FFN, experts routed by sigmoid scores with a correction bias whose SwiGLU caps its linear gate and its up projection, a normed embedding, a head of fewer rows than its stored ones and capped logits. A finished model plugin: its layout (layout.json) composed by the models core it extends (model-template: the serving contracts, the options) from model techniques.",
+  "fills": [
+    "model"
+  ],
+  "needs": [
+    [
+      "model_type:inkling2_loop",
+      "model_type:inkling2_loop_text"
+    ]
+  ],
+  "requires": [
+    "norms",
+    "embeddings",
+    "recurrence",
+    "router",
+    "experts"
+  ],
+  "provides": [
+    "draft:head",
+    "draft:head-device"
+  ],
+  "devices": [
+    "cuda",
+    "cpu"
+  ],
+  "sources": {
+    "core": "../../core/model-template"
+  },
+  "extends": "core",
+  "test_with": [
+    "attention-state",
+    "device-placement",
+    "expert-tensors",
+    "experts-reference",
+    "fused-norms",
+    "memory-table-rows",
+    "projections-dense",
+    "sequential-recurrence",
+    "softmax-attention",
+    "token-sampling",
+    "topk-router",
+    "torch-norms"
+  ],
+  "entry": "plugin.py:create",
+  "tool_format": "tools.py:TOOL_FORMAT",
+  "reasoning_format": "tools.py:REASONING_FORMAT"
+}

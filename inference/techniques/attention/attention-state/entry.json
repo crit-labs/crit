@@ -1,0 +1,107 @@
+{
+  "id": "attention-state",
+  "category": "attention",
+  "summary": "Transactional KV state: staged rows, commit of an accepted prefix and rollback, on the device a paged pool with copy-on-write forks, round slots and the attention over it",
+  "implementation_status": "reference",
+  "implementation_scope": "Dense Python KV transaction with a stable-softmax formula; rotary tables from config.json; on the device a paged pool in torch (BF16, FP16, FP32, FP8 and INT8 pages, copy-on-write forks, sliding-window rings, round slots and prompt buffers for captured graphs, one allocation or an elastic range) and the attention slot's device form over it (crit's paged-kv-attention kernels, then torch); float64 references of latent attention and sparse key selection",
+  "agent_guidance": {
+    "use_when": "Share committed causal prefixes, branch speculative KV and keep every sequence's keys and values in pages on the device",
+    "avoid_when": "The model has no KV attention, or prefix reuse lacks complete sibling-state identity",
+    "provides": [
+      "Committed/pending KV transactions with partial acceptance and rollback (dense Python reference)",
+      "Rotary frequency tables and attention factor from config.json's rope parameters (default, mrope, linear, dynamic NTK, YaRN, Llama 3, LongRoPE) as Hugging Face derives them",
+      "A paged device pool: page types BF16, FP16, FP32, FP8 E4M3 (layer or row scales) and INT8 (row scales), page tables, copy-on-write forks, sliding-window rings, lending of unused pages, an elastic range backed only where sequences hold pages",
+      "Round slots for captured decode rounds and prompt buffers for captured prompt chunks, with slots and lengths computed on the device",
+      "The attention slot's device form over the pool: crit's paged-kv-attention kernels with tree masks and block lists, then torch fallbacks",
+      "Float64 references of latent attention and of a sparse attention's key selection"
+    ],
+    "engine_supplies": [
+      "Model projections, head geometry, RoPE layout/position IDs (frequencies from rope_table or its own), attention scale and allowed causal prefixes",
+      "Pool sizing (pages, page type, capacity per sequence) and the acceptance that sets each sequence's length",
+      "Complete state/representation identity and any logits, sampler or non-KV state needed for prefix reuse"
+    ],
+    "preserve": [
+      "Only accepted rows become committed and reused prefixes contain only committed state",
+      "A page a fork still shares is copied before it is written",
+      "Rejected rows and rejected rounds cannot publish partial KV",
+      "Token identity, representation identity, geometry and logical capacity remain consistent"
+    ],
+    "adapt": [
+      "Page geometry, page type, KV codec and scales",
+      "Which kernel structures read the pages (the attention plugins' reader option), tile sizes and partitions",
+      "Pool capacity, lending and the elastic range"
+    ]
+  },
+  "path": "inference/techniques/attention/attention-state/README.md",
+  "code_path": "inference/techniques/attention/attention-state/code",
+  "code_files": [
+    {
+      "path": "inference/techniques/attention/attention-state/code/implementation.py",
+      "purpose": "Dense Python KV transaction and single-query stable-softmax formula"
+    },
+    {
+      "path": "inference/techniques/attention/attention-state/code/rope_table.py",
+      "purpose": "Rotary inverse frequencies and attention factor from crit_core.model's RopeConfig, as Hugging Face's ROPE_INIT_FUNCTIONS derive them"
+    },
+    {
+      "path": "inference/techniques/attention/attention-state/code/pages.py",
+      "purpose": "Paged KV pool in torch on the device (bf16, fp16, fp32, fp8 pages with layer scales, fp8:row and int8 pages with a scale per position and KV head, copy-on-write forks, round slots bound with their pages reserved and their slots and lengths on the device; one allocation, or an elastic range backed only where sequences hold pages): the kv_cache slot's device form"
+    },
+    {
+      "path": "inference/techniques/attention/attention-state/code/device_attention.py",
+      "purpose": "The attention slot's device form over the pool, shared by the library's attention plugins: crit's paged-kv-attention kernels (split-KV decode and verify windows over every page type with tree masks and block lists, prompt rows and chunks over every page type), then torch fallbacks; FlashInfer only with the plugins' option flashinfer auto (a yardstick) (gathered SDPA, a capture-safe masked softmax over the page tables)"
+    },
+    {
+      "path": "inference/techniques/attention/attention-state/code/latent_attention.py",
+      "purpose": "The float64 reference of latent attention (operation latent-attention): every query head over one cached latent and rotary key a position, the latent the value too, with optional sinks; what crit's kernel latent-attention is checked against"
+    },
+    {
+      "path": "inference/techniques/attention/attention-state/code/sparse_index.py",
+      "purpose": "The float64 reference of a sparse attention's key selection (operation sparse-index): index heads' weighted ReLU scores of each query over the compressed keys it may see, and its k best keys; what crit's kernel sparse-indexer is checked against"
+    }
+  ],
+  "requires": {
+    "hardware": "Python 3.11+ for the dense reference; torch for the device pool (CUDA for crit's kernels, CPU through the torch fallbacks)",
+    "model": "Dot-product attention with explicit key/value rows; key and value widths may differ",
+    "workload": "KV transactions, speculative branches, full/chunked prefill and decode over paged keys and values"
+  },
+  "contract": {
+    "input": "Finite KV/query values, geometry and capacities, explicit RoPE positions/frequencies, a step's or round's rows with their sequences and positions",
+    "output": "Attention values (and log-sum-exps where asked) for every query row over the positions its sequence holds; KV slots and page tables for a step, a captured round or a captured prompt chunk",
+    "ownership": "The pool owns every page tensor and each sequence's page table; a fork shares pages until either side writes. A captured round's slots and tables sit at fixed device addresses the pool owns. A borrower of unused pages gives them back before the pool hands them out.",
+    "failure": "Invalid geometry, rows past a sequence's capacity and a pool whose pages are all in use are refused before any KV is written; a round wider than the pool's round rows is refused; writes outside every bound capacity go to the dump page.",
+    "core_boundary": "Core owns request, resource and lifetime policy, the device's memory (crit_plugins.memory: elastic ranges, the givers' ledger) and the round and prompt-graph drivers; this entry keeps the pages, their tables, their codecs and the attention over them."
+  },
+  "dependencies": [
+    "Python standard library",
+    "torch for the device pool and the attention fallbacks",
+    "crit's paged-kv-attention kernel (optional; torch serves where it does not build)",
+    "Core's config reader for rope_table: crit_core.model's RopeConfig"
+  ],
+  "symbols": [
+    "KVState",
+    "rope_table",
+    "rotary_dim",
+    "RopeTable",
+    "KVPool",
+    "DeviceAttention",
+    "windows_torch",
+    "latent_attention",
+    "sparse_scores",
+    "sparse_index"
+  ],
+  "interactions": [
+    "mtp-decode",
+    "checkpoint-storage"
+  ],
+  "techniques": [
+    "attention-state",
+    "mtp-decode",
+    "checkpoint-storage"
+  ],
+  "validation": {
+    "host": "Python fixtures retain the dense transaction/formula example and check rope_table.py against Hugging Face's ROPE_INIT_FUNCTIONS",
+    "native": "No native code; the plugin's tests cover the device pool (pages, forks, lending, round slots, prompt buffers, facts) and the attention plugins' tests its attention on the device",
+    "performance": "No engine throughput/latency claim; page sharing is a functional property"
+  }
+}

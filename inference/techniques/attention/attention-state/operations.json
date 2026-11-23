@@ -1,0 +1,46 @@
+{
+  "kind": "crit-technique-operations",
+  "technique": "attention-state",
+  "operations": [
+    {
+      "id": "paged-attention",
+      "what": "causal attention of query rows (prefill chunk, decode row or a verify's block) over paged KV with grouped query heads, softmax scale and masks",
+      "reference": {
+        "path": "inference/techniques/attention/attention-state/code/device_attention.py",
+        "symbol": "windows_torch (FP32 torch over the page tables, a masked online softmax)"
+      },
+      "verify": "on the target, attend a few query rows over a real prompt's pages with the kernel and with windows_torch on the same pages (FP8 pages decoded the same way): within BF16 probability rounding, a decode row equal to the same row inside a verify block when the build needs exactness, and the same bits on a repeat",
+      "invariance": "a decode row's result equal to the same row inside a verify block (the same position, the same keys) where the build needs exactness; the same bits on a repeat"
+    },
+    {
+      "id": "latent-attention",
+      "what": "multi-head latent attention in its absorbed form: every query head of a token over one cached row a position it sees (a latent of rank R and a rotary key of width P shared by every head), the latent the value too, the output in the latent space; with sinks one more position with no value a head",
+      "reference": {
+        "path": "inference/techniques/attention/attention-state/code/latent_attention.py",
+        "symbol": "latent_attention"
+      },
+      "verify": "on the target, attend decode rows and verify windows over a paged latent cache with the kernel and with latent_attention on the same cached rows: within BF16 probability rounding, log-sum-exps within FP32 error",
+      "invariance": "a token's result independent of the rows and columns beside it (a decode row equal to the same token inside a verify window); the same bits on a repeat"
+    },
+    {
+      "id": "sparse-index",
+      "what": "the keys a sparse attention reads: each query token's score over every compressed key it may see (the sum over its index heads of the head's weight times the ReLU of the head's query-key product), then the positions of its k best keys, ascending, ties to the lower position",
+      "reference": {
+        "path": "inference/techniques/attention/attention-state/code/sparse_index.py",
+        "symbol": "sparse_scores, sparse_index"
+      },
+      "verify": "on the target, score a prompt chunk's and a decode row's tokens over a real layer's compressed keys with the kernel and with sparse_scores: scores within FP32 accumulation of the 16-bit products; the picked positions those of sparse_index, or where they differ, scores within that error of the k-th best",
+      "invariance": "a token's scores and picks independent of the tokens beside it (a decode token's picks the same token's in a prompt chunk); the same bits on a repeat"
+    },
+    {
+      "id": "kv-page-write",
+      "what": "keys and values of new positions into their page slots in the pool's page kind: 16-bit values as they are, FP8 codes at the layer's multipliers, fp8:row and int8 codes with an FP32 scale a position and KV head (max |x| / 448 or / 127, at least 1e-30, codes the nearest, ties to even); a negative slot written nowhere",
+      "reference": {
+        "path": "inference/techniques/attention/attention-state/code/pages.py",
+        "symbol": "write"
+      },
+      "verify": "on the target, write the same rows with the kernel and with the pool's torch write: the codes and scales bit for bit, every slot outside the written ones untouched",
+      "invariance": "a position's codes and scale depend on its own row only; the same bits on a repeat"
+    }
+  ]
+}

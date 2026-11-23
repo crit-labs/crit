@@ -1,0 +1,92 @@
+{
+  "id": "lookup-table-rows",
+  "category": "memory",
+  "summary": "Gather rows of a file-backed embedding or n-gram table with random-access advice, exact positioned reads and a hot-row cache",
+  "implementation_status": "native_source",
+  "implementation_scope": "Python reference: random-access advice on the table's file region (POSIX_FADV_RANDOM) or on a mapping (MADV_RANDOM), exact positioned reads of the rows a gather needs in a worker pool, duplicate rows read once, request order kept, an optional LRU of hot rows and counters for reads, bytes and hits. RowPrefetch starts a token's rows when it exists and gathers queued requests in one batch, so a speculative round's rows are read while drafting. The device form reads files through a native reader built at load (row_reader.cpp).",
+  "agent_guidance": {
+    "use_when": "A gathered lookup table (token embeddings, hashed n-gram embeddings) stays in a file or mapping, as recon's placement scenario puts lookup tables on disk",
+    "avoid_when": "The table is loaded once into host or device memory, or it is small enough that its reads never show in a pass",
+    "provides": [
+      "Random-access advice for a file region or a mapping, reporting where the platform has none",
+      "Exact positioned row reads checked for length, with a locked seek-and-read fallback",
+      "Parallel reads of a gather's cold rows, duplicate rows read once, request order kept",
+      "An optional least-recently-used cache of hot rows and read, byte and hit counters",
+      "A native gather into pinned staging slots that the engine copies to the device, each slot reused only after its copy finished",
+      "Draft-time prefetch (RowPrefetch): a token's rows started the moment the token exists, queued tokens gathered in one batch, a wait per token that blocks only for rows still in flight, wait telemetry"
+    ],
+    "engine_supplies": [
+      "The table's file, offset, row count and row size, and any per-row scales",
+      "Row ids per token from the model's own tokenization or n-gram hashing",
+      "Where gathered rows go next and their arithmetic",
+      "Worker count and cache size measured on the target disk and charged to host memory"
+    ],
+    "preserve": [
+      "No read-ahead on the table: advice, or reads of exactly one row",
+      "Every read checked for its full length",
+      "Rows returned in request order",
+      "A prefetched token's rows written before its wait returns"
+    ],
+    "adapt": [
+      "Native reads (io_uring, overlapped I/O, Core's ReadOnlyFile mapping with random advice)",
+      "Batching a prompt's rows, pinned host caches, and where a draft token's rows are started from (host drafter, mapped memory a device drafter writes)",
+      "Cache size and policy"
+    ]
+  },
+  "path": "inference/techniques/memory/lookup-table-rows/README.md",
+  "code_path": "inference/techniques/memory/lookup-table-rows/code",
+  "code_files": [
+    {
+      "path": "inference/techniques/memory/lookup-table-rows/code/table_rows.py",
+      "purpose": "TableRegion, random-access advice for files and mappings, and RowTable's parallel exact row gather with a hot-row cache"
+    },
+    {
+      "path": "inference/techniques/memory/lookup-table-rows/code/device_rows.py",
+      "purpose": "HostRows, the device form (embeddings:host, rounds:embeddings): a table on the device, in registered host memory gathered over the link, or in files read by the native reader as a host function on the stream; prefetch into a hot-row cache"
+    },
+    {
+      "path": "inference/techniques/memory/lookup-table-rows/code/row_reader.cpp",
+      "purpose": "The native row reader (host C++): files of rows opened for random access, a persistent pool of positioned reads off an atomic counter, a hot-row cache with background prefetch, gathers as CUDA host functions"
+    },
+    {
+      "path": "inference/techniques/memory/lookup-table-rows/code/row_reader.py",
+      "purpose": "Builds row_reader.cpp at load through torch's extension builder, None where it does not build"
+    }
+  ],
+  "requires": {
+    "hardware": "Python 3.11+ standard library; any disk; file advice on POSIX systems",
+    "model": "A lookup table stored as contiguous fixed-size rows in a file",
+    "workload": "Decode and prefill that gather a few rows per token"
+  },
+  "contract": {
+    "input": "TableRegion (path, offset, rows, row_bytes) and row ids",
+    "output": "The bytes of each requested row in request order, with read, byte and hit counters",
+    "ownership": "RowTable owns its file descriptor, worker pool and cache until close(); returned rows are private copies",
+    "failure": "Rejects regions the file does not hold at open, rows outside the table and short reads",
+    "core_boundary": "Core's ReadOnlyFile maps files natively; this entry adds the random-access rule and the row gather the engine adapts"
+  },
+  "dependencies": [
+    "Python standard library"
+  ],
+  "symbols": [
+    "TableRegion",
+    "RowTable",
+    "advise_random",
+    "advise_mapping_random",
+    "RowPrefetch",
+    "HostRows",
+    "Reader"
+  ],
+  "interactions": [
+    "ssd-expert-materialization"
+  ],
+  "techniques": [
+    "lookup-table-rows",
+    "ssd-expert-materialization"
+  ],
+  "validation": {
+    "host": "Python fixtures check request order, duplicates, cache hits and eviction, counters, rows outside the table, short files and short reads; RowPrefetch per token, tickets handed out once, failed reads raised in their wait",
+    "native": "The device form (tests/test_device.py): rows byte-exact from the device, registered host memory, a mapped file and many files through the native reader and its Python fallback, prefetched rows from the cache and the others read, a lookup over files and over host memory captured in a CUDA graph",
+    "performance": "Unmeasured here; one engine's 51 GB n-gram table went from 500-700 ms to 2-5 ms per token of cold rows with random-access advice"
+  }
+}

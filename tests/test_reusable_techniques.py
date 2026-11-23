@@ -198,14 +198,6 @@ class PartitionedAttentionTests(unittest.TestCase):
         self.assertEqual(p.output, (2.,))
 
 
-class GgufBlockReferenceTests(unittest.TestCase):
-    # SHA-256 of the FP32 values of test_blocks(kind, 6, 0x5eed + len(kind)) as gguf 0.19.0's quants.dequantize returns them.
-    DIGESTS = {"Q4_0": "52a944d0347e56eeb04f2dbd96e806d71f7ab3cdf242c1a88f92369aee862dc0",
-               "Q8_0": "d0490b67f7527a093422496ba0ee467127deaf0710b10355ddada41f076be3f0",
-               "Q4_K": "f0c481aeb5d28f121f3c2a9debd69aed8a87478857898010cd185a0ce64e8fc0",
-               "Q5_K": "8572635116b72c2c501bcc25e82c2273e5d54cfb76d91072a1b7bc1538e5feda",
-               "Q6_K": "1517224025493bd0dee5259d7a4018aaad62949ea072dfc18cba6fe638824d9b"}
-
 class DenseOffloadPlannerTests(unittest.TestCase):
     def test_candidates_rank_by_prediction_and_respect_the_budget(self):
         m = load("dense-layer-offload", "planner.py")

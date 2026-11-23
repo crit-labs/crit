@@ -36,7 +36,7 @@ def package(tmp_path, decorator):
 
 def test_every_launched_triton_kernel_of_crit_says_which_arguments_follow_the_request():
     folders = [p for p in sorted((ROOT / "kernels" / "techniques").glob("*/*/torch-ext/*")) if p.is_dir()]
-    folders += sorted({p.parent for p in (ROOT / "inference").glob("*/code/*.py")
+    folders += sorted({p.parent for p in (ROOT / "inference" / "techniques").glob("*/*/code/*.py")
                        if "triton.jit" in p.read_text(encoding="utf-8")})
     found = {str(folder.relative_to(ROOT)): specialization.problems(folder) for folder in folders}
     assert {k: v for k, v in found.items() if v} == {}

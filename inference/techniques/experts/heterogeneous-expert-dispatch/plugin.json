@@ -1,0 +1,126 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "heterogeneous-expert-dispatch",
+  "title": "Routed experts split between the device and the CPU tier, in the device's bits",
+  "description": "heterogeneous-expert-dispatch's partition. Host form: routes whose expert the expert_residency slot holds on the device run there (at most device_slots of them), the rest on the host; each route's weighted contribution is accepted into async-expert-contributions' ContributionGroup, which settles a token only when every route's receipt is done and sums them in route order, so the output is bitwise the reference whichever side ran a route. Device form on CUDA: nvfp4 / int4 experts; routes whose slot is -2 computed by host-expert-tier's CPU tier, posted and joined inside the stream through one of the host's handoffs (Core's crit_plugins.host; one post and one join a layer, capturable), the others by the device part, summed in route order; both parts in host-expert-arithmetic's declared integer block order, so the split never changes a bit.",
+  "fills": [
+    "experts"
+  ],
+  "needs": [
+    "experts:source",
+    "experts:residency"
+  ],
+  "reference": [
+    "experts-reference"
+  ],
+  "test_with": [
+    "device-expert-cache",
+    "expert-residency",
+    "expert-tensors"
+  ],
+  "options": {
+    "device_slots": {
+      "type": "int",
+      "default": 64,
+      "min": 0
+    },
+    "resident": {
+      "type": "int",
+      "default": -1,
+      "min": -1,
+      "description": "forward() over the plugin's own store: the experts of each layer kept on the device (the lowest ids; -1 all); the others go to the CPU tier"
+    },
+    "max_tokens": {
+      "type": "int",
+      "default": 64,
+      "min": 1,
+      "description": "the most tokens one post sends the CPU (a decode step or verify round; the handoff's slot holds this many tokens of the model's top routes); a longer call posts in pieces"
+    },
+    "join": {
+      "type": "choice",
+      "default": "auto",
+      "choices": [
+        "auto",
+        "device_poll",
+        "stream_wait",
+        "host_eager"
+      ],
+      "description": "how the stream waits for the CPU: auto takes the cheaper capturable join the host measured on the device (crit_plugins.host)"
+    },
+    "native": {
+      "type": "choice",
+      "default": "auto",
+      "choices": [
+        "auto",
+        "on",
+        "off"
+      ],
+      "description": "the CPU tier's rows: native (built at load) or the declared order in torch; without the native tier CPU routes are joined on the host, outside capture"
+    },
+    "workers": {
+      "type": "int",
+      "default": -1,
+      "min": -1,
+      "description": "the workers of the host's pool (Core's, crit_plugins.host: one a process) when this plugin is the first to ask for it (-1: Core's plan, one per physical core but the service thread's)"
+    },
+    "pin": {
+      "type": "bool",
+      "default": true,
+      "description": "with workers: pin each worker of the host's pool to a physical core of its own (Linux)"
+    },
+    "rows_per_task": {
+      "type": "int",
+      "default": 128,
+      "min": 64,
+      "description": "rows of one expert in a CPU pool task"
+    },
+    "device_part": {
+      "type": "choice",
+      "default": "auto",
+      "choices": [
+        "auto",
+        "kernel",
+        "torch"
+      ],
+      "description": "the device part's rows: auto, crit's grouped-experts kernel in the declared order where it builds and reads the tier's bundles as they are, else DeclaredRoutes in torch (one route at a time, exact, slow); kernel refuses to load without it; torch always runs DeclaredRoutes. Both give the CPU tier's bits"
+    },
+    "prompt_arithmetic": {
+      "type": "choice",
+      "default": "auto",
+      "choices": [
+        "auto",
+        "declared",
+        "tensor"
+      ],
+      "description": "the arithmetic of a call past max_tokens (prompt chunks) that sends no route to the CPU: auto (the default), tensor where the engine's configuration asks repeatable prompt rows (exactness, docs/PLUGINS.md#exactness) and the kernel device part is here, declared otherwise; declared, the CPU tier's integer order like every other call; tensor, the grouped-experts kernel's BF16 tensor cores (W4A4 for nvfp4 bundles), much faster, other bits than decode rows: a prompt scores its tokens a little apart from the replies decode serves, which a speed engine's honesty bound allows and a preserve engine's exact one does not. Needs the kernel device part"
+    }
+  },
+  "sources": {
+    "dispatch": "code",
+    "contributions": "../async-expert-contributions/code",
+    "prefill": "../expert-streamed-prefill/code",
+    "tier": "../host-expert-tier/code",
+    "arithmetic": "../host-expert-arithmetic/code",
+    "quantized": "../../projections/quantized-projections/code",
+    "split": "../device-expert-cache/code",
+    "grouped": "../grouped-experts/code"
+  },
+  "entry": "plugin.py:create",
+  "devices": [
+    "cuda"
+  ],
+  "provides": [
+    "experts:bundles",
+    "rounds:experts"
+  ],
+  "kernels": [
+    {
+      "name": "cpu-routes",
+      "fallback": "the host path: the CPU tier served outside the stream, a synchronization a layer (not capture-safe)"
+    },
+    {
+      "name": "grouped-experts",
+      "fallback": "DeclaredRoutes: the declared order in torch, one route at a time (exact, slow)"
+    }
+  ]
+}

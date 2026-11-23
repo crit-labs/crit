@@ -20,8 +20,8 @@ ARCHS = ("80", "86", "89", "90a", "100a", "120a")
 SPILL_BYTES = 1024
 # (source, its include folders, whether it includes torch's extension headers)
 SOURCES = (
-    ("core/python/crit_plugins/host/handoff.cu", ("core/python/crit_plugins/host",), False),
-    ("core/python/crit_plugins/host/handoff_module.cu", ("core/python/crit_plugins/host",), True),
+    ("inference/core/python/crit_plugins/host/handoff.cu", ("inference/core/python/crit_plugins/host",), False),
+    ("inference/core/python/crit_plugins/host/handoff_module.cu", ("inference/core/python/crit_plugins/host",), True),
 )
 
 

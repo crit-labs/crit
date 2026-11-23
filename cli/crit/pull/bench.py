@@ -108,12 +108,13 @@ def worst(result, field):
 
 
 def measured_stats(result):
-    """A crit Eval result's six headline stats, as crit-hub's cards state them: the sampled decode where it measured
-    one, prefill and time to first token, the worst served perplexity ratio and mean KL divergence, and the context."""
+    """A crit Eval result's six headline stats, as crit-hub's cards state them: the sampled decode (None where the
+    sampled suite did not measure: the greedy suite's decode is a comparison, never a speed), prefill and time to first
+    token, the worst served perplexity ratio and mean KL divergence, and the context."""
     sampled = (result.get("sampled_speed") or {}).get("decode_score")
     speed = result.get("speed") or {}
     ppl = worst(result, "ppl_ratio")
-    return {"decode_tok_s": sampled if sampled is not None else speed.get("decode_score"),
+    return {"decode_tok_s": sampled,
             "prefill_tok_s": speed.get("prefill_score"), "ttft_ms": speed.get("ttft_score_ms"),
             "ppl": {"vs_reference": ppl} if ppl is not None else None, "kld_mean": worst(result, "kld_mean"),
             "context_tokens": (result.get("context") or {}).get("tokens")}
@@ -136,7 +137,7 @@ def shown(key, value):
 
 def comparison(card_stats, stats, label):
     """The card's stats and the measured ones side by side, one line per stat."""
-    names = {"decode_tok_s": "decode tok/s", "prefill_tok_s": "prefill tok/s", "ttft_ms": "time to first token ms",
+    names = {"decode_tok_s": "sampled decode tok/s", "prefill_tok_s": "prefill tok/s", "ttft_ms": "time to first token ms",
              "ppl": "perplexity vs reference", "kld_mean": "mean KL divergence", "context_tokens": "context tokens"}
     width = max(18, len(label) + 2)
     lines = [f"{'':<26}{label:>{width}}{'this machine':>16}"]
