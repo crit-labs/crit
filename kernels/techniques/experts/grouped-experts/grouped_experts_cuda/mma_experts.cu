@@ -75,6 +75,9 @@ struct MmaPass {
                                   // [routes][inter]; down: y FP32 [routes][hidden]
     std::uint8_t* out_scales;     // FP4 gate/up: the intermediate's scales [routes][inter / 16]
     int chunk;                    // k values a prompt item stages a pass (a multiple of 128)
+    const float* rcp;             // FP4 with row scales: each route's 1 / g of its operands (fp4_rows_kernel), else
+                                  // null (the bundle's input scales); gate/up then writes h BF16 for the next quantizer
+    int terms;                    // FP4 with row scales: the operands' terms (1, or 2: [term 1 | term 2] a route row)
 };
 
 __device__ __forceinline__ float input_scale(const std::uint8_t* bundle, const Layout& L, int i) {
@@ -134,6 +137,72 @@ __global__ void fp4_inputs_kernel(const bf16* x, int top, const std::uint8_t* st
     quantize_block(v, g, out, s);
     *reinterpret_cast<uint2*>(codes + static_cast<long long>(r) * (H / 2) + 8 * b) = out;
     scales[static_cast<long long>(r) * blocks + b] = s;
+}
+
+// Item u's routes' FP4 operands at a scale of each route's own (no input scales): route r's row r / div of rows
+// [..][K] BF16 at global scale g = 6 * 448 / amax(row) (1 for a row of zeros), each 16-value block by crit's declared
+// NVFP4 quantizer (codes and UE4M3 block scale); with terms 2 also what the first term leaves (the row minus its
+// decoded operands) at the same g, so both terms' products share one accumulator. Codes [routes][terms * K / 2] and
+// scales [routes][terms * K / 16] (term 1, then term 2 a row), rcp[r] = 1 / g. One block a route, 128 threads.
+__global__ void fp4_rows_kernel(const bf16* rows, int div, int K, Items it, int terms, std::uint8_t* codes,
+                                std::uint8_t* scales, float* rcp) {
+    const int u = blockIdx.x;
+    if(u >= *it.count) return;
+    const int r = it.routes[static_cast<long long>(u) * it.width + blockIdx.y];
+    if(r < 0) return;
+    const bf16* src = rows + static_cast<long long>(r / div) * K;
+    float amax = 0.0f;
+    for(int i = 8 * threadIdx.x; i < K; i += 8 * blockDim.x) {
+        const uint4 w = __ldg(reinterpret_cast<const uint4*>(src + i));
+        const uint32_t words[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+        for(int q = 0; q < 4; ++q) {
+            const float2 f = __bfloat1622float2(kc::bf162_of(words[q]));
+            amax = kc::abs_max(kc::abs_max(amax, f.x), f.y);
+        }
+    }
+#pragma unroll
+    for(int o = 16; o > 0; o >>= 1) amax = kc::abs_max(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    __shared__ float warps[32];
+    if((threadIdx.x & 31) == 0) warps[threadIdx.x >> 5] = amax;
+    __syncthreads();
+    amax = 0.0f;
+    for(int w = 0; w < static_cast<int>(blockDim.x >> 5); ++w) amax = kc::abs_max(amax, warps[w]);
+    const float g = amax > 0.0f && amax <= 3.402823466e38f ? __fdiv_rn(2688.0f, amax) : 1.0f;
+    if(threadIdx.x == 0) rcp[r] = __fdiv_rn(1.0f, g);
+    const int blocks = K / 16;
+    const long long crow = static_cast<long long>(r) * terms * (K / 2);
+    const long long srow = static_cast<long long>(r) * terms * blocks;
+    for(int b = threadIdx.x; b < blocks; b += blockDim.x) {
+        const uint4* at = reinterpret_cast<const uint4*>(src + 16 * b);
+        const uint4 a = __ldg(at), c = __ldg(at + 1);
+        const uint32_t words[8] = {a.x, a.y, a.z, a.w, c.x, c.y, c.z, c.w};
+        float v[16];
+#pragma unroll
+        for(int q = 0; q < 8; ++q) {
+            const float2 f = __bfloat1622float2(kc::bf162_of(words[q]));
+            v[2 * q] = f.x;
+            v[2 * q + 1] = f.y;
+        }
+        for(int t = 0; t < terms; ++t) {
+            float bmax = 0.0f;
+#pragma unroll
+            for(int i = 0; i < 16; ++i) bmax = kc::abs_max(bmax, v[i]);
+            uint32_t q[16], sc;
+            kc::nvfp4_quantize16(v, bmax, g, q, sc);
+            uint32_t w2[2] = {0u, 0u};
+#pragma unroll
+            for(int i = 0; i < 16; ++i) w2[i / 8] |= q[i] << (4 * (i % 8));
+            *reinterpret_cast<uint2*>(codes + crow + t * (K / 2) + 8 * b) = make_uint2(w2[0], w2[1]);
+            scales[srow + t * blocks + b] = static_cast<std::uint8_t>(sc);
+            if(t + 1 < terms) {   // what this term leaves: the values minus their decoded operands
+                const float decoded = sc == 0x7Fu ? 0.0f : kc::e4m3_value(sc);
+#pragma unroll
+                for(int i = 0; i < 16; ++i)
+                    v[i] = __fsub_rn(v[i], __fdiv_rn(__fmul_rn(kc::e2m1_value(q[i]), decoded), g));
+            }
+        }
+    }
 }
 
 // Item u's routes' FP8 operands, crit's declared group quantizer: each 128 values of a row (route r's row r / div of
@@ -209,12 +278,125 @@ struct WeightRing {
     uint2 s[DEPTH][ROWS / 2];   // FP4: the step's two scale words of the lane's scale row a tile
 };
 
+// An item's outputs as a warp's row tiles and n-tiles end (acc: their sums): gate/up's SwiGLU (or GELU) rows, quantized
+// for the down pass (FP4 with input scales) or as h in BF16 for its quantizer (FP8, FP4 with row scales); down's rows
+// by their factors, unweighted, a route's row each. routes: the warp's n-tiles' routes (8 a tile, -1 none), active of
+// them live; rows and r0 the warp's matrix rows.
+template <int A, int TILES, int NT, bool GATEUP, int ROWS>
+__device__ __forceinline__ void finish(const MmaPass& p, const std::uint8_t* bundle, const std::uint8_t* wscales,
+                                       float (&acc)[TILES][NT][4], const int (&rows)[ROWS], const int* routes,
+                                       int active, int r0, int g, int t4) {
+    const Layout& L = p.layout;
+    const int H = L.hidden, I = L.inter;
+    (void)H, (void)I;
+    if constexpr(GATEUP) {
+        // c0, c1: gate row rows[2t] (inter r0 + 8t + g) for routes 2 t4, 2 t4 + 1; c2, c3: its up row, same routes.
+        float fg[TILES], fu[TILES];
+        if constexpr(A == kFp4) {
+            const float* inverse = reinterpret_cast<const float*>(bundle + L.gate_up_inverse);
+            const float in_rcp = p.rcp ? 1.0f : input_scale(bundle, L, 2);   // row scales: the route's, below
+#pragma unroll
+            for(int t = 0; t < TILES; ++t) {
+                fg[t] = __fmul_rn(inverse[rows[2 * t]], in_rcp);
+                fu[t] = __fmul_rn(inverse[rows[2 * t + 1]], in_rcp);
+            }
+        } else {
+            const bool channel = L.format == Format::fp8_channel;
+#pragma unroll
+            for(int t = 0; t < TILES; ++t) {
+                fg[t] = channel ? reinterpret_cast<const float*>(wscales)[rows[2 * t]] : 1.0f;
+                fu[t] = channel ? reinterpret_cast<const float*>(wscales)[rows[2 * t + 1]] : 1.0f;
+            }
+        }
+#pragma unroll
+        for(int n = 0; n < NT; ++n) {
+            if(n >= active) break;
+#pragma unroll
+            for(int c = 0; c < 2; ++c) {
+                const int r = routes[8 * n + 2 * t4 + c];
+                const float rr = A == kFp4 && p.rcp ? (r >= 0 ? p.rcp[r] : 0.0f) : 1.0f;   // the route's 1 / g
+                float hv[TILES];
+#pragma unroll
+                for(int t = 0; t < TILES; ++t) {
+                    const float gv = A == kFp4 && p.rcp ? __fmul_rn(__fmul_rn(acc[t][n][c], fg[t]), rr)
+                                                        : __fmul_rn(acc[t][n][c], fg[t]);
+                    const float uv = A == kFp4 && p.rcp ? __fmul_rn(__fmul_rn(acc[t][n][2 + c], fu[t]), rr)
+                                                        : __fmul_rn(acc[t][n][2 + c], fu[t]);
+                    hv[t] = L.activation == 1   ? kc::gelu_tanh_mul(gv, uv)
+                            : L.activation == 2 ? kc::softcapped_swiglu(gv, uv, L.gate_cap, L.up_cap)
+                                                : kc::swiglu_declared(gv, uv);
+                }
+                if(A == kFp8 || p.rcp) {   // h in BF16: the group (or row-scale) quantizer reads it next
+                    bf16* h = reinterpret_cast<bf16*>(p.out);
+                    if(r >= 0) {
+#pragma unroll
+                        for(int t = 0; t < TILES; ++t)
+                            h[static_cast<long long>(r) * I + r0 + 8 * t + g] = __float2bfloat16_rn(hv[t]);
+                    }
+                    continue;
+                } else {
+                    std::uint8_t* hc = reinterpret_cast<std::uint8_t*>(p.out);
+                    const float g_dn = input_scale(bundle, L, 1);
+#pragma unroll
+                    for(int q = 0; q < TILES / 2; ++q) {
+                        // tiles 2q and 2q + 1: inter rows r0 + 16q .. + 15, one block of the down's input
+                        float amax = kc::abs_max(kc::abs_max(0.0f, hv[2 * q]), hv[2 * q + 1]);
+#pragma unroll
+                        for(int o = 4; o < 32; o <<= 1) amax = kc::abs_max(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+                        uint32_t code2[2], s;
+                        kc::nvfp4_quantize_pair(hv[2 * q], hv[2 * q + 1], amax, g_dn, code2, s);
+                        // inter rows i (lane g) and i + 1 (lane g + 1, lane ^ 4) of each tile: one byte, low nibble first
+#pragma unroll
+                        for(int h = 0; h < 2; ++h) {
+                            const uint32_t other = __shfl_xor_sync(0xffffffffu, code2[h], 4);
+                            if(r >= 0 && !(g & 1))
+                                hc[static_cast<long long>(r) * (I / 2) + (r0 + 16 * q + 8 * h + g) / 2] =
+                                    static_cast<std::uint8_t>(code2[h] | (other << 4));
+                        }
+                        if(r >= 0 && g == 0)
+                            p.out_scales[static_cast<long long>(r) * (I / 16) + (r0 + 16 * q) / 16] =
+                                static_cast<std::uint8_t>(s);
+                    }
+                }
+            }
+        }
+    } else {
+        float* y = reinterpret_cast<float*>(p.out);
+        float f[ROWS];
+        if constexpr(A == kFp4) {
+            const float* inverse = reinterpret_cast<const float*>(bundle + L.down_inverse);
+            const float in_rcp = p.rcp ? 1.0f : input_scale(bundle, L, 3);   // row scales: the route's, below
+#pragma unroll
+            for(int r = 0; r < ROWS; ++r) f[r] = __fmul_rn(inverse[rows[r]], in_rcp);
+        } else {
+            const bool channel = L.format == Format::fp8_channel;
+#pragma unroll
+            for(int r = 0; r < ROWS; ++r) f[r] = channel ? reinterpret_cast<const float*>(wscales)[rows[r]] : 1.0f;
+        }
+#pragma unroll
+        for(int n = 0; n < NT; ++n) {
+            if(n >= active) break;
+#pragma unroll
+            for(int t = 0; t < TILES; ++t)
+#pragma unroll
+                for(int i = 0; i < 4; ++i) {
+                    const int r = routes[8 * n + 2 * t4 + (i & 1)];
+                    const int row = rows[2 * t + (i >> 1)];
+                    if(r >= 0) {
+                        const float v = __fmul_rn(acc[t][n][i], f[2 * t + (i >> 1)]);
+                        y[static_cast<long long>(r) * H + row] = A == kFp4 && p.rcp ? __fmul_rn(v, p.rcp[r]) : v;
+                    }
+                }
+        }
+    }
+}
+
 // One block: item blockIdx.y, WARPS warps of TILES MMA row tiles each. NT n-tiles of 8 routes (1: decode items, the
 // routes' operands read straight from global memory; 4 or 8: prompt items, staged a chunk at a time). FETCH (decode
 // items): 0, a lane loads 16 contiguous bytes of a step's row and a quad transpose gives it its fragment words; 1, a
 // lane loads its four fragment words directly (bytes 16 s + 4 t4 of the step, s = 0..3): the same registers, so the
 // same MMAs and bits, with four 4-byte loads in place of one 16-byte load and the transpose's shuffles.
-template <int A, int NT, int TILES, int WARPS, int DEPTH, bool GATEUP, int FETCH = 0>
+template <int A, int NT, int TILES, int WARPS, int DEPTH, bool GATEUP, int FETCH = 0, int TERMS = 1>
 __global__ void __launch_bounds__((NT == 1 && WARPS < 4 ? 4 : WARPS) * 32) mma_kernel(MmaPass p) {
     constexpr bool kHas = A == kFp4 ? kHasFp4 : kHasFp8;
     if constexpr(!kHas) {
@@ -248,7 +430,9 @@ __global__ void __launch_bounds__((NT == 1 && WARPS < 4 ? 4 : WARPS) * 32) mma_k
     const int P = k_parts(K), G = kSplitWarps ? decode_groups(WARPS, P) : WARPS;
     const int part = kSplitWarps ? warp % P : 0, grp = kSplitWarps ? warp / P : warp;
     constexpr int SB = A == kFp4 ? 1 : 2;   // steps a 128-k block
-    auto part_step = [&](int q) { return q * (K / kGroup) / P * SB; };
+    static_assert(TERMS == 1 || A == kFp4, "two operand terms are FP4's");
+    const int KA = TERMS * K;   // the operands' k: each term's K values a route row, term after term
+    auto part_step = [&](int q) { return q * (KA / kGroup) / P * SB; };
     const int r0 = (blockIdx.x * G + grp) * (GATEUP ? 8 : 16) * TILES;
     const bool live = r0 < M;
     int rows[ROWS];
@@ -258,10 +442,12 @@ __global__ void __launch_bounds__((NT == 1 && WARPS < 4 ? 4 : WARPS) * 32) mma_k
         rows[2 * t + 1] = GATEUP ? I + r0 + 8 * t + g : r0 + 16 * t + 8 + g;  // A row g + 8
     }
     const int steps = K / STEP, rowb = K / kCodesPerByte<A>, rows_s = K / 16;
-    const int sb = kSplitWarps ? part_step(part) : 0, se = kSplitWarps ? part_step(part + 1) : steps;
+    const int asteps = TERMS * steps, arowb = KA / kCodesPerByte<A>, arows_s = KA / 16;   // the operands' rows
+    const int sb = kSplitWarps ? part_step(part) : 0, se = kSplitWarps ? part_step(part + 1) : asteps;
     // The lane's 16 bytes of a step of each row, and (FP4) the scale words of the row it gives the MMA (A row g + 8
     // (t4 & 1)).
-    auto fetch = [&](WeightRing<DEPTH, ROWS>& ring, int slot, int st) {
+    auto fetch = [&](WeightRing<DEPTH, ROWS>& ring, int slot, int ast) {
+        const int st = TERMS == 1 ? ast : ast % steps;   // a later term's step reads the same weights
 #pragma unroll
         for(int r = 0; r < ROWS; ++r) {
             const std::uint8_t* at = wcodes + static_cast<long long>(rows[r]) * rowb + 64 * st;
@@ -303,8 +489,8 @@ __global__ void __launch_bounds__((NT == 1 && WARPS < 4 ? 4 : WARPS) * 32) mma_k
     if constexpr(kDirect) {
         const int r = routes[g];
         if(r >= 0) {
-            bcodes = p.codes + static_cast<long long>(r) * rowb + (kWords ? 4 : 16) * t4;
-            if constexpr(A == kFp4) bscales = static_cast<const std::uint8_t*>(p.scales) + static_cast<long long>(r) * rows_s;
+            bcodes = p.codes + static_cast<long long>(r) * arowb + (kWords ? 4 : 16) * t4;
+            if constexpr(A == kFp4) bscales = static_cast<const std::uint8_t*>(p.scales) + static_cast<long long>(r) * arows_s;
         }
     }
     const int cw = code_row<A>(p.chunk), sw = scale_row<A>(p.chunk), hb = half_bytes<A>(p.chunk);
@@ -369,20 +555,20 @@ __global__ void __launch_bounds__((NT == 1 && WARPS < 4 ? 4 : WARPS) * 32) mma_k
             }
     }
     int done = 0, part_end = part_step(1);   // prompt items: the parts added into total, the end of the current one
-    if constexpr(!kDirect) stage<A>(p, routes, 8 * active, K, 0, K < p.chunk ? K : p.chunk, smem);
+    if constexpr(!kDirect) stage<A>(p, routes, 8 * active, KA, 0, KA < p.chunk ? KA : p.chunk, smem);
     for(int s0 = sb; s0 < se; s0 += DEPTH) {
 #pragma unroll
         for(int d = 0; d < DEPTH; ++d) {
             const int st = s0 + d;
             if(st >= se) break;
-            const int k = STEP * st, kk = k % (kDirect ? K : p.chunk);
+            const int k = STEP * st, kk = k % (kDirect ? KA : p.chunk);
             if constexpr(!kDirect) {
                 if(kk == 0) {   // chunk k / chunk landed; every warp is done with the other half
                     kc::cp_async_wait_all();
                     __syncthreads();
                     const int next = k + p.chunk;
-                    if(next < K)
-                        stage<A>(p, routes, 8 * active, K, next, K - next < p.chunk ? K - next : p.chunk,
+                    if(next < KA)
+                        stage<A>(p, routes, 8 * active, KA, next, KA - next < p.chunk ? KA - next : p.chunk,
                                  smem + ((next / p.chunk) & 1) * hb);
                 }
             }
@@ -492,97 +678,152 @@ __global__ void __launch_bounds__((NT == 1 && WARPS < 4 ? 4 : WARPS) * 32) mma_k
                 for(int i = 0; i < 4; ++i) acc[t][n][i] = total[t][n][i];
     }
     if(!live) return;
-    if constexpr(GATEUP) {
-        // c0, c1: gate row rows[2t] (inter r0 + 8t + g) for routes 2 t4, 2 t4 + 1; c2, c3: its up row, same routes.
-        float fg[TILES], fu[TILES];
-        if constexpr(A == kFp4) {
-            const float* inverse = reinterpret_cast<const float*>(bundle + L.gate_up_inverse);
-            const float in_rcp = input_scale(bundle, L, 2);
-#pragma unroll
-            for(int t = 0; t < TILES; ++t) {
-                fg[t] = __fmul_rn(inverse[rows[2 * t]], in_rcp);
-                fu[t] = __fmul_rn(inverse[rows[2 * t + 1]], in_rcp);
-            }
-        } else {
-            const bool channel = L.format == Format::fp8_channel;
-#pragma unroll
-            for(int t = 0; t < TILES; ++t) {
-                fg[t] = channel ? reinterpret_cast<const float*>(wscales)[rows[2 * t]] : 1.0f;
-                fu[t] = channel ? reinterpret_cast<const float*>(wscales)[rows[2 * t + 1]] : 1.0f;
-            }
-        }
-#pragma unroll
-        for(int n = 0; n < NT; ++n) {
-            if(n >= active) break;
-#pragma unroll
-            for(int c = 0; c < 2; ++c) {
-                float hv[TILES];
-#pragma unroll
-                for(int t = 0; t < TILES; ++t)
-                    hv[t] = L.activation == 1
-                        ? kc::gelu_tanh_mul(__fmul_rn(acc[t][n][c], fg[t]), __fmul_rn(acc[t][n][2 + c], fu[t]))
-                        : kc::swiglu_declared(__fmul_rn(acc[t][n][c], fg[t]), __fmul_rn(acc[t][n][2 + c], fu[t]));
-                const int r = routes[8 * n + 2 * t4 + c];
-                if constexpr(A == kFp8) {   // h in BF16: the group quantizer reads it next
-                    bf16* h = reinterpret_cast<bf16*>(p.out);
-                    if(r >= 0) {
-#pragma unroll
-                        for(int t = 0; t < TILES; ++t)
-                            h[static_cast<long long>(r) * I + r0 + 8 * t + g] = __float2bfloat16_rn(hv[t]);
-                    }
-                    continue;
-                } else {
-                    std::uint8_t* hc = reinterpret_cast<std::uint8_t*>(p.out);
-                    const float g_dn = input_scale(bundle, L, 1);
-#pragma unroll
-                    for(int q = 0; q < TILES / 2; ++q) {
-                        // tiles 2q and 2q + 1: inter rows r0 + 16q .. + 15, one block of the down's input
-                        float amax = kc::abs_max(kc::abs_max(0.0f, hv[2 * q]), hv[2 * q + 1]);
-#pragma unroll
-                        for(int o = 4; o < 32; o <<= 1) amax = kc::abs_max(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-                        uint32_t code2[2], s;
-                        kc::nvfp4_quantize_pair(hv[2 * q], hv[2 * q + 1], amax, g_dn, code2, s);
-                        // inter rows i (lane g) and i + 1 (lane g + 1, lane ^ 4) of each tile: one byte, low nibble first
-#pragma unroll
-                        for(int h = 0; h < 2; ++h) {
-                            const uint32_t other = __shfl_xor_sync(0xffffffffu, code2[h], 4);
-                            if(r >= 0 && !(g & 1))
-                                hc[static_cast<long long>(r) * (I / 2) + (r0 + 16 * q + 8 * h + g) / 2] =
-                                    static_cast<std::uint8_t>(code2[h] | (other << 4));
-                        }
-                        if(r >= 0 && g == 0)
-                            p.out_scales[static_cast<long long>(r) * (I / 16) + (r0 + 16 * q) / 16] =
-                                static_cast<std::uint8_t>(s);
-                    }
-                }
-            }
-        }
+    finish<A, TILES, NT, GATEUP, ROWS>(p, bundle, wscales, acc, rows, routes, active, r0, g, t4);
+    }
+}
+
+// FP4 prompt items through a block tile: WM x WN warps, warp (wm, wn) mma_kernel's TILES row tiles of row group wm
+// for n-tiles wn * NT / WN .. (wn + 1) * NT / WN - 1 of the item. The block's weight rows (a 128-k step's codes and
+// scales) and the item's routes are staged a step at a time through a STAGES-deep cp.async ring the block shares, so
+// a weight fragment leaves global memory once a block and feeds WN warps, and no weight waits in registers. Every
+// output is mma_kernel's chain a part over the same steps, its parts added in part order: mma_kernel's bits.
+template <int NT, int TILES, int WM, int WN, int STAGES, bool GATEUP, int TERMS>
+__global__ void __launch_bounds__(WM * WN * 32) tile_kernel(MmaPass p) {
+    if constexpr(!kHasFp4) {
+        (void)p;
+        __trap();
     } else {
-        float* y = reinterpret_cast<float*>(p.out);
-        float f[ROWS];
-        if constexpr(A == kFp4) {
-            const float* inverse = reinterpret_cast<const float*>(bundle + L.down_inverse);
-            const float in_rcp = input_scale(bundle, L, 3);
+    constexpr int R = 8 * NT, NTW = NT / WN, ROWS = 2 * TILES, AROWS = WM * TILES * 16;
+    constexpr int ACW = 64 + kCodePad, ASW = 8 + kScalePad;   // a staged weight row's bytes: a step's codes, scales
+    constexpr int BHALF = half_bytes<kFp4>(128), SLOT = BHALF + AROWS * (ACW + ASW);
+    constexpr int RT = GATEUP ? 8 : 16;   // matrix rows a tile (gate/up: 8 gate rows over the same 8 up rows)
+    static_assert(NT % WN == 0 && NT <= 8 && STAGES >= 2, "items of up to 64 routes, two stages or more");
+    static_assert(!GATEUP || TILES % 2 == 0, "FP4's intermediate blocks of 16 rows are tile pairs");
+    extern __shared__ __align__(16) unsigned char smem[];
+    __shared__ int routes[R];
+    const int u = blockIdx.y;
+    if(u >= *p.item_count) return;
+    for(int j = threadIdx.x; j < R; j += blockDim.x) routes[j] = p.item_routes[static_cast<long long>(u) * R + j];
+    __syncthreads();
+    int active = 0;
 #pragma unroll
-            for(int r = 0; r < ROWS; ++r) f[r] = __fmul_rn(inverse[rows[r]], in_rcp);
-        } else {
-            const bool channel = L.format == Format::fp8_channel;
+    for(int n = 0; n < NT; ++n)
+        if(routes[8 * n] >= 0) active = n + 1;
+    const Layout& L = p.layout;
+    const std::uint8_t* bundle = p.store + static_cast<long long>(p.item_slot[u]) * L.bytes;
+    const int H = L.hidden, I = L.inter;
+    const int K = GATEUP ? H : I, M = GATEUP ? I : H;
+    const std::uint8_t* wcodes = bundle + (GATEUP ? L.gate_up : L.down);
+    const std::uint8_t* wscales = bundle + (GATEUP ? L.gate_up_scale : L.down_scale);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
+    const int wm = warp / WN, wn = warp % WN;
+    const int P = k_parts(K), KA = TERMS * K;
+    auto part_step = [&](int q) { return q * (KA / kGroup) / P; };
+    const int rbase = blockIdx.x * WM * RT * TILES;
+    const int r0 = rbase + wm * RT * TILES;
+    const bool live = r0 < M;
+    int rows[ROWS];
 #pragma unroll
-            for(int r = 0; r < ROWS; ++r) f[r] = channel ? reinterpret_cast<const float*>(wscales)[rows[r]] : 1.0f;
+    for(int t = 0; t < TILES; ++t) {
+        rows[2 * t] = GATEUP ? r0 + 8 * t + g : r0 + 16 * t + g;            // A row g
+        rows[2 * t + 1] = GATEUP ? I + r0 + 8 * t + g : r0 + 16 * t + 8 + g;  // A row g + 8
+    }
+    const int steps = K / kStepK<kFp4>, asteps = TERMS * steps, rowb = K / 2, rows_s = K / 16;
+    const int n0 = wn * NTW;
+    const int act = active - n0 < 0 ? 0 : (active - n0 > NTW ? NTW : active - n0);   // the warp's live n-tiles
+    // One step into a slot: staged weight row j is row j % 8 of half (j / 8) % 2 (gate/up: gate, up; down: rows
+    // + 0, + 8) of the block's tile j / 16 (row group j / (16 TILES)); zeros for a row group past M. Then the routes'.
+    auto stage_step = [&](int ast, int slot) {
+        unsigned char* base = smem + slot * SLOT;
+        unsigned char* ac = base + BHALF;
+        unsigned char* as = ac + AROWS * ACW;
+        const int st = TERMS == 1 ? ast : ast % steps;   // a later term's step reads the same weights
+        for(int i = threadIdx.x; i < AROWS * 5; i += blockDim.x) {
+            const int j = i / 5, c = i % 5, tile = j >> 4, h = (j >> 3) & 1, gg = j & 7;
+            const int g0 = rbase + (tile / TILES) * RT * TILES, tt = tile % TILES;
+            const bool ok = g0 < M;
+            const long long row = !ok ? 0 : GATEUP ? (h ? I : 0) + g0 + 8 * tt + gg : g0 + 16 * tt + 8 * h + gg;
+            if(c < 4) kc::cp_async16(ac + j * ACW + 16 * c, wcodes + row * rowb + 64 * st + 16 * c, ok);
+            else kc::cp_async_ca<8>(as + j * ASW, wscales + row * rows_s + 8 * st, ok);
         }
+        stage<kFp4>(p, routes, 8 * active, KA, kStepK<kFp4> * ast, kStepK<kFp4>, base);   // commits the group
+    };
+    float acc[TILES][NTW][4], total[TILES][NTW][4];
 #pragma unroll
-        for(int n = 0; n < NT; ++n) {
-            if(n >= active) break;
+    for(int t = 0; t < TILES; ++t)
+#pragma unroll
+        for(int n = 0; n < NTW; ++n)
+#pragma unroll
+            for(int i = 0; i < 4; ++i) acc[t][n][i] = 0.0f;
+#pragma unroll
+    for(int s0 = 0; s0 < STAGES - 1; ++s0) {
+        if(s0 < asteps) stage_step(s0, s0);
+        else kc::cp_async_commit();
+    }
+    int done = 0, part_end = part_step(1);
+    for(int st = 0; st < asteps; ++st) {
+        kc::cp_async_wait<STAGES - 2>();   // step st landed; every warp is done with step st - 1's slot
+        __syncthreads();
+        const int nx = st + STAGES - 1;
+        if(nx < asteps) stage_step(nx, nx % STAGES);
+        else kc::cp_async_commit();
+        if(live && act > 0) {
+            const unsigned char* base = smem + (st % STAGES) * SLOT;
+            const unsigned char* ac = base + BHALF;
+            const unsigned char* as = ac + AROWS * ACW;
+            uint32_t a[ROWS][4];
+            uint2 sa[TILES];
+#pragma unroll
+            for(int t = 0; t < TILES; ++t) {
+#pragma unroll
+                for(int h = 0; h < 2; ++h) {
+                    const unsigned char* row = ac + (((wm * TILES + t) * 2 + h) * 8 + g) * ACW;
+#pragma unroll
+                    for(int i = 0; i < 4; ++i)
+                        a[2 * t + h][i] = *reinterpret_cast<const uint32_t*>(row + 16 * i + 4 * t4);
+                }
+                sa[t] = *reinterpret_cast<const uint2*>(as + (((wm * TILES + t) * 2 + (t4 & 1)) * 8 + g) * ASW);
+            }
+            constexpr int BCW = code_row<kFp4>(kStepK<kFp4>), BSW = scale_row<kFp4>(kStepK<kFp4>);
+#pragma unroll
+            for(int n = 0; n < NTW; ++n) {
+                if(n >= act) break;
+                const unsigned char* brow = base + (8 * (n0 + n) + g) * BCW;
+                uint32_t b[4];
+#pragma unroll
+                for(int i = 0; i < 4; ++i) b[i] = *reinterpret_cast<const uint32_t*>(brow + 16 * i + 4 * t4);
+                const uint2 sb = *reinterpret_cast<const uint2*>(base + 64 * BCW + (8 * (n0 + n) + g) * BSW);
+#pragma unroll
+                for(int m = 0; m < 2; ++m)
+#pragma unroll
+                    for(int t = 0; t < TILES; ++t)
+                        kc::mma_nvf4_m16n8k64(acc[t][n], a[2 * t][2 * m], a[2 * t + 1][2 * m], a[2 * t][2 * m + 1],
+                                              a[2 * t + 1][2 * m + 1], b[2 * m], b[2 * m + 1],
+                                              m ? sa[t].y : sa[t].x, m ? sb.y : sb.x);
+            }
+        }
+        if(st + 1 == part_end) {   // a part ends: its chain added into total, in part order; the next from zero
 #pragma unroll
             for(int t = 0; t < TILES; ++t)
 #pragma unroll
-                for(int i = 0; i < 4; ++i) {
-                    const int r = routes[8 * n + 2 * t4 + (i & 1)];
-                    const int row = rows[2 * t + (i >> 1)];
-                    if(r >= 0) y[static_cast<long long>(r) * H + row] = __fmul_rn(acc[t][n][i], f[2 * t + (i >> 1)]);
-                }
+                for(int n = 0; n < NTW; ++n)
+#pragma unroll
+                    for(int i = 0; i < 4; ++i) {
+                        total[t][n][i] = done ? __fadd_rn(total[t][n][i], acc[t][n][i]) : acc[t][n][i];
+                        acc[t][n][i] = 0.0f;
+                    }
+            ++done;
+            part_end = part_step(done + 1);
         }
     }
+    if(!live || act == 0) return;
+#pragma unroll
+    for(int t = 0; t < TILES; ++t)
+#pragma unroll
+        for(int n = 0; n < NTW; ++n)
+#pragma unroll
+            for(int i = 0; i < 4; ++i) acc[t][n][i] = total[t][n][i];
+    finish<kFp4, TILES, NTW, GATEUP, ROWS>(p, bundle, wscales, acc, rows, routes + 8 * n0, act, r0, g, t4);
     }
 }
 
@@ -590,11 +831,12 @@ __global__ void probe_kernel(int* found) { found[0] = kHasFp4 ? 1 : 0, found[1] 
 
 // ----------------------------------------------------------------------------------------------- launches
 
-template <int A, int NT, bool GATEUP, int WARPS, int TILES, int DEPTH, int CHUNK, int FETCH = 0>
+template <int A, int NT, bool GATEUP, int WARPS, int TILES, int DEPTH, int CHUNK, int FETCH = 0, int TERMS = 1>
 cudaError_t launch(const MmaPass& base, const Items& items, cudaStream_t stream) {
     MmaPass p = base;
     const int K = GATEUP ? p.layout.hidden : p.layout.inter, M = GATEUP ? p.layout.inter : p.layout.hidden;
-    p.chunk = NT == 1 ? K : (K < CHUNK ? K : CHUNK);
+    const int KA = TERMS * K;   // the operands' k (every term's)
+    p.chunk = NT == 1 ? KA : (KA < CHUNK ? KA : CHUNK);
     // Decode items: groups x parts warps a block (k_parts), the parts' sums through shared memory; prompt items: WARPS.
     const int parts = k_parts(K), groups = NT == 1 ? decode_groups(WARPS, parts) : WARPS;
     const int threads = NT == 1 ? groups * parts * 32 : WARPS * 32;
@@ -605,23 +847,46 @@ cudaError_t launch(const MmaPass& base, const Items& items, cudaStream_t stream)
     if(bytes > 48 * 1024) {
         static kc::PerDevice<cudaError_t> optin;
         if(const cudaError_t e =
-               kc::shared_memory_optin(optin, mma_kernel<A, NT, TILES, WARPS, DEPTH, GATEUP, FETCH>, int(bytes));
+               kc::shared_memory_optin(optin, mma_kernel<A, NT, TILES, WARPS, DEPTH, GATEUP, FETCH, TERMS>, int(bytes));
            e != cudaSuccess)
             return e;
     }
-    mma_kernel<A, NT, TILES, WARPS, DEPTH, GATEUP, FETCH><<<grid, threads, bytes, stream>>>(p);
+    mma_kernel<A, NT, TILES, WARPS, DEPTH, GATEUP, FETCH, TERMS><<<grid, threads, bytes, stream>>>(p);
+    return cudaGetLastError();
+}
+
+template <int NT, bool GATEUP, int TILES, int WM, int WN, int STAGES, int TERMS>
+cudaError_t launch_tile(const MmaPass& base, const Items& items, cudaStream_t stream) {
+    MmaPass p = base;
+    p.chunk = kStepK<kFp4>;   // the routes staged a step at a time
+    const int M = GATEUP ? p.layout.inter : p.layout.hidden;
+    const int rows_per_block = WM * (GATEUP ? 8 : 16) * TILES;
+    const dim3 grid((M + rows_per_block - 1) / rows_per_block, items.capacity);
+    const size_t bytes = STAGES * static_cast<size_t>(half_bytes<kFp4>(kStepK<kFp4>) +
+                                                      WM * TILES * 16 * (64 + kCodePad + 8 + kScalePad));
+    if(bytes > 48 * 1024) {
+        static kc::PerDevice<cudaError_t> optin;
+        if(const cudaError_t e =
+               kc::shared_memory_optin(optin, tile_kernel<NT, TILES, WM, WN, STAGES, GATEUP, TERMS>, int(bytes));
+           e != cudaSuccess)
+            return e;
+    }
+    tile_kernel<NT, TILES, WM, WN, STAGES, GATEUP, TERMS><<<grid, WM * WN * 32, bytes, stream>>>(p);
     return cudaGetLastError();
 }
 
 #ifdef CRIT_SWEEP_BUILD
 constexpr bool kMmaTuning = CRIT_CONFIG_COUNT_fp4_decode > 1 || CRIT_CONFIG_COUNT_fp4_prompt > 1 ||
+                            CRIT_CONFIG_COUNT_fp4_tile > 1 ||
                             CRIT_CONFIG_COUNT_fp8_decode > 1 || CRIT_CONFIG_COUNT_fp8_prompt > 1;
 constexpr bool kBuiltFp4Decode = !kMmaTuning || CRIT_CONFIG_COUNT_fp4_decode > 1;
 constexpr bool kBuiltFp4Prompt = !kMmaTuning || CRIT_CONFIG_COUNT_fp4_prompt > 1;
+constexpr bool kBuiltFp4Tile = !kMmaTuning || CRIT_CONFIG_COUNT_fp4_tile > 1;
 constexpr bool kBuiltFp8Decode = !kMmaTuning || CRIT_CONFIG_COUNT_fp8_decode > 1;
 constexpr bool kBuiltFp8Prompt = !kMmaTuning || CRIT_CONFIG_COUNT_fp8_prompt > 1;
 #else
-constexpr bool kBuiltFp4Decode = true, kBuiltFp4Prompt = true, kBuiltFp8Decode = true, kBuiltFp8Prompt = true;
+constexpr bool kBuiltFp4Decode = true, kBuiltFp4Prompt = true, kBuiltFp4Tile = true, kBuiltFp8Decode = true,
+               kBuiltFp8Prompt = true;
 #endif
 
 template <bool BUILT, int A, int NT, bool GATEUP, int WARPS, int TILES, int DEPTH, int CHUNK, int FETCH = 0>
@@ -629,8 +894,23 @@ cudaError_t built(const MmaPass& p, const Items& items, cudaStream_t stream) {
     if constexpr(!BUILT) {
         (void)p, (void)items, (void)stream;
         return cudaErrorNotSupported;
+    } else if constexpr(A == kFp4) {   // FP4 with row scales may run two operand terms
+        return p.terms == 2 ? launch<A, NT, GATEUP, WARPS, TILES, DEPTH, CHUNK, FETCH, 2>(p, items, stream)
+                            : launch<A, NT, GATEUP, WARPS, TILES, DEPTH, CHUNK, FETCH, 1>(p, items, stream);
     } else {
         return launch<A, NT, GATEUP, WARPS, TILES, DEPTH, CHUNK, FETCH>(p, items, stream);
+    }
+}
+
+// fp4-tile: items of 64 routes through the block tile, by the operands' terms.
+template <bool BUILT, bool GATEUP, int WM, int WN, int TILES, int STAGES>
+cudaError_t built_tile(const MmaPass& p, const Items& items, cudaStream_t stream) {
+    if constexpr(!BUILT || 8 % WN != 0) {
+        (void)p, (void)items, (void)stream;
+        return cudaErrorNotSupported;
+    } else {
+        return p.terms == 2 ? launch_tile<8, GATEUP, TILES, WM, WN, STAGES, 2>(p, items, stream)
+                            : launch_tile<8, GATEUP, TILES, WM, WN, STAGES, 1>(p, items, stream);
     }
 }
 
@@ -639,7 +919,7 @@ template <int A, bool GATEUP, int TILES>
 constexpr int tiles_of() { return A == kFp4 && GATEUP && TILES == 1 ? 2 : TILES; }
 
 template <bool GATEUP>
-cudaError_t dispatch_fp4(const MmaPass& p, const Items& items, int tokens, cudaStream_t stream) {
+cudaError_t dispatch_fp4(const MmaPass& p, const Items& items, int tokens, int tile, cudaStream_t stream) {
     const int H = p.layout.hidden, I = p.layout.inter, rows = tokens > 0 ? tokens : 0;
     switch(items.width) {
         case 8:
@@ -652,6 +932,7 @@ cudaError_t dispatch_fp4(const MmaPass& p, const Items& items, int tokens, cudaS
             }
         case 32:
         case 64:
+            if(items.width == 64 && tile) break;   // fp4-tile, below
             switch(crit_lookup_fp4_prompt(GATEUP ? 1 : 0, H, I, rows)) {
 #define CRIT_GX_FP4P(index, warps, tiles, depth, chunk)                                                                   \
     case index:                                                                                                           \
@@ -664,6 +945,16 @@ cudaError_t dispatch_fp4(const MmaPass& p, const Items& items, int tokens, cudaS
             }
         default:
             return cudaErrorInvalidValue;
+    }
+    // Items of 64 routes a call asks the block tile for (Workspace(tile=True)): fp4-tile
+    {
+            switch(crit_lookup_fp4_tile(GATEUP ? 1 : 0, H, I, rows)) {
+#define CRIT_GX_FP4T(index, wm, wn, tiles, stages) \
+    case index: return built_tile<kBuiltFp4Tile, GATEUP, wm, wn, tiles, stages>(p, items, stream);
+                CRIT_CONFIGS_fp4_tile(CRIT_GX_FP4T)
+#undef CRIT_GX_FP4T
+                default: return cudaErrorInvalidConfiguration;
+            }
     }
 }
 
@@ -699,11 +990,16 @@ cudaError_t dispatch_fp8(const MmaPass& p, const Items& items, int tokens, cudaS
 bool common_layout(const Layout& L) {
     return L.bytes > 0 && L.bytes % 16 == 0 && L.hidden % 128 == 0 && L.inter % 128 == 0 && L.hidden >= 128 &&
            L.inter >= 128 && L.gate_up >= 0 && L.down >= 0 && L.gate_up_scale >= 0 && L.down_scale >= 0 &&
-           (L.activation == 0 || L.activation == 1) && L.gate_up % 16 == 0 && L.down % 16 == 0;
+           (L.activation == 0 || L.activation == 1 || (L.activation == 2 && L.gate_cap > 0.0f && L.up_cap > 0.0f)) &&
+           L.gate_up % 16 == 0 && L.down % 16 == 0;
 }
 bool fp4_layout(const Layout& L) {
     return L.format == Format::nvfp4 && common_layout(L) && L.gate_up_inverse >= 0 && L.down_inverse >= 0 &&
            L.input >= 0 && L.gate_up_scale % 8 == 0 && L.down_scale % 8 == 0;
+}
+bool fp4_rows_layout(const Layout& L) {   // FP4 with row scales: no input scales needed
+    return L.format == Format::nvfp4 && common_layout(L) && L.gate_up_inverse >= 0 && L.down_inverse >= 0 &&
+           L.gate_up_scale % 8 == 0 && L.down_scale % 8 == 0;
 }
 bool fp8_layout(const Layout& L) {
     return (L.format == Format::fp8_channel || L.format == Format::fp8_block) && common_layout(L) &&
@@ -744,20 +1040,53 @@ cudaError_t enqueue_fp4_inputs(const bf16* x, int top, const std::uint8_t* store
 
 cudaError_t enqueue_fp4_gate_up(const std::uint8_t* codes, const std::uint8_t* scales, const std::uint8_t* store,
                                 const Layout& layout, const Items& items, std::uint8_t* h_codes,
-                                std::uint8_t* h_scales, cudaStream_t stream, int tokens) {
+                                std::uint8_t* h_scales, cudaStream_t stream, int tokens, int tile) {
     if(!codes || !scales || !store || !h_codes || !h_scales || !fp4_layout(layout) || !items_ok(items))
         return cudaErrorInvalidValue;
     if(items.capacity == 0) return cudaSuccess;
     const MmaPass p{store, layout, items.slot, items.routes, items.count, codes, scales, h_codes, h_scales, 0};
-    return dispatch_fp4<true>(p, items, tokens, stream);
+    return dispatch_fp4<true>(p, items, tokens, tile, stream);
 }
 
 cudaError_t enqueue_fp4_down(const std::uint8_t* h_codes, const std::uint8_t* h_scales, const std::uint8_t* store,
-                             const Layout& layout, const Items& items, float* y, cudaStream_t stream, int tokens) {
+                             const Layout& layout, const Items& items, float* y, cudaStream_t stream, int tokens, int tile) {
     if(!h_codes || !h_scales || !store || !y || !fp4_layout(layout) || !items_ok(items)) return cudaErrorInvalidValue;
     if(items.capacity == 0) return cudaSuccess;
     const MmaPass p{store, layout, items.slot, items.routes, items.count, h_codes, h_scales, y, nullptr, 0};
-    return dispatch_fp4<false>(p, items, tokens, stream);
+    return dispatch_fp4<false>(p, items, tokens, tile, stream);
+}
+
+cudaError_t enqueue_fp4_rows(const bf16* rows, int div, int K, const Items& items, int terms, std::uint8_t* codes,
+                             std::uint8_t* scales, float* rcp, cudaStream_t stream) {
+    if(!rows || div < 1 || K < 128 || K % 128 || (terms != 1 && terms != 2) || !codes || !scales || !rcp ||
+       !items_ok(items))
+        return cudaErrorInvalidValue;
+    if(items.capacity == 0) return cudaSuccess;
+    fp4_rows_kernel<<<dim3(items.capacity, items.width), 128, 0, stream>>>(rows, div, K, items, terms, codes, scales,
+                                                                           rcp);
+    return cudaGetLastError();
+}
+
+cudaError_t enqueue_fp4_gate_up_rows(const std::uint8_t* codes, const std::uint8_t* scales, const float* rcp, int terms,
+                                     const std::uint8_t* store, const Layout& layout, const Items& items, bf16* h,
+                                     cudaStream_t stream, int tokens, int tile) {
+    if(!codes || !scales || !rcp || (terms != 1 && terms != 2) || !store || !h || !fp4_rows_layout(layout) ||
+       !items_ok(items))
+        return cudaErrorInvalidValue;
+    if(items.capacity == 0) return cudaSuccess;
+    const MmaPass p{store, layout, items.slot, items.routes, items.count, codes, scales, h, nullptr, 0, rcp, terms};
+    return dispatch_fp4<true>(p, items, tokens, tile, stream);
+}
+
+cudaError_t enqueue_fp4_down_rows(const std::uint8_t* h_codes, const std::uint8_t* h_scales, const float* rcp, int terms,
+                                  const std::uint8_t* store, const Layout& layout, const Items& items, float* y,
+                                  cudaStream_t stream, int tokens, int tile) {
+    if(!h_codes || !h_scales || !rcp || (terms != 1 && terms != 2) || !store || !y || !fp4_rows_layout(layout) ||
+       !items_ok(items))
+        return cudaErrorInvalidValue;
+    if(items.capacity == 0) return cudaSuccess;
+    const MmaPass p{store, layout, items.slot, items.routes, items.count, h_codes, h_scales, y, nullptr, 0, rcp, terms};
+    return dispatch_fp4<false>(p, items, tokens, tile, stream);
 }
 
 cudaError_t enqueue_fp8_inputs(const bf16* rows, int div, int K, const Items& items, std::uint8_t* codes, float* scales,

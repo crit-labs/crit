@@ -274,7 +274,7 @@ void fp4_inputs(const torch::Tensor& x, int64_t top, const torch::Tensor& store,
 
 void fp4_gate_up(const torch::Tensor& codes, const torch::Tensor& scales, const torch::Tensor& store,
                  c10::ArrayRef<int64_t> layout, const torch::Tensor& item_slot, const torch::Tensor& item_routes,
-                 const torch::Tensor& item_count, torch::Tensor& h_codes, torch::Tensor& h_scales, int64_t tokens) {
+                 const torch::Tensor& item_count, torch::Tensor& h_codes, torch::Tensor& h_scales, int64_t tokens, int64_t tile) {
     const c10::cuda::CUDAGuard guard(codes.device());
     const gx::Layout L = layout_of(layout);
     typed(codes, "codes", torch::kUInt8);
@@ -291,13 +291,13 @@ void fp4_gate_up(const torch::Tensor& codes, const torch::Tensor& scales, const 
     ok(gx::enqueue_fp4_gate_up(codes.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(), store.data_ptr<uint8_t>(), L,
                                items_of(item_slot, item_routes, item_count), h_codes.data_ptr<uint8_t>(),
                                h_scales.data_ptr<uint8_t>(), at::cuda::getCurrentCUDAStream(),
-                               static_cast<int>(tokens)),
+                               static_cast<int>(tokens), static_cast<int>(tile)),
        "fp4_gate_up");
 }
 
 void fp4_down(const torch::Tensor& h_codes, const torch::Tensor& h_scales, const torch::Tensor& store,
               c10::ArrayRef<int64_t> layout, const torch::Tensor& item_slot, const torch::Tensor& item_routes,
-              const torch::Tensor& item_count, torch::Tensor& y, int64_t tokens) {
+              const torch::Tensor& item_count, torch::Tensor& y, int64_t tokens, int64_t tile) {
     const c10::cuda::CUDAGuard guard(h_codes.device());
     const gx::Layout L = layout_of(layout);
     typed(h_codes, "h_codes", torch::kUInt8);
@@ -310,8 +310,73 @@ void fp4_down(const torch::Tensor& h_codes, const torch::Tensor& h_scales, const
     TORCH_CHECK(y.dim() == 2 && y.size(1) == L.hidden && y.size(0) == h_codes.size(0), "y is [routes][hidden]");
     ok(gx::enqueue_fp4_down(h_codes.data_ptr<uint8_t>(), h_scales.data_ptr<uint8_t>(), store.data_ptr<uint8_t>(), L,
                             items_of(item_slot, item_routes, item_count), y.data_ptr<float>(),
-                            at::cuda::getCurrentCUDAStream(), static_cast<int>(tokens)),
+                            at::cuda::getCurrentCUDAStream(), static_cast<int>(tokens), static_cast<int>(tile)),
        "fp4_down");
+}
+
+void fp4_rows(const torch::Tensor& rows, int64_t div, const torch::Tensor& item_slot, const torch::Tensor& item_routes,
+              const torch::Tensor& item_count, int64_t terms, torch::Tensor& codes, torch::Tensor& scales,
+              torch::Tensor& rcp) {
+    const c10::cuda::CUDAGuard guard(rows.device());
+    typed(rows, "rows", torch::kBFloat16);
+    typed(codes, "codes", torch::kUInt8);
+    typed(scales, "scales", torch::kUInt8);
+    typed(rcp, "rcp", torch::kFloat32);
+    TORCH_CHECK(rows.dim() == 2 && rows.is_contiguous(), "rows is [rows][K], contiguous");
+    TORCH_CHECK(terms == 1 || terms == 2, "terms is 1 or 2");
+    const int64_t K = rows.size(1);
+    TORCH_CHECK(codes.dim() == 2 && codes.size(1) == terms * K / 2 && scales.dim() == 2 &&
+                    scales.size(1) == terms * K / 16 && scales.size(0) == codes.size(0) && rcp.dim() == 1 &&
+                    rcp.size(0) == codes.size(0),
+                "codes is [routes][terms * K / 2], scales [routes][terms * K / 16], rcp [routes]");
+    ok(gx::enqueue_fp4_rows(reinterpret_cast<const __nv_bfloat16*>(rows.data_ptr()), static_cast<int>(div),
+                            static_cast<int>(K), items_of(item_slot, item_routes, item_count), static_cast<int>(terms),
+                            codes.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(), rcp.data_ptr<float>(),
+                            at::cuda::getCurrentCUDAStream()),
+       "fp4_rows");
+}
+
+void fp4_gate_up_rows(const torch::Tensor& codes, const torch::Tensor& scales, const torch::Tensor& rcp, int64_t terms,
+                      const torch::Tensor& store, c10::ArrayRef<int64_t> layout, const torch::Tensor& item_slot,
+                      const torch::Tensor& item_routes, const torch::Tensor& item_count, torch::Tensor& h,
+                      int64_t tokens, int64_t tile) {
+    const c10::cuda::CUDAGuard guard(codes.device());
+    const gx::Layout L = layout_of(layout);
+    typed(codes, "codes", torch::kUInt8);
+    typed(scales, "scales", torch::kUInt8);
+    typed(rcp, "rcp", torch::kFloat32);
+    typed(h, "h", torch::kBFloat16);
+    store_of(store, L);
+    TORCH_CHECK(codes.dim() == 2 && codes.size(1) == terms * L.hidden / 2 && scales.size(1) == terms * L.hidden / 16,
+                "codes is [routes][terms * hidden / 2], scales [routes][terms * hidden / 16]");
+    TORCH_CHECK(h.dim() == 2 && h.size(1) == L.inter && h.size(0) == codes.size(0), "h is [routes][inter]");
+    ok(gx::enqueue_fp4_gate_up_rows(codes.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(), rcp.data_ptr<float>(),
+                                    static_cast<int>(terms), store.data_ptr<uint8_t>(), L,
+                                    items_of(item_slot, item_routes, item_count),
+                                    reinterpret_cast<__nv_bfloat16*>(h.data_ptr()), at::cuda::getCurrentCUDAStream(),
+                                    static_cast<int>(tokens), static_cast<int>(tile)),
+       "fp4_gate_up_rows");
+}
+
+void fp4_down_rows(const torch::Tensor& h_codes, const torch::Tensor& h_scales, const torch::Tensor& rcp, int64_t terms,
+                   const torch::Tensor& store, c10::ArrayRef<int64_t> layout, const torch::Tensor& item_slot,
+                   const torch::Tensor& item_routes, const torch::Tensor& item_count, torch::Tensor& y,
+                   int64_t tokens, int64_t tile) {
+    const c10::cuda::CUDAGuard guard(h_codes.device());
+    const gx::Layout L = layout_of(layout);
+    typed(h_codes, "h_codes", torch::kUInt8);
+    typed(h_scales, "h_scales", torch::kUInt8);
+    typed(rcp, "rcp", torch::kFloat32);
+    typed(y, "y", torch::kFloat32);
+    store_of(store, L);
+    TORCH_CHECK(h_codes.dim() == 2 && h_codes.size(1) == terms * L.inter / 2 && h_scales.size(1) == terms * L.inter / 16,
+                "h_codes is [routes][terms * inter / 2], h_scales [routes][terms * inter / 16]");
+    TORCH_CHECK(y.dim() == 2 && y.size(1) == L.hidden && y.size(0) == h_codes.size(0), "y is [routes][hidden]");
+    ok(gx::enqueue_fp4_down_rows(h_codes.data_ptr<uint8_t>(), h_scales.data_ptr<uint8_t>(), rcp.data_ptr<float>(),
+                                 static_cast<int>(terms), store.data_ptr<uint8_t>(), L,
+                                 items_of(item_slot, item_routes, item_count), y.data_ptr<float>(),
+                                 at::cuda::getCurrentCUDAStream(), static_cast<int>(tokens), static_cast<int>(tile)),
+       "fp4_down_rows");
 }
 
 bool fp8_available() {

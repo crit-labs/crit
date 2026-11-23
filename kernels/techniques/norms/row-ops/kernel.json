@@ -1,0 +1,489 @@
+{
+  "schema": "crit-kernel-v1",
+  "id": "row-ops",
+  "family": "norms",
+  "title": "Row operations around a model's blocks: head clips, small products, sink-gated outputs, scaled adds, summary mixes, gated joins with low-rank gates and span attention, one Triton launch a call (two where a reduction spans programs)",
+  "package": "row_ops",
+  "language": "triton",
+  "operations": [
+    "head-clip",
+    "small-product",
+    "sink-gate",
+    "scaled-add",
+    "summary-mix",
+    "pair-norm",
+    "gated-join",
+    "span-attention"
+  ],
+  "structures": {
+    "head-clip": {
+      "what": "each head vector of a token (times a learned scale) shortened to an L2 length, then times a per-token factor: one program a token head, BD = the head width rounded up to a power of two",
+      "call": "head_clip",
+      "operations": [
+        "head-clip"
+      ],
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        1,
+        8,
+        64,
+        512,
+        4096
+      ],
+      "key": [
+        "D"
+      ],
+      "exactness": "row-exact",
+      "knobs": {
+        "WARPS": {
+          "values": [
+            1,
+            2,
+            4,
+            8,
+            16
+          ],
+          "default": 4,
+          "order": true,
+          "what": "warps a program (its reductions' layout: the shape's alone)"
+        }
+      },
+      "yardstick": {
+        "library": "torch on the same rows: the model technique's own torch form (its CUDA fallback), a chain of elementwise kernels"
+      },
+      "bench": "bench.py:HeadClip"
+    },
+    "small-product": {
+      "what": "each row's R values (rounded to BF16) times a small FP32 matrix [R][E], summed in index order and rounded to BF16: a program a row and BLOCK of the E outputs",
+      "call": "small_product",
+      "operations": [
+        "small-product"
+      ],
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        1,
+        8,
+        64,
+        512,
+        4096
+      ],
+      "key": [
+        "R",
+        "E"
+      ],
+      "exactness": "row-exact",
+      "knobs": {
+        "BLOCK": {
+          "values": [
+            64,
+            128,
+            256,
+            512,
+            1024
+          ],
+          "default": 256,
+          "what": "outputs a program"
+        },
+        "WARPS": {
+          "values": [
+            1,
+            2,
+            4,
+            8,
+            16
+          ],
+          "default": 4,
+          "what": "warps a program"
+        }
+      },
+      "yardstick": {
+        "library": "torch.matmul of the BF16-rounded rows and the matrix in FP32 (cuBLAS), rounded to BF16"
+      },
+      "bench": "bench.py:SmallProduct"
+    },
+    "sink-gate": {
+      "what": "an attention's rows times sigmoid(lse - sink) (a sink logit with no value) and a sigmoid output gate, BF16 out: one program a token head",
+      "call": "sink_gate",
+      "operations": [
+        "sink-gate"
+      ],
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        1,
+        8,
+        64,
+        512,
+        4096
+      ],
+      "key": [
+        "D"
+      ],
+      "exactness": "row-exact",
+      "knobs": {
+        "WARPS": {
+          "values": [
+            1,
+            2,
+            4,
+            8,
+            16
+          ],
+          "default": 4,
+          "what": "warps a program"
+        }
+      },
+      "yardstick": {
+        "library": "torch on the same rows: the model technique's own torch form (its CUDA fallback), a chain of elementwise kernels"
+      },
+      "bench": "bench.py:SinkGate"
+    },
+    "scaled-add": {
+      "what": "(y + x) * scale over every value, elementwise: BLOCK values a program",
+      "call": "scaled_add",
+      "operations": [
+        "scaled-add"
+      ],
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        1,
+        8,
+        64,
+        512,
+        4096
+      ],
+      "key": [],
+      "exactness": "row-exact",
+      "knobs": {
+        "BLOCK": {
+          "values": [
+            256,
+            512,
+            1024,
+            2048,
+            4096
+          ],
+          "default": 1024,
+          "what": "values a program"
+        },
+        "WARPS": {
+          "values": [
+            1,
+            2,
+            4,
+            8,
+            16
+          ],
+          "default": 4,
+          "what": "warps a program"
+        }
+      },
+      "yardstick": {
+        "library": "torch on the same rows: the model technique's own torch form (its CUDA fallback), a chain of elementwise kernels"
+      },
+      "bench": "bench.py:ScaledAdd"
+    },
+    "summary-mix": {
+      "what": "softmax attention of learned queries over a token's normed summary rows and its own row: two launches over (token, CHUNK of the hidden values), the chunks' partial sums of squares and dot products, then each chunk's output from their sum in chunk order",
+      "call": "summary_mix",
+      "operations": [
+        "summary-mix"
+      ],
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        1,
+        8,
+        64,
+        512,
+        4096
+      ],
+      "key": [
+        "H"
+      ],
+      "exactness": "row-exact",
+      "knobs": {
+        "CHUNK": {
+          "values": [
+            64,
+            128,
+            256,
+            512,
+            1024
+          ],
+          "default": 256,
+          "order": true,
+          "what": "hidden values a program: the partials' chunk, so a token's sums follow it"
+        },
+        "WARPS": {
+          "values": [
+            1,
+            2,
+            4,
+            8,
+            16
+          ],
+          "default": 4,
+          "order": true,
+          "what": "warps a program (its reductions' layout: the shape's alone)"
+        }
+      },
+      "yardstick": {
+        "library": "torch on the same rows: the model technique's own torch form (its CUDA fallback), a chain of elementwise kernels"
+      },
+      "bench": "bench.py:SummaryMix"
+    },
+    "pair-norm": {
+      "what": "[rms(x), rms(m)] of two rows in BF16, each without a weight: one program a row, its sums of squares in BLOCK lanes",
+      "call": "pair_norm",
+      "operations": [
+        "pair-norm"
+      ],
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        1,
+        8,
+        64,
+        512,
+        4096
+      ],
+      "key": [
+        "H"
+      ],
+      "exactness": "row-exact",
+      "knobs": {
+        "BLOCK": {
+          "values": [
+            256,
+            512,
+            1024,
+            2048,
+            4096
+          ],
+          "default": 1024,
+          "order": true,
+          "what": "lanes the sums of squares accumulate"
+        },
+        "WARPS": {
+          "values": [
+            1,
+            2,
+            4,
+            8,
+            16
+          ],
+          "default": 4,
+          "order": true,
+          "what": "warps a program (its reductions' layout: the shape's alone)"
+        }
+      },
+      "yardstick": {
+        "library": "torch on the same rows: the model technique's own torch form (its CUDA fallback), a chain of elementwise kernels"
+      },
+      "bench": "bench.py:PairNorm"
+    },
+    "gated-join": {
+      "what": "(1 - tanh(f)) * x + tanh(a) * m over every value of a row: a program a row and BLOCK of its values",
+      "call": "gated_join",
+      "operations": [
+        "gated-join"
+      ],
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        1,
+        8,
+        64,
+        512,
+        4096
+      ],
+      "key": [
+        "H"
+      ],
+      "exactness": "row-exact",
+      "knobs": {
+        "BLOCK": {
+          "values": [
+            256,
+            512,
+            1024,
+            2048,
+            4096
+          ],
+          "default": 1024,
+          "what": "values a program"
+        },
+        "WARPS": {
+          "values": [
+            1,
+            2,
+            4,
+            8,
+            16
+          ],
+          "default": 4,
+          "what": "warps a program"
+        }
+      },
+      "yardstick": {
+        "library": "torch on the same rows: the model technique's own torch form (its CUDA fallback), a chain of elementwise kernels"
+      },
+      "bench": "bench.py:GatedJoin"
+    },
+    "low-rank-gates": {
+      "what": "several gated joins of a row at once with their low-rank gate products inside: the gate rows g = down . [rms(x), rms(m)] (BR rank rows a program, the inputs in BK lanes), then f, a = up . g and the join (BH hidden values a program)",
+      "call": "low_rank_gates",
+      "operations": [
+        "gated-join"
+      ],
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        1,
+        8,
+        64,
+        512,
+        4096
+      ],
+      "key": [
+        "H",
+        "R"
+      ],
+      "exactness": "row-exact",
+      "knobs": {
+        "BR": {
+          "values": [
+            4,
+            8,
+            16,
+            32
+          ],
+          "default": 8,
+          "what": "rank rows a program of the down product"
+        },
+        "BK": {
+          "values": [
+            64,
+            128,
+            256,
+            512,
+            1024
+          ],
+          "default": 256,
+          "order": true,
+          "what": "input lanes the down product's sums accumulate"
+        },
+        "BH": {
+          "values": [
+            32,
+            64,
+            128,
+            256
+          ],
+          "default": 64,
+          "what": "hidden values a program of the up product"
+        },
+        "WARPS": {
+          "values": [
+            1,
+            2,
+            4,
+            8,
+            16
+          ],
+          "default": 4,
+          "order": true,
+          "what": "warps a program (its reductions' layout: the shape's alone)"
+        }
+      },
+      "yardstick": {
+        "library": "the same joins as pair_norm, two matmuls (cuBLAS) and gated_join"
+      },
+      "bench": "bench.py:LowRankGates"
+    },
+    "span-attention": {
+      "what": "each row's queries over a span of its cached positions, no causal mask: programs (row's KV head, CHUNK positions) with an online softmax in steps of BN keys, then the splits merged in split order",
+      "call": "span_attention",
+      "operations": [
+        "span-attention"
+      ],
+      "rows": [
+        1,
+        1048576
+      ],
+      "tune_rows": [
+        1,
+        8,
+        64,
+        512,
+        4096
+      ],
+      "key": [
+        "G",
+        "D"
+      ],
+      "exactness": "row-exact",
+      "knobs": {
+        "CHUNK": {
+          "values": [
+            128,
+            256,
+            512,
+            1024,
+            2048
+          ],
+          "default": 512,
+          "order": true,
+          "what": "key positions a program (a split)"
+        },
+        "BN": {
+          "values": [
+            16,
+            32,
+            64,
+            128
+          ],
+          "default": 64,
+          "order": true,
+          "what": "keys a step of the online softmax"
+        },
+        "WARPS": {
+          "values": [
+            1,
+            2,
+            4,
+            8,
+            16
+          ],
+          "default": 4,
+          "order": true,
+          "what": "warps a program (its reductions' layout: the shape's alone)"
+        }
+      },
+      "yardstick": {
+        "library": "torch scaled_dot_product_attention with the span's mask over the same rows"
+      },
+      "bench": "bench.py:SpanAttention"
+    }
+  }
+}

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core" / "python"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "inference" / "core" / "python"))
 from crit_plugins import files  # noqa: E402
 
 BINARY = getattr(os, "O_BINARY", 0)

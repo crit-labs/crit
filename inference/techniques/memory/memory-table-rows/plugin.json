@@ -1,0 +1,64 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "memory-table-rows",
+  "title": "Lookup-table rows held in memory",
+  "description": "The plain embeddings plugin: the table kept in memory, rows indexed by id. The reference for file-backed tables; its device form's store() returns a table handle (lookup(ids), close(); any number of tables, NVFP4 rows too, as lookup-table-rows' store() gives them) indexing a table on the device, or with host: true keeping it in registered host memory and gathers a step's rows over the link (no device memory for the table); open() (embeddings:host) reads a table the plan put off the device from the checkpoint's files once into registered host memory, gathered over the link the same way. Either lookup captures in a CUDA graph (rounds:embeddings, and prompts:embeddings: a padded prompt bucket's lookup reads the batch's token ids alone, the padding row 0).",
+  "fills": [
+    "embeddings"
+  ],
+  "devices": [
+    "cuda",
+    "cpu"
+  ],
+  "provides": [
+    "rounds:embeddings",
+    "prompts:embeddings",
+    "embeddings:host"
+  ],
+  "options": {
+    "host": {
+      "type": "bool",
+      "default": false,
+      "description": "device form: store() keeps the table in registered host memory, gathered over the link (lookup-table-rows' HostRows), not on the device"
+    }
+  },
+  "sources": {
+    "rows": "../lookup-table-rows/code",
+    "memory": "../../experts/device-expert-cache/code"
+  },
+  "entry": "plugin.py:create",
+  "test_with": [
+    "lookup-table-rows"
+  ],
+  "defines": {
+    "slots": {
+      "embeddings": {
+        "about": "token embedding and lookup-table rows",
+        "host": {
+          "load": "load(table): the lookup table, one [width] row per id (token or hashed n-gram embeddings)",
+          "rows": "rows(ids) -> [row]: the table rows of the ids, in request order"
+        },
+        "device": {
+          "store": "store(rows, format=None, scales=None, scale=1.0, dtype=None) -> table: a lookup table on the device ([ids][width] of its dtype; format nvfp4: rows the E2M1 codes [ids][width / 2], scales the E4M3 scales [ids][width / 16], scale the global scale, dtype the decoded dtype), returned as a handle with lookup(ids) and close(); a plugin holds any number of tables",
+          "lookup": "lookup(ids) -> rows: the last stored table's row of each id ([tokens] int64 -> [tokens][width])"
+        },
+        "cases": "cases.py:embeddings"
+      }
+    },
+    "facts": {
+      "rounds:embeddings": {
+        "methods": {}
+      },
+      "prompts:embeddings": {
+        "methods": {}
+      },
+      "embeddings:host": {
+        "methods": {
+          "open": "open(source, width, dtype, device) -> a table (lookup(ids), prefetch(ids), close()): the table in host memory or files (source: a CPU tensor of rows, a file path, a list of paths each holding the next rows, or {paths, offsets, rows}); store(rows) also returns one",
+          "prefetch": "prefetch(ids): host ids known ahead (the next prompt chunk, a round's tokens), read for the last table's lookup"
+        },
+        "about": "Lookup-table rows kept in host memory or files, staged to the device."
+      }
+    }
+  }
+}

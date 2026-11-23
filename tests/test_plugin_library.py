@@ -1,5 +1,5 @@
 """crit's library of plugins, its Inference folder: every technique that fills a slot is one plugin of its id and passes
-its own tests against its reference, the base plugins (inference/base) give each slot its plain plugin, every entry is a
+its own tests against its reference, each slot's plain plugin sits in its category beside them, every entry is a
 plugin, lends one its code or is an engine service, and crit plugins add copies plugins into an engine where their tests
 pass again (offline, CPU)."""
 import ast
@@ -29,21 +29,22 @@ def source_files(name):
                                                          or (folder == str(ROOT) and f == "build")))
         found += [Path(folder) / name] if name in files else []
     return found
-sys.path.insert(0, str(ROOT / "core" / "python"))
+sys.path.insert(0, str(ROOT / "inference" / "core" / "python"))
 sys.path.insert(0, str(ROOT / "cli"))
 sys.path.insert(0, str(ROOT / "kernels"))
 # The plugins' own tests run in subprocesses (crit_plugins.testing), which see PYTHONPATH, not this sys.path: Core's
 # kernel settings (crit_plugins.kernels) import crit_kernels, and it crit: an installed crit has both beside crit_core.
-os.environ["PYTHONPATH"] = os.pathsep.join([str(ROOT / folder) for folder in ("kernels", "cli", "core/python")]
+os.environ["PYTHONPATH"] = os.pathsep.join([str(ROOT / folder) for folder in ("kernels", "cli", "inference/core/python")]
                                            + ([os.environ["PYTHONPATH"]] if os.environ.get("PYTHONPATH") else []))
 
-from crit_plugins import SLOTS, PluginError, Registry  # noqa: E402
-from crit_plugins.slots import CASES, INTERFACES  # noqa: E402
+from crit_plugins import PluginError, Registry  # noqa: E402
+
 from crit_plugins.testing import run_tests  # noqa: E402
 from crit.plugins import ENGINE_SERVICES, SOURCES, add, library, main, status, update  # noqa: E402
 
-INFERENCE = ROOT / "inference"
-ENTRIES = sorted(p.parent.name for p in INFERENCE.glob("*/entry.json"))
+INFERENCE = ROOT / "inference" / "techniques"
+MODELS_CORE = ROOT / "models" / "core"
+ENTRIES = sorted(p.parent.name for p in INFERENCE.glob("*/*/entry.json"))
 BASE = ["chain-verifier", "device-placement", "expert-tensors", "experts-reference", "greedy-head-drafter",
         "memory-table-rows", "projections-dense", "sequential-recurrence", "softmax-attention", "topk-router",
         "torch-norms"]
@@ -77,32 +78,34 @@ def tests_of(manifest):
 tests_of.__test__ = False   # a helper, not a test (pytest collects module functions named test*)
 
 
+def harness_of(manifest):
+    """crit_models.testing, where a model plugin's tests run on it (whole engines over library plugins the harness
+    names, held to Core's model interface there), else None."""
+    if "from crit_models import testing" not in tests_of(manifest):
+        return None
+    from crit_models import testing
+    return testing
+
+
 class LibraryTests(unittest.TestCase):
     maxDiff = None   # a failing plugin's whole test output, not a diff cut to its first characters
     @classmethod
     def setUpClass(cls):
         cls.registry = library()
 
-    def test_every_library_plugin_passes_its_own_tests(self):
-        # Where Core's runtime is not built (a checkout before `crit core build`), a plugin whose tests skip only for
-        # it fails crit plugins test but not this suite, which has its own tests gate on the runtime; CI builds it, so
-        # there every unchecked skip fails here too.
-        from crit_core.native import step_library
-        from crit_plugins.testing import NO_CORE_RUNTIME
-        built = step_library() is not None
-        items = run_tests(self.registry, log=lambda line: None)
-        failed = {i["name"]: i["detail"] for i in items if i["state"] != "passed"
-                  and (built or not i.get("unchecked") or any(s["reason"] != NO_CORE_RUNTIME for s in i["unchecked"]))}
-        self.assertEqual(failed, {})
-        self.assertEqual(len(items), len(self.registry))
-
     def test_every_plugin_fills_slots_crit_names_and_is_held_to_their_interface(self):
         for manifest in self.registry:
             with self.subTest(plugin=manifest["id"]):
-                self.assertTrue(set(manifest["fills"]) <= set(SLOTS), manifest["fills"])
-                self.assertTrue(set(manifest["fills"]) <= set(INTERFACES), manifest["fills"])
-                self.assertIn("assertImplements", tests_of(manifest))
+                self.assertTrue(set(manifest["fills"]) <= set(self.registry.contracts.slots), manifest["fills"])
+                self.assertTrue(set(manifest["fills"]) <= set(self.registry.contracts.host), manifest["fills"])
                 self.assertTrue(manifest["description"])
+                if not manifest["fills"]:
+                    continue   # a core other plugins extend: no engine part by itself
+                harness = harness_of(manifest)
+                held = tests_of(manifest) if harness is None else Path(harness.__file__).read_text(encoding="utf-8")
+                self.assertIn("assertImplements", held)
+                if harness is not None:   # its engine classes take the harness's checks
+                    self.assertRegex(tests_of(manifest), r"class \w+\(t\.Layout\):")
 
     def test_a_plugin_with_a_reference_is_compared_with_it(self):
         compared = [m for m in self.registry if m["reference"]]
@@ -110,7 +113,7 @@ class LibraryTests(unittest.TestCase):
         for manifest in compared:
             with self.subTest(plugin=manifest["id"]):
                 self.assertRegex(tests_of(manifest), r"assertMatchesReference\(|self\.reference\(")
-        for slot in CASES:
+        for slot in self.registry.contracts.cases:
             with self.subTest(slot=slot):
                 self.assertTrue(any(slot in m["fills"] for m in self.registry), f"no library plugin fills {slot}")
 
@@ -119,23 +122,26 @@ class LibraryTests(unittest.TestCase):
         for manifest in self.registry:
             with self.subTest(plugin=manifest["id"]):
                 named = {m for m in re.findall(r'"([a-z0-9][a-z0-9-]*)"', tests_of(manifest)) if m in ids}
+                harness = harness_of(manifest)
+                named |= set(harness.PLUGINS) if harness is not None else set()
                 expected = named - {manifest["id"]} - set(manifest["reference"] or [])
                 self.assertEqual(set(manifest["test_with"]), expected)
 
     def test_a_technique_is_its_entry_and_builds_on_its_own_code(self):
         for manifest in self.registry:
             folder = Path(manifest["folder"])
-            if folder.parent.name == "base":
+            if not (folder / "entry.json").is_file():   # a slot's plain plugin, a model plugin or the models core
                 continue
             with self.subTest(plugin=manifest["id"]):
-                self.assertEqual(folder.parent, INFERENCE)
-                self.assertTrue((folder / "entry.json").is_file())
+                self.assertEqual(folder.parent.parent, INFERENCE)
+                self.assertEqual(json.loads((folder / "entry.json").read_text(encoding="utf-8"))["category"],
+                                 folder.parent.name)
                 self.assertEqual(json.loads((folder / "entry.json").read_text(encoding="utf-8"))["id"], manifest["id"])
                 paths = [source["path"] for source in manifest["sources"].values()]
                 self.assertEqual(paths[0], "code", "a technique's first source is its own code")
                 for source in manifest["sources"].values():
                     code = Path(source["folder"])
-                    self.assertEqual((code.parent.parent, code.name), (INFERENCE, "code"), source["path"])
+                    self.assertEqual((code.parent.parent.parent, code.name), (INFERENCE, "code"), source["path"])
 
     def test_every_declared_kernel_is_one_the_plugin_loads_and_one_of_crits(self):
         """plugin.json "kernels" lists what the plugin's code asks crit_plugins.kernels.load_kernel for, by name
@@ -176,27 +182,79 @@ class LibraryTests(unittest.TestCase):
             self.assertEqual(kernel_requests([module]), (False, {"c"}))
 
     def test_every_slot_with_cases_has_one_base_plugin_and_it_has_no_entry(self):
-        base = [m for m in self.registry if Path(m["folder"]).parent == INFERENCE / "base"]
+        base = [m for m in self.registry if Path(m["folder"]).is_relative_to(INFERENCE)
+                and not (Path(m["folder"]) / "entry.json").is_file()]   # a slot's plain plugin: no technique entry
         self.assertEqual(sorted(m["id"] for m in base), BASE)
         slots = [slot for m in base for slot in m["fills"]]
         self.assertEqual(len(slots), len(set(slots)), "one base plugin per slot")
-        self.assertTrue(set(CASES) - {"sampler", "kv_cache"} <= set(slots))
+        self.assertTrue(set(self.registry.contracts.cases) - {"sampler", "kv_cache"} <= set(slots))
+        # A layer part's slot is its base plugin's to define (crit_plugins.contracts), with its cases beside it.
+        defined = {slot for m in base for slot in m["defines"].get("slots", {})}
+        with_cases = {slot for m in base for slot, spec in m["defines"].get("slots", {}).items() if spec.get("cases")}
+        self.assertTrue(with_cases <= set(slots))   # a slot's cases come with the base plugin that fills it
+        self.assertEqual(defined & {"model", "placement", "kv_cache", "sampler", "drafter", "verifier"}, set())
         for manifest in base:
             with self.subTest(plugin=manifest["id"]):
                 self.assertIsNone(manifest["reference"])
                 self.assertFalse((Path(manifest["folder"]) / "entry.json").exists())
                 for source in manifest["sources"].values():
-                    self.assertEqual(Path(source["folder"]).parent.parent, INFERENCE, source["path"])
+                    self.assertEqual(Path(source["folder"]).parent.parent.parent, INFERENCE, source["path"])
 
     def test_every_inference_entry_is_a_plugin_or_lends_one_code_or_is_an_engine_service(self):
-        techniques = {Path(m["folder"]).name for m in self.registry if Path(m["folder"]).parent == INFERENCE}
-        sourced = {Path(s["folder"]).parent.name for m in self.registry for s in m["sources"].values()}
+        techniques = {Path(m["folder"]).name for m in self.registry if (Path(m["folder"]) / "entry.json").is_file()}
+        sourced = {Path(s["folder"]).parent.name for m in self.registry for s in m["sources"].values()
+                   if Path(s["folder"]).parent.parent.parent == INFERENCE}
         self.assertEqual(set(ENGINE_SERVICES) & (techniques | sourced), set())
         self.assertEqual(sorted(techniques | sourced | set(ENGINE_SERVICES)), ENTRIES)
         self.assertEqual(sorted(sourced - techniques), ["async-expert-contributions", "expert-streamed-prefill"])
-        self.assertEqual((len(techniques), len(ENTRIES)), (23, 29))
-        self.assertEqual(list(INFERENCE.glob("*/plugins/*/plugin.json")), [])
+        self.assertEqual((len(techniques), len(ENTRIES)), (22, 28))
+        self.assertEqual(list(INFERENCE.glob("*/*/plugins/*/plugin.json")), [])
 
+
+class PluginRuns:
+    """The library's plugins' own tests, one part of the library a class (every PARTS-th plugin of the registry from
+    `part`): each class is a unit tests/run_parallel.py runs in its own process, so the library's tests, the longest
+    unit of the suite while one test ran them all, spread over the shards."""
+    maxDiff = None   # a failing plugin's whole test output, not a diff cut to its first characters
+    PARTS = 4
+    part = 0
+
+    def test_every_library_plugin_of_this_part_passes_its_own_tests(self):
+        # Where Core's runtime is not built (a checkout before `crit core build`), a plugin whose tests skip only for
+        # it fails crit plugins test but not this suite, which has its own tests gate on the runtime; CI builds it, so
+        # there every unchecked skip fails here too.
+        from crit_core.native import step_library
+        from crit_plugins.testing import NO_CORE_RUNTIME
+        built = step_library() is not None
+        registry = library()
+        mine = [manifest["id"] for index, manifest in enumerate(registry) if index % self.PARTS == self.part]
+        items = run_tests(registry, only=mine, log=lambda line: None)
+        failed = {i["name"]: i["detail"] for i in items if i["state"] != "passed"
+                  and (built or not i.get("unchecked") or any(s["reason"] != NO_CORE_RUNTIME for s in i["unchecked"]))}
+        self.assertEqual(failed, {})
+        self.assertEqual(sorted(i["name"] for i in items), sorted(mine))
+
+
+class LibraryPluginTestsA(PluginRuns, unittest.TestCase):
+    part = 0
+
+
+class LibraryPluginTestsB(PluginRuns, unittest.TestCase):
+    part = 1
+
+
+class LibraryPluginTestsC(PluginRuns, unittest.TestCase):
+    part = 2
+
+
+class LibraryPluginTestsD(PluginRuns, unittest.TestCase):
+    part = 3
+
+
+class PluginPartsTests(unittest.TestCase):
+    def test_the_parts_hold_every_library_plugin_once(self):
+        parts = [cls.part for cls in PluginRuns.__subclasses__()]
+        self.assertEqual(sorted(parts), list(range(PluginRuns.PARTS)))
 
 class AddTests(unittest.TestCase):
     maxDiff = None   # a failing plugin's whole test output, not a diff cut to its first characters
@@ -207,12 +265,12 @@ class AddTests(unittest.TestCase):
 
     def test_an_update_copies_the_code_its_plugins_import_again(self):
         add(self.dest, ["heterogeneous-expert-dispatch"])
-        stale = self.dest / SOURCES / "host-expert-tier" / "code"
+        stale = self.dest / SOURCES / "experts" / "host-expert-tier" / "code"
         files = sorted(p for p in stale.rglob("*.py"))
         self.assertTrue(files)
         files[0].write_text("# a stale copy\n", encoding="utf-8")
         report = add(self.dest, ["heterogeneous-expert-dispatch"], update=True)
-        self.assertIn(f"{SOURCES}/host-expert-tier/code", report["sources"])
+        self.assertIn(f"{SOURCES}/experts/host-expert-tier/code", report["sources"])
         self.assertNotEqual(files[0].read_text(encoding="utf-8"), "# a stale copy\n")
 
     def test_added_plugins_bring_their_references_tests_and_code_and_pass_there(self):
@@ -224,30 +282,30 @@ class AddTests(unittest.TestCase):
         self.assertEqual(added["quantized-projections"], "the reference of host-expert-arithmetic")
         self.assertEqual(added["projections-dense"], "the reference of quantized-projections")
         self.assertEqual(added["attention-state"], "the tests of softmax-attention use it")
-        self.assertEqual(sorted(report["sources"]), [f"{SOURCES}/async-expert-contributions/code",
-                                                     f"{SOURCES}/expert-streamed-prefill/code",
-                                                     f"{SOURCES}/grouped-experts/code",
-                                                     f"{SOURCES}/host-expert-tier/code",
-                                                     f"{SOURCES}/lookup-table-rows/code"])   # memory-table-rows' rows
+        self.assertEqual(sorted(report["sources"]), [f"{SOURCES}/experts/async-expert-contributions/code",
+                                                     f"{SOURCES}/experts/expert-streamed-prefill/code",
+                                                     f"{SOURCES}/experts/grouped-experts/code",
+                                                     f"{SOURCES}/experts/host-expert-tier/code",
+                                                     f"{SOURCES}/memory/lookup-table-rows/code"])   # memory-table-rows' rows
         engine = Registry.discover(self.dest)
         self.assertEqual(set(engine.manifests), set(added))
-        self.assertTrue((self.dest / "host-expert-arithmetic" / "README.md").is_file())   # a technique comes whole
-        self.assertTrue((self.dest / "base" / "softmax-attention" / "plugin.json").is_file())
+        self.assertTrue((self.dest / "experts" / "host-expert-arithmetic" / "README.md").is_file())   # a technique comes whole
+        self.assertTrue((self.dest / "attention" / "softmax-attention" / "plugin.json").is_file())
 
         def sources(folder):
             return json.loads((self.dest / folder / "plugin.json").read_text(encoding="utf-8"))["sources"]
 
-        self.assertEqual(sources("heterogeneous-expert-dispatch"), {
-            "dispatch": "code", "contributions": f"../{SOURCES}/async-expert-contributions/code",
-            "prefill": f"../{SOURCES}/expert-streamed-prefill/code", "tier": f"../{SOURCES}/host-expert-tier/code",
-            "arithmetic": "../host-expert-arithmetic/code", "quantized": "../quantized-projections/code",
+        lent = f"../../{SOURCES}/experts"   # code no plugin of the engine holds, at its place in the library
+        self.assertEqual(sources("experts/heterogeneous-expert-dispatch"), {
+            "dispatch": "code", "contributions": f"{lent}/async-expert-contributions/code",
+            "prefill": f"{lent}/expert-streamed-prefill/code", "tier": f"{lent}/host-expert-tier/code",
+            "arithmetic": "../host-expert-arithmetic/code", "quantized": "../../projections/quantized-projections/code",
             "split": "../device-expert-cache/code",
-            "grouped": f"../{SOURCES}/grouped-experts/code"})
-        self.assertEqual(sources("host-expert-arithmetic"), {"arithmetic": "code",
-                                                             "quantized": "../quantized-projections/code"})
-        self.assertEqual(sources("base/softmax-attention"), {"state": "../../attention-state/code"})
-        self.assertEqual(sources("base/experts-reference"),
-                         {"prefill": f"../../{SOURCES}/expert-streamed-prefill/code"})
+            "grouped": f"{lent}/grouped-experts/code"})
+        self.assertEqual(sources("experts/host-expert-arithmetic"), {
+            "arithmetic": "code", "quantized": "../../projections/quantized-projections/code"})
+        self.assertEqual(sources("attention/softmax-attention"), {"state": "../attention-state/code"})
+        self.assertEqual(sources("experts/experts-reference"), {"prefill": f"{lent}/expert-streamed-prefill/code"})
         for manifest in engine:
             for source in manifest["sources"].values():
                 Path(source["folder"]).relative_to(self.dest.resolve())
@@ -257,13 +315,13 @@ class AddTests(unittest.TestCase):
 
     def test_the_engines_own_plugins_and_code_are_kept(self):
         add(self.dest, ["attention-state"])
-        (self.dest / "attention-state" / "plugin.py").write_text("# the engine's own\n" + (
-            self.dest / "attention-state" / "plugin.py").read_text(encoding="utf-8"), encoding="utf-8")
+        (self.dest / "attention" / "attention-state" / "plugin.py").write_text("# the engine's own\n" + (
+            self.dest / "attention" / "attention-state" / "plugin.py").read_text(encoding="utf-8"), encoding="utf-8")
         report = add(self.dest, ["softmax-attention"])
         self.assertEqual(report["added"], [("softmax-attention", "named")])
         self.assertEqual(report["kept"], [("attention-state", "the tests of softmax-attention use it")])
         self.assertEqual(report["sources"], [])    # it reads the engine's attention-state code
-        own = (self.dest / "attention-state" / "plugin.py").read_text(encoding="utf-8")
+        own = (self.dest / "attention" / "attention-state" / "plugin.py").read_text(encoding="utf-8")
         self.assertTrue(own.startswith("# the engine"))
         with self.assertRaisesRegex(PluginError, "has attention-state already"):
             add(self.dest, ["attention-state"])
@@ -272,7 +330,7 @@ class AddTests(unittest.TestCase):
 
     def test_update_replaces_a_library_copy_an_engine_plugin_reads(self):
         add(self.dest, ["softmax-attention"])
-        own = self.dest / "attention-state" / "plugin.py"
+        own = self.dest / "attention" / "attention-state" / "plugin.py"
         own.write_text("# an old copy\n" + own.read_text(encoding="utf-8"), encoding="utf-8")
         # an engine plugin of its own that reads attention-state's code and names it as its reference
         mine = self.dest / "my-attention"
@@ -280,7 +338,7 @@ class AddTests(unittest.TestCase):
         (mine / "plugin.json").write_text(json.dumps({
             "schema": "crit-plugin-v1", "id": "my-attention", "title": "The engine's attention",
             "description": "Reads attention-state's code.", "fills": ["attention"], "needs": [["kv:rows", "kv:pages"]],
-            "devices": ["cuda"], "reference": ["softmax-attention"], "sources": {"state": "../attention-state/code"},
+            "devices": ["cuda"], "reference": ["softmax-attention"], "sources": {"state": "../attention/attention-state/code"},
             "entry": "plugin.py:create"}), encoding="utf-8")
         (mine / "plugin.py").write_text("def create(context, options, parts):\n    return None\n", encoding="utf-8")
         report = add(self.dest, ["attention-state"], update=True)
@@ -296,7 +354,7 @@ class AddTests(unittest.TestCase):
         self.assertEqual({row["state"] for row in rows.values()}, {"current"})
         self.assertEqual(set(rows), {"softmax-attention", "attention-state"})
         # A copy the engine changed, and a plugin of its own.
-        own = self.dest / "attention-state" / "plugin.py"
+        own = self.dest / "attention" / "attention-state" / "plugin.py"
         own.write_text("# the engine's change\n" + own.read_text(encoding="utf-8"), encoding="utf-8")
         mine = self.dest / "my-sampler"
         mine.mkdir()
@@ -317,7 +375,7 @@ class AddTests(unittest.TestCase):
     def test_status_finds_the_library_version_a_copy_that_is_behind_came_from(self):
         # A library of its own in a git checkout: one plugin that imports another technique's code.
         root = Path(self.dest).parents[1] / "library"
-        inference = root / "inference"
+        inference = root / "inference" / "techniques"
         (inference / "tiny-sampler").mkdir(parents=True)
         (inference / "lent" / "code").mkdir(parents=True)
         (inference / "tiny-sampler" / "plugin.json").write_text(json.dumps({
@@ -386,7 +444,8 @@ class AddTests(unittest.TestCase):
 
     def test_needs_no_plugin_of_the_engine_provides_are_reported(self):
         report = add(self.dest, ["draft-trees", "experts-reference"])
-        self.assertEqual(report["unmet"]["draft:head"], ["model-template"])   # the model's: the library's provides it
+        # the model's: the finished model plugins whose layout has a draft layer provide it
+        self.assertEqual(report["unmet"]["draft:head"], ["inkling2-loop-model", "qwen3-5-model", "qwen4-exp-model"])
         self.assertNotIn("experts:source", report["unmet"])    # its tests bring expert-tensors
         report = add(self.dest, ["heterogeneous-expert-dispatch"])
         self.assertEqual(report["unmet"], {})
@@ -411,9 +470,9 @@ class AddTests(unittest.TestCase):
                 fitted = [plugin.strip() for plugin in fitting.split(":", 1)[1].split(",")]
                 self.assertEqual("quantized-projections" in fitted, fits, text)
                 self.assertEqual("not quantized-projections: needs cuda:fp4" in text, not fits, text)
-                # The library's model plugin composes llama from its decoder layout.
+                # The finished model plugin that serves llama; the models core fills no slot.
                 fitting = next(line for line in text.splitlines() if line.startswith("model (required)"))
-                self.assertEqual(fitting.split(":", 1)[1].strip(), "model-template", text)
+                self.assertEqual(fitting.split(":", 1)[1].strip(), "llama-qwen3-model", text)
 
     def test_the_cli_lists_the_library_and_adds_from_it(self):
         def run(*args):
@@ -424,21 +483,21 @@ class AddTests(unittest.TestCase):
         code, out = run("list")
         self.assertEqual(code, 0, out)
         self.assertRegex(out, r"recurrent-state-recovery +technique +recurrence ")
-        self.assertRegex(out, r"sequential-recurrence +base +recurrence ")
+        self.assertRegex(out, r"sequential-recurrence +plain +recurrence ")
         self.assertIn("(reference sequential-recurrence)", out)
         self.assertRegex(out, r"draft-trees +technique +drafter, verifier .*\(fused; reference greedy-head-drafter, "
                               r"chain-verifier\)")
         code, out = run("add", self.dest, "draft-trees")
         self.assertEqual(code, 0, out)
         self.assertIn("added   chain-verifier", out)
-        self.assertIn(f"copied  {SOURCES}/mtp-decode/code", out)
+        self.assertIn(f"copied  {SOURCES}/speculation/mtp-decode/code", out)
         code, out = run("add", self.dest, "draft-trees")
         self.assertEqual(code, 1)
         self.assertIn("has draft-trees already", out)
-        manifest = json.loads((self.dest / "draft-trees" / "plugin.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["sources"], {"trees": "code", "mtp": f"../{SOURCES}/mtp-decode/code"})
-        manifest = json.loads((self.dest / "base" / "chain-verifier" / "plugin.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["sources"], {"mtp": f"../../{SOURCES}/mtp-decode/code"})
+        manifest = json.loads((self.dest / "speculation" / "draft-trees" / "plugin.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["sources"], {"trees": "code", "mtp": f"../../{SOURCES}/speculation/mtp-decode/code"})
+        manifest = json.loads((self.dest / "speculation" / "chain-verifier" / "plugin.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["sources"], {"mtp": f"../../{SOURCES}/speculation/mtp-decode/code"})
 
 
 if __name__ == "__main__":

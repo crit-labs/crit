@@ -4,8 +4,8 @@ Latent attention (multi-head latent attention in its absorbed form) in Triton: d
 every query head over a paged cache of compressed rows, one row a position holding the latent (rank R) and then the
 rotary key (width P), shared by all heads. The latent is each position's value too, so a piece of cached rows is read
 once and serves the scores and the values. Operation `latent-attention` (attention-state's
-[operations.json](../../../../inference/attention-state/operations.json), reference
-[latent_attention.py](../../../../inference/attention-state/code/latent_attention.py)).
+[operations.json](../../../../inference/techniques/attention/attention-state/operations.json), reference
+[latent_attention.py](../../../../inference/techniques/attention/attention-state/code/latent_attention.py)).
 
 **Why it exists.** A model with latent attention keeps one compressed row a position instead of a key and a value a
 KV head (576 values a position at rank 512, against 128 heads' keys and values), and its decode reads that row from

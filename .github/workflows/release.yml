@@ -1,6 +1,7 @@
 name: Release to PyPI
 
-# A pushed vX.Y.Z tag builds crit X.Y.Z and crit-core X.Y.Z (core/python) and publishes both through PyPI trusted
+# A pushed vX.Y.Z tag builds crit X.Y.Z, crit-core X.Y.Z (inference/core/python) and crit-models X.Y.Z
+# (models/core/python) and publishes them through PyPI trusted
 # publishing (no token) once main's CI passed on the tagged commit. crit-eval releases from its own repository.
 on:
   push:
@@ -43,7 +44,8 @@ jobs:
           mkdir -p build/package-source
           git archive HEAD | tar -x -C build/package-source
           python -B -c "import os; from setuptools.build_meta import build_sdist, build_wheel; os.chdir('build/package-source'); build_sdist('../../dist'); build_wheel('../../dist')"
-          python -B -c "import os; from setuptools.build_meta import build_sdist, build_wheel; os.chdir('build/package-source/core/python'); build_sdist('../../../../dist'); build_wheel('../../../../dist')"
+          python -B -c "import os; from setuptools.build_meta import build_sdist, build_wheel; os.chdir('build/package-source/inference/core/python'); build_sdist('../../../../../dist'); build_wheel('../../../../../dist')"
+          python -B -c "import os; from setuptools.build_meta import build_sdist, build_wheel; os.chdir('build/package-source/models/core/python'); build_sdist('../../../../../dist'); build_wheel('../../../../../dist')"
           ls -l dist
       - name: Wheels install and run
         run: |
@@ -52,6 +54,7 @@ jobs:
           cd "$RUNNER_TEMP"
           crit --version
           python -B -c "import crit_core; print(crit_core.__version__)"
+          python -B -c "import crit_models; print(crit_models.__version__)"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist
@@ -105,14 +108,14 @@ jobs:
         with:
           name: dist
           path: dist/
-      - name: Split crit-core from crit
-        # crit pins crit-core exactly: crit-core is published first, so a failed upload never leaves a crit on PyPI
-        # whose pinned Core is missing.
+      - name: Split crit-core and crit-models from crit
+        # crit pins crit-core and crit-models exactly (crit-models pins crit-core): they are published first, so a
+        # failed upload never leaves a crit on PyPI whose pinned packages are missing.
         run: |
           mkdir -p core-dist
-          mv dist/crit_core-* core-dist/
+          mv dist/crit_core-* dist/crit_models-* core-dist/
           ls -l core-dist dist
-      - name: Publish crit-core
+      - name: Publish crit-core and crit-models
         uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with:
           packages-dir: core-dist/

@@ -4,7 +4,7 @@ from pathlib import Path
 import sys
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core" / "python"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "inference" / "core" / "python"))
 
 from crit_plugins.steps import GRACE, QUANTUM, SECONDS, StepBudget, Steps  # noqa: E402
 

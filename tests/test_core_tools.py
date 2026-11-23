@@ -6,7 +6,7 @@ import sys
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "api", "cli"): sys.path.insert(0, str(ROOT / _folder))
+for _folder in ("inference/core/python", "api", "cli"): sys.path.insert(0, str(ROOT / _folder))
 
 from crit_core.text import (ChatTemplate, TextError, ToolCallParser, ToolFormat, ToolReply,  # noqa: E402
                             templates_tool_format, tool_call_format)

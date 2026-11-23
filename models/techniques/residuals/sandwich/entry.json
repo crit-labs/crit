@@ -1,0 +1,38 @@
+{
+  "schema": "crit-model-technique-v1",
+  "id": "sandwich",
+  "category": "residuals",
+  "summary": "One residual stream, each block between two norms, a scalar a layer",
+  "provides": {
+    "residuals": [
+      "sandwich"
+    ]
+  },
+  "source": "sandwich",
+  "needs_sources": [
+    "template"
+  ],
+  "path": "models/techniques/residuals/sandwich/README.md",
+  "code_path": "models/techniques/residuals/sandwich/code",
+  "code_files": [
+    {
+      "path": "models/techniques/residuals/sandwich/code/sandwich.py",
+      "purpose": "The residual class and its registry (RESIDUALS)"
+    }
+  ],
+  "reads": {
+    "tensors": [
+      "input_layernorm.weight",
+      "layer_scalar",
+      "norm.weight",
+      "post_attention_layernorm.weight",
+      "post_feedforward_layernorm.weight",
+      "pre_feedforward_layernorm.weight"
+    ],
+    "config": [],
+    "layout": [
+      "norms",
+      "scalar"
+    ]
+  }
+}

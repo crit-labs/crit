@@ -1,0 +1,42 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "deepseek-v3-model",
+  "title": "The model plugin of DeepSeek-V3 checkpoints",
+  "description": "A pre-norm decoder of multi-head latent attention (each position one cached latent row and one rotary key every head shares, low-rank queries, interleaved rotary pairs) with a SwiGLU MLP on its first layers and, on the rest, a mixture of experts routed by sigmoid scores within the best groups, with shared experts. A finished model plugin: its layout (layout.json) composed by the models core it extends (model-template: the serving contracts, the options) from model techniques.",
+  "fills": [
+    "model"
+  ],
+  "needs": [
+    [
+      "model_type:deepseek_v3"
+    ]
+  ],
+  "requires": [
+    "norms",
+    "embeddings",
+    "router",
+    "experts"
+  ],
+  "devices": [
+    "cuda",
+    "cpu"
+  ],
+  "sources": {
+    "core": "../../core/model-template"
+  },
+  "extends": "core",
+  "test_with": [
+    "attention-state",
+    "device-placement",
+    "expert-tensors",
+    "experts-reference",
+    "fused-norms",
+    "memory-table-rows",
+    "projections-dense",
+    "softmax-attention",
+    "token-sampling",
+    "topk-router",
+    "torch-norms"
+  ],
+  "entry": "plugin.py:create"
+}

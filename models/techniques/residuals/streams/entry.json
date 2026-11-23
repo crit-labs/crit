@@ -1,0 +1,64 @@
+{
+  "schema": "crit-model-technique-v1",
+  "id": "streams",
+  "category": "residuals",
+  "summary": "Several residual streams (hyper-connections) mixed by weights the streams compute themselves",
+  "provides": {
+    "residuals": [
+      "streams"
+    ]
+  },
+  "source": "streams",
+  "needs_sources": [
+    "template"
+  ],
+  "path": "models/techniques/residuals/streams/README.md",
+  "code_path": "models/techniques/residuals/streams/code",
+  "code_files": [
+    {
+      "path": "models/techniques/residuals/streams/code/streams.py",
+      "purpose": "The residual class and its registry (RESIDUALS)"
+    }
+  ],
+  "reads": {
+    "tensors": [
+      "attn_hyper_connection.block_inject_weight",
+      "attn_hyper_connection.hc_norm.weight",
+      "attn_hyper_connection.input_mix_weight_down",
+      "attn_hyper_connection.input_mix_weight_up",
+      "fc_embedding",
+      "fc_hidden",
+      "fc_hidden.weight",
+      "hyper_connection_mixer.hc_norm.weight",
+      "hyper_connection_mixer.input_mix_weight_down",
+      "hyper_connection_mixer.input_mix_weight_up",
+      "layers.N.attn_hyper_connection.block_inject_weight",
+      "layers.N.attn_hyper_connection.hc_norm.weight",
+      "layers.N.attn_hyper_connection.input_mix_weight_down",
+      "layers.N.attn_hyper_connection.input_mix_weight_up",
+      "layers.N.mlp_hyper_connection.block_inject_weight",
+      "layers.N.mlp_hyper_connection.hc_norm.weight",
+      "layers.N.mlp_hyper_connection.input_mix_weight_down",
+      "layers.N.mlp_hyper_connection.input_mix_weight_up",
+      "mlp_hyper_connection.block_inject_weight",
+      "mlp_hyper_connection.hc_norm.weight",
+      "mlp_hyper_connection.input_mix_weight_down",
+      "mlp_hyper_connection.input_mix_weight_up",
+      "pre_fc_norm_embedding.weight",
+      "pre_fc_norm_hidden.weight"
+    ],
+    "config": [
+      "hc_count"
+    ],
+    "layout": [
+      "count",
+      "down",
+      "ffn",
+      "final",
+      "inject",
+      "mixer",
+      "norm",
+      "up"
+    ]
+  }
+}

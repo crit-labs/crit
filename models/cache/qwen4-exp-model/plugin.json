@@ -1,0 +1,55 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "qwen4-exp-model",
+  "title": "The model plugin of Qwen4-Exp checkpoints",
+  "description": "A hybrid decoder over several residual streams (hyper-connections: each block reads a row mixed from the streams and its output is added to every stream by weights of its own) of gated delta-rule layers and gated block-sparse attention (an indexer picks the KV blocks a token reads past its budget), with zero-centred RMSNorms (1 + weight), a mixture of experts with a gated shared expert, and a multi-token-prediction layer the model drafts from. A finished model plugin: its layout (layout.json) composed by the models core it extends (model-template: the serving contracts, the options) from model techniques.",
+  "fills": [
+    "model"
+  ],
+  "needs": [
+    [
+      "model_type:qwen4_exp",
+      "model_type:qwen4_exp_text"
+    ]
+  ],
+  "requires": [
+    "norms",
+    "embeddings",
+    "recurrence",
+    "router",
+    "experts"
+  ],
+  "provides": [
+    "draft:head",
+    "draft:head-device"
+  ],
+  "devices": [
+    "cuda",
+    "cpu"
+  ],
+  "sources": {
+    "core": "../../core/model-template"
+  },
+  "extends": "core",
+  "test_with": [
+    "attention-state",
+    "device-placement",
+    "expert-tensors",
+    "experts-reference",
+    "fused-norms",
+    "memory-table-rows",
+    "projections-dense",
+    "sequential-recurrence",
+    "softmax-attention",
+    "token-sampling",
+    "topk-router",
+    "torch-norms"
+  ],
+  "kernels": [
+    {
+      "name": "sparse-indexer",
+      "fallback": "an indexed attention's blocks scored in torch a token at a time and chosen by Core's topk_blocks (the same canonical choice, slower at long contexts)"
+    }
+  ],
+  "entry": "plugin.py:create"
+}

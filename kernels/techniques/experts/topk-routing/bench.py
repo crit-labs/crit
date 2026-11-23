@@ -71,7 +71,7 @@ class WarpRows:
         picked weights' softmax or renormalization; the selection by torch.topk below 1,024 rows and by FlashInfer's
         row top-k (flashinfer.top_k, sorted) from 1,024 rows, the faster of the two at each (RTX 5090, 512 experts:
         torch 24 us against 91 at 1 row, 210 against 153 at 4,096). No library fuses the whole rule: FlashInfer's
-        fused_topk_deepseek always limits groups (one group of all experts is rejected for top > 1)."""
+        fused grouped top-k always limits groups (one group of all experts is rejected for top > 1)."""
         logits, top, bias, rule = s["logits"], s["top"], s["bias"], s["rule"]
         top_k = None
         if logits.shape[0] >= 1024:

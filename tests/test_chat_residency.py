@@ -828,7 +828,7 @@ class OwnershipReadTests(unittest.TestCase):
 
 
 # crit as installed for a child process: the CLI package with Core's Python package (a dependency of crit) beside it.
-INSTALLED = os.pathsep.join(str(Path(__file__).resolve().parents[1] / folder) for folder in ('cli', 'core/python'))
+INSTALLED = os.pathsep.join(str(Path(__file__).resolve().parents[1] / folder) for folder in ('cli', 'inference/core/python'))
 
 
 @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux process identity and group retirement')

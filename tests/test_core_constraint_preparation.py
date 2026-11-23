@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 import sys
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "core/python"))
+sys.path.insert(0, str(ROOT / "inference/core/python"))
 
 from crit_core.constraints import compiler, preparation  # noqa: E402
 

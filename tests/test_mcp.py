@@ -12,7 +12,7 @@ import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-FOLDERS = ("core/python", "api", "../crit-eval", "kernels", "models", "cli", "mcp")
+FOLDERS = ("inference/core/python", "api", "../crit-eval", "kernels", "cli", "mcp")
 for _folder in FOLDERS: sys.path.insert(0, str(ROOT / _folder))
 from crit.process.ownership import process_identity
 from crit_mcp.jobs import Jobs

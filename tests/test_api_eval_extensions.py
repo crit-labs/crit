@@ -35,6 +35,7 @@ Engine.telemetry = lambda self: {"kv": {"pages": 4, "free_pages": 2}, "core": {"
 
 
 class Served(ServeFixture):
+    shared_engine = True   # its tests leave the served engine as they found it, or get a new one (ServeFixture)
     def setUp(self):
         super().setUp()
         self.server = Server(("127.0.0.1", 0), Api(self.engine()))

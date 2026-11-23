@@ -7,7 +7,8 @@ origin. See [licensing](LICENSES.md).
 
 Every change must meet the three criteria in [what belongs in crit](CONTRIBUTION_CRITERIA.md):
 it improves the platform measurably, it does not overfit to one model or machine, and it is
-valuable to almost any model on any hardware backend.
+valuable to almost any model on any hardware backend. Shared code names no model: `python tests/test_model_neutral.py`
+checks it ([model-neutral code](CONTRIBUTION_CRITERIA.md#model-neutral-code)).
 
 ## How pull requests land
 
@@ -28,10 +29,11 @@ release is out, naming the version it shipped in.
 
 | Folder | Responsibility |
 | --- | --- |
-| `core/` | C++ request lifecycle, scheduling, resources and retirement, with its text, file and structured-output libraries; the `crit_core` and `crit_plugins` Python packages (`python/`) |
-| `inference/` | Reusable technique descriptions, contracts and code |
+| `inference/core/` | Core: C++ request lifecycle, scheduling, resources and retirement, with its text, file and structured-output libraries; the `crit_core` and `crit_plugins` Python packages (`python/`) |
+| `inference/techniques/` | Reusable technique descriptions, contracts and code by category (`attention/`, `experts/`, `memory/`, `norms/`, `projections/`, `recurrence/`, `sampling/`, `speculation/`), each slot's plain plugin beside them |
+| `inference/starters/` | The plugin engine walkthrough |
+| `models/` | Model plugins: the core they extend (`core/model-template`, and `core/python`, crit-models), the model techniques (`techniques/`) and the finished model plugins (`cache/`) |
 | `kernels/` | Kernel inspection/retention, the `crit_kernels` package behind `crit kernels`, integration examples |
-| `models/` | Weight transforms (PTQ), their recipes and records, the `crit_models` package behind `crit models` |
 | `eval/` | Common evaluation suite, preparation, reference scoring and comparisons |
 | `cli/` | The `crit` command, run records, process trees and runtime ownership |
 | `api/` | `crit serve`, the OpenAI-compatible API |
@@ -52,18 +54,29 @@ the pinned dependencies CI installs:
 
 ```sh
 python -m pip install tokenizers==0.23.3 jinja2==3.1.6
-python -m pip install -e core/python -e .
+python -m pip install -e inference/core/python -e models/core/python -e .
 crit core build
 python -B -m unittest discover -s tests -v
 ```
 
-`-e core/python` matters: crit's version pin on `crit-core` is met by the release on PyPI too, and a checkout's CLI
+`-e inference/core/python` matters: crit's version pin on `crit-core` is met by the release on PyPI too, and a checkout's CLI
 on a released Core fails in confusing ways, so crit refuses to run that way. `crit core build` builds Core's runtime,
 `crit_core_steps`, into `build/core-steps/<sys.platform>` (`win32`, `linux`, ...), where Core's loader finds it
 (`CRIT_CORE_STEP_LIBRARY` names another).
 `python -B tests/run_parallel.py` runs the same tests as CI does, several processes at once: one a module, or one
 a test class where [tests/durations.json](../tests/durations.json) splits a module. `--shard I/N` runs one of CI's
-shards, filled by those recorded times.
+shards, filled by those recorded times. Each process computes on one thread (`OMP_NUM_THREADS=1` unless set): side
+by side, torch's thread per core in every process made the suite several times slower.
+
+While a change is being written, `python -B tests/run_parallel.py --changed` runs only the test modules the working
+tree's change touches ([tests/select_tests.py](../tests/select_tests.py): the modules that import a changed file,
+through the tests' own modules and crit's packages, or that name a changed library item, which is loaded by path),
+and `--changed main` those of the branch's commits as well. `--fast 30` leaves out the units recorded as longer than
+30 s and lists them. A changed file no test module imports or names is listed: run that item's own tests (`crit
+plugins test`, `crit kernels test`). Before a push, `ruff check .`, `python -B tests/test_model_neutral.py` and
+`python -B tests/test_technique_reads.py` are CI's lint job, half a minute together; the two guards run there and
+not among the host tests (`tests/run_parallel.py --only test_model_neutral test_technique_reads` runs them too). The whole suite is the check of
+a finished change, and CI runs all of it.
 
 CI installs no transformers, so the fixtures that compare against transformers' own code (expert routing, RoPE
 tables) skip there. They run with torch and a transformers in crit's supported range, `>=5.20,<6` (the `reference`
@@ -79,7 +92,7 @@ published checkpoints store their tensors in (an FP8 n-gram table, a draft layer
 decoder experts). Two checks cover them:
 
 - **Checkpoint manifests** (CPU, in CI): [tests/manifests](../tests/manifests) keeps the safetensors headers and
-  configs of every checkpoint crit targets, and `tests/test_checkpoint_manifests.py` loads model-template over each
+  configs of every checkpoint crit targets, and `tests/test_checkpoint_manifests.py` loads the model plugin that serves it over each
   one without its weights ([tests/support/dry_plan.py](../tests/support/dry_plan.py)), failing on a tensor the load
   cannot read or that no part of the model reads. Add a target's manifest with
   `python tests/support/manifests.py MODEL_FOLDER`, which reads only the headers.
@@ -87,7 +100,7 @@ decoder experts). Two checks cover them:
   layer-cut copies of real checkpoints ([tests/support/layer_cut.py](../tests/support/layer_cut.py): a few decoder
   layers, every tensor byte for byte, and a twelve-layer cut where an error that grows with depth shows) as
   `crit run serve --check` serves a candidate of the library's plugins at their defaults, in both quality modes and at four device memory pressures made by a VRAM ballast
-  (`CRIT_VRAM_BALLAST`, [crit_plugins.memory](../core/python/crit_plugins/memory.py)), with short, 32k and
+  (`CRIT_VRAM_BALLAST`, [crit_plugins.memory](../inference/core/python/crit_plugins/memory.py)), with short, 32k and
   full-context prompts, a cancel inside a prefill, a reopen at a lower context, drafting from the draft layer and
   through the drafter seam, crit smoke and crit-eval's gate pre-check repeated for its spread. A ladder of prompt
   lengths fails where a longer prompt is prefilled at a lower rate than a shorter one (a cost its length does not
@@ -102,20 +115,20 @@ Builds and releases start only from a commit where both pass ([Building engines]
 ## Source snapshots
 
 [CI](../.github/workflows/ci.yml) runs the host tests on Windows and Linux with Python 3.11
-and 3.14, in shards, and the native CMake tests once per OS and compiler, builds independent SDK consumers
+and 3.14, in shards (a pull request runs Python 3.11 on Linux only; a push to main on Windows too), and the native CMake tests once per OS and compiler, builds independent SDK consumers
 and installs the wheel from a clean snapshot:
 
 ```sh
 mkdir -p build/package-source
 git archive HEAD | tar -x -C build/package-source
 python -B -c "import os; from setuptools.build_meta import build_sdist, build_wheel; os.chdir('build/package-source'); build_sdist('../dist'); build_wheel('../dist')"
-python -m pip install build/dist/crit-0.22.0-py3-none-any.whl
+python -m pip install build/dist/crit-0.23.0-py3-none-any.whl
 ```
 
-The `crit` wheel holds `crit`, `crit_api`, `crit_kernels`, `crit_mcp`, `crit_models` and `crit_smoke`, and
+The `crit` wheel holds `crit`, `crit_api`, `crit_kernels`, `crit_mcp` and `crit_smoke`, and
 Inference, the plugin library, as package data at `crit/library/inference`: every technique's and base plugin's
 folder whole, without Inference's native `CMakeLists.txt` and `examples/`, which build against a checkout's `core/`.
-Core's `crit_core` and `crit_plugins` are the `crit-core` wheel (`core/python`), and crit Eval is its own
+Core's `crit_core` and `crit_plugins` are the `crit-core` wheel (`inference/core/python`), and crit Eval is its own
 distribution, `crit-eval`. crit depends on `tokenizers`, `jinja2`, `crit-core` and `crit-eval`. Core's native SDK is
 a separate CMake project, and Eval's suite data ship in the source checkout. crit finds its library in the checkout it
 runs from (`inference/`, installed with `-e .` or not), else in the copy its wheel ships, so an engine's plugins are

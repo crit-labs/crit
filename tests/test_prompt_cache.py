@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "tests"):
+for _folder in ("inference/core/python", "tests"):
     sys.path.insert(0, str(ROOT / _folder))
 
 from core_text_fixtures import llama_files, write_files  # noqa: E402

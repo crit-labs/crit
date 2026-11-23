@@ -300,6 +300,97 @@ def test_a_cuda_prompt_chunk_reads_its_own_keys_and_values_fresh(kind):
                 torch.testing.assert_close(lse[t].double(), want_lse, atol=1e-3, rtol=1e-4, msg=(at, split, t))
 
 
+def _biased_reference(q, keys, values, bias, position, t, sliding, scale):
+    """Token t of a chunk at `position` in float64: positions d < extent behind it get bias[t][h][d] after the scale."""
+    end = position + t + 1
+    behind = end - 1 - torch.arange(end, device=dev)
+    seen = behind >= 0 if not sliding else behind < sliding
+    extent = bias.shape[2]
+    out, lse = [], []
+    hq, hkv = q.shape[1], keys.shape[1]
+    for h in range(hq):
+        k, v = keys[:end, h // (hq // hkv)], values[:end, h // (hq // hkv)]
+        s = (k @ q[t, h].double()) * scale
+        s = s + torch.where(behind < extent, bias[t, h].double()[behind.clamp(max=extent - 1)], 0.0)
+        s = torch.where(seen, s, torch.tensor(float("-inf"), dtype=torch.float64, device=dev))
+        lse.append(torch.logsumexp(s, 0))
+        out.append(torch.softmax(s, 0) @ v)
+    return torch.stack(out), torch.stack(lse)
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("kind", ["fp8:row", "bf16"])
+@pytest.mark.parametrize("sliding,extent", [(0, 48), (64, 64), (0, 1000)])
+def test_a_cuda_prompt_chunk_adds_each_tokens_distance_bias(kind, sliding, extent):
+    # Each token's scores for the positions d < extent behind it get its bias[d] after the scale (nothing further
+    # back), over fresh rows, a sliding window, split or in one range; a bias of zeros keeps every bit of none, and a
+    # chunk captured at a device position replays the eager chunk's bits.
+    T, at = 100, 200
+    cache = Cache(kind, 2, 128, 128, 16, [at + T])
+    g = torch.Generator().manual_seed(31)
+    q = _q(T, 8, 128, 32).to(torch.bfloat16)
+    fk = torch.randn(T, 2, 128, generator=g).to(dev).to(torch.bfloat16)
+    fv = torch.randn(T, 2, 128, generator=g).to(dev).to(torch.bfloat16)
+    bias = (torch.randn(T, 8, extent, generator=g) * 2).to(dev)
+    table = cache.tables[0]
+    keys, values = cache.rows(0, at)
+    keys, values = torch.cat([keys, fk.double()]), torch.cat([values, fv.double()])
+
+    def chunk(position, **given):
+        return pk.prefill(q, cache.k, cache.v, kind, table, position, 16, key_scales=cache.ks, value_scales=cache.vs,
+                          multipliers=cache.multipliers, fresh=(fk, fv), sliding=sliding, **CUDA, **given)
+    for splits in (1, 4, None):
+        lse = torch.empty(T, 8, device=dev)
+        out = chunk(at, bias=bias, lse=lse, splits=splits)
+        for t in (0, 37, T - 1):
+            want, want_lse = _biased_reference(q, keys, values, bias, at, t, sliding, 128 ** -0.5)
+            torch.testing.assert_close(out[t].double(), want, atol=8e-3, rtol=2e-2, msg=(splits, t))
+            torch.testing.assert_close(lse[t].double(), want_lse, atol=1e-3, rtol=1e-4, msg=(splits, t))
+        assert torch.equal(chunk(at, bias=torch.zeros_like(bias), splits=splits), chunk(at, splits=splits)), splits
+    position = torch.full((1,), at, dtype=torch.int64, device=dev)
+    out = torch.empty_like(q)
+    chunk(position, bias=bias, out=out, splits=1)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        chunk(position, bias=bias, out=out, splits=1)
+    for where in (0, 150, at):
+        position.fill_(where)
+        graph.replay()
+        assert torch.equal(out, chunk(where, bias=bias, splits=1)), where
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("kind", ["fp8:row", "bf16"])
+@pytest.mark.parametrize("sliding,extent", [(0, 0), (0, 64), (64, 64), (0, 1024), (1024, 1024)])
+def test_a_cuda_prompt_chunk_in_one_range_gives_a_prefix_its_bits_at_every_length(kind, sliding, extent):
+    # The chunk of 17 tokens and the chunk of 629 at the same position: the 17 rows equal bit for bit (splits 1 reads
+    # a token's positions in one range, whatever the chunk), the bias the longer chunk's rows of it.
+    T, short = 629, 17
+    cache = Cache(kind, 2, 128, 128, 16, [T])
+    g = torch.Generator().manual_seed(7)
+    q = _q(T, 8, 128, 9).to(torch.bfloat16)
+    biased = extent > 0
+    bias = (torch.randn(T, 8, extent, generator=g) * 2).to(dev) if biased else None
+    table = cache.tables[0]
+
+    def chunk(n):
+        given = {"bias": bias[:n].contiguous()} if biased else {}
+        return pk.prefill(q[:n].contiguous(), cache.k, cache.v, kind, table, 0, 16, key_scales=cache.ks,
+                          value_scales=cache.vs, multipliers=cache.multipliers, sliding=sliding, splits=1, **CUDA,
+                          **given)
+    whole, part = chunk(T), chunk(short)
+    assert torch.equal(part, whole[:short]), float((part.float() - whole[:short].float()).abs().max())
+
+
+def test_a_prompt_chunks_bias_is_the_cuda_tiles_and_of_its_shape():
+    cache = Cache("bf16", 2, 128, 128, 16, [64])
+    q = _q(16, 8, 128, 3).to(torch.bfloat16)
+    for flash, bias in ((False, torch.zeros(16, 8, 5, device=dev)), ("cuda", torch.zeros(16, 4, 5, device=dev)),
+                        ("cuda", torch.zeros(16, 8, 5, device=dev, dtype=torch.bfloat16))):
+        with pytest.raises(ValueError):
+            pk.prefill(q, cache.k, cache.v, "bf16", cache.tables[0], 0, 16, flash=flash, bias=bias)
+
+
 def _tuned(knobs):
     module = load("paged-kv-attention", configs={s: [k] for s, k in knobs.items()})
     for structure in knobs:

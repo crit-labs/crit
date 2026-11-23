@@ -1,0 +1,36 @@
+{
+  "kind": "crit-technique-operations",
+  "technique": "block-attention",
+  "operations": [
+    {
+      "id": "summary-mix",
+      "what": "softmax attention of learned queries over a token's summary rows and its own row, all normed without a weight, scaled by the width's inverse square root, and the weighted sum of the normed rows",
+      "reference": {
+        "path": "models/techniques/residuals/block-attention/code/reference.py",
+        "symbol": "summary_mix"
+      },
+      "verify": "on the target against the FP64 reference: within 2e-5 absolute plus 2e-5 relative (FP32 out)",
+      "invariance": "a row's bits independent of the rows beside it and of the row count"
+    },
+    {
+      "id": "pair-norm",
+      "what": "[rms(x), rms(m)] of a row and a message row, each normed without a weight (eps 1e-6), in BF16: a gate's low-rank input",
+      "reference": {
+        "path": "models/techniques/residuals/block-attention/code/reference.py",
+        "symbol": "pair_norm"
+      },
+      "verify": "on the target against the FP64 reference: within one BF16 rounding",
+      "invariance": "a row's bits independent of the rows beside it and of the row count"
+    },
+    {
+      "id": "gated-join",
+      "what": "(1 - tanh(f)) * x + tanh(a) * m of a row and a message row, f and a given or computed by low-rank gates (g = bf16(down . bf16([rms(x), rms(m)])), [f; a] = up . g)",
+      "reference": {
+        "path": "models/techniques/residuals/block-attention/code/reference.py",
+        "symbol": "gated_join"
+      },
+      "verify": "on the target against the FP64 reference: within 1e-4 absolute plus 1e-4 relative where f and a are given; through low-rank gates within 2e-2 of the largest value (a BF16 rounding of g may fall the other way)",
+      "invariance": "a row's bits independent of the rows beside it and of the row count"
+    }
+  ]
+}

@@ -1,0 +1,67 @@
+{
+  "schema": "crit-model-technique-v1",
+  "id": "relative-attention",
+  "category": "mixers",
+  "summary": "Softmax attention with a relative-position bias a token computes for the positions behind it, learned sinks a token, L2-clipped queries and keys, short and dynamic convolutions over keys and values, a gated output",
+  "provides": {
+    "blocks": [
+      "relative-attention"
+    ]
+  },
+  "source": "relative_attention",
+  "needs_sources": [
+    "template"
+  ],
+  "path": "models/techniques/mixers/relative-attention/README.md",
+  "code_path": "models/techniques/mixers/relative-attention/code",
+  "code_files": [
+    {
+      "path": "models/techniques/mixers/relative-attention/code/relative_attention.py",
+      "purpose": "The block class and its registry (BLOCKS)"
+    },
+    {
+      "path": "models/techniques/mixers/relative-attention/code/reference.py",
+      "purpose": "The FP64 references of its row operations (operations.json), which crit's kernel row-ops is held to"
+    }
+  ],
+  "reads": {
+    "tensors": [
+      "conv1d.weight",
+      "k_proj.linear",
+      "k_proj.sconv.conv1d.weight",
+      "k_proj.sconv.static_weight",
+      "k_proj.sconv.weight_proj",
+      "o_proj.gate_proj",
+      "o_proj.linear",
+      "q_proj.linear",
+      "q_proj.norm.scale",
+      "relative_position_bias.linear",
+      "relative_position_bias.norm.scale",
+      "relative_position_bias.proj",
+      "self_attn.k_proj.sconv.static_weight",
+      "sink_proj",
+      "v_proj.linear",
+      "v_proj.sconv.conv1d.weight",
+      "v_proj.sconv.static_weight",
+      "v_proj.sconv.weight_proj"
+    ],
+    "config": [
+      "conv_kernel_size",
+      "d_rel",
+      "log_scaling_alpha",
+      "log_scaling_n_floor",
+      "qk_l2_clip_threshold",
+      "rel_extent",
+      "rel_l2_clip_threshold",
+      "sconv_kernel_size"
+    ],
+    "layout": [
+      "head_dim",
+      "heads",
+      "kv_heads",
+      "log_scaling",
+      "post",
+      "window"
+    ]
+  }
+}

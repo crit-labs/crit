@@ -1,5 +1,5 @@
 """Hidden-state drafters: Core's reader of the published drafter formats (speculators EAGLE-3/DFlash/DSpark, native
-EAGLE-3, native DFlash and DSpark, and crit's own crit models drafter heads) with one tap convention, and the drafting
+EAGLE-3, native DFlash and DSpark) with one tap convention, and the drafting
 reference's catch-up, block, mapping and truncation rules."""
 import importlib.util
 import json
@@ -10,7 +10,7 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "core" / "python"))
+sys.path.insert(0, str(ROOT / "inference" / "core" / "python"))
 
 from crit_core.model.config import ConfigError  # noqa: E402
 from crit_core.model.drafters import BLOCK, EAGLE3, read_drafter, read_drafter_file  # noqa: E402
@@ -20,7 +20,7 @@ def drafting():
     name = "crit_test_hidden_drafters_drafting"
     if name in sys.modules:
         return sys.modules[name]
-    spec = importlib.util.spec_from_file_location(name, ROOT / "inference" / "hidden-state-drafters" / "code" / "drafting.py")
+    spec = importlib.util.spec_from_file_location(name, ROOT / "inference" / "techniques" / "speculation" / "hidden-state-drafters" / "code" / "drafting.py")
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
@@ -73,17 +73,6 @@ class DrafterFormatTests(unittest.TestCase):
             read_drafter({"architectures": ["DFlashDraftModel"], "dflash_config": {"target_layer_ids": [1]}})  # no block
         self.assertIsNone(read_drafter({"architectures": ["LlamaForCausalLM"]}))
         self.assertIsNone(read_drafter({"speculators_model_type": "medusa"}))
-
-    def test_crits_own_drafters(self):
-        d = read_drafter({"num_hidden_layers": 1, "hidden_size": 64, "crit_drafter": {
-            "format": "crit-drafter-v1", "kind": "mtp-head", "target_layers": 28, "target": {"path": "/models/target"}}},
-            target_layers=28)
-        self.assertEqual((d.kind, d.taps, d.drafts_per_pass, d.verifier, d.source), ("mtp-head", (28,), 1, "/models/target",
-                                                                                     "crit:crit-drafter-v1"))
-        with self.assertRaises(ConfigError):
-            read_drafter({"crit_drafter": {"kind": "mtp-head", "target_layers": 28}}, target_layers=32)
-        with self.assertRaises(ConfigError):
-            read_drafter({"crit_drafter": {"kind": "unknown", "target_layers": 28}})
 
     def test_reads_a_drafter_directory(self):
         with tempfile.TemporaryDirectory() as folder:

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(crit_inference VERSION 0.22.0 LANGUAGES CXX)
+project(crit_inference VERSION 0.23.0 LANGUAGES CXX)
 # The fixtures of Inference's native code (what plugins build at load) and of its host references. Inference uses Core only through its public SDK
 # (crit::core); Core never builds or includes Inference code.
 find_package(Threads REQUIRED)
@@ -8,9 +8,9 @@ option(CRIT_INFERENCE_CUDA "Build Inference's CUDA reference kernels and their f
 option(CRIT_INFERENCE_INSTALLED_CORE "Use an installed Core SDK (CMAKE_PREFIX_PATH) instead of this checkout's core/" OFF)
 if(NOT TARGET crit::core)
   if(CRIT_INFERENCE_INSTALLED_CORE)
-    find_package(critCore 0.22.0 CONFIG REQUIRED)
+    find_package(critCore 0.23.0 CONFIG REQUIRED)
   else()
-    add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../core" "${CMAKE_CURRENT_BINARY_DIR}/core")
+    add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/core" "${CMAKE_CURRENT_BINARY_DIR}/core")
   endif()
 endif()
 
@@ -58,14 +58,14 @@ endif()
 
 # Host examples and fixtures.
 crit_inference_executable(crit_quantized_tests SOURCES ${FIXTURES}/quantized_tests.cpp
-  INCLUDES ${INFERENCE}/quantized-projections/code)
+  INCLUDES ${INFERENCE}/techniques/projections/quantized-projections/code)
 crit_inference_tests(crit_quantized_tests crit_quantized 45 fp8_block)
 
-crit_inference_executable(crit_nvfp4_tests SOURCES ${FIXTURES}/nvfp4_tests.cpp INCLUDES ${INFERENCE}/quantized-projections/code)
+crit_inference_executable(crit_nvfp4_tests SOURCES ${FIXTURES}/nvfp4_tests.cpp INCLUDES ${INFERENCE}/techniques/projections/quantized-projections/code)
 crit_inference_test(crit_nvfp4 30 crit_nvfp4_tests ${FIXTURES}/e4m3_scale_vectors.txt)
 # Host ISA files: AVX2 and AVX-512 sources compiled with their own flags and chosen at run time through host_isa.h.
 # One condition builds them for every library, so host_isa's supported() answers for all of them.
-set(_host_nvfp4 ${INFERENCE}/host-expert-arithmetic/code)
+set(_host_nvfp4 ${INFERENCE}/techniques/experts/host-expert-arithmetic/code)
 set(CRIT_INFERENCE_HOST_ISA OFF)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
   set(CRIT_INFERENCE_HOST_ISA ON)
@@ -98,7 +98,7 @@ endfunction()
 # Host NVFP4 rows in a declared order: no file may contract a multiply and an add into an FMA the order does not
 # declare.
 add_library(crit_host_nvfp4 STATIC ${_host_nvfp4}/host_nvfp4.cpp ${_host_nvfp4}/host_int.cpp ${_host_nvfp4}/host_capi.cpp)
-target_include_directories(crit_host_nvfp4 PUBLIC ${_host_nvfp4} ${INFERENCE}/quantized-projections/code)
+target_include_directories(crit_host_nvfp4 PUBLIC ${_host_nvfp4} ${INFERENCE}/techniques/projections/quantized-projections/code)
 target_compile_features(crit_host_nvfp4 PUBLIC cxx_std_20)
 crit_inference_warnings(crit_host_nvfp4)
 if(MSVC)
@@ -125,14 +125,14 @@ crit_inference_executable(crit_host_int_tests SOURCES ${FIXTURES}/host_int_tests
 crit_inference_test(crit_host_int 60 crit_host_int_tests)
 # The host's worker pool, which is Core's (crit_plugins.host builds it on the machine at first use): its source is
 # compiled here for the fixtures that run on it.
-set(_core_host ${CMAKE_CURRENT_SOURCE_DIR}/../core/python/crit_plugins/host)
+set(_core_host ${CMAKE_CURRENT_SOURCE_DIR}/core/python/crit_plugins/host)
 add_library(crit_host_pool STATIC ${_core_host}/pool.cpp)
 target_include_directories(crit_host_pool PUBLIC ${_core_host})
 target_link_libraries(crit_host_pool PUBLIC Threads::Threads)
 target_compile_features(crit_host_pool PUBLIC cxx_std_20)
 crit_inference_warnings(crit_host_pool)
 # A CPU expert tier over the integer rows: one layer's CPU routes on the host's pool.
-set(_host_tier ${INFERENCE}/host-expert-tier/code)
+set(_host_tier ${INFERENCE}/techniques/experts/host-expert-tier/code)
 add_library(crit_host_tier STATIC ${_host_tier}/host_tier.cpp ${_host_tier}/tier_capi.cpp)
 target_include_directories(crit_host_tier PUBLIC ${_host_tier})
 target_link_libraries(crit_host_tier PUBLIC crit_host_nvfp4 crit_host_pool Threads::Threads)
@@ -186,7 +186,7 @@ crit_inference_test(crit_token_sampling 120 crit_token_sampling_tests)
 crit_inference_executable(crit_token_law_tests SOURCES ${FIXTURES}/token_law_tests.cpp LINK crit_token_sampling)
 crit_inference_test(crit_token_law 300 crit_token_law_tests)
 
-# The host's handoffs, Core's (crit_plugins.host, core/python/crit_plugins/host/README.md): its CUDA fixture.
+# The host's handoffs, Core's (crit_plugins.host, inference/core/python/crit_plugins/host/README.md): its CUDA fixture.
 crit_inference_kernels(crit_host_mailbox ${_core_host} handoff.cu)
 add_library(crit_host_mailbox_fixture STATIC ${FIXTURES}/host_mailbox_fixture.cu)
 target_link_libraries(crit_host_mailbox_fixture PUBLIC crit_host_mailbox)

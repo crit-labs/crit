@@ -12,7 +12,7 @@ import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "api", "../crit-eval", "kernels", "cli", "tests"): sys.path.insert(0, str(ROOT / _folder))
+for _folder in ("inference/core/python", "api", "../crit-eval", "kernels", "cli", "tests"): sys.path.insert(0, str(ROOT / _folder))
 from crit import __version__
 from crit_api import anthropic, api_chat
 from crit_api.engine import EngineError
@@ -80,6 +80,7 @@ def events(data):
 
 
 class DialectFixture(ServeFixture):
+    shared_engine = True   # its tests leave the served engine as they found it, or get a new one (ServeFixture)
     stream = True
     request_options = True
     api_keys = ()

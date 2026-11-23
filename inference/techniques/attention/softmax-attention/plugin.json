@@ -1,0 +1,174 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "softmax-attention",
+  "title": "Exact causal softmax attention over the KV rows (attention-state)",
+  "description": "attention-state's attend for each query over the rows at positions up to its own: the plain attention every attention plugin is compared with. On the device (attention-state's device_attention.py) it reads attention-state's pages in place: prompt rows of every page type through crit's paged-kv-attention prompt reader (FlashInfer's paged prefill over 16-bit and FP8 pages only with option flashinfer auto, a yardstick); decode and verify windows of every page type through crit's paged-kv-attention split-KV reader (built for the engine's device, tuned or default knobs) where it loads, in a step as in a captured round (no host work, its work following each row's length), so a row a step decodes (plain decoding, log-probabilities, replays) has the bits of the same row in a round (option decode flashinfer: a step's window rows through FlashInfer's decode instead), with tree masks, block-sparse lists, attention sinks (a query head's sink logit: one more position with no value) and sliding windows (a token sees its last W positions; FlashInfer and torch's SDPA give way to crit's readers or the masked softmax for either); otherwise each row's queries over its sequence's KV gathered from the pool with torch's scaled dot product attention or a masked softmax, the plain path the others are tested against (option kernels: torch forces it). A captured prompt chunk (prompts:attention) reads the staged prompt table on the device: crit's prompt reader at a position read on the device, or the split-KV reader or its torch fallback; no FlashInfer plan inside a capture.",
+  "fills": [
+    "attention"
+  ],
+  "needs": [
+    [
+      "kv:rows",
+      "kv:pages"
+    ]
+  ],
+  "provides": [
+    "rounds:attention",
+    "attention:blocks",
+    "attention:tree",
+    "attention:lse",
+    "attention:sinks",
+    "attention:sliding",
+    "attention:latent",
+    "attention:distance-bias",
+    "prompts:attention"
+  ],
+  "devices": [
+    "cuda",
+    "cpu"
+  ],
+  "options": {
+    "kernels": {
+      "type": "choice",
+      "default": "auto",
+      "choices": [
+        "auto",
+        "torch"
+      ],
+      "description": "auto: crit's paged-kv-attention kernels where they load (every page kind, window and prompt rows; FlashInfer only with option flashinfer auto); torch: every row gathered and multiplied in torch"
+    },
+    "int8_qk": {
+      "type": "bool",
+      "default": false,
+      "description": "over INT8 pages, prompt rows' queries quantized to INT8 per token and head and multiplied with the INT8 keys on integer tensor cores (twice the BF16 rate, an approximation of the queries)"
+    },
+    "decode": {
+      "type": "choice",
+      "default": "split",
+      "choices": [
+        "split",
+        "flashinfer"
+      ],
+      "description": "a step's window rows (decode tokens, verify windows): split: crit's split-KV reader wherever it loads, the same kernel as captured rounds (a decode row's bits the same in a step and in a round: a plain or log-probability request's tokens equal a drafted round's); flashinfer: FlashInfer's decode and prefill over 16-bit and FP8 pages where it is installed, else the split-KV reader (another reduction than a captured round's, so a row a step decodes may differ from the same row in a round: for engines that decode in steps only)"
+    },
+    "prompt_reader": {
+      "type": "choice",
+      "default": "auto",
+      "choices": [
+        "auto",
+        "prefill",
+        "decode"
+      ],
+      "description": "auto (the default): the fastest reader that keeps the level the engine's configuration asks of its prompt rows (exactness, docs/PLUGINS.md#exactness): prefill where it asks repeatable or nothing, and where it asks row-exact and reader split's own prompt reader reads the pages (crit's kernel loaded, no FlashInfer); decode where it asks exact, and where it asks row-exact with reader flash or cuda, FlashInfer or torch; prefill: prompt rows through a prompt reader (FlashInfer's prefill or crit's), fastest, another reduction than decode rows' (a scored token may differ from the served one by more than 0.001 nats); decode: prompt rows (a step's and a captured chunk's) in the decode's reduction, the split-KV reader as window rows of up to 64 columns (each program folding its partitions as the merge does) or its torch fallback over the page tables: a scored token equals the same token served, bit for bit, over every page type (window rows through the split-KV reader too, no FlashInfer); latent attention's prompt rows likewise, as window rows through latent-attention's fused launch"
+    },
+    "reader": {
+      "type": "choice",
+      "default": "auto",
+      "choices": [
+        "auto",
+        "split",
+        "flash",
+        "cuda"
+      ],
+      "description": "auto (the default): window rows through crit's CUDA flash tile for each pool it takes, the split-KV reader for the others, prompt chunks through reader split's prompt reader (partitioned-attention's reader option has the numbers); otherwise which of crit's paged-kv-attention structures read the pages where the kernel loads: split: the split-KV launch (piece i of a row's positions to KV partition i mod P, partials merged in partition order) for window rows and crit's prompt reader for prompt chunks; flash: the flash structures (flash-window, flash-fused: a row's positions in contiguous splits of one chunk per pool, its columns times a KV head's query heads packed into tensor-core tiles, the splits merged in split order; a column's bits the same alone, in any window, in a step and in a captured round, another reduction than split's) and the flash prompt chunk (flash-prefill: a prompt token's bits follow its chunk's length); partitions and piece do not apply, block lists stay on the split launch; cuda: the same launches through the CUDA flash tile (cuda-window, cuda-fused, cuda-prefill: queries in shared memory, 16 rows a warp, each warp's online softmax in registers, one chunk and block per pool; a column's bits the same alone, in any window, in a step and in a round, another reduction than split's and flash's; its prompt chunk follows the chunk's length), compiled with nvcc for the GPU on first use"
+    },
+    "partitions": {
+      "type": "int",
+      "default": 0,
+      "min": 0,
+      "max": 1024,
+      "description": "KV partitions of the split-KV reader (0: from the GPU's SM count, the KV heads and the page kind); a row's bits depend on it"
+    },
+    "piece": {
+      "type": "int",
+      "default": 0,
+      "min": 0,
+      "max": 128,
+      "description": "Positions per piece of the split-KV reader (0: the kernel's default from the head width and the page kind); a row's bits depend on it"
+    },
+    "workspace_mib": {
+      "type": "int",
+      "default": 128,
+      "min": 1,
+      "max": 65536,
+      "description": "MiB of partials a launch of the split-KV reader may take from the engine's scratch (crit_plugins.memory: each launch takes what its rows need, nothing is held between launches): a launch reads as many rows as they hold"
+    },
+    "flashinfer": {
+      "type": "choice",
+      "default": "off",
+      "choices": [
+        "auto",
+        "off"
+      ],
+      "description": "off (the default): no library kernel, crit's kernels read every row; auto: FlashInfer's paged prefill for eager prompt rows of 16-bit and FP8 pages where it is installed (and with decode flashinfer a step's window rows), a yardstick to compare crit's kernels with, its workspaces allocated when the plugin is made"
+    },
+    "flashinfer_mib": {
+      "type": "int",
+      "default": 128,
+      "min": 16,
+      "max": 65536,
+      "description": "MiB of FlashInfer's scheduling workspace, allocated when the plugin is made where FlashInfer serves (memory() declares it with its wrappers' own workspaces)"
+    }
+  },
+  "kernels": [
+    {
+      "name": "latent-attention",
+      "fallback": "latent attention of a step's rows in FP32 torch from the gathered rows (captured rounds and prompt chunks need the kernel)"
+    },
+    {
+      "name": "paged-kv-attention",
+      "fallback": "window rows (decode, verify, trees, block lists, rounds) in a masked FP32 softmax over the pool's page tables in torch; prompt rows over fp8:row and INT8 pages gathered and multiplied by torch's SDPA"
+    }
+  ],
+  "test_with": [
+    "attention-state"
+  ],
+  "sources": {
+    "state": "../attention-state/code"
+  },
+  "entry": "plugin.py:create",
+  "defines": {
+    "slots": {
+      "attention": {
+        "about": "the attention kernels a layer runs over its KV state, in prefill and in decode",
+        "host": {
+          "attend": "attend(sequence, queries, positions, scale=None, pending=False) -> [output row]: each query attends the sequence's rows at positions up to its own (scale 1 / sqrt(key width) by default)"
+        },
+        "device": {
+          "forward": "forward(layer, queries, pool, batch, scale=None) -> out: queries [tokens][heads][dim]; each token attends its sequence's KV at positions up to its own, the batch's own rows included once written; out [tokens][heads][value dim]. With the facts below also forward(..., blocks=None, block_size=None, parents=None, lse=False): attention:blocks (blocks [tokens][k] KV block ids, block_size positions each, -1 for none: a token reads only its listed blocks, still nothing past its own position; topk_blocks chooses them), attention:tree (parents [tokens]: each token's parent column in its row, -1 for none, parents before children: a verify window's columns see the positions before it and their ancestors and themselves in it), attention:lse (lse=True also returns each token's log-sum-exp [tokens][heads] FP32, natural log over the scaled scores), attention:sinks (sinks [heads] FP32: each query head's sink logit, natural log in the scaled scores' units, one more position with no value in every token's softmax; -inf for none), attention:sliding (sliding: an int, a sliding window: a token sees its last `sliding` positions, its own included; 0 for all; never with blocks), attention:latent (latent=R: latent attention, queries [tokens][heads][R + P] over a pool of keys only with one KV head whose rows are each position's latent then its rotary key, the latent its value too; out [tokens][heads][R]), attention:distance-bias (bias [tokens][heads][extent] FP32: each token's score added, in the scaled scores' units, to head h's score of the position d before its own for d below extent; nothing further back; never with blocks or latent)"
+        },
+        "cases": "cases.py:attention"
+      }
+    },
+    "facts": {
+      "rounds:attention": {
+        "methods": {}
+      },
+      "attention:blocks": {
+        "methods": {},
+        "about": "Attention over chosen KV blocks, draft trees and log-sum-exps: forward's keywords (DEVICE_INTERFACES[\"attention\"])."
+      },
+      "attention:tree": {
+        "methods": {}
+      },
+      "attention:lse": {
+        "methods": {}
+      },
+      "attention:sinks": {
+        "methods": {}
+      },
+      "attention:sliding": {
+        "methods": {}
+      },
+      "attention:latent": {
+        "methods": {}
+      },
+      "attention:distance-bias": {
+        "methods": {}
+      },
+      "prompts:attention": {
+        "methods": {}
+      }
+    }
+  }
+}

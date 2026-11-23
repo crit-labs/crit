@@ -14,9 +14,12 @@ This file is what crit cannot check for you: how to set up, what to build, and h
 [candidate ladder](docs/RUN_RECORDS.md#the-candidate-ladder)), [Building engines](docs/BUILDING_ENGINES.md) (the
 engineering details), [Plugins](docs/PLUGINS.md) and [Eval](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md).
 Changes to crit itself must meet [what belongs in crit](docs/CONTRIBUTION_CRITERIA.md) and follow
-[Contributing](docs/CONTRIBUTING.md).
+[Contributing](docs/CONTRIBUTING.md). crit's shared code names no model: what is one model's (its name, its tensor
+spellings, a kernel tuned for its shapes) stays in its model plugin's layout or in the engine, a technique one model
+uses today is built so any model can use it, and `python tests/test_model_neutral.py` must pass before a change to
+crit is committed.
 
-Install from the repo root with `python -m pip install -e core/python -e .` (the checkout's Core and its CLI; crit
+Install from the repo root with `python -m pip install -e inference/core/python -e models/core/python -e .` (the checkout's Core and its CLI; crit
 refuses to run from a checkout whose Core comes from elsewhere), build Core's runtime once with `crit core build`
 (CMake and a C++20 compiler), then run `crit ...`. A wheel install (`python -m pip install .`, or `pip install crit`
 without a checkout) builds engines too, after the same `crit core build`, which fetches Core's source at the installed
@@ -60,7 +63,7 @@ release's tag: records go in the folder `--project` names (default the current o
   `dense_device_host` or `beyond_host`, with one plain pass's floor per expert source (device, link, CPU). Write
   recon.md's placement plan from the scenario's starting design: candidate 1 is a proof of concept of the scenario,
   not a placeholder below it. In `sparse_device_host` and `sparse_device_host_disk` that means the routed experts
-  through [expert-offload](inference/expert-offload/README.md) and the checkpoint's drafter from candidate 1 on: the
+  through [expert-offload](inference/techniques/experts/expert-offload/README.md) and the checkpoint's drafter from candidate 1 on: the
   model plugin calls it as for experts that fit, and it places the experts, keeps those routed last in a device
   cache that takes every byte the device has free past the run's VRAM headroom while the engine serves, computes
   misses on the CPU and says why.
@@ -85,10 +88,17 @@ its launch command in `configuration.engine`, and `crit run` records, checks, me
 ([external engines](docs/RUN_RECORDS.md#external-engines)).
 
 - **Start from the selection.** Choose the `model` plugin for the checkpoint's architecture, then a plugin for each
-  slot it calls: [model-template](inference/model-template/README.md) for every checkpoint one of its layouts covers,
-  and for any other a model plugin composed from its blocks (a layout file, a block class only for a layer part no
-  block computes), which keeps the serving contracts `serve --check` holds an engine to (exact rows, prompt spans
-  within the cancel grace, the device's room at a step's peak, drafting and batching) without writing them again.
+  slot it calls: the finished model plugin that serves the checkpoint where there is one
+  ([models/cache](models/cache/README.md); `crit models inspect MODEL` names it, the
+  [model techniques](models/techniques/README.md) that read its config and tensors, and what none reads), and for any
+  other a model plugin of the engine's own that extends the models core
+  ([model-template](models/core/model-template/README.md#a-new-model-plugin): a manifest, a layout file, a block
+  class only for a layer part no technique computes), which keeps the serving contracts `serve --check` holds an
+  engine to (exact rows, prompt spans within the cancel grace, the device's room at a step's peak, drafting and
+  batching) without writing them again. Check a new model plugin on a tiny random checkpoint first (`crit models
+  tiny`, then `crit models diff --model TINY --plugin ENGINE/plugins/ID`), and keep it once it passes (`crit models
+  cache add ENGINE/plugins/ID`: `crit plugins add ID` then puts it into any engine) so the architecture is built
+  once.
   Take the slots' plugins from crit's library and crit-hub (`crit plugins list --model MODEL --device cuda` lists
   what fits and the slots nothing fits; `crit plugins add`; `crit plugins status ENGINE/plugins` says which copies the
   library has changed since and which the engine changed, and `crit plugins update` brings the unchanged ones up
@@ -146,9 +156,8 @@ its launch command in `configuration.engine`, and `crit run` records, checks, me
   checked and timed with `crit eval workbench`; its `bench.json` is the lever's `yardstick`. Only the run's criteria
   can exclude a provider, by naming it. A request to build from crit alone keeps the providers and excludes earlier
   results: past runs, earlier engines for the model and records outside this run.
-- **[Models](models/README.md):** when `weights_policy` is `transformable` (the default in `speed`), quantize the
-  source with `crit models ptq`, or re-encode stored 16-bit matrices as the engine loads them (declare `weights:
-  "transformed"` and `configuration.re_encoding`; the only route for an already quantized checkpoint). Where memory
+- **Transformed weights:** when `weights_policy` is `transformable` (the default in `speed`), re-encode stored
+  16-bit matrices as the engine loads them (declare `weights: "transformed"` and `configuration.re_encoding`). Where memory
   or bandwidth bounds decode, measure re-encoding the 16-bit matrices before other levers. Draft-only weights take
   any encoding in any run, since the stored target verifies every token.
 - **[Eval](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md)** measures a candidate as a chat client
@@ -219,6 +228,14 @@ Each round:
 
 How to judge a round:
 
+- **Decode speed is sampled decode, always.** Every decode tok/s you report, compare, plan on or hand off is
+  measured sampled, at the run's sampling: crit Eval's sampled suite, and `crit run measure`, `ablate`, `profile` and
+  `kernels`, which send sampled requests unless a captured request names its own temperature. Greedy decode is for
+  correctness comparisons only (drafted against plain output, one candidate's text against another's), never a
+  speed: do not time greedy decode with your own script and report it, and never put a greedy number anywhere as the
+  engine's speed. crit labels every greedy timing comparison-only (`decode_greedy`, a benchmark's
+  `comparison_only`), and an Eval without a sampled suite has no decode score: fix what stopped it rather than
+  quoting the greedy one.
 - **Eval sets the goals; the priority rule orders them.** `crit eval status` gives one goal per KPI (decode,
   prefill, time to first token, and long-context decode and time to first token), each from its score to its
   physical limit with its noise. The headline decode is the sampled one. Decode and prefill are each *needed* while
@@ -243,14 +260,14 @@ How to judge a round:
   kernel reject those variants, not the term. A kernel's share of its phase bounds what replacing it can gain
   (share x (1 - 1/speedup)): size kernel work by that bound. An isolated benchmark is a lead; measure the integrated
   engine before building on it.
-- **Build for both decode modes.** Eval scores both on the same speed cases. Greedy: speculative output equals plain
-  greedy when the run requires `exactness`; by default (`reported`) the drift budget judges it, and in `speed` Eval
-  judges each output fork. Sampled, at the model's sampling, the headline: verify drafts by rejection sampling
+- **Build for both decode modes.** Eval runs both on the same speed cases. Greedy, for correctness: speculative
+  output equals plain greedy when the run requires `exactness`; by default (`reported`) the drift budget judges it,
+  and in `speed` Eval judges each output fork. Sampled, at the model's sampling, the speed: verify drafts by rejection sampling
   (accept with probability min(1, p/q), resample from max(p - q, 0) on the first rejection; a greedy draft is q
-  one-hot) and sample on the device inside the captured round ([token-sampling](inference/token-sampling/README.md)'s
-  `rounds:sampler`; its host oracle is [mtp-decode](inference/mtp-decode/README.md)). A drafter that only helps
+  one-hot) and sample on the device inside the captured round ([token-sampling](inference/techniques/sampling/token-sampling/README.md)'s
+  `rounds:sampler`; its host oracle is [mtp-decode](inference/techniques/speculation/mtp-decode/README.md)). A drafter that only helps
   greedy requests leaves the headline at one token per pass. Fill the sampler with
-  [token-constraints](inference/token-constraints/README.md) (token-sampling's law, each constrained row masked first):
+  [token-constraints](inference/techniques/sampling/token-constraints/README.md) (token-sampling's law, each constrained row masked first):
   JSON, grammar and forced-call requests then decode in the captured rounds too, not one Python step a token. A
   model plugin that drafts also decodes plainly on request (`chat-plain-v1`).
 - **The context is a requirement.** Build every candidate for `kv_tokens`. Beyond weights and KV the engine gets
@@ -267,16 +284,20 @@ How to judge a round:
   A difference inside the quality spread (`budget_spread`) is no measurement.
 - **Exactness is a setting.** `configuration.exactness` says how exact the engine's rows are, for the `decode` and
   the `prompt` rows, on [the kernels' scale](kernels/README.md#exactness): `declared`, `exact`, `row-exact` or
-  `repeatable`. A candidate that sets none takes its run's quality mode's, `exact` in both modes (a prompt row has
-  the bits of the same token decoded, which `serve --check` judges without a tolerance). A plugin whose option
+  `repeatable`. A candidate that sets none takes its run's quality mode's: `exact` in `preserve` (a prompt row has
+  the bits of the same token decoded, which `serve --check` judges without a tolerance), `row-exact` in `speed` (a
+  prompt row's bits its own at any prompt length, so plugins take their faster prompt paths; decoding against
+  prefilling is judged by quantized arithmetic's drift). A plugin whose option
   is `auto` takes its fastest way that keeps the level, the engine's facts say what each plugin keeps, and Core
   refuses an engine that keeps less than it asks ([exactness](docs/PLUGINS.md#exactness)). A phase's level is a lever
   like any other: change it with its speed and its drift measured.
 - **Precision follows the quality mode.** A candidate's configuration states the run's `quality_mode`, and a
   plugin's precision option left on `auto` follows it ([precision](docs/PLUGINS.md#precision)). Load the output head
-  with role `head`: in `speed` quantized-projections then holds it in FP8, in `preserve` as stored. Write no head
-  option of your own into the model plugin, and count the head in the memory plan at the bytes it is held in. Where
-  `weights_policy` is `as_stored`, set quantized-projections' `head` to `stored`. The plan's `prompt_activations` are
+  with role `head`: in `speed` quantized-projections then holds it, and every other target matrix stored in 16 bits
+  (`trunk`), in FP8, in `preserve` as stored. Write no head or precision option of your own into the model plugin,
+  and count each matrix in the memory plan at the bytes it is held in. Where `weights_policy` is `as_stored`, set
+  quantized-projections' `head` and `trunk` to `stored`. In `speed` the KV pages, the MTP layer and the experts'
+  arithmetic follow the mode too (8- and 4-bit where they pay); 4-bit dense weights are a lever to measure. The plan's `prompt_activations` are
   written into the candidate's configuration: an activation option left on `auto` takes them, and Core refuses an
   engine that serves others at load, naming the option that chose them. Budget the KV cache from what the engine
   takes (`crit plugins resolve PACKAGE --model M --context N`: its plugins' answer from the checkpoint's headers,
@@ -296,8 +317,7 @@ How to judge a round:
   content-dependent choice needs a general corpus unrelated to Eval and a held-out check in several languages and
   domains, both stated in the proposal; a residency profile from `device-expert-cache`'s `corpus.json` meets this.
 - **Never train or fine-tune a drafter.** Use the checkpoint's drafter, a published companion drafter as released,
-  or one the user produced with [`crit models drafter`](models/README.md#drafters) and handed you with its transform
-  record (retain it, name its `output.manifest_sha256` in the configuration).
+  as released.
 - **Long jobs.** Downloads, `crit eval reference`, Evals and builds take minutes to hours. Run each as a background
   command your harness tracks and wakes you on (never a detached `nohup`, `setsid` or `wsl ... &`, never a sleep
   loop), and never end a turn without such a wake pending. While one holds the GPU, do the next round's CPU work. An

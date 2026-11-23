@@ -7,13 +7,15 @@ import sys
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "core" / "python"))
+sys.path.insert(0, str(ROOT / "inference" / "core" / "python"))
 
-from crit_core.model import ConfigError, parse_model_config  # noqa: E402
+sys.path.insert(0, str(ROOT / "models" / "core" / "python"))
+from crit_core.model import ConfigError  # noqa: E402
+from crit_models.config import architecture as parse_model_config  # noqa: E402 - the config with its rotary sections
 
 
 def load_rope_tables():
-    path = ROOT / "inference" / "attention-state" / "code" / "rope_table.py"
+    path = ROOT / "inference" / "techniques" / "attention" / "attention-state" / "code" / "rope_table.py"
     spec = importlib.util.spec_from_file_location("crit_rope_table", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

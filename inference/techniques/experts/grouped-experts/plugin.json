@@ -1,0 +1,104 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "grouped-experts",
+  "title": "Routed experts over expert bundles in a slot store, grouped by expert on the device",
+  "description": "The experts slot's device plugin for decode rows and prompt chunks alike. Each expert is one bundle in its stored format (bf16, fp8 with channel or 128 x 128 block scales, nvfp4, int4 with an E4M3 scale per 16, mxfp4, int4_zp:<group> (INT4 with a zero point a group: AWQ and GPTQ checkpoints' experts, load format awq or gptq, repacked exactly at load; no act order); code/bundles.py), held by the plugin or by a residency cache's slot store and found through a slot table. A layer's routes are grouped by expert on the device and every expert's gate/up and down rows run once for all of its routes, through crit's kernel grouped-experts (built on this GPU, tuned or default knobs; BF16 tensor cores, weights decoded exactly, crit's declared SwiGLU, each token's routes summed in route order) or the same arithmetic in torch where the kernel is not there. A route's bits do not depend on the rows beside it, on the chunk or on decode against prompt, and a call at a fixed token count is captured in a CUDA graph. With activations nvfp4, NVFP4 experts run W4A4: inputs and intermediates quantized per route at the checkpoint's input scales by crit's declared quantizer. Its host form is expert-streamed-prefill's FP64 block on the expert_source slot's weights.",
+  "fills": [
+    "experts"
+  ],
+  "devices": [
+    "cuda",
+    "cpu"
+  ],
+  "needs": [
+    "experts:source"
+  ],
+  "provides": [
+    "experts:bundles",
+    "experts:routes",
+    "experts:activations",
+    "experts:mxfp8",
+    "rounds:experts",
+    "prompts:experts",
+    "experts:phases"
+  ],
+  "reference": [
+    "experts-reference"
+  ],
+  "test_with": [
+    "expert-tensors"
+  ],
+  "options": {
+    "activations": {
+      "type": "choice",
+      "default": "auto",
+      "choices": [
+        "auto",
+        "bf16",
+        "nvfp4"
+      ],
+      "description": "what NVFP4 experts multiply: auto (the default), by the quality mode the engine's configuration states (docs/PLUGINS.md#precision): nvfp4 in speed, whose arithmetic starts from the stored activations, bf16 in preserve and where no mode is stated; bf16, 16-bit activations everywhere (W4A16, weight only); nvfp4, each NVFP4 layer as its stored matrices declare: activations and intermediates quantized to NVFP4 at each matrix's input_scale where they carry one (W4A4), 16-bit activations where they do not (W4A16); the facts name each layer's"
+    },
+    "arithmetic": {
+      "type": "choice",
+      "default": "auto",
+      "choices": [
+        "auto",
+        "tensor",
+        "declared",
+        "fp4",
+        "fp4-row",
+        "fp4-row2",
+        "fp8"
+      ],
+      "description": "auto (the default): in quality mode speed each layer on its format's own tensor cores where crit's kernel has them on this GPU and the layer takes them (fp4 for W4A4 NVFP4 layers, fp8 for FP8 ones, hidden and inter multiples of 128), every other layer tensor; tensor in preserve and where no mode is stated; the facts name each layer's (experts.layers.L.arithmetic). tensor: BF16 tensor cores for every format; declared: crit's integer block order (host-expert-arithmetic's host_int.h), the bits crit's CPU expert tier gives on the same bundles, for NVFP4 experts W4A4 (with activations nvfp4) and int4 experts W4A8 (8-bit activations, a quantization of its own for speed runs), so a dispatch that sends some routes to the CPU changes no token; only crit's kernel grouped-experts computes it (refused without it); fp4: NVFP4 experts W4A4 (activations nvfp4, matrices carrying input_scale; hidden and inter multiples of 128) on the block-scaled FP4 tensor cores (the sm_120 family): the same quantized operands as tensor's W4A4 as E2M1 codes and UE4M3 scales, the weights' own codes, one MMA chain an output (decode and prompt items give a route the same bits: exact), another arithmetic than tensor's W4A4; only crit's kernel grouped-experts on such a GPU computes it (refused elsewhere, and for other formats); fp8: FP8 experts (fp8 with channel or 128 x 128 block scales; hidden and inter multiples of 128) W8A8 on the E4M3 tensor cores (8.9 on): inputs and intermediates quantized per 128 values in E4M3 at amax / 448 (crit's declared group quantizer), each 128-k block's sum folded by the two scales, decode and prompt items with the same bits (exact); only crit's kernel grouped-experts computes it (refused elsewhere, and for other formats); fp4-row: NVFP4 experts W4A4 on the same FP4 tensor cores at a scale of each route's own (g = 6 * 448 / amax of its row, the inputs', then the intermediate's, which passes between the two as BF16), so it needs no input scales; fp4-row2: the same with two FP4 terms a value (the first's remainder at the same scale, about 8 bits a value, twice the MMAs over the same weights); layers of other formats run tensor"
+    },
+    "prompt_arithmetic": {
+      "type": "choice",
+      "default": "auto",
+      "choices": [
+        "auto",
+        "same",
+        "tensor",
+        "fp4",
+        "fp4-row",
+        "fp4-row2",
+        "fp8"
+      ],
+      "description": "the arithmetic of prompt rows (the calls a model marks prompt, experts:phases), where it differs from `arithmetic`, which decode rows keep: auto (the default): in quality mode speed an NVFP4 layer without input scales takes fp4-row for prompt rows where the engine asks its prompt rows no more than row-exact, as `arithmetic` elsewhere; same; or one of arithmetic's choices but declared. fp4-row on a prompt: W4A4 at each route's own scale, about 1.6x the BF16 path's prompt rate on the FP4 tensor cores, while decode rows (bound by their weights' bytes, where FP4 operands save nothing) keep theirs; a prompt row's bits are then its own (row-exact), not the decoded route's"
+    },
+    "prompt_items": {
+      "type": "choice",
+      "default": "auto",
+      "choices": [
+        "auto",
+        "fp4-prompt",
+        "fp4-tile"
+      ],
+      "description": "the items an FP4 prompt call's routes are grouped in (fp4, fp4-row, fp4-row2 at 8 routes an expert or more): fp4-prompt (crit's kernel's structure of 32-route items), fp4-tile (64-route items through its block tile, the weights staged in shared memory and shared by its warps), or auto (the default): the one the engine's sweep report of grouped-experts on this device timed faster at the call's tokens over both passes (crit_kernels.select), fp4-prompt where no report times both. A route's bits are the same in either. The facts name the choice for each shape (prompt_items)"
+    },
+    "workspace_mib": {
+      "type": "int",
+      "default": 512,
+      "min": 16,
+      "max": 65536,
+      "description": "the route rows a call keeps at once: a longer prompt chunk runs in parts of the tokens that fit (whole multiples of 256), each part combined into its tokens' rows as it goes, which changes no route's bits; a prompt-sized call of fewer tokens runs in a kept prompt workspace's buffers"
+    },
+    "kernel": {
+      "type": "bool",
+      "default": true,
+      "description": "use crit's kernel grouped-experts (built on this GPU, tuned or default knobs) where it builds; false runs the torch arithmetic"
+    }
+  },
+  "kernels": [
+    {
+      "name": "grouped-experts",
+      "fallback": "the tensor arithmetic in torch (code/fallback.py): each route's expert decoded and multiplied by batched matrix products in fixed chunks; correct, row invariant and capture-safe, much slower; the declared arithmetic is refused"
+    }
+  ],
+  "sources": {
+    "grouped": "code",
+    "prefill": "../expert-streamed-prefill/code"
+  },
+  "entry": "plugin.py:create"
+}

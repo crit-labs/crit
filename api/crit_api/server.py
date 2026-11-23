@@ -1843,6 +1843,12 @@ class Server(ThreadingHTTPServer):
         self.api = api
         self.tls = tls
 
+    def serve_forever(self, poll_interval=.05):
+        """socketserver's loop looks for shutdown() once per poll_interval, and shutdown() waits for that look: at
+        its half second every server crit stops (crit run's serve steps, crit pull's bench) waited a quarter second
+        on average for nothing."""
+        super().serve_forever(poll_interval)
+
     def handle_error(self, request, client_address):
         """A client that went away mid-request (a readiness probe that gave up, a closed tab) is one line, not a
         traceback; any other error keeps socketserver's traceback."""

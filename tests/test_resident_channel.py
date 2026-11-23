@@ -6,7 +6,7 @@ import sys
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "api", "cli"):
+for _folder in ("inference/core/python", "api", "cli"):
     sys.path.insert(0, str(ROOT / _folder))
 from crit_api import channel  # noqa: E402
 

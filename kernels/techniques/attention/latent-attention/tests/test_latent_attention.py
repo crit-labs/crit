@@ -14,7 +14,7 @@ from crit_kernels.build import load
 la = load("latent-attention")
 dev = torch.device("cuda")
 _spec = importlib.util.spec_from_file_location(
-    "latent_reference", Path(__file__).resolve().parents[5] / "inference" / "attention-state" / "code" /
+    "latent_reference", Path(__file__).resolve().parents[5] / "inference" / "techniques" / "attention" / "attention-state" / "code" /
     "latent_attention.py")
 ref = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ref)

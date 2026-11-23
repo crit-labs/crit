@@ -1,0 +1,358 @@
+# Heterogeneous placement and exact expert dispatch
+
+This entry explores where routed experts execute and where their weight bytes
+come from. It supplies static placement feasibility, measured host/device split
+planning, occurrence-preserving contribution splitting, one projection that
+resolves cached, staged and original sources, and one description of the router that
+a host reference and an engine's device kernel share. Each is an optional ingredient.
+
+## When to use it
+
+Use it when routed experts do not all fit on the device and the engine must
+decide placement, split work between host and device, or read some experts from a
+cache and others from their original source. Recon's placement scenario prices one
+plain pass per miss source from the probe (misses copied over the host link, misses
+computed on the CPU from host memory, and the two split, which share host memory's
+read rate rather than add up); where the CPU's bound is the lower one, plan
+the host share from the first candidate and measure the split on the target machine:
+each path alone and both running together, since a link copy and the CPU's arithmetic
+read the same host memory. Those bounds assume even routing, the pessimistic case: the
+cache's hit rate under real routing moves decode more than the split does. Choose by actual memory pressure and
+operation costs: static placement can be simple and effective, a cache may adapt
+better to route locality, and a source-aware projection avoids duplicated work
+from splitting an operation.
+
+## How it works
+
+**Static feasibility.** Given ordered indivisible allocation groups, enumerate
+host prefixes and device suffixes that fit after fixed device state and headroom.
+This answers which placements fit a snapshot; it does not rank speed. Extents
+must include padding, repacking and aliases.
+
+**Split execution.** Partition route occurrences between a device path and a host
+path, preserving position and weight on both. Device capacity here limits route
+occurrences, not distinct experts. Contributions are weighted before combination,
+so repeated expert IDs contribute at every occurrence.
+
+**Measured split planning.** Keep protected resident experts on the device, order
+unique misses, and consider every CPU-prefix/device-suffix split; all occurrences
+of one expert stay together. Each upload is charged once, each occurrence counted
+for arithmetic, and splits over the staging bytes or a lane's occurrence limit are
+rejected. Each split's estimate uses the median retained sample at the exact
+counts: `common + max(cpu, upload + device)` with CPU/device overlap, otherwise
+`common + cpu + upload + device`. There is no assumed bandwidth, linear scaling or
+interpolation; unmeasured splits stay visible but cannot win, and ties keep the
+split with the fewest CPU experts.
+
+**Mixed sources.** Each route uses a protected READY cache slot when available,
+else one scratch slot per unique miss while scratch remains, else the exact
+original expert as stock fallback. Repeated occurrences share one selection and
+staging demand but keep their positions and weights. Scratch cannot overlap a
+READY slot. A native backend can resolve a source descriptor per occurrence and
+run one projection over one prepared activation, without two graphs or two
+activation quantizations.
+
+## What the code supplies
+
+| File | Supplies |
+| --- | --- |
+| [`implementation.py`](code/implementation.py) | `ResidencyGroup`, `ResidencyPlan`, `prefix_residency_plans`; `Route`, `partition`, `combine`; `ReadySlot`, `MixedRoute`, `MixedSourcePlan`, `mixed_source_plan`; `execute_mixed`, which calls `quantize(activations)` once then `project(encoded, plan)` once |
+| [`measured_dispatch.py`](code/measured_dispatch.py) | `CalibrationKey`, `TimingCurve`, `DispatchCalibration`, `plan_dispatch` returning a `DispatchDecision` of every `DispatchCandidate`; optional `HostMemoryCosts`, `admit_host` and `revalidate_memory` |
+| [`routing.py`](code/routing.py) | `Routing`, one description of top-k routing; `route`, its host reference for one token; `routing_from_config`, which maps the config.json fields Core parses |
+| [`device_dispatch.py`](code/device_dispatch.py) | `DeviceDispatch` (post, forward, calibrate, status), `KernelRoutes` (the grouped-experts kernel device part, `kernel_part` checks the bundle layouts), `DeclaredRoutes` (the torch fallback), the load of crit's kernel [cpu-routes](../../../../kernels/techniques/experts/cpu-routes) (the post and scatter kernels of a layer's CPU routes over the slots of one of the host's handoffs) |
+
+`decision.best` is `None` when no feasible measured split exists; the engine then
+uses its ordinary exact path. Rejected splits keep their bytes and reasons. The
+planner performs no tuning or file writes. `execute_mixed` is an orchestration
+boundary, not a hidden kernel.
+
+**Routing.** One `Routing` describes how a token's router logits become expert IDs
+and weights; an engine's device routing kernel (a fused MoE kernel from
+[Kernels](../../../../kernels/README.md)' providers, or its own) implements the same fields:
+
+| Field | Meaning |
+| --- | --- |
+| `scoring` | `softmax` or `sigmoid` |
+| `score_before_selection` | Score every expert and select on the scores; otherwise select on raw logits and score only the selected (softmax over them, or sigmoid of each) |
+| `correction_bias` | A per-expert bias added to the selection value only; weights use the unbiased scores |
+| `groups`, `selected_groups`, `group_score_top` | Equal contiguous expert groups, each ranked by the sum of its `group_score_top` best selection values; only the best `selected_groups` groups are selectable |
+| `renormalize`, `renormalize_epsilon`, `renormalize_floor` | Divide the selected weights by `max(sum + epsilon, floor)` |
+| `scaling` | Multiply every final weight |
+
+Ties keep the lower expert ID, and the lower group index. IDs come back in selection
+order. The defaults, softmax over the top-k raw logits, are the kernel's previous
+behavior bit for bit. The same fields describe, for example, Mixtral's renormalized
+softmax, Qwen-MoE's `norm_topk_prob`, GPT-OSS's and Llama 4's scoring after
+selection, and DeepSeek-V3's sigmoid with a correction bias, eight groups ranked by
+their two best values, renormalization and 2.5x scaling (GLM-4.5 and Kimi K2 use the
+same form with one group). The host fixtures check each against the transformers
+router class it names, in crit's supported transformers range (`>=5.20,<6`, the
+`reference` extra).
+
+`routing_from_config` reads Core's `scoring_func`, `norm_topk_prob`,
+`routed_scaling_factor`, `n_group`, `topk_group` and `topk_method`. A field the
+config omits comes from `defaults`, the value the model's reference code assumes,
+and fails when neither gives it, because references disagree (Mixtral always
+renormalizes; a Qwen-MoE config without `norm_topk_prob` does not). The engine also
+states `score_before_selection`, which no config declares, and whether the
+checkpoint has an `e_score_correction_bias` tensor. `topk_method` sets the group
+rank: `group_limited_greedy` ranks by the best value, `noaux_tc` by the best two and
+requires the bias, `greedy` ignores groups. Not covered: scoring other than softmax
+and sigmoid (for example `sqrtsoftplus`), and a renormalization floor stored under a
+config key Core does not parse (Ernie 4.5's `moe_norm_min`), which the engine passes
+as `renormalize_floor`.
+
+
+## The plugin on CUDA
+
+The experts slot's device form splits a layer between the device and
+[host-expert-tier](../host-expert-tier/README.md)'s CPU tier by the slot table an expert cache's plan writes
+([experts:bundles](../../../../docs/PLUGINS.md#device-extensions)): a slot >= 0 is the device part's, -2 the CPU's. One post kernel (crit's kernel `cpu-routes`) lists the layer's -2
+routes in route order, writes their expert keys, tokens and the tokens' FP32 rows into a
+slot of a handoff (Core's `crit_plugins.host`, [the handoffs' protocol](../../../core/python/crit_plugins/host/README.md))
+and posts it (or answers it itself when the layer has none); the host's service thread runs the tier's C handler
+(`crit_tier_serve`) on the host's worker pool; the stream joins (the capturable join the host measured cheaper on
+the device) and a scatter kernel copies the CPU's rows into the device
+part's route rows, which its combine then sums in route order. One post and one join a layer: the next layer's input
+needs this layer's sum, so a decode step cannot join less often; a layer with no CPU routes pays its post kernel and a
+join that passes at once. `post(layer, x, ids, slots)` posts early, right after the slot table is known and before the
+link's fills, so the CPU computes while the link copies; `forward` then only joins. All of it captures in a CUDA graph
+and replays with new routes and splits.
+
+Both parts compute host-expert-arithmetic's declared integer block order (NVFP4 W4A4, INT4 W4A8; the device experts'
+`declared` arithmetic), so a token's bits never depend on which part computed which route: the plugin's tests check
+random admission quotas against the all-device result bit for bit, eagerly and in replayed graphs. The device part is
+an object with `route_outputs(layer, x, ids, store, slots)` and `combine(y, ids, weights)` (the experts plugin's
+`experts:routes`). By default (`device_part: auto`) it is `KernelRoutes`, crit's grouped-experts kernel in its
+declared arithmetic, reading the CPU tier's bundles where they are (both use the experts:bundles layout); where the
+kernel does not build, `DeclaredRoutes`, the declared order in torch one route at a time (exact, far too slow to
+serve), and the facts say which runs and why. A prompt chunk sends no route to the CPU (an expert cache stages its
+misses), so it need not match the CPU's bits: with `prompt_arithmetic: tensor` a call past `max_tokens` without -2
+routes runs the kernel's tensor arithmetic (BF16 tensor cores, W4A4 for NVFP4 bundles) instead of the integer order,
+the prompt path's time where the declared order bounds prefill. Its rows differ from the decode rows' in the last
+bits, which a `speed` engine's honesty bound allows and a `preserve` engine's exact one does not, so the option's
+default `auto` is `tensor` only where the engine asks `repeatable` prompt rows
+([exactness](../../../../docs/PLUGINS.md#exactness)) and the device kernel is there; decode rows and
+any call with CPU routes keep the declared order. `forward_bundles` takes a cache's store and slot
+table; `forward` uses the plugin's own: the first `resident` experts of each layer in a device store, the rest on the
+CPU. `quota_table(tokens)` measures, with the loaded experts on this machine, a layer's time with k misses copied over
+the link, j computed on the CPU (plus the join) and both at once, and returns
+[device-expert-cache](../device-expert-cache/README.md)'s split.py quota table (link misses per miss count) for the
+cache's admission: the share is measured per shape, never a constant. Without the native CPU tier or the CUDA build the
+CPU routes are computed on the host after a synchronization (the same bits, not capturable), and the facts say so.
+
+## What the engine supplies
+
+Quantization, projection, copies, device source resolution and completion
+receipts for mixed experts. Every source must produce the same expert values under
+the chosen arithmetic; cache and scratch indices are storage locations, never
+replacement expert IDs. Protect all READY hits before choosing replacement or
+scratch storage, and stage every component in `plan.demands` before projection
+reads it. If source formats differ, dispatch compatible decode explicitly, and keep
+the original-source fallback executable when scratch runs out.
+
+For the device router and shared expert: a kernel that implements the model's
+`Routing` (checked against `route` on the model's parameterization), and its owners
+retained until the stream settles.
+
+For measured dispatch: a complete current `CalibrationKey` (model content,
+representation, workload, implementation and hardware topology, including shapes,
+route multiplicity, residency, concurrency, CPU threads and transfer settings).
+Selection rejects a different key; invalidate samples when inputs change or
+timings drift. Measure warmed lanes under representative simultaneous traffic,
+with upload samples covering the real copy grouping, not only total bytes. Where a lane-cost model does not fit, record the measured choice once
+(`crit_plugins.decisions.settle`) so every load of the package replays it.
+
+`HostMemoryCosts` takes explicit peak-byte tables (CPU scratch by occurrence
+count, pinned staging by upload bytes, per-expert and per-upload loader bytes and
+file pages, common overhead) bound to the same identity. Missing estimates fail
+closed; use explicit zeros for resident sources. Compose `admit_host` with
+Core's `admit_working_set` (`crit_plugins.host.memory`, the host memory admission)
+and call `revalidate_memory(candidate, callback)` with a fresh observation just
+before allocating; on denial, replan or use the exact fallback. No planner result
+reserves memory or proves device readiness.
+
+## Worked example
+
+Run from `code/`. One cache hit is reused twice, one miss gets scratch, and the
+remaining misses keep their original IDs. No expert is dropped or wrapped.
+
+```python
+from implementation import Route, ReadySlot, mixed_source_plan, execute_mixed
+
+routes = (Route(0, 9, 0.5), Route(1, 2, 1.0), Route(2, 9, 0.25),
+          Route(3, 7, 1.0), Route(4, 8, 1.0))
+plan = mixed_source_plan(routes, {9: ReadySlot(0, 3)},
+                         capacity=2, scratch_slots=(1,))
+assert plan.demands == ((2, 1),)
+assert [(r.source, r.index) for r in plan.routes] == [
+    ("cache", 0), ("scratch", 1), ("cache", 0), ("stock", 7), ("stock", 8)]
+
+# A small host projection hook makes source identity and weights observable.
+stock = {9: (2.0, 4.0), 2: (1.0, 3.0), 7: (5.0, 1.0), 8: (2.0, 2.0)}
+cache, scratch, prepared = {0: stock[9]}, {}, []
+def quantize(activation):
+    prepared.append(tuple(activation))
+    return tuple(activation)  # this fixture deliberately uses plain host values
+def project(activation, selected):
+    for expert, slot in selected.demands:
+        scratch[slot] = stock[expert]
+    outputs = []
+    for resolved in selected.routes:
+        sources = {"cache": cache, "scratch": scratch, "stock": stock}
+        weight_row = sources[resolved.source][resolved.index]
+        value = sum(a * w for a, w in zip(activation, weight_row))
+        outputs.append((resolved.route.position, value * resolved.route.weight))
+    return tuple(outputs)
+
+assert execute_mixed(plan, (1.0, 2.0), quantize, project) == (
+    (0, 5.0), (1, 7.0), (2, 2.5), (3, 7.0), (4, 6.0))
+assert prepared == [(1.0, 2.0)]
+
+# Synthetic calibration: the same host planner accepts any measured hardware.
+from measured_dispatch import CalibrationKey, TimingCurve, DispatchCalibration, plan_dispatch
+
+identity = CalibrationKey("weights-v1", "layout-v1", "uniform-row-workload-v1",
+                          "kernels-and-config-v1", "cpu-device-topology-v1")
+def curve(points):
+    return TimingCurve.from_samples({count: (ms,) for count, ms in points.items()})
+
+calibration = DispatchCalibration(identity,
+    cpu=curve({0: 0, 1: 4, 2: 8, 3: 12}),
+    upload=curve({0: 0, 7: 2, 14: 4, 21: 6}),
+    device=curve({0: 0, 1: 1, 2: 2, 3: 3, 4: 4}),
+    common_samples_ms=(0.5,), overlap="cpu-device")
+work = tuple(Route(i, i, 1.0) for i in range(4))
+decision = plan_dispatch(work, {0}, {1: 7, 2: 7, 3: 7}, calibration,
+                         identity=identity, staging_budget_bytes=21)
+assert tuple(r.expert for r in decision.best.host) == (1,)
+assert decision.best.estimated_ms == 7.5
+# Byte pressure rules out that split; two misses now execute on the CPU.
+tight = plan_dispatch(work, {0}, {1: 7, 2: 7, 3: 7}, calibration,
+                      identity=identity, staging_budget_bytes=7)
+assert tuple(r.expert for r in tight.best.host) == (1, 2)
+
+# Compose OS admission with exact measured dispatch, using synthetic observations.
+from crit_plugins.host.memory import Observation, admit_working_set
+from measured_dispatch import HostMemoryCosts, revalidate_memory
+
+costs = HostMemoryCosts(identity,
+    scratch=((0, 0), (1, 16), (2, 32), (3, 48)),
+    staging=((0, 0), (7, 7), (14, 14), (21, 21)),
+    experts=((1, 0, 1024), (2, 0, 1024), (3, 0, 1024)),
+    upload_sources=((1, 0, 0), (2, 0, 0), (3, 0, 0)))
+seen = Observation(physical_available=256, commit_available=128)
+def admission(**extents):
+    return admit_working_set(**extents, observation=seen)
+
+safe = plan_dispatch(work, {0}, {1: 7, 2: 7, 3: 7}, calibration,
+                     identity=identity, staging_budget_bytes=21,
+                     memory_costs=costs, admit_host=admission)
+assert safe.best is not None and not safe.best.host
+assert revalidate_memory(safe.best, admission)
+seen = Observation(physical_available=10, commit_available=128)
+assert not revalidate_memory(safe.best, admission)  # replan before allocating
+
+# Routing for one token, with DeepSeek-V3's form on four groups of two experts
+# (synthetic values).
+from routing import Routing, route
+
+rule = Routing(scoring="sigmoid", score_before_selection=True, correction_bias=True,
+               groups=4, selected_groups=3, group_score_top=2, renormalize=True,
+               renormalize_epsilon=1e-20, scaling=2.5)
+ids, weights = route((2.0, 1.0, -1.0, 0.0, 3.0, -2.0, 0.5, 0.5), 2, rule,
+                     bias=(0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0))
+assert ids == (0, 1)  # without the bias, group 2 is selectable and expert 4 ranks first
+assert abs(sum(weights) - 2.5) < 1e-12
+assert route((1.0, 3.0, 2.0), 2) == ((1, 2), route((3.0, 2.0), 2)[1])
+```
+
+## Adapting it
+
+Preserve every route occurrence, exact expert identity, compatible
+representation, protected source generations, complete staging and readiness
+before use. Placement order, replacement policy, scratch count and where
+resolution runs are choices.
+
+Substituting a different resident expert for a missing one changes the routed
+computation and is outside `mixed_source_plan`'s exact contract. An approximate
+consumer must keep the original routes for comparison and declare its replacement
+selection, gate reweighting and quality criteria separately, with the exact
+fallback still executable. [Residency](../expert-residency/README.md) supplies
+lifetime rules; [asynchronous contributions](../async-expert-contributions/README.md)
+supplies a join protocol when splitting pays.
+
+**Exact split.** When host workers compute missed experts, give them the device
+kernel's exact per-row operation order, so an expert's contribution is bitwise the
+same on either processor and output does not depend on the split, the cache state or
+host load. [Host expert arithmetic](../host-expert-arithmetic/README.md) supplies that
+for NVFP4: a declared order, host paths matching it bit for bit and the device
+function that declares the same one.
+For prompt chunks, choose host experts by a fixed function of (layer, expert), never
+by what happens to be resident: a cache-dependent split changes a token's arithmetic
+between two identical requests. A miss the host computes is not admitted to the
+device cache, so the miss rate rises with the host share; weigh that against the
+transfer it saves.
+
+**In quality mode `speed` the split need not be exact.** Eval passes an output
+difference that parts at a near-tie there ([forks](https://github.com/crit-labs/crit-eval/blob/main/docs/MEASUREMENTS.md#forks-in-quality-mode-speed)), which is all that rounding
+apart on two processors can cause. So host workers may compute misses with their own
+fastest rows (8-bit activations on integer dot products, for example, where the device
+runs 4-bit ones), and prompt chunks may put an expert on the host because it is not
+resident. Measure such a split against the exact one: it pays when the host's faster rows
+or the saved copies outweigh the drift, which the run's quality budget judges.
+
+**Host work inside a captured decode.** To run the host share mid-graph, post it
+through one of the host's handoffs (Core's `crit_plugins.host`;
+[the handoffs' protocol](../../../core/python/crit_plugins/host/README.md)), which supply the
+doorbell protocol, measured join choice, release and failure answering.
+
+## Costs and validation
+
+**The CUDA form, for scale only** (one RTX 5090 and a Ryzen 5 9600 under WSL2, 2.78 MB NVFP4 experts of hidden 2560
+and inter 640, the device part left out since it is the same in every split): a layer's post, join (the poll kernel,
+2.7-2.9 µs measured against 40-44 µs for the stream wait) and scatter with nothing for the CPU cost 5.4 µs. A captured
+round of 48 layers at 3.5 misses a layer took 23.3 ms with every miss copied over the link (~104-114 µs an expert),
+20.1 ms with one miss a layer on the CPU and 17.8 ms with two, at one token an expert; at four tokens an expert 23.5,
+21.0 and 27.5 ms. The CPU tier there computes an expert in 135-206 µs at one token and 300-360 µs at four (5 threads,
+bundles read in place), so the share that pays moves with the tokens an expert has: `quota_table(tokens)` measures it
+there as link misses for 1-4 misses a layer of [0, 0, 1, 2] at one token an expert, [0, 1, 1, 2] at two and [1, 1, 2, 2]
+at four.
+The scatter reads mapped host memory only in blocks that have rows to copy: reads over the link serialize, and one read
+of the status word in each of a grid's blocks cost 0.78 ms a layer before.
+
+Placement feasibility is not a throughput model. Splitting can gain from overlap
+but adds transfers, launches and reduction; mixed sources can add irregular access
+or slower fallback reads. Measure miss bytes and complete operation time. Host
+execution of missed experts reads the same DRAM as concurrent host-to-device
+copies, so measure host latency while those copies run. Spin barriers across host
+workers stall when one thread is descheduled; leave cores for the launching
+thread. Choose the host share of each pass's misses from measurements on the target
+machine, never a fixed fraction: host workers add per-expert compute time until they
+saturate host DRAM bandwidth, the device pays each miss's transfer at the measured
+host-to-device rate (`crit eval probe`), and past the share where host time exceeds
+the transfer it replaces, decode slows down. Sweep the share on the mixed suite. Where
+the first CPU read of host memory registered with the device is slow (seen under
+WSL2), touch every page once at load. (For scale only: on
+one machine with 6 Ryzen 5 9600 cores, an engine with 3.1 MB NVFP4 experts reached
+about 36 GB/s with six threads, near the host's DRAM rate, and gained most with about
+60% of its misses on the CPU, while a second engine on the same machine measured its
+CPU path slower than the transfer. The same CPU can be worth a large share for one
+model and none for another.)
+
+Measured prefix planning is quadratic in route count and prices one
+operation, not future cache warmth. Common errors: treating occurrence capacity as
+cache capacity, applying weights twice, remapping IDs modulo cache size, and
+aliasing scratch with live content.
+
+[Routing fixtures](../../../../tests/test_expert_routing.py)
+check the host reference against hand-worked cases and, when transformers is
+installed, against the Mixtral, Qwen2/Qwen3-MoE, GPT-OSS, Llama 4, DeepSeek-V2/V3,
+GLM-4.5, MiniMax-M2, Ernie 4.5 and LongCat-Flash router classes, each built from a
+minimal config with an identity gate so the fixture sets the logits, plus the config
+mapping. Host fixtures cover placement feasibility, duplicate occurrences,
+ordered combination, staging demands, exact fallback and single activation
+preparation. [Measured policy fixtures](../../../../tests/test_measured_expert_policies.py)
+cover stale identities, nonlinear curves, overlap, capacity limits, memory
+admission and unchanged weighted results across splits. None validates mixed
+cache/stock expert kernels, full-model quality or a CPU/GPU speedup.

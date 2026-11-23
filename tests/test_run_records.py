@@ -50,7 +50,7 @@ class RunRecordTests(RunFixture, unittest.TestCase):
 
     def test_run_root_rejects_eval_sources_before_creating_directories(self):
         project = self.root / "project"
-        header = project / "core/include/crit/core.h"
+        header = project / "inference/core/include/crit/core.h"
         header.parent.mkdir(parents=True)
         header.write_text("synthetic project marker", encoding="utf-8")
         evaluation = project / "eval"
@@ -148,11 +148,10 @@ class RunRecordTests(RunFixture, unittest.TestCase):
 
     def test_a_candidate_states_the_exactness_of_its_rows(self):
         """crit completes a candidate's configuration with the exactness of its rows: what it asks, and the run's
-        quality mode's level for a phase it leaves out (exact in speed as in preserve: a prompt row has the bits of
-        the same token decoded, and a lower level is asked for)."""
-        exact = {"decode": "row-exact", "prompt": "exact"}
+        quality mode's level for a phase it leaves out (row-exact in speed: a prompt row's bits its own at any prompt
+        length; exact in preserve), and a level it asks."""
         first = self.candidate()
-        self.assertEqual(first["configuration"]["exactness"], exact)
+        self.assertEqual(first["configuration"]["exactness"], {"decode": "row-exact", "prompt": "row-exact"})
         asked = self.candidate(configuration={"batch": 2, "exactness": {"prompt": "repeatable"}})
         self.assertEqual(asked["configuration"]["exactness"], {"decode": "row-exact", "prompt": "repeatable"})
         whole = self.candidate(configuration={"batch": 3, "exactness": "exact"})   # a decode row's exact is row-exact
@@ -177,13 +176,14 @@ class RunRecordTests(RunFixture, unittest.TestCase):
         with patch("crit.run.external.spec_of", lambda configuration: object()):
             self.assertEqual(with_exactness(external, "preserve"), external)
         brief = (self.directory / "agent_request.md").read_text(encoding="utf-8")
-        self.assertIn("decode rows row-exact and prompt rows exact, so each prompt row has the bits of the same token "
-                      "decoded, which crit smoke judges without a tolerance", brief)
+        self.assertIn("decode rows row-exact and prompt rows row-exact, so each prompt row's bits follow nothing but "
+                      "the row at any prompt length", brief)
         # It states the run's quality mode too, whatever it named: the plugins' precision options follow it.
         self.assertEqual(first["configuration"]["quality_mode"], "speed")
         named = self.candidate(configuration={"batch": 5, "quality_mode": "preserve"})
         self.assertEqual(named["configuration"]["quality_mode"], "speed")
-        self.assertIn("quantized-projections' head option, left on auto, holds it in FP8 in this mode", brief)
+        self.assertIn("quantized-projections' head and trunk options (the head; every other target matrix stored in 16 "
+                      "bits), left on auto, hold them in FP8 in this mode", brief)
 
     def test_a_preserve_run_asks_exact_rows_of_a_candidate_that_sets_none(self):
         run = self.store.create(self.data | {"quality_mode": "preserve"})["run"]
@@ -197,7 +197,7 @@ class RunRecordTests(RunFixture, unittest.TestCase):
         brief = (self.directory / "agent_request.md").read_text(encoding="utf-8")
         self.assertIn("decode rows row-exact and prompt rows exact, so each prompt row has the bits of the same token "
                       "decoded", brief)
-        self.assertIn("quantized-projections' head option, left on auto, keeps it as stored in this mode", brief)
+        self.assertIn("left on auto, keep them as stored in this mode", brief)
 
     def test_a_candidate_and_its_package_are_plugin_packages(self):
         """crit run takes an engine only as Core's loader runs it: plugins/ and a configuration whose plugins

@@ -119,6 +119,12 @@ Triton kernels for attention over paged KV caches, used by crit's attention-stat
   that carries no value, `out = sum p v / (sum p + e^sink)`, as attention with learned sinks computes it. It is folded
   into a row's final state once, after its partials (the kernel core's `sink` / `softmax_sink2`), so a fused launch
   keeps its split launch's bits; the log-sum-exp counts it; sinks of -inf keep every bit of a launch without them.
+- **Distance bias** (`attend(..., bias=)` split and fused, `prefill(..., flash="cuda", bias=)`): FP32
+  `[tokens][heads][extent]`, each token's additive scores (natural log, after the scale) for the positions
+  `0 .. extent - 1` behind its own, nothing further back: a relative-position bias the model computes per token. The
+  CUDA prompt chunk takes it in the variant `B=1` (the bias code compiled out of every other library): each block's
+  bias values read into registers ahead of its products, added in base 2 as the scores are; a bias of zeros keeps
+  every bit of the chunk without one. Not on the flash structures, block lists or trees.
 - **Derived keys** (`attend(..., derive=)` split and fused, `prefill(..., derive=)`): for a layer that caches one row
   per position and KV head and uses it as both value and key. The cache holds value pages only
   (`write(None, values, slots, None, value_pages, ...)`), and each row is read as its value and, on read, as its key

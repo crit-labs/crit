@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 import sys
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "core/python"))
+sys.path.insert(0, str(ROOT / "inference/core/python"))
 
 from crit_core.constraints import compiler as c  # noqa: E402
 
@@ -276,7 +276,7 @@ class GrammarCheckTests(unittest.TestCase):
         code = ("import sys; before = set(sys.modules); sys.path.insert(0, sys.argv[1]); import crit_core.constraints; "
                 "loaded = {n.partition('.')[0] for n in set(sys.modules) - before}; "
                 "loaded -= set(sys.stdlib_module_names) | {'crit_core'}; sys.exit(', '.join(sorted(loaded)) or None)")
-        result = subprocess.run([sys.executable, "-I", "-B", "-c", code, str(ROOT / "core/python")],
+        result = subprocess.run([sys.executable, "-I", "-B", "-c", code, str(ROOT / "inference/core/python")],
                                 capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
 

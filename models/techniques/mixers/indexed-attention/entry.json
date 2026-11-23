@@ -1,0 +1,43 @@
+{
+  "schema": "crit-model-technique-v1",
+  "id": "indexed-attention",
+  "category": "mixers",
+  "summary": "Block-sparse attention: an indexer scores the complete blocks of positions before a token and the token reads its best ones within a budget, and its own block",
+  "provides": {
+    "blocks": [
+      "indexed-attention"
+    ]
+  },
+  "source": "indexed_attention",
+  "needs_sources": [
+    "template",
+    "attention"
+  ],
+  "path": "models/techniques/mixers/indexed-attention/README.md",
+  "code_path": "models/techniques/mixers/indexed-attention/code",
+  "code_files": [
+    {
+      "path": "models/techniques/mixers/indexed-attention/code/indexed_attention.py",
+      "purpose": "The block class and its registry (BLOCKS)"
+    }
+  ],
+  "reads": {
+    "tensors": [
+      "indexer.index_qk_proj",
+      "indexer.k_layernorm.weight",
+      "indexer.q_layernorm.weight"
+    ],
+    "config": [
+      "indexer_budget",
+      "indexer_compress_ratio",
+      "indexer_head_dim",
+      "indexer_kv_heads",
+      "indexer_n_heads"
+    ],
+    "layout": [
+      "config",
+      "indexer",
+      "pool"
+    ]
+  }
+}

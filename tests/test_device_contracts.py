@@ -7,16 +7,19 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "core" / "python"))
+sys.path.insert(0, str(ROOT / "inference" / "core" / "python"))
 
 from crit_plugins import PluginError, Registry, assemble  # noqa: E402
-from crit_plugins.device import DEVICE_EXTENSIONS, RoundBatch, StepBatch, extension_missing  # noqa: E402
+from crit_plugins.contracts import Contracts  # noqa: E402
+from crit_plugins.device import RoundBatch, StepBatch, extension_missing  # noqa: E402
 from support.plugins import write_plugins  # noqa: E402
 
 
 class ExtensionTests(unittest.TestCase):
     def test_every_extension_names_a_fact_and_documents_its_methods(self):
-        for fact, methods in DEVICE_EXTENSIONS.items():
+        # Core's facts and those the library's plugins define.
+        library = Registry.discover(ROOT / "inference" / "techniques")
+        for fact, methods in Contracts.of(library).facts.items():
             self.assertRegex(fact, r"^[a-z_]+:[a-z0-9_-]+$")
             for name, text in methods.items():
                 self.assertTrue(text.startswith(name + "("), f"{fact}.{name}: {text}")
@@ -205,7 +208,8 @@ class ReleaseCachedTests(unittest.TestCase):
         cuda = types.SimpleNamespace(is_available=lambda: True, is_initialized=lambda: True)
         fake = types.SimpleNamespace(cuda=cuda, device=lambda name: types.SimpleNamespace(type=str(name).split(":")[0]))
         # the helper is the device memory's release(below=): crit_plugins.memory's object for the device
-        with mock.patch.dict(sys.modules, {"torch": fake}),                 mock.patch.object(memory, "of", lambda device="cuda": memory.DeviceMemory(device, readings)):
+        with mock.patch.dict(sys.modules, {"torch": fake}), \
+                mock.patch.object(memory, "of", lambda device="cuda": memory.DeviceMemory(device, readings)):
             self.assertEqual(release_cached_under(1 << 30), 0)         # 4 GiB free: the cache stays
             self.assertEqual(readings.emptied, 0)
             self.assertEqual(release_cached_under(8 << 30), 2 << 30)   # under 8 GiB: the 2 GiB nothing uses

@@ -15,7 +15,7 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "cli"):
+for _folder in ("inference/core/python", "cli"):
     sys.path.insert(0, str(ROOT / _folder))
 
 from crit_core.native import step_library  # noqa: E402

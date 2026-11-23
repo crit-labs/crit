@@ -289,7 +289,7 @@ refuses them ([a busy engine](#a-busy-engine): `--max-queue`, `--queue-timeout`)
 | `logprobs`, `top_logprobs` | [Token log-probabilities](#token-log-probabilities) for packages declaring `chat-logprobs-v1`: every token's own and up to 20 alternatives. Not with `stop` |
 | `chat_template_kwargs`, `reasoning_effort` | [Thinking controls](#thinking-controls) for packages declaring `chat-template-kwargs-v1`: the chat-template variables the package declares (`enable_thinking`, `thinking`, `reasoning_effort`), and `reasoning_effort` `none`, `minimal`, `low`, `medium`, `high` or `xhigh` mapped onto them; otherwise 400 `unsupported_parameter` (ignored with `--lenient`) |
 | `crit` | crit's own extension: `{"decode": "plain"}` decodes the reply one token per target pass, without drafting, for packages declaring `chat-plain-v1` ([plain decoding](#engine-facts-and-plain-decoding)); `{"timeout": SECONDS}`, a positive number, limits this request's turn as `--timeout` does, at most `--timeout` (a larger value keeps it): a turn that runs out is a 504 and a cooperative engine stays loaded; `{"prompt_cache": false}` has the engine prefill every prompt token, whatever its [prompt cache](PLUGINS.md#the-prompt-cache) holds, for packages declaring `chat-prompt-cache-v1` (a measured request: without it a prompt that begins as an earlier request did is served from the cache, and `usage.prompt_tokens_details.cached_tokens` counts the tokens it did not compute) |
-| `priority` | An extension to the OpenAI API: an integer, default 0 (also when null). Requests waiting for the engine go lower values first, then in arrival order (Core's rule, [request priority](../core/src/runtime/README.md#request-priority): the request carries it to Core's scheduler, which orders the requests the engine holds, and crit serve's queue hands over the ones waiting for room in the same order), and are reordered only among requests for the same model: a request never moves ahead of a queued model switch, nor a switch ahead of requests queued before it, so priority adds no model loads. A running request is never preempted, and a higher value waits while lower ones keep arriving. Anthropic and `/api/chat` requests, whose APIs have no such field, and fixed-text scores wait at 0 |
+| `priority` | An extension to the OpenAI API: an integer, default 0 (also when null). Requests waiting for the engine go lower values first, then in arrival order (Core's rule, [request priority](../inference/core/src/runtime/README.md#request-priority): the request carries it to Core's scheduler, which orders the requests the engine holds, and crit serve's queue hands over the ones waiting for room in the same order), and are reordered only among requests for the same model: a request never moves ahead of a queued model switch, nor a switch ahead of requests queued before it, so priority adds no model loads. A running request is never preempted, and a higher value waits while lower ones keep arriving. Anthropic and `/api/chat` requests, whose APIs have no such field, and fixed-text scores wait at 0 |
 
 Responses carry `usage` when measured and `crit_telemetry`: prompt and output tokens, the
 prompt tokens the engine did not compute (`usage.prompt_tokens_details.cached_tokens`: its
@@ -1027,14 +1027,14 @@ engine. Fixed-bucket histograms give percentiles:
 ## Structured output
 
 `response_format` restricts the reply's bytes with Core's
-[structured-output service](../core/src/constraints/README.md). It needs a package
+[structured-output service](../inference/core/src/constraints/README.md). It needs a package
 declaring `chat-constraints-v1`; otherwise it returns 400. With `tools` it needs
 `tool_choice: "none"` ([tool calls](#tool-calls)).
 
 - `{"type": "json_object"}`: one JSON object (surrounding whitespace allowed).
 - `{"type": "json_schema", "json_schema": {"name": ..., "schema": {...}, "strict": ...}}`:
   compact JSON in the schema's declaration order, compiled with `crit_core.constraints`.
-  The [supported subset](../core/src/constraints/README.md#compiling-languages-python):
+  The [supported subset](../inference/core/src/constraints/README.md#compiling-languages-python):
   closed objects (`additionalProperties: false`), typed arrays, strings with lengths or a
   `pattern`, booleans, null, numbers, integers with both bounds, `enum`, `const`, `anyOf`,
   type lists, provably disjoint `oneOf` and local `$ref`/`$defs`. Anything else
@@ -1085,7 +1085,7 @@ refused before anything loads.
 
 Core's adapter is a `crit_core.serving.ResidentChat`: it renders the conversation, tools and tool history with the
 model's chat template (for a family whose checkpoints carry none, the one crit ships, such as DeepSeek V4's:
-[Core's text layer](../core/python/crit_core/text/README.md#chat-templates)), forwards the request's sampling fields,
+[Core's text layer](../inference/core/python/crit_core/text/README.md#chat-templates)), forwards the request's sampling fields,
 streams text without stop tokens, honors cancellation and reports Core's phase telemetry, over the model plugin's
 batched steps. The sections below are the chat-resident-v1 contract between crit serve's host and that adapter:
 crit serve and Core implement both sides, and an engine meets it by being a plugin package whose model plugin
@@ -1159,7 +1159,7 @@ The contract permits an engine's scheduler to batch requests; it does not itself
 promise batched device arithmetic or a throughput gain. A model plugin with mixed batches
 batches the arithmetic too: one step runs every scheduled request's rows and reads each
 weight once ([serve concurrent requests](BUILDING_ENGINES.md#serve-concurrent-requests)). A Python
-engine gets the same scheduling as a [step engine](../core/src/runtime/README.md#step-engines).
+engine gets the same scheduling as a [step engine](../inference/core/src/runtime/README.md#step-engines).
 
 ### Model access and allocation
 
@@ -1488,7 +1488,7 @@ clamps -inf and Core's rounding tolerance into the range and reads the bytes fro
 tokenizer.
 Core's resident adapter (`crit_core.engine.ResidentEngine`) serves them for every engine, whose model plugin declares
 `token_logprobs` with `max_top_logprobs` of at least 20, which Core's loader requires (see the
-[engine ABI](../core/src/runtime/README.md#engine-abi)).
+[engine ABI](../inference/core/src/runtime/README.md#engine-abi)).
 
 ### Fixed-text scores in Core's adapter
 

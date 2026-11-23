@@ -13,7 +13,7 @@ from crit_kernels import contracts
 PAGE = 64
 LENGTH = 8192
 _spec = importlib.util.spec_from_file_location(
-    "latent_reference", Path(__file__).resolve().parents[4] / "inference" / "attention-state" / "code" /
+    "latent_reference", Path(__file__).resolve().parents[4] / "inference" / "techniques" / "attention" / "attention-state" / "code" /
     "latent_attention.py")
 ref = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ref)

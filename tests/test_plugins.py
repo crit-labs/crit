@@ -10,7 +10,7 @@ import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "core" / "python"))
+sys.path.insert(0, str(ROOT / "inference" / "core" / "python"))
 sys.path.insert(0, str(ROOT / "cli"))
 
 from crit_plugins import PluginError, Registry, assemble, check, model_problems  # noqa: E402
@@ -18,7 +18,7 @@ from crit_plugins.assemble import plugins_root  # noqa: E402
 from crit_plugins.ablation import blame, describe, engine_facts, option_variants, summary, toggles, variants  # noqa: E402
 from crit_plugins.testing import run_tests  # noqa: E402
 from crit.plugins import main  # noqa: E402
-from support.plugins import PLUGINS, write_plugins  # noqa: E402
+from support.plugins import PLUGINS, library_defines, write_plugins  # noqa: E402
 
 FULL = {"use": {"attention": "attn-fp8", "kv_cache": "kv-fp8", "drafter": "draft-eagle"},
         "base": {"attention": "attn-plain", "kv_cache": "kv-bf16", "drafter": None},
@@ -44,18 +44,18 @@ class PluginFixture:
 
 class LibraryPlaceTests(unittest.TestCase):
     def test_a_checkout_s_crit_uses_the_checkout_s_library(self):
-        # An installed crit's is the copy its wheel ships, crit/library/inference (tests/test_wheel_install.py).
+        # An installed crit's is the copy its wheel ships, crit/library/inference/techniques (tests/test_wheel_install.py).
         import crit.inference
         import crit.plugins as plugins
-        self.assertEqual((crit.inference.ROOT, crit.inference.LIBRARY), (ROOT, ROOT / "inference"))
-        self.assertEqual(plugins.INFERENCE, ROOT / "inference")
+        self.assertEqual((crit.inference.ROOT, crit.inference.LIBRARY), (ROOT, ROOT / "inference" / "techniques"))
+        self.assertEqual(plugins.INFERENCE, ROOT / "inference" / "techniques")
 
     def test_a_crit_without_its_library_is_a_broken_install(self):
         from unittest.mock import patch
         import crit.inference
         import crit.plugins as plugins
         with tempfile.TemporaryDirectory() as root:
-            missing = Path(root) / "inference"
+            missing = Path(root) / "inference" / "techniques"
             out = io.StringIO()
             with patch.object(plugins, "INFERENCE", missing):
                 with patch.object(plugins.library, "__defaults__", (missing,)), contextlib.redirect_stderr(out):
@@ -77,7 +77,8 @@ class ManifestTests(PluginFixture, unittest.TestCase):
     def test_a_bad_manifest_is_refused_with_what_to_change(self):
         cases = [
             ({"id": "other"}, "id is the folder's name"),
-            ({"fills": []}, "fills is a nonempty list"),
+            ({"fills": []}, "a plugin that fills no slot is a core other plugins extend: it has no entry"),
+            ({"fills": "attention"}, "fills is a list"),
             ({"fills": ["Attention"]}, "fills holds 'Attention'"),
             ({"entry": "missing.py:create"}, "no file of the plugin"),
             ({"entry": "plugin.py"}, "entry is FILE.py:FUNCTION"),
@@ -135,18 +136,54 @@ class ManifestTests(PluginFixture, unittest.TestCase):
         self.addCleanup(assembly.close)
         self.assertEqual(assembly["kv_cache"].value(1.5), 3.0)
 
-    def test_a_folder_of_plugins_keeps_its_base_plugins_in_base(self):
-        (self.root / "base").mkdir()
+    def test_a_folder_of_plugins_names_the_folders_it_is_used_with(self):
+        # A library split over folders (crit's: inference/techniques and models/core) is one registry from either.
+        other = self.root.parent / "other"
+        other.mkdir()
+        (self.root / "kv-bf16").rename(other / "kv-bf16")
+        (self.root / "plugins.json").write_text(json.dumps({"with": ["../other"]}), encoding="utf-8")
+        (other / "plugins.json").write_text(json.dumps({"with": ["../" + self.root.name]}), encoding="utf-8")
+        for start in (self.root, other):
+            self.assertEqual(sorted(Registry.discover(start).manifests), sorted(PLUGINS))
+        (self.root / "plugins.json").write_text("[]", encoding="utf-8")
+        with self.assertRaisesRegex(PluginError, "plugins.json"):
+            Registry.discover(self.root)
+
+    def test_a_plugin_that_fills_no_slot_is_a_core_others_extend(self):
+        # A core holds what its extensions share (code, options): it has no factory and no selection names it.
+        from crit_plugins.assemble import load_module, plugin_package
+        core = self.root / "kv-core"
+        core.mkdir()
+        (core / "plugin.json").write_text(json.dumps({
+            "schema": "crit-plugin-v1", "id": "kv-core", "title": "Fixture core", "fills": [],
+            "options": {"pages": {"type": "int", "default": 4}}}), encoding="utf-8")
+        (core / "shared.py").write_text("PAGES = 4\n", encoding="utf-8")
+        data = json.loads((self.root / "kv-fp8" / "plugin.json").read_text(encoding="utf-8"))
+        data.update(sources={"core": "../kv-core"}, extends="core")
+        (self.root / "kv-fp8" / "plugin.json").write_text(json.dumps(data), encoding="utf-8")
+        registry = Registry.discover(self.root)
+        self.assertEqual((registry["kv-core"]["fills"], registry["kv-core"]["entry"]), ([], None))
+        self.assertIn("pages", registry["kv-fp8"]["options"])   # the extension takes the core's options
+        package = plugin_package(registry["kv-fp8"])
+        self.assertEqual(__import__(f"{package.__name__}.core.shared", fromlist=["PAGES"]).PAGES, 4)
+        with self.assertRaisesRegex(PluginError, "kv-core fills no slot"):
+            load_module(registry["kv-core"])
+        with self.assertRaisesRegex(PluginError, "kv-core fills"):
+            check({"use": {"attention": "attn-plain", "kv_cache": "kv-core"}}, registry)
+
+    def test_a_folder_of_plugins_holds_plugins_and_groups_of_them(self):
+        # The library's layout, and an engine's that crit plugins add made: CATEGORY/ID, the folder marked by
+        # plugins.json, so a plugin in a group finds the folder of plugins it lies in.
+        (self.root / "kv").mkdir()
+        (self.root / "_sources" / "lent").mkdir(parents=True)   # no group: code the plugins import
         for plugin_id in ("attn-plain", "kv-bf16"):
-            (self.root / plugin_id).rename(self.root / "base" / plugin_id)
+            (self.root / plugin_id).rename(self.root / "kv" / plugin_id)
+        (self.root / "plugins.json").write_text("{}", encoding="utf-8")
         registry = Registry.discover(self.root)
         self.assertEqual(sorted(registry.manifests), sorted(PLUGINS))
-        self.assertEqual(Path(registry["kv-bf16"]["folder"]).parent.name, "base")
+        self.assertEqual(Path(registry["kv-bf16"]["folder"]).parent.name, "kv")
         for plugin_id in ("kv-bf16", "kv-fp8"):
             self.assertEqual(plugins_root(registry[plugin_id]["folder"]), self.root.resolve())
-        write_plugins(self.root / "base", {"base": PLUGINS["kv-bf16"]})
-        with self.assertRaisesRegex(PluginError, "base is the folder of a folder's base plugins"):
-            Registry.discover(self.root)
 
     def test_two_plugins_of_one_id_are_refused(self):
         second = Path(self.root.parent) / "more"
@@ -350,7 +387,7 @@ ENGINE = {
     "model-x": {"fills": ["model"], "needs": [["model_type:x", "model_type:x_text"]], "requires": ["recurrence"],
                 "provides": ["draft:head"], "devices": ["cuda"]},
     "place": {"fills": ["placement"], "devices": ["host"]},
-    "proj": {"fills": ["projections"], "devices": ["cuda"]},
+    "proj": {"fills": ["projections"], "devices": ["cuda"], "defines": library_defines()},
     "attn": {"fills": ["attention"], "devices": ["cuda", "rocm"]},
     "attn-rocm": {"fills": ["attention"], "devices": ["rocm"]},
     "kv": {"fills": ["kv_cache"], "devices": ["cuda"]},
@@ -503,7 +540,9 @@ class EngineSelectionTests(unittest.TestCase):
 
 class DeviceFormTests(unittest.TestCase):
     def test_a_gpu_plugin_has_its_slots_device_form_beside_the_host_form(self):
-        from crit_plugins.device import DEVICE_INTERFACES, device_missing
+        from crit.plugins import library
+        contracts = library().contracts   # the attention slot's device form is its base plugin's definition
+        device_missing, DEVICE_INTERFACES = contracts.device_missing, contracts.device
 
         class Attention:
             def attend(self, sequence, queries, positions, scale=None, pending=False):
@@ -621,7 +660,8 @@ class SlowTests(unittest.TestCase):
             from unittest.mock import patch
             from crit import plugins as cli
             output = io.StringIO()
-            with patch.object(cli, "run_tests", lambda *a, **k: list(items.values())),                     contextlib.redirect_stdout(output):
+            with patch.object(cli, "run_tests", lambda *a, **k: list(items.values())), \
+                    contextlib.redirect_stdout(output):
                 self.assertEqual(cli.main(["test", str(root)]), 0)
         found = items["attn-kv-fused"]
         self.assertEqual((found["state"], found["detail"]), ("passed", "3 tests, 2 skipped"), found)
@@ -705,7 +745,8 @@ class CoreRuntimeTests(unittest.TestCase):
         case = PluginTestCase()
         with patch("crit_core.native.step_library", return_value="/built/crit_core_steps.dll"):
             self.assertEqual(case.core_runtime(), "/built/crit_core_steps.dll")
-        with patch("crit_core.native.step_library", return_value=None),                 self.assertRaisesRegex(unittest.SkipTest, "`crit core build` builds it"):
+        with patch("crit_core.native.step_library", return_value=None), \
+                self.assertRaisesRegex(unittest.SkipTest, "`crit core build` builds it"):
             case.core_runtime()
         # the skip leaves what the test checks unchecked, which crit plugins test fails
         from crit_plugins.testing import UNCHECKED

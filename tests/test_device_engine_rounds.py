@@ -19,7 +19,7 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "cli"):
+for _folder in ("inference/core/python", "cli"):
     sys.path.insert(0, str(ROOT / _folder))
 
 from crit_core.native import step_library  # noqa: E402
@@ -73,10 +73,10 @@ class DeviceRoundTests(unittest.TestCase):
             shutil.copytree(ROOT / "tests" / "support" / "device_plugins" / plugin, cls.package / "plugins" / plugin)
         # An attention plugin without a round form: softmax-attention's copy that does not provide rounds:attention.
         plain = cls.package / "plugins" / "plain-attention"
-        shutil.copytree(cls.package / "plugins" / "base" / "softmax-attention", plain)
+        shutil.copytree(cls.package / "plugins" / "attention" / "softmax-attention", plain)
         manifest = json.loads((plain / "plugin.json").read_text(encoding="utf-8"))
         manifest.update(id="plain-attention", provides=[f for f in manifest["provides"] if f != "rounds:attention"],
-                        sources={"state": "../attention-state/code"})
+                        sources={"state": "../attention/attention-state/code"})
         (plain / "plugin.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         (cls.package / "configuration.json").write_text(json.dumps(configuration(False)), encoding="utf-8")
         cls.sealed = inventory(cls.package)

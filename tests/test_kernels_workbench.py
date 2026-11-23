@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "kernels", "cli"):
+for _folder in ("inference/core/python", "kernels", "cli"):
     sys.path.insert(0, str(ROOT / _folder))
 from crit_kernels import main
 from crit_kernels import workbench

@@ -1,0 +1,53 @@
+{
+  "schema": "crit-model-technique-v1",
+  "id": "latent-attention",
+  "category": "mixers",
+  "summary": "Multi-head latent attention in its absorbed form: one cached row a position (a latent and a shared rotary key), low-rank queries multiplied into the latent space",
+  "provides": {
+    "blocks": [
+      "latent-attention"
+    ]
+  },
+  "source": "latent_attention",
+  "needs_sources": [
+    "template"
+  ],
+  "path": "models/techniques/mixers/latent-attention/README.md",
+  "code_path": "models/techniques/mixers/latent-attention/code",
+  "code_files": [
+    {
+      "path": "models/techniques/mixers/latent-attention/code/latent_attention.py",
+      "purpose": "The block class and its registry (BLOCKS)"
+    }
+  ],
+  "reads": {
+    "tensors": [
+      "kv_a_layernorm.weight",
+      "kv_a_proj_with_mqa",
+      "kv_b_proj",
+      "kv_b_proj.weight",
+      "o_proj",
+      "q_a_layernorm.weight",
+      "q_a_proj",
+      "q_b_proj",
+      "q_proj"
+    ],
+    "config": [
+      "rope_interleave",
+      "rope_parameters",
+      "rope_parameters.factor",
+      "rope_parameters.mscale_all_dim",
+      "rope_parameters.rope_type",
+      "rope_parameters.type",
+      "rope_scaling",
+      "rope_scaling.factor",
+      "rope_scaling.mscale_all_dim",
+      "rope_scaling.rope_type",
+      "rope_scaling.type"
+    ],
+    "layout": [
+      "interleave",
+      "pool"
+    ]
+  }
+}

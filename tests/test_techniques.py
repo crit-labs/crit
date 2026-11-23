@@ -16,14 +16,14 @@ import unittest
 
 class DescriptionExamples(unittest.TestCase):
     def test_worked_examples_run_against_the_supplied_code(self):
-        store = Path(__file__).resolve().parents[1] / "inference"
-        for description in sorted(store.glob("*/README.md")):
+        store = Path(__file__).resolve().parents[1] / "inference" / "techniques"
+        for description in sorted(store.glob("*/*/README.md")):
             with self.subTest(technique=description.parent.name):
                 blocks = re.findall(r"^```python\n(.*?)^```$",
                                     description.read_text(encoding="utf-8"), re.M | re.S)
                 self.assertEqual(len(blocks), 1, "one runnable mechanism example per entry")
                 # The entry's code beside Core's Python package (crit_plugins), as an installed crit has it.
-                core = str(Path(__file__).resolve().parents[1] / "core" / "python")
+                core = str(Path(__file__).resolve().parents[1] / "inference" / "core" / "python")
                 path = os.pathsep.join(filter(None, [core, os.environ.get("PYTHONPATH")]))
                 result = subprocess.run([sys.executable, "-B", "-c", blocks[0]],
                                         cwd=description.parent / "code", capture_output=True,
@@ -37,7 +37,8 @@ def load(ident, name="implementation.py"):
     module_name = "crit_test_" + ident.replace("-", "_") + "_" + name.replace(".", "_")
     if module_name in sys.modules:
         return sys.modules[module_name]
-    spec = importlib.util.spec_from_file_location(module_name, ROOT / "inference" / ident / "code" / name)
+    (folder,) = (ROOT / "inference" / "techniques").glob(f"*/{ident}")   # the technique, whatever its category
+    spec = importlib.util.spec_from_file_location(module_name, folder / "code" / name)
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
@@ -690,7 +691,7 @@ class TechniqueTests(unittest.TestCase):
 class ChunkedPrefillTests(unittest.TestCase):
     def test_two_pass_chunks_equal_the_token_by_token_recurrence(self):
         import random
-        code = ROOT / "inference" / "recurrent-state-recovery" / "code"
+        code = ROOT / "inference" / "techniques" / "recurrence" / "recurrent-state-recovery" / "code"
         sys.path.insert(0, str(code))
         try:
             m = load("recurrent-state-recovery", "chunked_prefill.py")
@@ -834,7 +835,7 @@ class DeviceExpertCacheTests(unittest.TestCase):
             m.ClockDirectory(8, 1, 16, admit_by_misses=[1, 2])
 
     def test_ranked_residency_swaps_at_boundaries_and_follows_a_topic_change(self):
-        sys.path.insert(0, str(ROOT / "inference" / "device-expert-cache" / "code"))
+        sys.path.insert(0, str(ROOT / "inference" / "techniques" / "experts" / "device-expert-cache" / "code"))
         m = load("device-expert-cache", "device_cache.py")
         r = load("device-expert-cache", "ranked_residency.py")
         policy = r.RankedPolicy(keys=16, slots=4, options=r.RankedOptions(period=2, max_swaps=1, burst_swaps=3))
@@ -893,7 +894,7 @@ class DeviceExpertCacheTests(unittest.TestCase):
         self.assertNotIn(3, d.key_slot)
 
     def test_residency_profile_build_check_and_load(self):
-        sys.path.insert(0, str(ROOT / "inference" / "device-expert-cache" / "code"))
+        sys.path.insert(0, str(ROOT / "inference" / "techniques" / "experts" / "device-expert-cache" / "code"))
         m = load("device-expert-cache", "residency_profile.py")
         tuning = [(g, [0, 1, (i % 3) + 2]) for i in range(30) for g in (0, 1)]
         held = {"en": [(0, [0, 1, 4])] * 5, "de": [(1, [1, 0, 3])] * 5}
@@ -914,7 +915,7 @@ class DeviceExpertCacheTests(unittest.TestCase):
                 bad()
 
     def test_the_profile_corpus_fetches_pages_caches_and_states_its_revisions(self):
-        sys.path.insert(0, str(ROOT / "inference" / "device-expert-cache" / "code"))
+        sys.path.insert(0, str(ROOT / "inference" / "techniques" / "experts" / "device-expert-cache" / "code"))
         m = load("device-expert-cache", "corpus.py")
         manifest = m.load_manifest()
         self.assertGreaterEqual(len(manifest["held_out"]), 2)
@@ -973,8 +974,8 @@ class DeviceExpertCacheTests(unittest.TestCase):
 
     def test_the_expert_store_packs_one_bundle_per_key_and_is_reused(self):
         import struct
-        sys.path.insert(0, str(ROOT / "core" / "python"))
-        sys.path.insert(0, str(ROOT / "inference" / "device-expert-cache" / "code"))
+        sys.path.insert(0, str(ROOT / "inference" / "core" / "python"))
+        sys.path.insert(0, str(ROOT / "inference" / "techniques" / "experts" / "device-expert-cache" / "code"))
         from crit_core.model.safetensors import inspect_model
         m = load("device-expert-cache", "expert_store.py")
 
@@ -1113,8 +1114,8 @@ class ExpertStreamedPrefillTests(unittest.TestCase):
             import torch
         except ImportError:
             self.skipTest("torch")
-        sys.path.insert(0, str(ROOT / "inference" / "expert-streamed-prefill" / "code"))
-        self.addCleanup(sys.path.remove, str(ROOT / "inference" / "expert-streamed-prefill" / "code"))
+        sys.path.insert(0, str(ROOT / "inference" / "techniques" / "experts" / "expert-streamed-prefill" / "code"))
+        self.addCleanup(sys.path.remove, str(ROOT / "inference" / "techniques" / "experts" / "expert-streamed-prefill" / "code"))
         m = load("expert-streamed-prefill", "streamed.py")
         calls = []
 
@@ -1166,8 +1167,8 @@ class ExpertStreamedPrefillTests(unittest.TestCase):
                          960)
 
     def test_a_timed_chunk_needs_an_experts_kernel_whose_rows_keep_their_bits(self):
-        sys.path.insert(0, str(ROOT / "inference" / "expert-streamed-prefill" / "code"))
-        self.addCleanup(sys.path.remove, str(ROOT / "inference" / "expert-streamed-prefill" / "code"))
+        sys.path.insert(0, str(ROOT / "inference" / "techniques" / "experts" / "expert-streamed-prefill" / "code"))
+        self.addCleanup(sys.path.remove, str(ROOT / "inference" / "techniques" / "experts" / "expert-streamed-prefill" / "code"))
         m = load("expert-streamed-prefill", "streamed.py")
         curve = m.RateCurve({1: 10.0, 2: 50.0, 4: 100.0, 8: 101.0})
 
@@ -1199,7 +1200,7 @@ class ExpertStreamedPrefillTests(unittest.TestCase):
 class TokenSamplingTests(unittest.TestCase):
     def test_greedy_nucleus_and_cores_draws(self):
         m = load("token-sampling", "sampling.py")
-        # Core's Philox4x32-10 known answers (core/src/sampling/README.md).
+        # Core's Philox4x32-10 known answers (inference/core/src/sampling/README.md).
         self.assertEqual(m.philox4x32(0, 0, 0, 0), (0x6627e8d5, 0xe169c58d, 0xbc57ac4c, 0x9b00dbd8))
         self.assertEqual(m.uniform(0, 0), 0xcc4fd1abc2d38 * 2.0 ** -53)
         top = (1 << 64) - 1

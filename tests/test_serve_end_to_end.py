@@ -1,5 +1,5 @@
 """crit serve end to end, the one way it runs an engine: a sealed candidate's plugin package (the toy engine's plugins,
-inference/examples/plugin-engine/plugins) opened by Core's loader in crit serve's resident host on Core's concurrent runtime, behind the
+inference/starters/plugin-engine/plugins) opened by Core's loader in crit serve's resident host on Core's concurrent runtime, behind the
 HTTP API, with no test hook. A model whose chat template teaches a call syntax crit writes and whose tokenizer's bytes
 Core can match, so Core's adapter serves every capability it derives: chat, streaming, tool calls forced by
 tool_choice, structured output, token log-probabilities, fixed-text scores, tokenizing and concurrent requests.
@@ -36,7 +36,19 @@ class ServeEndToEndTests(MeasureFixture, unittest.TestCase):
                    "config.json": {"model_type": "llama", "eos_token_id": 1,
                                    "text_config": {"eos_token_id": 4, "vocab_size": 420}}}
 
+    @classmethod
+    def setUpClass(cls):
+        """One run, measured candidate and served engine for the class: building them took 7 s before each of the 8
+        tests, which only send requests. The test that needs an engine no request has reached builds its own."""
+        fixture = cls("build")
+        cls.addClassCleanup(fixture.doCleanups)
+        fixture.build()
+        cls.address = fixture.address
+
     def setUp(self):
+        pass   # the class's engine (setUpClass)
+
+    def build(self):
         super().setUp()
         from crit_core.model import open_model
         from crit_core.text import load_model_text
@@ -108,6 +120,12 @@ class ServeEndToEndTests(MeasureFixture, unittest.TestCase):
         self.assertEqual(text, reply["choices"][0]["message"]["content"])
 
     def test_a_follow_up_turn_is_served_from_the_prompt_cache_unless_the_request_says_no(self):
+        # An engine of its own: its first request must find nothing cached, and every prompt shares the template's
+        # first tokens with the other tests' requests.
+        fixture = type(self)("build")
+        self.addCleanup(fixture.doCleanups)
+        fixture.build()
+        self.address = fixture.address
         status, text = self.call("/v1/models")
         (card,) = json.loads(text)["data"]
         self.assertTrue(card["engine_facts"]["prompt_cache"])

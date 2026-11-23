@@ -8,20 +8,45 @@ support/hooks on PYTHONPATH, whose sitecustomize makes Core's adapter create the
 plus a test's adapter_suffix), and crit serve offers the capabilities the fixture names in place of the ones Core
 derives (package_capabilities). The real path, a plugin package through Core's loader behind the HTTP API, is
 tests/test_serve_end_to_end.py, beside tests/test_core_engine.py and tests/core/concurrency_end_to_end_check.py."""
+import copy
 import json
+import os
 from pathlib import Path
+import shutil
+import tempfile
 import threading
 import time
 from unittest.mock import patch
 
-from .runs import RunFixture, with_plugins
+from .runs import RunFixture, RunStore, with_plugins
 from crit_api.engine import EngineError, ServedEngine
 from crit_api.options import serving_capabilities
 
 HOOKS = Path(__file__).with_name("hooks")   # sitecustomize: the scripted engine in the resident host
 SCRIPTED = "engine.py"                      # the package file it creates the engine from
 RECIPE = {"build": {"toolchain": {"fixture": "host-python"}, "dependencies": [], "command": ["fixture"]}}
+_RUNS = {}   # ServeFixture's built runs, by class and what its packages depend on
 
+
+def _loaded(engine, status):
+    """What says a served engine is still the one a test opened: its host process, the model it loaded and how often
+    it has loaded one."""
+    return engine.host_pid(), status.get('model_id'), status.get('model_generation'), status.get('engine_loads')
+
+
+def _signature(root):
+    """(what a run's folder holds outside its runtime folder: every file's path, size and time; the paths in its
+    runtime folder, where the host's logs grow with every request and a failed request's records are new files)."""
+    found, runtime, held = [], [], os.path.join(root, 'runtime-owner')
+    for folder, folders, files in os.walk(root):
+        for name in files:
+            path = os.path.join(folder, name)
+            if folder.startswith(held):
+                runtime.append(path)
+            else:
+                status = os.stat(path)
+                found.append((path, status.st_size, status.st_mtime_ns))
+    return sorted(found), sorted(runtime)
 
 def scripted_serving(test, capabilities):
     """Serve `test`'s packages with their scripted engine.py (the module docstring), crit serve offering
@@ -182,6 +207,10 @@ class ServeFixture(RunFixture):
     temperature = True  # declare chat-sampling-temperature-v1
     adapter_suffix = ''
     extra_capabilities = ()
+    # One served engine for the class's tests, where each leaves it as it found it: a test whose engine is not the
+    # one the test before left (a changed run folder, another host process, an engine not loaded and idle) gets a
+    # new one. For classes whose tests assert nothing about a fresh host (its first call, its process).
+    shared_engine = False
 
     def capabilities(self):
         """What the fixture's engine serves (crit serve offers it in place of Core's derived capabilities)."""
@@ -222,21 +251,95 @@ class ServeFixture(RunFixture):
         return self.store.package(self.run_id, candidate['candidate_id'], package, RECIPE)
 
     def setUp(self):
-        super().setUp()
-        environment = patch.dict('os.environ', {'CRIT_RUNTIME_DIRECTORY': str(self.root / 'runtime-owner')})
+        """Every test starts from the same run: a class's first test builds it (a second and a half of records,
+        packages and seals), and each test, the first included, gets a copy of what that left, at the same path, since
+        the run's records name their model by its path."""
+        self.patch_ladder()
+        key = (type(self), json.dumps(self.capabilities()), repr(self.reported), self.adapter_suffix,
+               repr(self.model_files))
+        kept = _RUNS.get(key)
+        if kept is None:
+            # A host that is still ending may write beside the files being removed: the folder goes as far as it can.
+            home = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+            type(self).addClassCleanup(home.cleanup)
+            type(self).addClassCleanup(_RUNS.pop, key, None)
+            kept = _RUNS[key] = {'home': Path(home.name).resolve()}
+        root, built = kept['home'] / 'root', kept['home'] / 'built'
+        environment = patch.dict('os.environ', {'CRIT_RUNTIME_DIRECTORY': str(root / 'runtime-owner')})
         environment.start()
         self.addCleanup(environment.stop)
         scripted_serving(self, self.capabilities)
-        candidate, *_ = self.measured()
-        self.a = candidate['candidate_id']
-        self.store.seal(self.run_id, self.a, 'completed')
-        self.store.select(self.run_id, self.a)
-        candidate, *_ = self.measured(label='Engine B', configuration={'batch': 2})
-        self.b = candidate['candidate_id']
-        self.store.seal(self.run_id, self.b, 'completed')
+        if 'state' not in kept:
+            before = set(vars(self))
+            root.mkdir()
+            self.create_run(root)
+            candidate, *_ = self.measured()
+            self.a = candidate['candidate_id']
+            self.store.seal(self.run_id, self.a, 'completed')
+            self.store.select(self.run_id, self.a)
+            candidate, *_ = self.measured(label='Engine B', configuration={'batch': 2})
+            self.b = candidate['candidate_id']
+            self.store.seal(self.run_id, self.b, 'completed')
+            shutil.copytree(root, built)
+            # What building set on the test (the run's id, the candidates', a subclass's package folders), less what
+            # each test opens anew below.
+            kept['state'] = {name: value for name, value in vars(self).items()
+                             if name not in before and name not in ('root', 'store', 'view', 'run', 'directory')}
+        self._kept = kept
+        shared = kept.get('engine')
+        if shared is not None and not (kept.get('untouched') and self._healthy(shared)):
+            kept.pop('engine')['engine'].close()
+            shared = None
+        if shared is None:
+            # What the test before this one left (its runtime folder, its records) goes with the folder.
+            shutil.rmtree(root, ignore_errors=True)
+            shutil.copytree(built, root)
+        if self.shared_engine:
+            # Registered first, so it looks after the test's other cleanups ran (its server stopped).
+            kept['untouched'], kept['signature'] = False, _signature(root)[0]
+            self.addCleanup(self._settle, root)
+        else:
+            self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        self.root = root
+        for name, value in kept['state'].items():
+            setattr(self, name, copy.deepcopy(value))
+        self.store = RunStore(root / 'runs')
+        self.view = self.store.get(self.run_id)
+        self.run = self.view['run']
+        self.directory = self.store.directory(self.run_id)
+
+    def _settle(self, root):
+        """Whether the test left the run's folder as it found it: only then may the next test keep its engine."""
+        found, runtime = _signature(root)
+        self._kept['untouched'] = found == self._kept['signature'] and runtime == self._kept.get('runtime')
+
+    @staticmethod
+    def _healthy(shared):
+        """The shared engine's host is the process it was opened with, its first load still loaded, and idle."""
+        engine = shared['engine']
+        try:
+            status = engine.status()
+        except Exception:   # a host that went away answers nothing
+            return False
+        return (status.get('state') == 'ready' and engine.ready(status) and status.get('active_requests') == 0
+                and _loaded(engine, status) == shared['loaded'])
 
     def engine(self, open=True, **options):
+        """A served engine, opened unless `open` is false. In a class with shared_engine, the opened engine of the
+        test before, where that test left the run's folder untouched and the host as it was (the same process, its
+        engine loaded and idle) and this test asks for the same options; otherwise a new one, closed with the test
+        or, shared, with the class."""
+        shared = self._kept.get('engine') if self.shared_engine and open else None
+        if shared is not None and shared['options'] == options:
+            self._kept['runtime'] = _signature(self.root)[1]
+            return shared['engine']
         engine = ServedEngine(self.store.root, self.run_id, host_limit=1024, device_limit=1024, **options)
+        if self.shared_engine and open and shared is None:
+            type(self).addClassCleanup(engine.close)
+            engine.open()
+            self._kept['engine'] = {'engine': engine, 'options': options, 'loaded': _loaded(engine, engine.status())}
+            self._kept['runtime'] = _signature(self.root)[1]
+            return engine
         self.addCleanup(engine.close)
         if open:
             engine.open()

@@ -74,17 +74,22 @@ namespace {
 #ifndef CRIT_VARIANT_VS
 #define CRIT_VARIANT_VS 0         // a caller's value split of fused launches (0: the tuning's)
 #endif
+#ifndef CRIT_VARIANT_B
+#define CRIT_VARIANT_B 0          // 1: launches may add a distance bias (F_BIAS); 0 compiles it out
+#endif
 #ifndef CRIT_VARIANT_SMEM
 #define CRIT_VARIANT_SMEM 101376  // the GPU's shared memory a block (opt-in): fewer stages, then warps, past it
 #endif
 
 constexpr int TQ = CRIT_VARIANT_T, KIND = CRIT_VARIANT_KIND, D = CRIT_VARIANT_D, DV = CRIT_VARIANT_DV;
 constexpr bool BYTE_PAGES = KIND != 0;
+constexpr bool BIAS = CRIT_VARIANT_B != 0;
 static_assert(D % 64 == 0 && DV % 64 == 0 && D <= 256 && DV <= 256, "head widths of 64, 128 or 256");
 
 enum : int {
     F_COUNTS = 1, F_OFFSETS = 2, F_TREE = 4, F_LSE = 8, F_FRESH = 16, F_ONE_ROW = 32, F_POS_T = 64, F_FIRST_T = 128,
-    F_DEV_CHUNK = 256, F_ONE_SPLIT = 512, F_PAR64 = 1024, F_SINKS = 2048, F_STATE_OUT = 4096, F_STATE_IN = 8192
+    F_DEV_CHUNK = 256, F_ONE_SPLIT = 512, F_PAR64 = 1024, F_SINKS = 2048, F_STATE_OUT = 4096, F_STATE_IN = 8192,
+    F_BIAS = 16384
 };
 
 }  // namespace
@@ -117,12 +122,15 @@ struct Params {
     int* sync;              // fused: the ticket and done counters, then a tile's flag and two group counters
     const float* sinks;     // F_SINKS: each query head's sink logit (FP32 [hq], natural log), folded in last
     float* state;           // F_STATE_OUT / F_STATE_IN: every thread's running state between a chunk's two passes
+    const float* bias;      // F_BIAS: each query row's scores for the positions 0 .. extent - 1 behind its own (FP32
+                            // [tokens][hq][extent], natural log), added after the scale
     long long stride_qt, stride_qh, stride_ot, stride_oh, stride_fk, stride_fv;
     long long first0, ffirst0;
     int stride_fr, tab_stride, tab_width, hq, hkv, g, page, n_parts, chunk, cols, flags, page_shift;
     int block, group, tiles, merge, ring, ramp, ramp_k;
     int window;             // a sliding window: positions a token sees, its own included (0: all)
     int state_part;         // F_STATE_*: the pass's positions (0: below the cut, 1: the cut's block, 2: past it)
+    int extent;             // F_BIAS: the positions behind a row its bias reaches
     float qk_scale, k_mult, v_mult, pad2;
 };
 
@@ -444,6 +452,13 @@ __device__ __forceinline__ void cw_tile(const Params& p, const Work w, unsigned 
             anc[h] = a;
         }
     }
+    // F_BIAS: each lane row's bias row (its token's, its query head's), read at the distance a position lies behind
+    const bool biased = BIAS && (flags & F_BIAS);
+    const float* brow[2];
+#pragma unroll
+    for(int h = 0; h < 2; ++h)
+        brow[h] = biased && live[h] ? p.bias + ((start + col[h]) * p.hq + kvh * G + hd[h]) * (long long)p.extent
+                                    : nullptr;
     // The warp's last position seen (its rows are in column order): blocks past it are skipped (a block a row does
     // not see changes none of its bits).
     const int wj_last = j0 + 16 * warp + 15;
@@ -746,6 +761,23 @@ __device__ __forceinline__ void cw_tile(const Params& p, const Work w, unsigned 
         const unsigned char* vb8 = kb8 + STAGE_K;
         const float* ss8 = reinterpret_cast<const float*>(kb8 + STAGE_K + STAGE_V);
         float sc[NT][4];
+        // F_BIAS: the lane's scores' bias values for this block (0 past the extent), read ahead of the products so
+        // their latency hides under them
+        float bz[BIAS ? NT : 1][4];
+        if constexpr(BIAS) {
+            if(biased && active) {
+#pragma unroll
+                for(int t = 0; t < NT; ++t) {
+                    if(VW > 1 && C::owner(t) != vw) continue;
+#pragma unroll
+                    for(int i = 0; i < 4; ++i) {
+                        const int h = i >> 1;
+                        const int d = lim[h] - (n0 + 8 * t + 2 * tig + (i & 1));
+                        bz[t][i] = brow[h] != nullptr && d >= 0 && d < p.extent ? __ldg(brow[h] + d) : 0.0f;
+                    }
+                }
+            }
+        }
         float kf[NT][2];   // IREG: the lane's positions' key factors (read before the keys' stage is reloaded)
         if(active) {
             // scores: the row group's 16 rows x BN positions (VW > 1: the warp's n8 tiles of them)
@@ -800,12 +832,19 @@ __device__ __forceinline__ void cw_tile(const Params& p, const Work w, unsigned 
         }
         // scale, mask (VW > 1: the warp's tiles, then shared with the group's other warps)
         const bool full = __all_sync(0xffffffffu, n0 + BN - 1 <= warp_seen && (win == 0 || n0 > warp_last - win));
+        // F_BIAS: a seen position d behind its row (d < extent) gets the row's bias[d], in base 2 as the scores are
+        // (a bias of 0 past the extent: x + 0 changes no bit)
+        auto add_bias = [&](int t, int i) {
+            if constexpr(BIAS) sc[t][i] = __fmaf_rn(bz[t][i], kc::kAttnLog2e, sc[t][i]);
+        };
         auto scale_mask = [&](int t) {
             if(full) {
 #pragma unroll
-                for(int i = 0; i < 4; ++i)
+                for(int i = 0; i < 4; ++i) {
                     sc[t][i] = __fmul_rn(sc[t][i], IREG ? kf[t][i & 1] : BYTE_PAGES ? cks[8 * t + 2 * tig + (i & 1)]
                                                                                    : p.qk_scale);
+                    if(biased) add_bias(t, i);
+                }
                 return;
             }
 #pragma unroll
@@ -823,6 +862,7 @@ __device__ __forceinline__ void cw_tile(const Params& p, const Work w, unsigned 
                 }
                 if(win > 0) vis = vis && n > lim[h] - win;
                 sc[t][i] = vis ? __fmul_rn(sc[t][i], f) : -INFINITY;
+                if(biased && vis) add_bias(t, i);
             }
         };
         if constexpr(VW > 1) {

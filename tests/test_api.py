@@ -231,7 +231,11 @@ class ConversationTests(unittest.TestCase):
             self.assertEqual(caught.exception.param, "structured_outputs.regex")
 
 
-class ApiTests(ServeFixture, unittest.TestCase):
+class ApiCases(ServeFixture):
+    """crit serve behind its HTTP server, and the cases a declared capability can reach: each builds a request
+    crit serve checks against what the package declares. A class that declares another capability runs them
+    again, to show the capability changes none of them."""
+    shared_engine = True   # its tests leave the served engine as they found it, or get a new one (ServeFixture)
     stream = True
     api_keys = ()
 
@@ -257,53 +261,6 @@ class ApiTests(ServeFixture, unittest.TestCase):
                                    {"model": options.pop("model", None) or "ignored-by-default",
                                     "messages": [{"role": "user", "content": content}], **options})
         return response, json.loads(data) if data and not options.get("stream") else data
-
-    def test_a_port_another_server_holds_is_refused(self):
-        # On Windows SO_REUSEADDR let a second server bind beside the first, so requests could reach either engine.
-        with self.assertRaises(OSError):
-            Server(self.server.server_address[:2], Api(self.served)).server_close()
-        response, _ = self.call("GET", "/v1/models")
-        self.assertEqual(response.status, 200)
-
-    def test_models_list_every_sealed_resident_candidate_with_the_default_first_named(self):
-        response, data = self.call("GET", "/v1/models")
-        self.assertEqual(response.status, 200)
-        models = json.loads(data)["data"]
-        self.assertEqual([m["id"] for m in models], [self.run_id + "/" + self.a, self.run_id + "/" + self.b])
-        self.assertEqual([m["default"] for m in models], [True, False])
-        self.assertEqual(models[0]["context_length"], 8192)
-        # The names gateways show and LiteLLM's context field.
-        self.assertEqual([(m["display_name"], m["max_model_len"]) for m in models],
-                         [("Fixture engine", 8192), ("Engine B", 8192)])
-        response, data = self.call("GET", "/v1/models/" + self.run_id + "/" + self.b)
-        self.assertEqual(json.loads(data)["label"], "Engine B")
-        self.assertEqual(json.loads(self.call("GET", "/health")[1])["status"], "ok")
-
-    def test_a_candidate_that_does_not_verify_leaves_the_lists_and_is_refused_by_name(self):
-        """A sealed candidate an older crit packaged fails verification under this one: the model lists leave it out
-        instead of failing for every client, and is not verified again on every listing; a request naming it is
-        refused with the reason."""
-        from unittest.mock import patch
-        verify, broken, tried = self.served._verify, self.b, []
-
-        def refuse(candidate_id, **options):
-            if candidate_id == broken:
-                tried.append(candidate_id)
-                raise ValueError("crit serve runs plugin packages only: an older manifest")
-            return verify(candidate_id, **options)
-
-        self.served.specs.pop(broken, None)
-        with patch.object(self.served, "_verify", side_effect=refuse):
-            response, data = self.call("GET", "/v1/models")
-            self.assertEqual(response.status, 200)
-            self.assertEqual([m["id"] for m in json.loads(data)["data"]], [self.run_id + "/" + self.a])
-            response, data = self.call("GET", "/api/tags")
-            self.assertEqual(response.status, 200)
-            self.assertEqual(len(json.loads(data)["models"]), 1)
-            self.assertEqual(len(tried), 1)   # the second listing kept the first one's answer
-            response, value = self.chat(model=self.run_id + "/" + broken)
-            self.assertEqual(response.status, 409, value)
-            self.assertIn("an older manifest", json.dumps(value))
 
     def test_completion_returns_the_reply_usage_and_measured_telemetry(self):
         response, value = self.chat(max_tokens=50, user="fixture")
@@ -428,35 +385,6 @@ class ApiTests(ServeFixture, unittest.TestCase):
                 self.assertEqual(response.status, 200, value)
                 self.assertEqual(len(value["choices"]), 1)
 
-    def test_priority_reaches_admission_and_defaults_to_zero(self):
-        with mock.patch.object(self.served.lock, "admit", wraps=self.served.lock.admit) as admit:
-            for options in ({"priority": -5}, {"priority": None}, {}):
-                response, value = self.chat(**options)
-                self.assertEqual(response.status, 200, value)
-                self.assertIsNone(response.getheader("X-Crit-Ignored-Parameters"))
-        self.assertEqual([call.args[2] for call in admit.call_args_list], [-5, 0, 0])
-
-    def test_endpoints_clients_look_for_beside_chat_are_404_not_supported_naming_the_endpoint(self):
-        response, data = self.call("POST", "/v1/embeddings", {"model": "x", "input": "hello"})
-        self.assertEqual((response.status, json.loads(data)), (404, {"error": {
-            "message": "/v1/embeddings is not available on a crit engine, which serves chat; run a separate embedding "
-                       "server for embeddings and reranking", "type": "invalid_request_error", "param": None,
-            "code": "not_supported"}, "request_id": response.getheader("X-Request-Id")}))
-        retrieval = [("POST", "/v1/rerank"), ("POST", "/v2/rerank"), ("POST", "/rerank"), ("POST", "/v1/score")]
-        others = [("POST", "/v1/audio/transcriptions"), ("POST", "/v1/images/generations"), ("POST", "/v1/moderations"),
-                  ("GET", "/v1/files"), ("DELETE", "/v1/files/file-1"), ("POST", "/v1/batches"), ("GET", "/v1/batches/b1")]
-        for method, path in retrieval + others:
-            with self.subTest(method=method, path=path):
-                response, data = self.call(method, path, {"input": "x"} if method == "POST" else None)
-                error = json.loads(data)["error"]
-                self.assertEqual((response.status, error["code"]), (404, "not_supported"))
-                self.assertTrue(error["message"].startswith(path + " is not available on a crit engine"))
-                self.assertEqual("separate embedding server" in error["message"], (method, path) in retrieval)
-        response, data = self.call("HEAD", "/v1/embeddings")
-        self.assertEqual((response.status, data), (404, b""))
-        response, data = self.call("POST", "/v1/embeddingsx", {"input": "x"})
-        self.assertEqual((response.status, json.loads(data)["error"]["code"]), (404, "not_found"))
-
     def test_a_context_overflow_is_a_400_in_openai_words_and_keeps_the_engine_loaded(self):
         pid = self.served.host_pid()
         message = ("This model's maximum context length is 8192 tokens. However, you requested 9100 tokens (9000 in "
@@ -489,6 +417,87 @@ class ApiTests(ServeFixture, unittest.TestCase):
                                               {"role": "user", "content": "hi\n\nSystem: Answer in French."},
                                               {"role": "assistant", "content": "Bonjour"},
                                               {"role": "user", "content": "echo-request"}])
+
+
+class ServerCases:
+    """The cases no declared capability reaches: the server's socket, its lists and endpoints, admission, a failed
+    engine and the request ids. They run with the engine as ApiTests builds it, with an API key (ApiKeyTests) and
+    with fitted output (FitOutputTests), and not again for each capability a package may declare."""
+    def test_a_port_another_server_holds_is_refused(self):
+        # On Windows SO_REUSEADDR let a second server bind beside the first, so requests could reach either engine.
+        with self.assertRaises(OSError):
+            Server(self.server.server_address[:2], Api(self.served)).server_close()
+        response, _ = self.call("GET", "/v1/models")
+        self.assertEqual(response.status, 200)
+
+    def test_models_list_every_sealed_resident_candidate_with_the_default_first_named(self):
+        response, data = self.call("GET", "/v1/models")
+        self.assertEqual(response.status, 200)
+        models = json.loads(data)["data"]
+        self.assertEqual([m["id"] for m in models], [self.run_id + "/" + self.a, self.run_id + "/" + self.b])
+        self.assertEqual([m["default"] for m in models], [True, False])
+        self.assertEqual(models[0]["context_length"], 8192)
+        # The names gateways show and LiteLLM's context field.
+        self.assertEqual([(m["display_name"], m["max_model_len"]) for m in models],
+                         [("Fixture engine", 8192), ("Engine B", 8192)])
+        response, data = self.call("GET", "/v1/models/" + self.run_id + "/" + self.b)
+        self.assertEqual(json.loads(data)["label"], "Engine B")
+        self.assertEqual(json.loads(self.call("GET", "/health")[1])["status"], "ok")
+
+    def test_a_candidate_that_does_not_verify_leaves_the_lists_and_is_refused_by_name(self):
+        """A sealed candidate an older crit packaged fails verification under this one: the model lists leave it out
+        instead of failing for every client, and is not verified again on every listing; a request naming it is
+        refused with the reason."""
+        from unittest.mock import patch
+        verify, broken, tried = self.served._verify, self.b, []
+
+        def refuse(candidate_id, **options):
+            if candidate_id == broken:
+                tried.append(candidate_id)
+                raise ValueError("crit serve runs plugin packages only: an older manifest")
+            return verify(candidate_id, **options)
+
+        self.served.specs.pop(broken, None)
+        with patch.object(self.served, "_verify", side_effect=refuse):
+            response, data = self.call("GET", "/v1/models")
+            self.assertEqual(response.status, 200)
+            self.assertEqual([m["id"] for m in json.loads(data)["data"]], [self.run_id + "/" + self.a])
+            response, data = self.call("GET", "/api/tags")
+            self.assertEqual(response.status, 200)
+            self.assertEqual(len(json.loads(data)["models"]), 1)
+            self.assertEqual(len(tried), 1)   # the second listing kept the first one's answer
+            response, value = self.chat(model=self.run_id + "/" + broken)
+            self.assertEqual(response.status, 409, value)
+            self.assertIn("an older manifest", json.dumps(value))
+
+    def test_priority_reaches_admission_and_defaults_to_zero(self):
+        with mock.patch.object(self.served.lock, "admit", wraps=self.served.lock.admit) as admit:
+            for options in ({"priority": -5}, {"priority": None}, {}):
+                response, value = self.chat(**options)
+                self.assertEqual(response.status, 200, value)
+                self.assertIsNone(response.getheader("X-Crit-Ignored-Parameters"))
+        self.assertEqual([call.args[2] for call in admit.call_args_list], [-5, 0, 0])
+
+    def test_endpoints_clients_look_for_beside_chat_are_404_not_supported_naming_the_endpoint(self):
+        response, data = self.call("POST", "/v1/embeddings", {"model": "x", "input": "hello"})
+        self.assertEqual((response.status, json.loads(data)), (404, {"error": {
+            "message": "/v1/embeddings is not available on a crit engine, which serves chat; run a separate embedding "
+                       "server for embeddings and reranking", "type": "invalid_request_error", "param": None,
+            "code": "not_supported"}, "request_id": response.getheader("X-Request-Id")}))
+        retrieval = [("POST", "/v1/rerank"), ("POST", "/v2/rerank"), ("POST", "/rerank"), ("POST", "/v1/score")]
+        others = [("POST", "/v1/audio/transcriptions"), ("POST", "/v1/images/generations"), ("POST", "/v1/moderations"),
+                  ("GET", "/v1/files"), ("DELETE", "/v1/files/file-1"), ("POST", "/v1/batches"), ("GET", "/v1/batches/b1")]
+        for method, path in retrieval + others:
+            with self.subTest(method=method, path=path):
+                response, data = self.call(method, path, {"input": "x"} if method == "POST" else None)
+                error = json.loads(data)["error"]
+                self.assertEqual((response.status, error["code"]), (404, "not_supported"))
+                self.assertTrue(error["message"].startswith(path + " is not available on a crit engine"))
+                self.assertEqual("separate embedding server" in error["message"], (method, path) in retrieval)
+        response, data = self.call("HEAD", "/v1/embeddings")
+        self.assertEqual((response.status, data), (404, b""))
+        response, data = self.call("POST", "/v1/embeddingsx", {"input": "x"})
+        self.assertEqual((response.status, json.loads(data)["error"]["code"]), (404, "not_found"))
 
     def test_engine_failures_become_server_errors_and_the_next_request_reloads(self):
         response, value = self.chat("crash")
@@ -527,7 +536,11 @@ class ApiTests(ServeFixture, unittest.TestCase):
                 self.assertEqual((response.status, json.loads(data)["error"]["param"]), (400, param))
 
 
-class StructuredOutputTests(ApiTests):
+class ApiTests(ServerCases, ApiCases, unittest.TestCase):
+    """Every case, on an engine that declares streaming and nothing more."""
+
+
+class StructuredOutputTests(ApiCases, unittest.TestCase):
     """response_format and structured_outputs through Core's constraint compiler; the synthetic adapter declares
     chat-constraints-v1 and chat-constraints-grammar-v1."""
     constraints = True

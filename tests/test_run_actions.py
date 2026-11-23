@@ -273,7 +273,7 @@ class ServeCheckTests(run_measure.MeasureFixture, unittest.TestCase):
 
         def run(planned, served):
             class Client:
-                def __init__(self, port, timeout):
+                def __init__(self, port, timeout, defaults=None):
                     pass
 
                 def chat(self, body):
@@ -303,7 +303,7 @@ class ServeCheckTests(run_measure.MeasureFixture, unittest.TestCase):
         asked = []
 
         class Client:
-            def __init__(self, port, timeout):
+            def __init__(self, port, timeout, defaults=None):
                 pass
 
             def models(self):
@@ -349,7 +349,7 @@ class ServeCheckTests(run_measure.MeasureFixture, unittest.TestCase):
         gib, mib = 1 << 30, 1 << 20
 
         class Client:
-            def __init__(self, port, timeout):
+            def __init__(self, port, timeout, defaults=None):
                 pass
 
             def models(self):
@@ -508,7 +508,8 @@ class ServeCheckTests(run_measure.MeasureFixture, unittest.TestCase):
         def full_context(*args, **options):
             calls.append("full context")
             return []
-        with patch.object(served, "_smoke", smoke), patch.object(served, "_precheck", precheck),                 patch("crit.run.checks.full_context_checks", full_context):
+        with patch.object(served, "_smoke", smoke), patch.object(served, "_precheck", precheck), \
+                patch("crit.run.checks.full_context_checks", full_context):
             result = served.serve(self.store, self.run_id, candidate, port=0, check=True, data=self.directory)
         (check,) = result["checks"]
         self.assertEqual(calls, ["run", "full context", "precheck", "lower"])

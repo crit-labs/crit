@@ -9,6 +9,366 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-11-23
+
+### Overview
+
+crit 0.23.0 makes model support a pillar of its own, beside Inference and Kernels. `models/core` holds the models
+core (`model-template` and the new `crit-models` package, which now owns a decoder's mechanisms that Core's config
+reader held), `models/techniques` the blocks, residuals and drafters an architecture is composed of, and
+`models/cache` the finished model plugins, one an architecture. The new `crit models` lists them, inspects a
+checkpoint against them, builds tiny random checkpoints and diffs a plugin's engine against its reference, position
+by position. Core moves to `inference/core/` and the Inference entries to `inference/techniques/CATEGORY/ID`. A
+guard keeps crit's shared code model-neutral: no model name in it, every technique declares what it reads, and each
+one is engine-tested under two checkpoint spellings. The GGUF reader now reads each architecture from its layout's
+data. Quality mode `speed` starts from 8- and 4-bit arithmetic wherever it pays (16-bit matrices in FP8, FP8 KV,
+NVFP4 experts on their own tensor cores, row-exact prompt rows), and decode speed is now always sampled decode. The
+Inkling-2-Mini work lands in the library: a `block-drafter` model technique, the `row-ops` kernel template, the
+fused row operations, grouped-experts' `fp4-tile`, and the model's reasoning and tool-call formats. Its rebuilt
+engine's certified Eval at crit-eval-v0.8.1 decodes at 196.7 tok/s sampled on one RTX 5090 (0.22.0 quoted about 46
+greedy), and the README carries it as a case study, with a caution that the case studies were built on a budget.
+The host test suite and CI got much faster, and `tests/run_parallel.py --changed` runs only the tests a change
+touches. **Breaking:** an engine sealed with the 0.22.0 library is rebuilt from the current library. Core's engine
+ABI stays 10. crit 0.23.0 needs crit-eval 0.8.1, and the release publishes `crit-models` beside `crit-core`.
+
+### Added
+
+- Model plugins can name a reasoning format that repeats (`ReasoningFormat` repeated: reasoning in messages of its
+  own that a reply opens again after text), and the splitter reads each opening as more reasoning. A thinking budget
+  holds past the first close of such a format (the opening marker biased out, or short steps that close reasoning
+  opened again), and a reply continuation reads its own prompt and reply from the prompt cache.
+- A `ToolFormat` may name its call before its opening marker (`lead`). The lead is held back while it may start a
+  call, dropped with a parsed call, and kept as written otherwise.
+- inkling2-loop-model names its reasoning markers (`<|content_thinking|>` ... `<|end_message|>`, repeated) and its
+  chat template's tool-call syntax (`NAME<|content_invoke_tool_json|>{name, args}<|end_message|>`) as the plugin's
+  `reasoning_format` and `tool_format`.
+- Each model technique's entry declares what its code reads (`reads.tensors`, config keys), held both ways by
+  tests/test_technique_reads.py (an AST pass over the code; `--write` regenerates), which CI's lint job runs beside
+  the model-neutral guard.
+- native: a plugin callback that raises prints its traceback to the host log, where the failure message alone did not
+  say where it came from.
+- paged-kv-attention: a test that a CUDA prompt chunk in one range gives a prefix the same bits at every chunk length,
+  with and without a distance bias.
+- `python -B tests/run_parallel.py --changed [BASE]` runs only the test modules the working tree's change touches
+  (HEAD by default; a branch name adds this branch's commits since it left that branch), and `--fast SECONDS` leaves
+  out the units recorded as longer and lists them: the loop while a change is being written, where the choice was
+  the whole suite or a guess. [tests/select_tests.py](tests/select_tests.py), which the runner's docstring named and
+  no checkout held, chooses them: the modules that import a changed file, followed through the tests' own modules
+  and crit's packages from the source (imports inside functions included), and the modules that name a changed
+  library item (a plugin's, technique's or kernel's folder, loaded by path) or file; a changed file no test module
+  imports or names is listed. A change to one technique's code selects 5 modules, to `crit_plugins/disk_cache.py`
+  1, to the run store 49 of 141 (most serving tests build a run). The whole suite stays the check of a finished
+  change, and CI runs all of it.
+- Model technique `block-drafter` (`models/techniques/drafters/block-drafter`, a layout's `draft: {block:
+  block-drafter, prefix, config, keys}`): a drafter stored beside the checkpoint, a few bidirectional layers that fill a
+  whole block of drafts in one pass over their own cache of the target's tapped rows, and a recurrent head that orders
+  the block's drafts, folded through the model's head; the model's device draft head in Core's captured rounds and
+  captured prompt chunks. The models core asks a drafter technique through one interface (`DRAFTERS`: `stored`,
+  `Class(model, prefix, spec)`, `taps`, `spare`, `weight_bytes`, `device_bytes`, `head`). Its local layers keep only
+  the positions a block pass reads, a doubled ring of window + block positions, so its cache does not grow with the
+  context.
+- grouped-experts: structure `fp4-tile`, FP4 prompt items of 64 routes through a block tile beside `fp4-prompt`'s
+  32-route items (the same bits), and option `prompt_items` (`auto`, `fp4-prompt`, `fp4-tile`): auto takes the
+  faster of the two in the engine's sweep report on this device for the call's shape and tokens, fp4-prompt where
+  there is none; the facts record what each FP4 prompt call ran and why (`prompt_items`).
+- Kernel template `row-ops` (`kernels/techniques/norms/row-ops`): the row operations between the model techniques'
+  products (head clips, small products, sink-gated outputs, scaled adds, summary mixes, pair norms, gated joins with
+  low-rank gates, span attention), every launch constant a knob `crit kernels sweep` tunes (order knobs looked up by
+  the shape alone), benches that read shapes from standard config keys and tensor shapes, and tests against FP64
+  references the techniques own (their `operations.json`, `code/reference.py`; `crit_kernels.contracts` reads model
+  techniques' operations too). relative-attention, block-attention and block-drafter call it through
+  `model.kernel("row-ops")` (declared by the models core; `kernel()` now falls back from the model plugin's
+  declarations to the core's) with their torch forms as fallback; the Triton row programs with fixed block sizes that
+  sat beside their code (`code/fused_rows.py`, `template/fused.py`) are gone. The defaults are those programs'
+  constants.
+- A guard that crit's shared code is model-neutral ([test_model_neutral.py](tests/test_model_neutral.py), in the host
+  tests and crit's lint job): no model family name or model_type in shared code (Core, Inference, Kernels, the models
+  core and techniques, the CLI, API, Eval, MCP, smoke, tools; comments included, JSON prose excepted), only listed
+  identifiers a published format or library defines; none of the tensor spellings a models/cache layout renames; and
+  every model technique composed by a model plugin whose engine tests serve two checkpoint layouts on tiny random
+  checkpoints (each plugin's `tests/checkpoints.json`: transformers' safetensors, the model under another spelling
+  that names rules map back through `crit_models.testing.Respelled`, which every plugin has, its `names` rules added
+  to the served copy of the layout for the test, and GGUF). It allows no
+  names but the identifiers a format or library defines, listed with their fields in
+  `tests/support/model_neutral.json`. Core's layering test keeps its plugin-name rule and leaves the family names to
+  it.
+- Model plugins as their own pillar, built like Inference and Kernels: `models/core` (the models core,
+  `model-template`: the step model, the serving contracts, compose() and the checkpoint readers; and `crit-models`),
+  `models/techniques` (the 12 blocks and residuals an architecture is composed of, each an entry with what it
+  provides, the sources it imports and the tensors and config keys it reads) and `models/cache` (finished model
+  plugins, one an architecture: `llama-qwen3-model`, `qwen3-5-model`, `qwen4-exp-model`, `deepseek-v3-model`,
+  `gemma4-model`, `inkling2-loop-model`). A model plugin is a folder of its own: a `plugin.json` that fills `model`
+  for the config model_types it names and extends the core, a `layout.json`, a `plugin.py` of the core's three
+  functions over that layout (`compose.model_plugin`), a class only for a layer part no technique computes, and
+  tests that serve a small random checkpoint against its reference. `model-template` fills no slot and names no
+  model type: an engine selects the model plugin that serves its checkpoint (`crit plugins list --model`, `crit
+  plugins add ID`, which brings the core), and the core mounts the techniques and finds them by their registry
+  (`blocks.library()`), so its code holds no block list and no family's layout. A selection that named
+  `model-template` in the model slot names the model plugin instead, and sets the core's options under that id; the
+  option `layout` is gone (a layout lies in its model plugin).
+- `crit models`: `list` the techniques and the finished model plugins; `inspect MODEL` (the checkpoint's fingerprint,
+  the model plugin that serves it, the techniques that read its config keys and tensors through the plugin's rename
+  rules, and what no technique reads); `tiny MODEL --out DIR` (a random checkpoint of the architecture from its
+  reference's own modeling code: sizes shrunk, layer kinds, loops, windows and routing kept); `diff --model TINY` (a
+  model plugin's engine through Core's loader against the reference, position by position; `--plugin
+  ENGINE/plugins/ID` serves the one being built from its engine's plugins); `cache add ENGINE/plugins/ID` (keeps a
+  model plugin a run built in the user's cache, so `crit plugins list` shows it and `crit plugins add ID` puts it
+  into any engine with the core and library plugins it uses: an architecture is built once; `--library` writes it
+  into a checkout's `models/cache`) and `cache check`. Also MCP tools (`crit_models_*`).
+- `crit_models.testing`, the harness a model plugin's tests run on: `Manifest` (its manifest and layout on the
+  host) and `Engines` / `Layout` (whole engines of the plugin against transformers, CUDA or CPU), for a finished
+  plugin and for one an engine is building alike. `crit_models.plugin.layout(folder)` reads and checks a model
+  plugin's layout without a checkpoint.
+- A plugin that fills no slot is a core other plugins extend (`"fills": []`, no `entry`): no engine selects it, and
+  `crit plugins list` shows it as `core`. `crit_plugins.assemble.plugin_package(manifest)` gives a plugin's package
+  without its factory.
+- A folder of plugins names the folders it is used with (`plugins.json`: `{"with": [...]}`), so one library spans
+  `inference/techniques`, `models/core` and `models/cache`; `crit plugins add` places a models plugin at its id and
+  code from `models/` under the engine's `_sources/models/`.
+
+### Changed
+
+- README: the Inkling-2-Mini case study ("Looped MoE, fits VRAM") is filled from the rebuilt engine's certified Eval
+  (`block-drafter-fp4-experts`, crit-eval-v0.8.1): 196.7 tok/s sampled decode, 8,036 tok/s prefill, 141 ms to first
+  token, 129 tok/s decode at 200,000 tokens. Case study titles name the model kind, whether it fits VRAM and the
+  architecture. A caution says the case studies were built with a limited candidate and time budget, that they do not
+  compete with established bespoke engines, and that more candidates and time make a better engine.
+- serve --check: on a package that ends reasoning at a budget, the check's chat requests carry a 16-token reasoning
+  budget, so a model that reasons first still writes the reply they compare. crit-eval's gate pre-check items are
+  hints, as crit-eval documents them: reported and marked, never failing the check (the Eval gates judge them).
+- block-drafter reads no checkpoint's spelling and taps any residual: its tensors and config under its own names,
+  which the layout's rename rules map a checkpoint's onto. The models core keeps a drafter's tapped rows for every
+  residual that gives its running row (pre-norm, sandwich and block-attention), so block-attention keeps no taps of
+  its own. inkling2-loop-model's layout leaves transformers' own names as they are, so a checkpoint loads under either
+  spelling.
+- The model-neutral guard closes its holes: a family name counts at a word start whatever follows, inside a word
+  where no English word holds it, and in a family's short names; it keeps no recorded debt, so any model name in
+  shared code fails.
+- tests/durations.json: Linux times for the four classes that run the library plugins' tests and for LibraryTests
+  without them (from a run of the whole suite, 6 jobs), Windows' time of the old LibraryTests removed (it would
+  count that class four times too long; the classes fall back to Linux's times until a run on main records
+  Windows'), and the two lint guards, no longer units, gone.
+- `crit_models.testing`: the engine test of prompts run layer by layer uses prompts of 40, 44 and 20 tokens (3, 3
+  and 2 chunks of 16, the last partial) and a scored text of 70 (5 chunks), where it used 75, 79 and 35 (5, 5 and 3
+  chunks) and 150 (10); the cancelled prompt stays 200 tokens (13 chunks), and each step of its open pass waits until
+  the cancel has been asked (looked for every 10 ms), so the cancel lands inside the pass on any host. A pass's steps are its chunks times the model's
+  layers, so the longer prompts ran the same calls through every layer more often and no other ones: several chunks
+  with a partial last one, passes of several requests beside decoding rows, the score and the cancel inside a pass
+  are all still there. The case in the eight classes of tests/test_model_template.py that run it on the CPU: 98.5 s
+  -> 84.7 s together (6 jobs, same load); less than the 30 s expected, since two engine loads are most of it. Every
+  model plugin's own tests run the case too.
+- tests/run_parallel.py runs the short classes of a module the recorded times split several a process (`grouped`:
+  the classes recorded as 15 s or less, joined in their order up to 60 recorded seconds a process), where each
+  started a process of its own: a class that runs for a fraction of a second, or skips where there is no GPU, cost
+  the process's start and its imports (4.4 s for a tests/test_model_template.py class that ran nothing). Every shard
+  joins them alike from the same recorded times, a joined unit's time is recorded in equal parts for its classes,
+  and its line names them. tests/test_model_template.py, test_api_dialects.py, test_run_plans.py and
+  test_plugin_library.py with their importers, 6 jobs, same load: 75 units -> 27; test_model_template's units' time
+  333 s -> 242 s.
+- tests/test_plugin_library.py runs the library plugins' own tests in four classes, a quarter of the registry each
+  (`LibraryPluginTestsA` to `D`), where one test of LibraryTests ran them all: the longest unit of the suite, which
+  no shard could end before, went from 121 s to 63 s (6 jobs; the four parts took 25 s, 50 s, 61 s and 63 s side by
+  side, more time in sum than the one run because each part runs its plugins' tests four at a time). Every library
+  plugin's tests run as before, each in exactly one part.
+- The API tests keep one served engine a test class where a test leaves it as it found it (`ServeFixture`'s
+  `shared_engine`, set by the fixtures of tests/test_api.py, test_api_options.py, test_tool_stream.py,
+  test_api_dialects.py, test_api_completions.py, test_api_eval_extensions.py, test_api_logprobs.py, test_api_score.py
+  and test_api_tokenize.py): starting a resident host and copying the run were half of an API test's 0.8 s. A test
+  gets the engine of the test before only when that test left the run's folder untouched (every file's size and
+  time, and no new file in the runtime folder, where a failed request leaves its records) and the host is the same
+  process with its first load still loaded and idle; otherwise the engine is closed, the run copied again and a new
+  one opened, so a test that crashes, retires, reloads or switches the engine, or writes to the run, costs the next
+  test nothing but the time. Each of the 72 serving test classes ran with it in four orders of its tests (as
+  written, reversed, two shuffles): the classes of the fixtures above pass in all four, 31 of them reusing engines;
+  the host-lifecycle classes (tests/test_chat_residency.py, test_chat_stream.py, test_serve_shutdown.py, test_api's
+  CommandTests) fail or gain nothing with it and stay as they were. The 15 modules that import those fixtures, 6
+  jobs, same load, with the entry below: 57 s -> 39 s (their units' time 341 s -> 233 s). One class-level error
+  showed once in a forward run under load and in none of 46 repeats; the class's temporary folder is now removed
+  as far as it can be when a host is still ending.
+- The kernels workflow builds a kernel for every architecture once for what its build reads: each build job has a
+  key over the kernel's folder, the kernel core and crit_kernels, Core's Python packages, crit's record reader, the
+  techniques' operations and CUDA sources, this workflow (the toolchain's versions) and the runner image, and a job
+  whose key passed before does nothing (a note in the Actions cache, kept only when the job succeeds). On the
+  0.22.0 pull request every push built all 17 kernels again, 15 to 17 minutes a run with decode-gemv alone 11 to 12;
+  a push that changes none of what a kernel reads now skips its build. A pull request reads the notes of its own
+  earlier runs and of main. Not run on GitHub yet: the workflow parses and the list step's script gives each
+  kernel its key on a checkout; the first run builds everything and the second shows the skips.
+- CI keeps uv's package cache on the drive Python is installed on (the runner's tool cache folder), so uv links the
+  pinned packages' files from the restored cache instead of copying them: on Windows the temporary folder it was in
+  is on another drive, and installing the 39 packages took 53 s of each job's 71 s of setup from a cache that had
+  every one of them. Expected: about 40 s less on each of the 11 Windows jobs that use the setup action. Not run on
+  GitHub yet: if the drives are not as read from the runner's paths, the install copies as before.
+- CI runs the host tests with Python 3.11 on Windows on pushes to main only: a pull request runs Python 3.14 on
+  both platforms and 3.11 on Linux. The four Windows shards of 3.11 were 2,191 s of the 6,893 s of runner time of
+  the 0.22.0 pull request (32%). A break that only Python 3.11 on Windows shows is found on main, after the merge.
+  Not run on GitHub yet: the workflow parses, and the first pull request shows its 8 host jobs (4 Windows, 4 Linux).
+- tests/test_api.py: eight of ApiTests' 18 cases no longer run again in StructuredOutputTests, RequestOptionsTests,
+  LegacyOptionsTests (tests/test_api_options.py) and AdvancedToolTests (tests/test_tool_stream.py): 32 runs, 34 s of
+  the suite's recorded time on Linux. They are the cases no declared capability reaches (`ServerCases`): a port
+  another server holds is refused, the models list, a candidate that does not verify, priority reaching admission,
+  the 404 endpoints, an engine failure and its reload, the request id on every response, and abort. Those four
+  classes still run the ten cases that build a request crit serve checks against the package's capabilities
+  (`ApiCases`: completion, length finish, streaming, stop sequences, include_stop_str_in_output, request timeout,
+  rejected requests, a null n, a context overflow, a later developer message) beside their own. ApiTests, ApiKeyTests
+  and FitOutputTests run all 18 as before.
+- The two guards CI's lint job runs as scripts, tests/test_model_neutral.py and tests/test_technique_reads.py, are no
+  longer units of tests/run_parallel.py, so CI's host jobs do not run them a second time on every platform and Python
+  (21 s of unit time on Linux a host run, four host runs a pull request); `--only test_model_neutral
+  test_technique_reads` runs them through the runner. The lint job runs them on Linux with Python 3.14 only, where
+  the host jobs also ran them on Windows and Python 3.11: both read the checkout's text and no platform's code.
+- tests/test_serve_end_to_end.py: 45 s -> 11 s. Its 8 tests send requests to one engine the class builds
+  (`setUpClass`), where each built a run, measured and sealed a candidate and loaded the engine for 7 s first; the
+  follow-up turn's test, whose first request must find nothing cached, still builds its own.
+- The host tests' own process does not sync the records it writes to the disk (tests/support/runs.py makes
+  `os.fsync` return at once there): crit syncs every record, thousands of times in a test module, which was 40% of
+  the run store tests' time on Linux, and no test can tell a synced file from a written one. The crit processes the
+  tests start sync as they do. tests/test_run_plans.py 32.3 s -> 17.2 s, tests/test_run_records.py 17.4 s -> 10.1 s
+  alone; the 45 modules that build a run, 6 jobs, same load, with the entry below: 167 s -> 139 s (their units' time
+  999 s -> 834 s).
+- CI fills the host shards by the unit times main's last run recorded, not only by the tests/durations.json someone
+  last committed: the durations job keeps its merged times in a cache, a `times` job restores them once a run and
+  hands them to every shard as one artifact (so all shards of a run split the units by the same times), and
+  `tests/run_parallel.py --times FILE` lays them over durations.json's. A unit added or grown since the file was
+  committed counts at its own time from the next run on; without a cache the shards fill by durations.json alone.
+  The host jobs start after that job (about ten seconds). Not run on GitHub yet: the workflow parses, and the first
+  pull request shows whether the cache and artifact steps do what they say.
+- tests/durations.json holds the unit times main's CI run of crit 0.22.0 recorded (261 units; Linux 2,599 s, Windows
+  5,703 s), where it held those of 0.21.0 (222 units; 1,623 s and 3,100 s). The 39 units it did not know counted as
+  20 s each when the shards were filled, tests/test_checkpoint_manifests.py (325 s on Linux, 646 s on Windows) among
+  them: on the 0.22.0 pull request one Windows shard ran 913 s and the other three 281 to 308 s, one Linux shard 562 s
+  and the other 231 s.
+- tests/test_checkpoint_manifests.py: 342 s -> 47 s on Linux. The dry plan (tests/support/dry_plan.py) takes the
+  shapes only of `crit_plugins.device.csf_decode` on tensors without bytes, as it does of the encodings: the decode's
+  dozen tensor operations cost 3 ms a call on meta tensors, and a checkpoint with compressed scales decodes one per
+  expert matrix (74,000 calls, 110 s of that checkpoint's 112 s plan; its arithmetic is tested on real values by
+  device-expert-cache's tests). The two tests that read the same checkpoint's plan share it. Every plan reads the
+  same tensors as before (374,988 of that checkpoint). In CI this one module took 7 to 12 minutes and set the pace
+  of the whole run.
+- The serving tests' fixture (tests/support/serve.py `ServeFixture`) builds its run once a test class: the run, its
+  two measured and sealed candidates and their packages took a second and a half of records, hashes and fsyncs before
+  every test (three quarters of an API test's time), and are now built by the class's first test and copied for each
+  test, the first included, to the same path (the run's records name their model by its path). Every test still
+  starts from the same untouched run with its own store, runtime folder and resident host; what the fixture's
+  construction exercised is `crit run`'s store, which tests/test_run_*.py test. test_api.ApiTests alone: about 27 s
+  -> 14 s. The 21 serving test modules together, 6 jobs, same load before and after and with the two entries above:
+  203 s -> 109 s (their units' time 1,213 s -> 646 s). `RunFixture.setUp` is split into `patch_ladder()` and
+  `create_run(root)` for it.
+- crit serve's HTTP server looks for its shutdown every 50 ms (`Server.serve_forever`), where socketserver's half
+  second had every stop of a server wait a quarter second on average for nothing: crit run's serve steps, crit pull's
+  bench, and each of the several hundred host tests that start one (test_api.ApiTests alone, 18 tests: 33.9 s ->
+  about 27 s).
+- tests/run_parallel.py runs every unit, and the processes it starts, on one math thread (`OMP_NUM_THREADS=1` unless
+  the caller set it). torch started a thread per core in each of them, so units side by side fought over the cores:
+  a model-template class that takes 19 s alone on one thread (36 s on six) took 245 s among five other units. Measured
+  on a 12-core machine with 6 jobs, same load before and after: test_model_template, test_plugin_library,
+  test_hybrid_engine, test_core_engine and test_device_engine together 974 s -> 114 s (their units' time 5,275 s ->
+  493 s), and the library plugins' tests no longer run past their 600 s limit there.
+- paged-kv-attention: the CUDA flash prompt chunk takes a distance bias (`prefill(..., flash="cuda", bias=)`, FP32
+  [tokens][heads][extent], in a library variant of its own: `B=1`), and attention-state reads biased prompt rows and
+  captured prompt chunks through it with prompt_reader prefill, where it took the decode's split-KV reduction in
+  pieces of 64 tokens. A biased prompt's scores move by the reduction order (on the engine it was measured on,
+  prompt NLL 0.6819 / 0.2384 -> 0.6798 / 0.2356 nats over two 4k prompts); a bias of zeros keeps every bit of the
+  chunk without one, and prompt_reader decode keeps the old path.
+- quantized-projections: under trunk fp8, a 16-bit target matrix whose rows alone the FP8 kernels do not take (not a
+  multiple of 16, as a product stacked with a few rows of another projection) is padded with zero rows and encoded,
+  where it stayed BF16; its products are its own rows (a view), each output row the bits it has among the padded
+  rows. A matrix whose columns FP8 does not take stays as stored under `trunk_kept`.
+- crit's shared code names no model: comments and messages that named one as evidence or example describe the shape
+  or kind instead (measured numbers keep their source in docs); the GGUF pre-tokenizer table names its regexes by what
+  they split and holds whether a file that does not say adds BOS; fused-norms' benchmark shapes are named by what they
+  hold. The only names left are identifiers a format or library defines (GGUF tokenizer.ggml.pre and
+  tokenizer.ggml.model values, the llama3 rope type, FlashInfer function names), listed with their fields in
+  `tests/support/model_neutral.json`.
+- A model plugin's layout says how a GGUF of each general.architecture it reads maps onto its names (`gguf`: `parts`,
+  `outside`, `draft` and `constants`, the GGUF names to the techniques' names as data; `experts`, the routed experts'
+  prefix; `transforms`, the converter's steps with their tensors and config keys: zero-centred, negated-exp,
+  squeezed, permuted-rotary, tiled-heads, joined-rows, joined-columns, split-rows, split-heads), where the models
+  core's GGUF reader kept a table of architectures and each family's part tables and code paths. The reader keeps
+  only GGUF's common convention and the generic steps; `open_checkpoint` and `GgufCheckpoint` take the layout, and
+  crit_models.testing's GGUF writer builds a file from the same entry.
+- Quality mode `speed` starts from 8- and 4-bit arithmetic wherever it pays, for every model; `preserve` is unchanged.
+  quantized-projections gains `trunk` (`auto`, `stored`, `fp8`; default `auto`): in `speed` every target matrix stored
+  in 16 bits, not only the head, is re-encoded to FP8 rows at load (facts `trunk_encoding`, `trunk_kept`), but the
+  roles `trunk_keep` names (default `router,shared_gate,index_qk`). model-template's `kv` `auto` takes `fp8:row` in
+  `speed` where the checkpoint stores no static KV scales, and `mtp_encode` and `mtp_kv` default to `auto` (`speed`:
+  NVFP4 matrices, `fp8:row` pages). grouped-experts' `activations` and `arithmetic` default to `auto` (`speed`: NVFP4
+  experts W4A4 at their input scales, each layer on its format's own tensor cores, `fp4` or `fp8`, where the GPU and
+  the layer take them, else `tensor`; facts `experts.layers.L.arithmetic`), and expert-offload's device rows take the
+  same arithmetic. A `speed` run whose `weights_policy` is `as_stored` sets `head` and `trunk` to `stored`
+  ([precision](docs/PLUGINS.md#precision)).
+- Quality mode `speed` asks `row-exact` rows where a configuration states no level (`preserve` still asks `exact`),
+  so every plugin takes its faster prompt path: quantized-projections' pinned prompt GEMMs, the split reader's prompt
+  launch, and for NVFP4 experts without input scales `fp4-row` prompt rows in grouped-experts and expert-offload.
+  crit smoke judges such an engine's decoding against its prefilling by the drift tolerance; an engine that fails
+  `decode_matches_prefill` there asks `exact` prompt rows ([exactness](docs/PLUGINS.md#exactness)).
+- Decode speed is sampled decode only. `crit run measure` (and `ablate`, `profile`, `kernels`, which send the same
+  requests) decodes a captured request that names no temperature at crit Eval's sampled-suite sampling for the run
+  (recon.json's `gathered.eval_sampling`, else temperature 1.0), each measured repetition with its own seed where the
+  engine takes one, instead of at temperature 0; a captured temperature-0 request's benchmark carries
+  `extensions.comparison_only`. `crit run ablate` decodes data prepared without a sampling at temperature 1.0, not 0.
+  A plan's frozen decode and `crit pull bench`'s decode are the sampled suite's only, never the greedy one's, and
+  AGENTS.md, the build-engine skill and the docs state the rule; the README's case study no longer quotes a greedy
+  decode as a speed.
+- Core's eval adapter's `cohort` takes per-request sampling (`sampling[c][r]`, the fields the engine applies kept),
+  which crit-eval-v0.8.0's concurrency levels time their sampled run with.
+- A decoder's mechanisms leave Core's config reader for `crit-models`, a package of its own built from
+  `models/core/python` as `crit-core` is from `inference/core/python`: `crit_models.config.architecture(config)` reads
+  the layer kinds, looped spans, routed experts, latent attention, linear-attention and Mamba-2 state and the rotary
+  sections over Core's `ModelConfig`, with the rules over them (`attention_shape`, `attention_geometry`,
+  `layer_kinds`, `kv_elements_per_token`, `fixed_state_bytes`, `routed_layers`, `layer_applications`), and a family's
+  key spellings are its `config_keys.json`. Core keeps the generic fields, the position limit and the head size.
+  crit Eval's limits and the model plugins read the mechanisms through it (checked identical on every checkpoint
+  config and model on hand: 318 values). A GGUF folder's check of what a mechanism adds (attention by layer kind,
+  experts, rotary base) is crit-models', registered with Core (`crit_core.registry` gguf_checks). crit, crit Eval
+  and a checkout's tests install or put `models/core/python` on the path beside `inference/core/python`; the release
+  publishes `crit-models` beside `crit-core`.
+- A layer part's slot and its facts are defined by the slot's base plugin, in its manifest's `defines` (host
+  interface, device form, comparison cases, facts and their pools; `crit_plugins.contracts`), not by Core:
+  attention and its `attention:*` facts (softmax-attention), projections (projections-dense), experts and
+  `experts:*` (experts-reference), expert residency and source with their policy (expert-tensors), router
+  (topk-router), recurrence (sequential-recurrence), norms (torch-norms), embeddings (memory-table-rows). Core keeps
+  the engine's own slots (model, placement, KV pool, sampler, drafter, verifier) and its round and prompt forms. A
+  folder of fixture or engine plugins knows the layer parts' slots through the plugins that define them; a host
+  plugin's policy slots are checked against the registry's definitions; tests take a slot's cases with
+  `crit_plugins.testing.cases_for(__file__)`.
+- Core moves to `inference/core/` and the Inference entries to `inference/techniques/CATEGORY/ID` (attention,
+  experts, memory, norms, projections, recurrence, sampling, speculation; an entry's `category` is its folder), each
+  slot's plain plugin in its category beside them (no `base/` folder), and the walkthrough to `inference/starters/`,
+  so inference is core, techniques and starters as kernels is. A folder of plugins holds plugins and groups of
+  them, marked by `plugins.json`; `crit plugins add` copies a plugin to `ENGINE/plugins/CATEGORY/ID`. **Breaking:**
+  an engine sealed with the 0.22.0 library or earlier is not supported on this crit (its plugin copies carry no slot
+  definitions, and its model plugin asks Core's config for the mechanisms that moved to crit-models); it is rebuilt
+  from the current library. Python package names stay. The
+  wheel ships the library as `crit/library/inference/techniques` and `crit/library/models`.
+
+### Removed
+
+- tests/test_reusable_techniques.py: the class GgufBlockReferenceTests, which held five reference digests and no test
+  since the function they were computed from left the tests (crit 0.5.0), is gone.
+- `models/` and `crit models` (PTQ, weight codecs, calibration, drafter distillation and their transform records), with
+  their MCP tools (`crit_models_*`) and the `crit_drafter` drafter kind. No engine build used them: a `transformable`
+  run re-encodes stored matrices as the engine loads them. Test checkpoints that need NVFP4 experts encode them with
+  `tests/nvfp4_checkpoint.py`, bit for bit the codec it replaces. `models/` now holds model support, and the new
+  `crit models` (Added) is its command.
+
+### Fixed
+
+- crit run plan: a parent sealed `eval_failed` (its Eval stopped before completing) is planned from as its build.
+  Before, `next` asked for a plan that refused the parent, and the run could not go on.
+- serving: a reasoning marker the splitter did not consume (a closing marker that also ends the template's other
+  messages) stays out of the content where no tool parser reads it.
+- model-template: a score's eager prompt chunks fit the device memory free when the score runs (the spans' bytes a
+  row, the headroom kept); prompt rows keep their bits at any chunk boundary.
+- quantized-projections: a matrix stored without a 16-bit weight (int4's `qweight`) has no FP8 target, so its shape
+  is not read; trunk padding read `tensors["weight"]` first and failed.
+- block-attention: the dry shape (`resolve`) asks for no kernel, which only the loaded model has.
+- Lines that a lost backslash continuation had joined are split again (crit run's plans, crit_models' layer passes,
+  paged-kv-attention, model-template, relative-attention, softmax-attention's kernel test and six host test modules),
+  and imports the lint job (ruff F401) refuses are gone.
+- Tests: token-sampling's and token-constraints' staged-form tests skip where Triton is not installed (a CUDA host
+  without it, such as Windows); model-template's GGUF tests skip in an engine package, which carries only its own
+  model plugin.
+
 ## [0.22.0] - 2026-11-21
 
 ### Overview
@@ -58,7 +418,7 @@ builds less, native code is cached by content and plugin tests run in parallel. 
   and crit Eval's in-process engines had no such ordering at all. `RequestOptions::priority` (the native ABI's
   `"priority"`; `StepEngine.generate(priority=)`) admits a lower value first, the oldest first among equals, of the
   generations queued before the first score; a score stays a barrier and takes no priority
-  ([request priority](core/src/runtime/README.md#request-priority)). `StepEngine(max_concurrent_requests=)` caps
+  ([request priority](inference/core/src/runtime/README.md#request-priority)). `StepEngine(max_concurrent_requests=)` caps
   what the runtime holds at once, lanes first, then waiting places (`crit_core.native.cap_concurrency`), and
   `pending_timeout` bounds the wait for a lane (the step engine's new `pending_timeout_ms` setting). Without one a
   request waits as long as it takes: Core's profile default of 30 s failed a request that waited behind long
@@ -3781,7 +4141,7 @@ needs crit-eval 0.5.2.
   still write to it.
 - Core holds no GGUF config rule of its own: a lone GGUF's `config.json` comes from the rule a package registers for
   its architecture in Core's new registry of model-family knowledge, `crit_core.registry` (kind `gguf_config`, at run
-  time or in an entry point of group `crit_core.gguf_config`; [config rules](core/python/crit_core/model/README.md#gguf)).
+  time or in an entry point of group `crit_core.gguf_config`; [config rules](inference/core/python/crit_core/model/README.md#gguf)).
   crit-eval gives the rules for `llama`, `qwen2`, `qwen3`, `qwen3moe`, `qwen35`, `qwen35moe`, `deepseek4` and
   `qwen4exp`, beside its reference's layouts for them (`crit_eval.architectures.gguf_config`, `gguf_deepseek4` and
   `gguf_qwen4exp`), registered when `crit_eval` is imported; crit imports it, and crit serve's host finds a crit-eval
@@ -3796,7 +4156,7 @@ needs crit-eval 0.5.2.
   positional-encoding arithmetic, against its own rule.
 - Core ships no chat template: the one a model without its own renders with comes from the registry
   (`crit_core.registry` kind `chat_templates`, by `config.json` `model_type`;
-  [chat templates](core/python/crit_core/text/README.md#chat-templates)), and crit-eval gives DeepSeek V4's, byte for
+  [chat templates](inference/core/python/crit_core/text/README.md#chat-templates)), and crit-eval gives DeepSeek V4's, byte for
   byte the one Core shipped, so prepared data and model identities are unchanged. `shipped_template` and
   `chat_template_sources` read the registry; `SHIPPED_TEMPLATES` and `crit_core/text/templates/` are gone, and the
   encoder's golden tests went to crit-eval with the template. Before, Core carried
@@ -3851,7 +4211,7 @@ crit-eval 0.5.2.
 - A run on several GPUs: a `device` file from `crit eval probe --devices` sizes the run's context from their memory
   together, `hardware_constraints.context.devices` names them, and `crit run measure` samples device memory on
   every one of them, summed (nvidia-smi `--id` of each). Checked with host tests on one GPU.
-- Core's CUDA backend gets device sets (`crit/cuda_devices.h`, [device sets](core/src/backends/cuda/README.md#device-sets)):
+- Core's CUDA backend gets device sets (`crit/cuda_devices.h`, [device sets](inference/core/src/backends/cuda/README.md#device-sets)):
   `CudaDeviceSet(devices)` holds one `CudaBackend` per GPU with its own streams, allocations and ledger, enables peer
   access where the hardware allows it, and orders work between members without a host fence: `copy_async` between
   members' device buffers (peer copies, the source kept alive until done), `order` (one member's stream after
@@ -3974,7 +4334,7 @@ crit-eval 0.5.2.
 - Python engines get Core's concurrent runtime by implementing a step instead of `generate()`: `crit/step_engine.h`
   makes a `ConcurrentModel` of C callbacks (admission, open, step, commit, retire, score), the new `crit_core_steps`
   library exports the engine ABI plus `crit_engine_open_steps`, and `crit_core.native.StepEngine` serves a Python step
-  model on it ([step engines](core/src/runtime/README.md#step-engines)). Core then schedules the model's requests in
+  model on it ([step engines](inference/core/src/runtime/README.md#step-engines)). Core then schedules the model's requests in
   mixed prefill/decode steps and handles admission, request options, stop tokens, cancellation, retirement and the
   scoring barrier; `open_engine` picks it for any opened engine with `step()`, so `eval_engine` and `resident_engine`
   serve it with `max_concurrent_requests` above 1. `crit_core.batch` is the Python twin of `crit/batch.h`. A toy step
@@ -4026,7 +4386,7 @@ crit-eval 0.5.2.
   check ask for the hit rate first. It still warns when Eval could not place the model.
 - Core's interface and request runtime are split by concern: `crit/core.h` includes its parts from `crit/core/`
   (resources, profile, request, model, concurrent and engine), which the SDK installs beside it, and
-  `core/src/runtime/runtime.cpp` became one file per part of the runtime ([request runtime](core/src/runtime/README.md)).
+  `core/src/runtime/runtime.cpp` became one file per part of the runtime ([request runtime](inference/core/src/runtime/README.md)).
   The interface and `#include <crit/core.h>` are unchanged.
 
 - AGENTS.md says shape tuning must hold for every prompt length: Eval measures the held-out
@@ -5904,7 +6264,7 @@ follow the model's own time-step limit). The Python distribution and the Core SD
 - Inference entry [host-work-mailbox](inference/host-work-mailbox/README.md): host work the device posts and a
   stream joins inside a captured graph (device-reset doorbells, release, terminal failure answering), with the
   stream-front-end and poll-kernel waits chosen by a measured probe and an eager fallback.
-- Inference entry [host-expert-arithmetic](inference/host-expert-arithmetic/README.md): NVFP4 expert rows on the
+- Inference entry [host-expert-arithmetic](inference/techniques/experts/host-expert-arithmetic/README.md): NVFP4 expert rows on the
   CPU in a declared operation order (element-scaled or block-dot products; scalar oracle, AVX2 and AVX-512
   paths chosen at run time) that a matching CUDA function reproduces bit for bit, with a scale-decode hook for
   checkpoint-specific scale encodings.
@@ -6089,7 +6449,7 @@ native Core SDK (`critCore`) share version 0.1.0.
 
 ### Added
 
-- **Core** ([guide](core/README.md)): a C++20 SDK with Model, Session and Backend
+- **Core** ([guide](inference/core/README.md)): a C++20 SDK with Model, Session and Backend
   interfaces for generation and query scoring, request scheduling and admission,
   resource accounting, readiness, cancellation, deadlines, quarantine and safe
   retirement. Mixed batching of up to 4096 request lanes with shared token-work budgets,

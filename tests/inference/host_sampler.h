@@ -1,6 +1,6 @@
 #pragma once
-// The host oracle of the token-sampling fixtures: Core's sampling rules (core/src/sampling/README.md) in IEEE double
-// on the host, against which the device law (inference/token-sampling/code/sampling.cu) is checked. Not part of
+// The host oracle of the token-sampling fixtures: Core's sampling rules (inference/core/src/sampling/README.md) in IEEE double
+// on the host, against which the device law (inference/techniques/sampling/token-sampling/code/sampling.cu) is checked. Not part of
 // Core: engines sample through a sampler plugin.
 #include <crit/core.h>
 #include <crit/sampling.h>
@@ -13,7 +13,7 @@ namespace crit::oracle {
 using namespace crit::core;
 // Most logit_bias entries one request may carry.
 inline constexpr std::size_t logit_bias_limit = 1024;
-// Resolved sampling rules for one request; validate() states the ranges. core/src/sampling/README.md gives the order.
+// Resolved sampling rules for one request; validate() states the ranges. inference/core/src/sampling/README.md gives the order.
 struct SamplingParams {
     double temperature = 1.0, top_p = 1.0, min_p = 0.0;                // temperature 0 = greedy
     std::uint32_t top_k = 0;                                            // 0 = no filter

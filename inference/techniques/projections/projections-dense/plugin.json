@@ -1,0 +1,45 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "projections-dense",
+  "title": "Dense FP64 projection",
+  "description": "The plain projection every projections plugin is compared with: y = W x with exact sums. On the device, a BF16 matrix multiplied by torch.",
+  "fills": [
+    "projections"
+  ],
+  "devices": [
+    "cuda",
+    "cpu"
+  ],
+  "provides": [
+    "rounds:projections"
+  ],
+  "conflicts": [
+    "stored:nvfp4",
+    "stored:fp8"
+  ],
+  "entry": "plugin.py:create",
+  "defines": {
+    "slots": {
+      "projections": {
+        "about": "dense weight formats and their GEMM/GEMV kernels, with fused epilogues",
+        "host": {
+          "prepare": "prepare(rows) -> weight: a dense [out][in] matrix in the plugin's format",
+          "project": "project(weight, activations) -> [[out] per token]",
+          "dense": "dense(weight) -> rows: the values project multiplies with (the format's decoded matrix)"
+        },
+        "device": {
+          "load": "load(tensors, format, role=None, encode=None) -> matrix: a matrix on the device from a checkpoint's stored tensors; format is the encoding (bf16, fp8:channel, fp8:tensor, mxfp8, nvfp4; a plugin refuses one it does not take), tensors as stored ({weight, scale, global_scale, input_scale} by role); role, where the model plugin gives one, is the matrix's part in the model in the model's own words (qkv, gate_up, ...), which a plugin may choose its arithmetic by; encode, which the model plugin passes only for a matrix only a drafter reads, names a format the plugin re-encodes the stored one to (nvfp4, fp8), recorded in its facts (draft_encoding)",
+          "matmul": "matmul(x, matrix, out_dtype=None) -> y: y[t] = W x[t] for each token row of x ([tokens][in], the activation dtype); in a call of up to invariant_rows(plugin) rows (decode rows, verify windows: DECODE_ROWS, or the facts' row_invariance rows when more) every row's bits are those of the row alone, so batched decoding matches serial; a longer call (prompt rows) may sum in another order than a shorter one, unless the plugin's facts say row_invariance prompt_rows (then a row's bits are the same in any call of more than invariant_rows(plugin) rows); out_dtype asks for the output in a dtype of its own (FP32 for logits) from the same FP32 sums"
+        }
+      }
+    },
+    "facts": {
+      "rounds:projections": {
+        "methods": {}
+      },
+      "prompts:projections": {
+        "methods": {}
+      }
+    }
+  }
+}

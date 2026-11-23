@@ -23,33 +23,33 @@ import sys
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-CORE = ROOT / "core"
+CORE = ROOT / "inference" / "core"
 PYTHON = CORE / "python"
 ALLOWLIST = ROOT / "tests/support/core_ownership_allowlist.json"
 
 # What Core owns: its home (the one module that assigns it), the name it has there, the names a copy goes by
 # elsewhere, and its values where a literal collection of them is a copy under any name.
 OWNED = {
-    "exactness levels": {"home": "core/python/crit_plugins/exactness.py", "name": "LEVELS",
+    "exactness levels": {"home": "inference/core/python/crit_plugins/exactness.py", "name": "LEVELS",
                          "names": ("LEVELS", "EXACTNESS_LEVELS"),
                          "values": {"repeatable", "row-exact", "exact", "declared"}},
     # A dict keyed by the phases is a value per phase (a plugin's exactness()), not a copy: only collections count.
-    "exactness phases": {"home": "core/python/crit_plugins/exactness.py", "name": "PHASES", "names": (),
+    "exactness phases": {"home": "inference/core/python/crit_plugins/exactness.py", "name": "PHASES", "names": (),
                          "values": {"decode", "prompt"}, "keys": False},
-    "quality modes": {"home": "core/python/crit_plugins/exactness.py", "name": "QUALITY_MODES",
+    "quality modes": {"home": "inference/core/python/crit_plugins/exactness.py", "name": "QUALITY_MODES",
                       "names": ("QUALITY_MODES", "MODE_LEVELS"), "values": {"speed", "preserve"}},
-    "cancel grace": {"home": "core/python/crit_plugins/steps.py", "name": "GRACE",
+    "cancel grace": {"home": "inference/core/python/crit_plugins/steps.py", "name": "GRACE",
                      "names": ("GRACE", "CANCEL_GRACE", "CANCEL_GRACE_SECONDS")},
-    "VRAM headroom": {"home": "core/python/crit_plugins/memory.py", "name": "HEADROOM",
+    "VRAM headroom": {"home": "inference/core/python/crit_plugins/memory.py", "name": "HEADROOM",
                       "names": ("HEADROOM", "VRAM_HEADROOM", "VRAM_HEADROOM_GIB", "VRAM_HEADROOM_BYTES",
                                 "DEFAULT_HEADROOM")},
 }
 # Module state of the process, not of an engine: what `global` may rebind in Core's Python.
 PROCESS = {
-    "core/python/crit_plugins/compiles.py": {"_recording"},   # the process's compile recorder (torch's are process-wide)
-    "core/python/crit_plugins/host/__init__.py": {"_current"},   # the process's one host: its cores and worker pool
-    "core/python/crit_plugins/memory.py": {"_CU"},   # the CUDA driver library, loaded once a process
-    "core/python/crit_plugins/policy.py": {"_process"},   # the policy outside any engine (tests, a quick try)
+    "inference/core/python/crit_plugins/compiles.py": {"_recording"},   # the process's compile recorder (torch's are process-wide)
+    "inference/core/python/crit_plugins/host/__init__.py": {"_current"},   # the process's one host: its cores and worker pool
+    "inference/core/python/crit_plugins/memory.py": {"_CU"},   # the CUDA driver library, loaded once a process
+    "inference/core/python/crit_plugins/policy.py": {"_process"},   # the policy outside any engine (tests, a quick try)
 }
 SKIP = {"__pycache__", "build", "manifests", "tests"}   # tests spell values out; checkpoint manifests are data
 BUILTINS = set(dir(builtins))
@@ -162,7 +162,7 @@ class CoreOwnership(unittest.TestCase):
 
     def test_the_homes_are_core_modules(self):
         for concept, owned in OWNED.items():
-            self.assertTrue(owned["home"].startswith("core/python/"), concept)
+            self.assertTrue(owned["home"].startswith("inference/core/python/"), concept)
         for path in PROCESS:
             self.assertTrue((ROOT / path).is_file(), path)
 

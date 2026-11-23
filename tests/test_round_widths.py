@@ -9,7 +9,7 @@ import sys
 import unittest
 
 ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT.parent / "core" / "python"))
+sys.path.insert(0, str(ROOT.parent / "inference" / "core" / "python"))
 sys.path.insert(0, str(ROOT))
 from test_device_drafting import DEVICE, GRAPHS, HEAD, Head, Target, host_decode, plugins, torch  # noqa: E402
 

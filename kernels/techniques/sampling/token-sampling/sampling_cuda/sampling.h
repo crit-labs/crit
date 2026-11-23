@@ -1,6 +1,6 @@
 // Token selection on the device after the head: greedy, or Core's sampling law over the
 // full vocabulary. Draws are Core's counter-based uniform (crit/sampling.h), so the device
-// follows Core's sampling rules (core/src/sampling/README.md) and draw for the same row, parameters and
+// follows Core's sampling rules (inference/core/src/sampling/README.md) and draw for the same row, parameters and
 // history. Rules are held in double and processing runs in IEEE double, as the rules state. Speculative verification uses the same law per column.
 //
 // Every row picks its path on the device, so one captured launch serves every request:
@@ -56,7 +56,7 @@ cudaError_t enqueue_mask(float* logits, int vocab, int stride, const std::uint32
 
 // ---- Core's whole law on the device -------------------------------------------------------------
 // Device-resident, one per sequence: a request's resolved rules, in double. Steps 2 to 5 and 7 to 12 of
-// Core's sampling rules (core/src/sampling/README.md) run on the device; constraint masks go through enqueue_mask first.
+// Core's sampling rules (inference/core/src/sampling/README.md) run on the device; constraint masks go through enqueue_mask first.
 // Pointers are device memory owned by the engine and borrowed by every launch.
 struct Request {
     double temperature = 0.;            // <= 0 greedy (lowest id on ties)

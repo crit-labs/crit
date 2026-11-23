@@ -12,7 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 # Core's runtime, which the resident host's loader opens the toy model on.
 os.environ["CRIT_CORE_STEP_LIBRARY"] = str(Path(sys.argv[1]).resolve())
-sys.path.insert(0, str(ROOT / "core" / "python"))
+sys.path.insert(0, str(ROOT / "inference" / "core" / "python"))
 sys.path.append(str(ROOT.parent / "crit-eval"))
 import crit_eval  # noqa: E402,F401  imported before crit's fixtures put the checkout beside this one first on sys.path
 
@@ -107,8 +107,9 @@ class ConcurrencyEndToEnd(MeasureFixture, unittest.TestCase):
             {"id": f"{kind}-{seed}", "messages": messages, "prompt_ids": text.encode_chat(messages)}
             for seed, count in zip(seeds, lengths)
             for messages in [[{"role": "user", "content": words(seed, count)}]]]
+        # A sampling, so each level's sampled run, which every speed figure is taken from (crit-eval-v0.8.0), runs.
         prepared = {"speed": cases("speed", (1, 2, 3, 4), (9, 17, 33, 50)),
-                    "heldout": cases("heldout", (5, 6), (12, 40))}
+                    "heldout": cases("heldout", (5, 6), (12, 40)), "sampling": {"temperature": 1.0, "top_p": 0.95}}
         chat = ChatEngine(ChatServer(self.serve(candidate), prepared),
                           {"context_tokens": 8192, "model": str(self.model)})
         output = protocol["concurrency"]["output_tokens"]

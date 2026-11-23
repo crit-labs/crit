@@ -11,7 +11,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
-    "crit_test_model_import_audit", ROOT / "inference/model-import-audit/code/implementation.py")
+    "crit_test_model_import_audit", ROOT / "inference/techniques/memory/model-import-audit/code/implementation.py")
 m = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = m
 SPEC.loader.exec_module(m)

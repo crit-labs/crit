@@ -10,7 +10,7 @@ import math
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core" / "python"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "inference" / "core" / "python"))
 
 from crit_core.native import step_library  # noqa: E402
 

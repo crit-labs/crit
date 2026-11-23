@@ -13,7 +13,7 @@ mailbox, a round's accept, a CPU SIMD codec) stays in its technique
 combine or fuse entries; the engine owns that design, and an engine may write every plugin
 itself instead of taking an entry.
 
-Use [Core](../core/README.md) for lifecycle, requests and resources,
+Use [Core](core/README.md) for lifecycle, requests and resources,
 [Kernels](../kernels/README.md) to find and integrate kernels (external links never
 substitute for code an entry claims to supply), and [Eval](https://github.com/crit-labs/crit-eval/blob/main/docs/README.md)
 to measure the engine; NLL, perplexity and KL code is in
@@ -28,35 +28,35 @@ leaves to the engine.
 
 | Need | Entry | Supplies |
 | --- | --- | --- |
-| Load exact encoded regions | [artifact-loading](artifact-loading/README.md) | Extent/content checks, retained materialization, native chunked reads |
-| Audit imported model metadata | [model-import-audit](model-import-audit/README.md) | Safetensors header/index checks, tensor roles, shard geometry |
-| Reuse serialized state | [checkpoint-storage](checkpoint-storage/README.md) | Complete manifests, prefix coordination, paced transfers, leased tiers |
-| Recover speculative recurrence | [recurrent-state-recovery](recurrent-state-recovery/README.md) | Gated-delta verification, accepted-prefix repair, chunked prefill reference; on the device a state pool whose verify windows keep their accepted prefix in captured rounds (deferred, checkpoints or recompute) |
-| Share KV and execute attention | [attention-state](attention-state/README.md) | A KV transaction with partial acceptance and rollback, rotary tables from the config; on the device a paged pool with FP8 and INT8 row-scaled pages, round slots for captured rounds and prompt buffers for captured prompt chunks, and the attention slot's shared device form (code/device_attention.py) |
-| Partition a long attention sequence | [partitioned-attention](partitioned-attention/README.md) | Interleaved ownership, stable partial reduction, head-major scatter; serves on CUDA: split-KV partitions merged by log-sum-exp on one GPU |
-| Execute low-bit projections | [quantized-projections](quantized-projections/README.md) | G32 W4/W8 and dynamic A8 on the CPU, row-scaled FP8 and NVFP4 host codecs; on CUDA stored BF16, FP8, MXFP8 and NVFP4 matrices through cuBLASLt and crit's kernels mma-rows, decode-gemv, fixed-tile-gemm and pinned-gemm, each decode row's bits alone and batched |
-| Run a GGUF checkpoint's matrices as stored | [gguf-projections](gguf-projections/README.md) | Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, TQ1_0, TQ2_0, MXFP4, Q1_0 and Q2_0 matrices read from the file's stored rows, decode rows on crit's kernel gguf-rows at the stored bits, prompt rows dequantized for cuBLAS or with the decode rows' bits |
-| Reuse expert weights, lend cache memory or borrow idle KV and workspace memory | [expert-residency](expert-residency/README.md) | Byte-cache leases, complete bundles, C++ region loans and owner slot loans |
-| Plan expert residency inside decode graphs | [device-expert-cache](device-expert-cache/README.md) | Ready `ExpertCache` (the `experts:cache` device form): CUDA directory, miss copies, admission limits and the CPU/link split, a prompt ring, lent KV pages, profile warm start, prefetch, offline policy replay |
-| Write a model plugin by picking and configuring blocks | [model-template](model-template/README.md) | The model slot's plugin for every checkpoint a layout covers (decoder: Llama, Qwen2, Qwen3 and their mixtures of experts; gated-hybrid: Qwen3-Next, Qwen3.5 and their MTP layers; latent: DeepSeek V3; gated-streams: Qwen4Exp), and compose() for an engine's own: attention, block-sparse indexed attention, latent attention, gated-delta, hashed n-gram rows, SwiGLU and MoE blocks over the other slots and over one pre-norm residual stream or several mixed streams, the checkpoint's MTP layer as the device draft head, on the serving contracts (exact rows, prompt spans timed at load within the cancel grace and the device's room, every device tensor planned, captured rounds and prompt chunks, the prompt cache) |
-| Serve a mixture of experts larger than the device, with no engine code for its experts | [expert-offload](expert-offload/README.md) | One plugin in the experts slot, called as for experts that fit: places the routed experts (device, host memory, a file), keeps the experts routed last in a device cache that takes every byte the device has free while the engine serves, computes misses on the CPU tier while the link copies them in beside the round, stages prompt chunks, says what it decided; `crit plugins offload` gives its options and replays routing traces |
-| Run routed experts in their stored format on the device | [grouped-experts](grouped-experts/README.md) | Routed SwiGLU experts over bundles in a slot store, every stored format (bf16, fp8, nvfp4, int4, mxfp4), the routes grouped by expert on the device; one function for decode rows and prompt chunks (registry kernel crit-labs/grouped-experts, torch fallback) |
-| Read prompts through routed experts kept in host memory | [expert-streamed-prefill](expert-streamed-prefill/README.md) | Chunk size from the measured rate curve, layer double-buffered expert copies, the FP64 reference and the grouped projection's contract (`operations.json`); streamed.py runs a prompt's routed layers through an experts plugin's `forward_bundles` in chunks at the measured knee (no plugin runs it yet) |
-| Choose expert execution sources | [heterogeneous-expert-dispatch](heterogeneous-expert-dispatch/README.md) | Placement plans, measured CPU/device splits, one routing description with its host reference; serves on CUDA: the expert cache's CPU routes (slot -2) computed by the CPU tier and joined inside the stream, the split never changing a bit |
-| Compute NVFP4 experts on the CPU with the device's bits | [host-expert-arithmetic](host-expert-arithmetic/README.md) | Declared FP32 orders and exact integer block rows, scalar oracles, AVX2/AVX-512 (VNNI) paths, matching CUDA functions, scale hook; serves the projections slot on the CPU |
-| Compute a layer's CPU share of experts on a pinned pool | [host-expert-tier](host-expert-tier/README.md) | Ready `HostExpertTier` on the host's worker pool (Core's): integer rows with the device's bits, declared SwiGLU and quantizer, handoff payload, telemetry; serves the experts slot on the CPU and joins a CUDA engine's -2 routes inside the stream (heterogeneous-expert-dispatch) |
-| Join asynchronous contributions | [async-expert-contributions](async-expert-contributions/README.md) | Receipt-based join, source retention, ordered reduction |
-| Serve a dense model larger than device memory | [dense-layer-offload](dense-layer-offload/README.md) | Measured planner, host AVX2/AVX-512 layers, double-buffered weight streaming, measured plan selection |
-| Fetch file-backed experts | [ssd-expert-materialization](ssd-expert-materialization/README.md) | Checked reads, a host tier fed by device evictions, bounded gather, read-ahead, upload handoff |
-| Read embedding or n-gram table rows from disk | [lookup-table-rows](lookup-table-rows/README.md) | Random-access advice, exact parallel row reads, hot-row cache; on CUDA tables in registered host memory or files, gathered inside captured graphs |
-| Execute speculative rounds | [mtp-decode](mtp-decode/README.md) | Token-history proposals, greedy/sampled verification, repair, adaptive budgets; copy drafts from device token histories (`draft:device`) |
-| Sample tokens on the device, and verify sampled drafts | [token-sampling](token-sampling/README.md) | Core's whole law over the full vocabulary (penalties, top-k/p, min-p), rejection-sampling verify predictions; `rounds:sampler` for captured rounds (draft draws with sparse laws, rejection-sampling predictions, emitted-token log-probabilities) |
-| Keep structured output exact under speculation | [token-constraints](token-constraints/README.md) | [Core](../core/src/constraints/README.md) matchers in sampled speculation, private forks and rewinds; serves on CUDA: masks before token-sampling's device law, staged for captured steps and rounds |
-| Keep a speculative round on the GPU | [device-speculative-round](device-speculative-round/README.md) | Device accept for greedy and sampled rounds, frontier advance, graphs, one readback per round |
-| Verify a tree of drafts in one pass | [draft-trees](draft-trees/README.md) | EAGLE-2 trees, ancestor masks, device tree walk (greedy or sampled), row compaction; device tree drafting and walk in captured rounds (`draft:device`, `verify:device`; its rounds need `attention:tree`) |
-| Draft with a published EAGLE-3, DFlash or DSpark drafter | [hidden-state-drafters](hidden-state-drafters/README.md) | Core's reader of every drafter format (one tap convention), catch-up, block input, d2t mapping, confidence cuts |
-| Cheapen the draft head | [draft-vocabulary-subset](draft-vocabulary-subset/README.md) | Head row subset, index mapping, CUDA gather-argmax |
-| Fuse the elementwise work around the matmuls | [fused-norms](fused-norms/README.md) | RMSNorm with a residual, head norms with rotary positions, gated norms, activation products, L2 norms, residual-stream mixes as the `norms` slot: one launch per call of crit's kernel fused-norms, each row's bits independent of its batch; the FP64 host form, the torch form (base torch-norms, and the fallback) and conformance checks for any norms plugin |
+| Load exact encoded regions | [artifact-loading](techniques/memory/artifact-loading/README.md) | Extent/content checks, retained materialization, native chunked reads |
+| Audit imported model metadata | [model-import-audit](techniques/memory/model-import-audit/README.md) | Safetensors header/index checks, tensor roles, shard geometry |
+| Reuse serialized state | [checkpoint-storage](techniques/memory/checkpoint-storage/README.md) | Complete manifests, prefix coordination, paced transfers, leased tiers |
+| Recover speculative recurrence | [recurrent-state-recovery](techniques/recurrence/recurrent-state-recovery/README.md) | Gated-delta verification, accepted-prefix repair, chunked prefill reference; on the device a state pool whose verify windows keep their accepted prefix in captured rounds (deferred, checkpoints or recompute) |
+| Share KV and execute attention | [attention-state](techniques/attention/attention-state/README.md) | A KV transaction with partial acceptance and rollback, rotary tables from the config; on the device a paged pool with FP8 and INT8 row-scaled pages, round slots for captured rounds and prompt buffers for captured prompt chunks, and the attention slot's shared device form (code/device_attention.py) |
+| Partition a long attention sequence | [partitioned-attention](techniques/attention/partitioned-attention/README.md) | Interleaved ownership, stable partial reduction, head-major scatter; serves on CUDA: split-KV partitions merged by log-sum-exp on one GPU |
+| Execute low-bit projections | [quantized-projections](techniques/projections/quantized-projections/README.md) | G32 W4/W8 and dynamic A8 on the CPU, row-scaled FP8 and NVFP4 host codecs; on CUDA stored BF16, FP8, MXFP8 and NVFP4 matrices through cuBLASLt and crit's kernels mma-rows, decode-gemv, fixed-tile-gemm and pinned-gemm, each decode row's bits alone and batched |
+| Run a GGUF checkpoint's matrices as stored | [gguf-projections](techniques/projections/gguf-projections/README.md) | Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, TQ1_0, TQ2_0, MXFP4, Q1_0 and Q2_0 matrices read from the file's stored rows, decode rows on crit's kernel gguf-rows at the stored bits, prompt rows dequantized for cuBLAS or with the decode rows' bits |
+| Reuse expert weights, lend cache memory or borrow idle KV and workspace memory | [expert-residency](techniques/experts/expert-residency/README.md) | Byte-cache leases, complete bundles, C++ region loans and owner slot loans |
+| Plan expert residency inside decode graphs | [device-expert-cache](techniques/experts/device-expert-cache/README.md) | Ready `ExpertCache` (the `experts:cache` device form): CUDA directory, miss copies, admission limits and the CPU/link split, a prompt ring, lent KV pages, profile warm start, prefetch, offline policy replay |
+| Write a model plugin by picking and configuring blocks | [model-template](../models/core/model-template/README.md) | The core every model plugin extends: the finished ones of [models/cache](../models/cache/README.md) (Llama, Qwen2, Qwen3 and their mixtures of experts; Qwen3-Next, Qwen3.5 and their MTP layers; DeepSeek V3; Qwen4Exp; Gemma 4; a looped decoder), and an engine's own: attention, block-sparse indexed attention, latent attention, gated-delta, hashed n-gram rows, SwiGLU and MoE blocks over the other slots and over one pre-norm residual stream or several mixed streams, the checkpoint's MTP layer as the device draft head, on the serving contracts (exact rows, prompt spans timed at load within the cancel grace and the device's room, every device tensor planned, captured rounds and prompt chunks, the prompt cache) |
+| Serve a mixture of experts larger than the device, with no engine code for its experts | [expert-offload](techniques/experts/expert-offload/README.md) | One plugin in the experts slot, called as for experts that fit: places the routed experts (device, host memory, a file), keeps the experts routed last in a device cache that takes every byte the device has free while the engine serves, computes misses on the CPU tier while the link copies them in beside the round, stages prompt chunks, says what it decided; `crit plugins offload` gives its options and replays routing traces |
+| Run routed experts in their stored format on the device | [grouped-experts](techniques/experts/grouped-experts/README.md) | Routed SwiGLU experts over bundles in a slot store, every stored format (bf16, fp8, nvfp4, int4, mxfp4), the routes grouped by expert on the device; one function for decode rows and prompt chunks (registry kernel crit-labs/grouped-experts, torch fallback) |
+| Read prompts through routed experts kept in host memory | [expert-streamed-prefill](techniques/experts/expert-streamed-prefill/README.md) | Chunk size from the measured rate curve, layer double-buffered expert copies, the FP64 reference and the grouped projection's contract (`operations.json`); streamed.py runs a prompt's routed layers through an experts plugin's `forward_bundles` in chunks at the measured knee (no plugin runs it yet) |
+| Choose expert execution sources | [heterogeneous-expert-dispatch](techniques/experts/heterogeneous-expert-dispatch/README.md) | Placement plans, measured CPU/device splits, one routing description with its host reference; serves on CUDA: the expert cache's CPU routes (slot -2) computed by the CPU tier and joined inside the stream, the split never changing a bit |
+| Compute NVFP4 experts on the CPU with the device's bits | [host-expert-arithmetic](techniques/experts/host-expert-arithmetic/README.md) | Declared FP32 orders and exact integer block rows, scalar oracles, AVX2/AVX-512 (VNNI) paths, matching CUDA functions, scale hook; serves the projections slot on the CPU |
+| Compute a layer's CPU share of experts on a pinned pool | [host-expert-tier](techniques/experts/host-expert-tier/README.md) | Ready `HostExpertTier` on the host's worker pool (Core's): integer rows with the device's bits, declared SwiGLU and quantizer, handoff payload, telemetry; serves the experts slot on the CPU and joins a CUDA engine's -2 routes inside the stream (heterogeneous-expert-dispatch) |
+| Join asynchronous contributions | [async-expert-contributions](techniques/experts/async-expert-contributions/README.md) | Receipt-based join, source retention, ordered reduction |
+| Serve a dense model larger than device memory | [dense-layer-offload](techniques/memory/dense-layer-offload/README.md) | Measured planner, host AVX2/AVX-512 layers, double-buffered weight streaming, measured plan selection |
+| Fetch file-backed experts | [ssd-expert-materialization](techniques/experts/ssd-expert-materialization/README.md) | Checked reads, a host tier fed by device evictions, bounded gather, read-ahead, upload handoff |
+| Read embedding or n-gram table rows from disk | [lookup-table-rows](techniques/memory/lookup-table-rows/README.md) | Random-access advice, exact parallel row reads, hot-row cache; on CUDA tables in registered host memory or files, gathered inside captured graphs |
+| Execute speculative rounds | [mtp-decode](techniques/speculation/mtp-decode/README.md) | Token-history proposals, greedy/sampled verification, repair, adaptive budgets; copy drafts from device token histories (`draft:device`) |
+| Sample tokens on the device, and verify sampled drafts | [token-sampling](techniques/sampling/token-sampling/README.md) | Core's whole law over the full vocabulary (penalties, top-k/p, min-p), rejection-sampling verify predictions; `rounds:sampler` for captured rounds (draft draws with sparse laws, rejection-sampling predictions, emitted-token log-probabilities) |
+| Keep structured output exact under speculation | [token-constraints](techniques/sampling/token-constraints/README.md) | [Core](core/src/constraints/README.md) matchers in sampled speculation, private forks and rewinds; serves on CUDA: masks before token-sampling's device law, staged for captured steps and rounds |
+| Keep a speculative round on the GPU | [device-speculative-round](techniques/speculation/device-speculative-round/README.md) | Device accept for greedy and sampled rounds, frontier advance, graphs, one readback per round |
+| Verify a tree of drafts in one pass | [draft-trees](techniques/speculation/draft-trees/README.md) | EAGLE-2 trees, ancestor masks, device tree walk (greedy or sampled), row compaction; device tree drafting and walk in captured rounds (`draft:device`, `verify:device`; its rounds need `attention:tree`) |
+| Draft with a published EAGLE-3, DFlash or DSpark drafter | [hidden-state-drafters](techniques/speculation/hidden-state-drafters/README.md) | Core's reader of every drafter format (one tap convention), catch-up, block input, d2t mapping, confidence cuts |
+| Cheapen the draft head | [draft-vocabulary-subset](techniques/speculation/draft-vocabulary-subset/README.md) | Head row subset, index mapping, CUDA gather-argmax |
+| Fuse the elementwise work around the matmuls | [fused-norms](techniques/norms/fused-norms/README.md) | RMSNorm with a residual, head norms with rotary positions, gated norms, activation products, L2 norms, residual-stream mixes as the `norms` slot: one launch per call of crit's kernel fused-norms, each row's bits independent of its batch; the FP64 host form, the torch form (base torch-norms, and the fallback) and conformance checks for any norms plugin |
 
 Each entry has a Python host reference; the entries that fill a slot also serve on a device as plugins, and some add
 C++ or CUDA mechanism code. Each entry states its tested scope and missing native or engine work. Host tests establish
@@ -111,8 +111,9 @@ checkpoint, keep the fastest that passes, and drop one that fails. A technique w
 `tests/` beside its README put its own code behind the slot's interface, imported
 through the manifest's `sources` (`"code"`), with tests against the slot's base plugin
 or the technique's exact reference. Its variants are options, and parts that only work
-together are one fused plugin. The base plugins, the plain plugin of each slot, are in
-[base/](base/) (chain-verifier, device-placement, expert-tensors,
+together are one fused plugin. The techniques are grouped by category
+(`techniques/CATEGORY/ID`, as kernels' and models'), and the plain plugin of each slot
+sits in its category beside them (chain-verifier, device-placement, expert-tensors,
 experts-reference, greedy-head-drafter, memory-table-rows, projections-dense,
 sequential-recurrence, softmax-attention, topk-router, torch-norms). Together they are
 crit's library: `crit plugins list` shows them, `crit inference show ID` lists a
@@ -125,9 +126,9 @@ artifact-loading, model-import-audit, checkpoint-storage and device-speculative-
 dense-layer-offload is the placement slot's layer planner.
 
 What Core does for every engine has no entry here, since no engine chooses it: the scheduling of requests and of
-prompt steps (Core's [runtime](../core/src/runtime/README.md), with request priority, mixed batches and step
+prompt steps (Core's [runtime](core/src/runtime/README.md), with request priority, mixed batches and step
 publication, and the prompt-step budgets of `crit_plugins.steps`), the host's handoffs that run device-decided host
-work inside a captured graph ([crit_plugins.host](../core/python/crit_plugins/host/README.md)), what host memory the
+work inside a captured graph ([crit_plugins.host](core/python/crit_plugins/host/README.md)), what host memory the
 OS can back (`crit_plugins.host.memory`), measured choices recorded once and replayed (`crit_plugins.decisions`) and
 the captured prompt chunks, which run the smallest captured bucket that holds a chunk (`crit_plugins.prompt_graphs`).
 These were entries of their own (session-scheduling, concurrent-request-execution, host-work-mailbox,
@@ -139,7 +140,7 @@ compose entries, agree on their shared facts: representation, byte extents,
 generation, ownership, completion, visibility and reduction order. A native
 adaptation may change placement, layout or batching but must keep sources alive
 and ready before reading. Expert-routed engines combine several entries; see
-[expert residency](expert-residency/README.md#with-other-inference-entries).
+[expert residency](techniques/experts/expert-residency/README.md#with-other-inference-entries).
 
 ## Writing a technique
 
@@ -185,5 +186,5 @@ ctest --test-dir build/inference -C Release --output-on-failure
 
 `-DCRIT_INFERENCE_INSTALLED_CORE=ON` uses an installed Core SDK from
 `CMAKE_PREFIX_PATH`. `-DCRIT_INFERENCE_CUDA=ON` adds the CUDA kernels and fixtures
-(CUDA Toolkit 13.1+ and a device). The [plugin engine walkthrough](examples/plugin-engine/README.md)
+(CUDA Toolkit 13.1+ and a device). The [plugin engine walkthrough](starters/plugin-engine/README.md)
 is the smallest engine package Core's loader runs.

@@ -7,7 +7,7 @@ import threading
 import unittest
 from unittest.mock import Mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core/python"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "inference/core/python"))
 from core_text_fixtures import byte_level_json
 from crit_core import engine as core_engine
 from crit_core.engine import ResidentEngine

@@ -1,0 +1,74 @@
+{
+  "schema": "crit-model-technique-v1",
+  "id": "block-drafter",
+  "category": "drafters",
+  "summary": "A drafter stored beside the checkpoint: a few bidirectional layers that fill a whole block of drafts in one pass over their own cache of the target's tapped rows, and a recurrent head that orders the block's drafts token by token, folded through the model's head",
+  "provides": {
+    "drafters": [
+      "block-drafter"
+    ]
+  },
+  "source": "block_drafter",
+  "needs_sources": [
+    "template"
+  ],
+  "path": "models/techniques/drafters/block-drafter/README.md",
+  "code_path": "models/techniques/drafters/block-drafter/code",
+  "code_files": [
+    {
+      "path": "models/techniques/drafters/block-drafter/code/block_drafter.py",
+      "purpose": "The draft block (BlockDrafter), its draft head (BlockHead) and its registry (DRAFTERS)"
+    },
+    {
+      "path": "models/techniques/drafters/block-drafter/code/reference.py",
+      "purpose": "The FP64 reference of its span attention (operations.json), which crit's kernel row-ops is held to"
+    }
+  ],
+  "reads": {
+    "tensors": [
+      "layers.N.input_layernorm.weight",
+      "layers.N.mlp.down_proj.weight",
+      "layers.N.mlp.gate_proj.weight",
+      "layers.N.mlp.up_proj.weight",
+      "layers.N.post_attention_layernorm.weight",
+      "layers.N.self_attn.context_k_norm.weight",
+      "layers.N.self_attn.context_k_proj.weight",
+      "layers.N.self_attn.context_v_proj.weight",
+      "layers.N.self_attn.k_norm.weight",
+      "layers.N.self_attn.k_proj.weight",
+      "layers.N.self_attn.o_proj.weight",
+      "layers.N.self_attn.q_norm.weight",
+      "layers.N.self_attn.q_proj.weight",
+      "layers.N.self_attn.v_proj.weight",
+      "layers.N.tap_norm.weight",
+      "mask_embedding",
+      "norm.weight",
+      "recurrent_head.out_proj.bias",
+      "recurrent_head.out_proj.weight",
+      "recurrent_head.recurrent_proj.bias",
+      "recurrent_head.recurrent_proj.weight",
+      "recurrent_head.tap_norm.weight",
+      "recurrent_head.token_embedding.weight",
+      "tap_weights"
+    ],
+    "config": [
+      "*.block_size",
+      "*.head_dim",
+      "*.head_rank",
+      "*.hidden_size",
+      "*.intermediate_size",
+      "*.local_layers",
+      "*.num_attention_heads",
+      "*.num_hidden_layers",
+      "*.num_key_value_heads",
+      "*.rms_norm_eps",
+      "*.rope_theta",
+      "*.sliding_window",
+      "*.tap_layers"
+    ],
+    "layout": [
+      "config",
+      "keys"
+    ]
+  }
+}

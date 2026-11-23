@@ -12,7 +12,8 @@ import socket
 import threading
 import time
 
-from crit_core.serving import LOGPROBS_CAPABILITY, TEMPLATE_KWARGS_CAPABILITY, TOOL_CHOICE_CAPABILITY, TOOLS_CAPABILITY
+from crit_core.serving import (LOGPROBS_CAPABILITY, TEMPLATE_KWARGS_CAPABILITY, THINKING_BUDGET_CAPABILITY,
+                                TOOL_CHOICE_CAPABILITY, TOOLS_CAPABILITY)
 
 from .records import digest, file_sha, ident, load_run, now, quality_mode, quality_terms, read_json, safe_path
 
@@ -110,18 +111,21 @@ TOOLS = [{"type": "function", "function": {"name": "get_weather", "description":
                                                           "required": ["city"]}}}]
 # Checks a served engine must pass; the others depend on what the model chooses or declares.
 REQUIRED = ("consecutive", "system_message", "streaming", "stop_string", "cancel", "stop_engine")
+# The reasoning a check's chat request may write on a package that ends reasoning at a budget, so its reply is written.
+CHECK_THINKING_TOKENS = 16
 
 
 class Client:
-    def __init__(self, port, timeout):
+    def __init__(self, port, timeout, defaults=None):
         self.port, self.timeout = port, timeout
         self.connection = None   # chat's connection while it waits, for abort
+        self.defaults = {"temperature": 0, "max_tokens": 48, **(defaults or {})}   # every chat request's
 
     def chat(self, body):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=self.timeout)
         self.connection = connection
         try:
-            connection.request("POST", "/v1/chat/completions", json.dumps({"temperature": 0, "max_tokens": 48, **body}),
+            connection.request("POST", "/v1/chat/completions", json.dumps(self._body(body)),
                                {"Content-Type": "application/json"})
             response = connection.getresponse()
             data = json.loads(response.read() or b"{}")
@@ -130,6 +134,14 @@ class Client:
         if response.status != 200:
             raise ValueError(f"crit serve answered {response.status}: {(data.get('error') or {}).get('message', data)}")
         return data
+
+    def _body(self, body):
+        """The request: the defaults under `body`; no reasoning budget with logprobs, a response_format or a forced call, which crit serve
+        refuses one with."""
+        found = {**self.defaults, **body}
+        if found.get("logprobs") or found.get("response_format") or found.get("tool_choice") not in (None, "auto", "none"):
+            found.pop("thinking_budget_tokens", None)
+        return found
 
     def abort(self):
         """Close the connection chat waits on (from another thread): crit serve cancels a request whose client
@@ -171,7 +183,7 @@ class Client:
         content, finish = [], None
         try:
             connection.request("POST", "/v1/chat/completions",
-                               json.dumps({"temperature": 0, "max_tokens": 48, **body, "stream": True}),
+                               json.dumps({**self._body(body), "stream": True}),
                                {"Content-Type": "application/json"})
             response = connection.getresponse()
             if response.status != 200:
@@ -602,7 +614,8 @@ def serve_checks(port, capabilities, variables, timeout, log, planned_activation
     at the next plan after a whole Eval. planned_kv: the plan's kv_bytes_per_token, which the engine's facts must
     give (plan_kv): a plan that budgeted the device for another KV (the protocol's FP8 price where the kv_cache
     plugin resolved BF16 and added indexer keys) is caught there too."""
-    client, items = Client(port, timeout), []
+    client, items = Client(port, timeout, {"thinking_budget_tokens": CHECK_THINKING_TOKENS}
+                                if THINKING_BUDGET_CAPABILITY in capabilities else None), []
 
     def check(name, run):
         started = time.perf_counter()
@@ -731,12 +744,15 @@ def serve_checks(port, capabilities, variables, timeout, log, planned_activation
 
 
 def verdict(items):
-    """(status, rationale) of the serving checks: failed if any failed, unverified if a required one is."""
-    states = {i["name"]: i["state"] for i in items}
+    """(status, rationale) of the serving checks: failed if any failed, unverified if a required one is. An item
+    marked `hint` (crit-eval's gate pre-check: its verdicts are hints, never a gate) is in the rationale, as a hint,
+    and leaves the status alone."""
+    states = {i["name"]: i["state"] for i in items if not i.get("hint")}
     if "failed" in states.values():
         status = "failed"
     elif all(states.get(name) == "passed" for name in REQUIRED):
         status = "passed"
     else:
         status = "unverified"
-    return status, "crit run serve --check: " + "; ".join(f"{i['name']} {i['state']}" for i in items)
+    return status, "crit run serve --check: " + "; ".join(
+        f"{i['name']} {i['state']}" + (" (hint)" if i.get("hint") else "") for i in items)

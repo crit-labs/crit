@@ -487,7 +487,8 @@ def _cuda_variants(shape, prefill=False):
     before it holds the GPU."""
     d = int(shape["D"])
     dv = d if prefill else int(shape.get("DV", d))
-    return [{"T": int(_kind(shape) == "fp16"), "KIND": int(shape["KIND"]), "D": d, "DV": dv, "W": 0, "S": 0, "VS": 0}]
+    return [{"T": int(_kind(shape) == "fp16"), "KIND": int(shape["KIND"]), "D": d, "DV": dv, "W": 0, "S": 0, "VS": 0,
+             "B": 0}]
 
 
 class CudaWindow(_Windows):

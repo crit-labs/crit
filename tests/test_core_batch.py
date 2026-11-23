@@ -1,10 +1,10 @@
-"""crit_core.batch: a batched step's layouts, rows and page reservations (core/python/crit_core/batch.md)."""
+"""crit_core.batch: a batched step's layouts, rows and page reservations (inference/core/python/crit_core/batch.md)."""
 from pathlib import Path
 import sys
 import types
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core" / "python"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "inference" / "core" / "python"))
 
 from crit_core.batch import (DECODE, DEFERRED, INFEASIBLE, PREFILL, READY, PageReservations, StepItem,  # noqa: E402
                              StepLayout, row_pages, step_item)

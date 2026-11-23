@@ -50,6 +50,7 @@ Engine.score = _packed_score
 
 
 class ScoreApiTests(ServeFixture, unittest.TestCase):
+    shared_engine = True   # its tests leave the served engine as they found it, or get a new one (ServeFixture)
     extra_capabilities = ("chat-score-v1",)
     adapter_suffix = SCORE_ADAPTER
 

@@ -1,0 +1,16 @@
+{
+  "schema": "crit-model-checkpoints-v1",
+  "layouts": {
+    "safetensors (transformers names)": [
+      "models/cache/qwen3-5-model/tests/test_device.py::HybridRoutedTests",
+      "models/cache/qwen3-5-model/tests/test_device.py::HybridMoeTests"
+    ],
+    "safetensors (a release's own tensor names, which names rules map back)": [
+      "models/cache/qwen3-5-model/tests/test_device.py::RespelledHybridRoutedTests"
+    ],
+    "GGUF": [
+      "tests/test_model_template.py::GgufHybridRoutedTests",
+      "tests/test_model_template.py::GgufHybridDraftTests"
+    ]
+  }
+}

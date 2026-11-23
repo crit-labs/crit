@@ -1,0 +1,64 @@
+{
+  "schema": "crit-plugin-v1",
+  "id": "qwen3-5-model",
+  "title": "The model plugin of Qwen3-Next and Qwen3.5 checkpoints, dense and with a mixture of experts",
+  "description": "A hybrid decoder of gated delta-rule layers and gated softmax attention (an output gate per head, query/key norms, partial rotary positions) with zero-centred RMSNorms (1 + weight), a SwiGLU MLP or a mixture of experts with a gated shared expert, and a multi-token-prediction layer the model drafts from. A finished model plugin: its layout (layout.json) composed by the models core it extends (model-template: the serving contracts, the options) from model techniques.",
+  "fills": [
+    "model"
+  ],
+  "needs": [
+    [
+      "model_type:qwen3_next",
+      "model_type:qwen3_5",
+      "model_type:qwen3_5_text",
+      "model_type:qwen3_5_moe",
+      "model_type:qwen3_5_moe_text"
+    ]
+  ],
+  "requires": [
+    "norms",
+    "embeddings",
+    "recurrence"
+  ],
+  "requires_when": {
+    "model_type:qwen3_next": [
+      "router",
+      "experts"
+    ],
+    "model_type:qwen3_5_moe": [
+      "router",
+      "experts"
+    ],
+    "model_type:qwen3_5_moe_text": [
+      "router",
+      "experts"
+    ]
+  },
+  "provides": [
+    "draft:head",
+    "draft:head-device"
+  ],
+  "devices": [
+    "cuda",
+    "cpu"
+  ],
+  "sources": {
+    "core": "../../core/model-template"
+  },
+  "extends": "core",
+  "test_with": [
+    "attention-state",
+    "device-placement",
+    "expert-tensors",
+    "experts-reference",
+    "fused-norms",
+    "memory-table-rows",
+    "projections-dense",
+    "sequential-recurrence",
+    "softmax-attention",
+    "token-sampling",
+    "topk-router",
+    "torch-norms"
+  ],
+  "entry": "plugin.py:create"
+}

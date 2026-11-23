@@ -1,0 +1,36 @@
+{
+  "kind": "crit-technique-operations",
+  "technique": "recurrent-state-recovery",
+  "operations": [
+    {
+      "id": "gated-delta",
+      "what": "the gated-delta recurrence over a prompt (chunked) and token by token (decode and a verify's columns): delta = beta (v - e^l S^T k); S' = e^l S + k delta^T; out = scale S'^T q",
+      "reference": {
+        "path": "inference/techniques/recurrence/recurrent-state-recovery/code/chunked_prefill.py",
+        "symbol": "sequential (token by token), two_pass"
+      },
+      "verify": "on the target, run the kernel and sequential on the same 100-200 tokens of a real layer's inputs from the same state: outputs and final state within FP32 accumulation error (relative 1e-4); for verify, the state after each column against sequential's, or the accepted prefix replayed per this entry's commit strategy",
+      "invariance": "a verify column's state equal to the state after decoding the same tokens one by one, within the tolerance"
+    },
+    {
+      "id": "ssd-scan",
+      "what": "Mamba-2's state-space recurrence over a prompt (chunked) and token by token: per head S = e^(dt a) S + dt x B^T, y = S C (+ D x), B and C shared by a group of heads",
+      "reference": {
+        "path": "inference/techniques/recurrence/recurrent-state-recovery/code/reference.py",
+        "symbol": "ssd_sequential"
+      },
+      "verify": "on the target, run the kernel and ssd_sequential on the same tokens from the same state: outputs and final state within FP32 accumulation error (1e-3 + 1e-3 |x|)",
+      "invariance": "a token's output equal to the state carried token by token within the tolerance"
+    },
+    {
+      "id": "causal-conv",
+      "what": "the causal depthwise convolution of a recurrent layer's rows over each sequence's carried window (W - 1 rows before the first), one filter a channel, optionally with a bias and SiLU",
+      "reference": {
+        "path": "inference/techniques/recurrence/recurrent-state-recovery/code/reference.py",
+        "symbol": "causal_conv_rows"
+      },
+      "verify": "on the target, convolve the same rows with the kernel and with causal_conv_rows after the same window: within FP32 rounding of the W products and the SiLU (1e-4 + 1e-4 |x|), the carried window the last W - 1 rows bit for bit",
+      "invariance": "a row's output depends on its own window only; prompt chunks and decode rows give the same bits"
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "schema": "crit-model-technique-v1",
+  "id": "swiglu",
+  "category": "ffn",
+  "summary": "The gated MLP: SiLU or tanh-GELU gate by the config's activation",
+  "provides": {
+    "blocks": [
+      "swiglu"
+    ]
+  },
+  "source": "swiglu",
+  "needs_sources": [
+    "template"
+  ],
+  "path": "models/techniques/ffn/swiglu/README.md",
+  "code_path": "models/techniques/ffn/swiglu/code",
+  "code_files": [
+    {
+      "path": "models/techniques/ffn/swiglu/code/swiglu.py",
+      "purpose": "The block class and its registry (BLOCKS)"
+    }
+  ],
+  "reads": {
+    "tensors": [
+      "down_proj",
+      "gate_proj",
+      "up_proj"
+    ],
+    "config": [],
+    "layout": []
+  }
+}

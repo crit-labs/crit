@@ -1,0 +1,59 @@
+{
+  "schema": "crit-model-technique-v1",
+  "id": "moe",
+  "category": "ffn",
+  "summary": "A mixture of experts over the router and experts slots (any experts plugin, expert-offload included), a shared expert and its gate; parallel-moe: a dense MLP and the experts side by side",
+  "provides": {
+    "blocks": [
+      "moe",
+      "parallel-moe"
+    ]
+  },
+  "source": "moe",
+  "needs_sources": [
+    "template",
+    "swiglu"
+  ],
+  "path": "models/techniques/ffn/moe/README.md",
+  "code_path": "models/techniques/ffn/moe/code",
+  "code_files": [
+    {
+      "path": "models/techniques/ffn/moe/code/moe.py",
+      "purpose": "The block class and its registry (BLOCKS)"
+    }
+  ],
+  "reads": {
+    "tensors": [
+      "experts.N.down_proj",
+      "experts.N.gate_proj",
+      "experts.N.up_proj",
+      "experts.down_proj",
+      "experts.gate_up_proj",
+      "gate",
+      "gate.e_score_correction_bias",
+      "post_feedforward_layernorm_1.weight",
+      "post_feedforward_layernorm_2.weight",
+      "pre_feedforward_layernorm_2.weight",
+      "router.per_expert_scale",
+      "router.proj",
+      "router.proj.e_score_correction_bias",
+      "router.scale",
+      "shared_expert.gate_proj",
+      "shared_expert_gate",
+      "shared_experts.gate_proj"
+    ],
+    "config": [
+      "group_score_top",
+      "norm_topk_prob",
+      "scoring_func"
+    ],
+    "layout": [
+      "dense",
+      "experts",
+      "gate_up",
+      "norms",
+      "router",
+      "weights"
+    ]
+  }
+}

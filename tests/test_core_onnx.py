@@ -10,7 +10,7 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("core/python", "tests"): sys.path.insert(0, str(ROOT / _folder))
+for _folder in ("inference/core/python", "tests"): sys.path.insert(0, str(ROOT / _folder))
 from crit_core.model import OnnxError, inspect_onnx, open_model  # noqa: E402
 from crit_core.model.onnx import description_folder  # noqa: E402
 from onnx_writer import floats, onnx_bytes  # noqa: E402

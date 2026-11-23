@@ -27,14 +27,14 @@ FAMILIES = (
     ("bench", "crit.pull.bench", "Measure an installed engine with crit Eval beside its card; use crit bench --help"),
     ("hub", "crit.pull.report", "Add a crit bench result to its crit-hub card (crit hub report); use crit hub --help"),
     ("kernels", "crit_kernels", "Inspect kernel applicability and retain verified dependency bytes"),
-    ("models", "crit_models", "Transform model weights (PTQ) and record how; use crit models --help"),
+    ("models", "crit.models", "Build a model's support: inspect a checkpoint, tiny checkpoints, diff, cache; use crit models --help"),
     ("mcp", "crit_mcp.server", "Serve these commands to an agent as MCP tools over stdio; use crit mcp --help"),
 )
 
 
 def checkout(folder):
     """Whether `folder` is a crit checkout, a crit repository: it holds Core's native headers."""
-    return (Path(folder) / "core/include/crit/core.h").is_file()
+    return (Path(folder) / "inference/core/include/crit/core.h").is_file()
 
 
 class Installed(NamedTuple):
@@ -100,7 +100,7 @@ def family(module):
 
 
 def core_mismatch():
-    """Why this checkout's crit cannot run, or None: crit from a checkout runs on that checkout's Core (core/python),
+    """Why this checkout's crit cannot run, or None: crit from a checkout runs on that checkout's Core (inference/core/python),
     and a crit-core installed from elsewhere (a release from PyPI, another checkout) would pair this CLI and plugin
     library with another Core's contracts."""
     if not checkout(ROOT):
@@ -111,8 +111,8 @@ def core_mismatch():
     except (ImportError, ValueError):
         return None
     if spec is None or spec.origin is None:
-        return None   # not installed: the commands put core/python on the path themselves
-    here = (ROOT / "core" / "python").resolve()
+        return None   # not installed: the commands put inference/core/python on the path themselves
+    here = (ROOT / "inference" / "core" / "python").resolve()
     found = Path(spec.origin).resolve()
     if here in found.parents:
         return None
@@ -148,7 +148,7 @@ def main(argv=None):
         return inference.main(args.arguments)
     if not checkout(default_project()):
         parser.error("Run repository maintenance commands from the crit repository")
-    print("core/include/crit/core.h\ncore/contracts/README.md")
+    print("inference/core/include/crit/core.h\ncore/contracts/README.md")
     return 0
 
 

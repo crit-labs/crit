@@ -1,0 +1,23 @@
+{
+  "schema": "crit-model-layout-v1",
+  "gguf": {"gemma4": {
+    "parts": {"ffn_norm": "pre_feedforward_layernorm", "post_ffw_norm": "post_feedforward_layernorm",
+              "pre_ffw_norm_2": "pre_feedforward_layernorm_2", "post_ffw_norm_1": "post_feedforward_layernorm_1",
+              "post_ffw_norm_2": "post_feedforward_layernorm_2", "layer_output_scale.weight": "layer_scalar",
+              "ffn_gate_inp": "router.proj", "ffn_gate_inp.scale": "router.scale",
+              "ffn_down_exps.scale": "router.per_expert_scale"},
+    "experts": "experts."}},
+  "norm_offset": 0.0,
+  "embed_scale": "sqrt_hidden",
+  "logit_softcap": "final_logit_softcapping",
+  "routed_if": "enable_moe_block",
+  "requires": {"num_kv_shared_layers": 0, "hidden_size_per_layer_input": 0, "use_double_wide_mlp": false},
+  "defaults": {"norm_topk_prob": true, "scoring_func": "softmax"},
+  "residual": {"block": "sandwich"},
+  "mixers": {
+    "full_attention": {"block": "attention", "prefix": "self_attn.", "scale": 1.0, "value_norm": true,
+                       "head_dim": "global_head_dim", "kv_heads": "num_global_key_value_heads"},
+    "sliding_attention": {"block": "attention", "prefix": "self_attn.", "scale": 1.0, "value_norm": true}
+  },
+  "ffn": {"block": "auto", "prefix": "mlp.", "routed": "parallel-moe"}
+}

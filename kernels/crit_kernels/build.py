@@ -542,23 +542,23 @@ def _generator_digest():
 
 def core_sdk_include(manifest=None):
     """Core's public headers (crit/*.h) for a kernel whose kernel.json says "core_include": true (a kernel that runs
-    Core's rules on the device, such as its sampler's draws): CRIT_CORE_INCLUDE, else the crit checkout's core/include
+    Core's rules on the device, such as its sampler's draws): CRIT_CORE_INCLUDE, else the crit checkout's inference/core/include
     beside kernels/. None for any other kernel."""
     if manifest is not None and not manifest.get("core_include"):
         return None
     found = os.environ.get("CRIT_CORE_INCLUDE")
-    return Path(found) if found else library().parent / "core" / "include"
+    return Path(found) if found else library().parent / "inference" / "core" / "include"
 
 
 def host_include(manifest=None):
     """Core's host-memory headers for plugins' native code (crit_plugins.host.INCLUDE: handoff_device.cuh, pool.h)
     for a kernel whose kernel.json says "host_include": true (a kernel that posts to or joins one of the host's
-    handoffs): CRIT_HOST_INCLUDE, else the crit checkout's core/python/crit_plugins/host beside kernels/. None for any
+    handoffs): CRIT_HOST_INCLUDE, else the crit checkout's inference/core/python/crit_plugins/host beside kernels/. None for any
     other kernel."""
     if manifest is not None and not manifest.get("host_include"):
         return None
     found = os.environ.get("CRIT_HOST_INCLUDE")
-    return Path(found) if found else library().parent / "core" / "python" / "crit_plugins" / "host"
+    return Path(found) if found else library().parent / "inference" / "core" / "python" / "crit_plugins" / "host"
 
 
 def _includes(manifest):

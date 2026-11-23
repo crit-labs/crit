@@ -1,0 +1,34 @@
+{
+  "inference/core/python/crit_core/model/gguf_files.py": {
+    "deepseek-r1-qwen": {"field": "a GGUF tokenizer.ggml.pre value (the format's name of a pre-tokenizer)",
+                         "in": ["PRE_TOKENIZERS"]},
+    "deepseek-v3": {"field": "a GGUF tokenizer.ggml.pre value (the format's name of a pre-tokenizer)",
+                    "in": ["PRE_TOKENIZERS"]},
+    "gpt-2": {"field": "a GGUF tokenizer.ggml.pre value (the format's name of a pre-tokenizer)",
+              "in": ["PRE_TOKENIZERS"]},
+    "gpt2": {"field": "a GGUF tokenizer.ggml.model value (byte-level BPE)", "in": ["derive_tokenizer"]},
+    "joyai-llm": {"field": "a GGUF tokenizer.ggml.pre value (the format's name of a pre-tokenizer)",
+                  "in": ["PRE_TOKENIZERS"]},
+    "llama-bpe": {"field": "a GGUF tokenizer.ggml.pre value (the format's name of a pre-tokenizer)",
+                  "in": ["PRE_TOKENIZERS"]},
+    "llama-v3": {"field": "a GGUF tokenizer.ggml.pre value (the format's name of a pre-tokenizer)",
+                 "in": ["PRE_TOKENIZERS"]},
+    "llama3": {"field": "a GGUF tokenizer.ggml.pre value (the format's name of a pre-tokenizer)",
+               "in": ["PRE_TOKENIZERS"]},
+    "megrez": {"field": "a GGUF tokenizer.ggml.pre value (the format's name of a pre-tokenizer)",
+               "in": ["PRE_TOKENIZERS"]},
+    "qwen2": {"field": "a GGUF tokenizer.ggml.pre value (the format's name of a pre-tokenizer)",
+              "in": ["PRE_TOKENIZERS"]},
+    "qwen35": {"field": "a GGUF tokenizer.ggml.pre value (the format's name of a pre-tokenizer)",
+               "in": ["PRE_TOKENIZERS"]}
+  },
+  "inference/techniques/attention/attention-state/code/rope_table.py": {
+    "llama3": {"field": "a config.json rope_parameters.rope_type value (transformers' modeling_rope_utils)",
+               "in": ["TYPES", "rope_table"]}
+  },
+  "kernels/techniques/norms/fused-norms/bench.py": {
+    "gemma_fused_add_rmsnorm": {"field": "a FlashInfer function (the bench's yardstick)", "as": "fi.",
+                                "in": ["yardstick"]},
+    "gemma_rmsnorm": {"field": "a FlashInfer function (the bench's yardstick)", "as": "fi.", "in": ["yardstick"]}
+  }
+}

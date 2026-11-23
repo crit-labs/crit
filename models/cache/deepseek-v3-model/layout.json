@@ -1,0 +1,28 @@
+{
+  "schema": "crit-model-layout-v1",
+  "gguf": {"deepseek2": {
+    "parts": {"attn_q_a": "self_attn.q_a_proj", "attn_q_a_norm": "self_attn.q_a_layernorm",
+              "attn_q_b": "self_attn.q_b_proj", "attn_kv_a_mqa": "self_attn.kv_a_proj_with_mqa",
+              "attn_kv_a_norm": "self_attn.kv_a_layernorm", "attn_kv_b": "self_attn.kv_b_proj",
+              "ffn_gate_shexp": "mlp.shared_experts.gate_proj", "ffn_up_shexp": "mlp.shared_experts.up_proj",
+              "ffn_down_shexp": "mlp.shared_experts.down_proj",
+              "exp_probs_b.bias": "mlp.gate.e_score_correction_bias"},
+    "transforms": {"split-heads": {"self_attn.kv_b_proj": {
+      "parts": ["attn_k_b", "attn_v_b"], "heads": "num_attention_heads", "rows": "qk_nope_head_dim"}}}}},
+  "norm_offset": 0.0,
+  "defaults": {
+    "scoring_func": "sigmoid",
+    "group_score_top": 2,
+    "rope_interleave": true
+  },
+  "mixers": {
+    "full_attention": {
+      "block": "latent-attention",
+      "prefix": "self_attn."
+    }
+  },
+  "ffn": {
+    "block": "auto",
+    "prefix": "mlp."
+  }
+}

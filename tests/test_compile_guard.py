@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "core" / "python"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "inference" / "core" / "python"))
 
 from crit_plugins.testing import compiles  # noqa: E402
 
@@ -149,7 +149,7 @@ class CompileGuardTests(unittest.TestCase):
                 "import torch.utils.cpp_extension\n"
                 "assert 'extension' in compiles._installed, compiles._installed\n"
                 "print('hooked')\n")
-        path = os.pathsep.join([str(Path(__file__).resolve().parents[1] / "core" / "python"),
+        path = os.pathsep.join([str(Path(__file__).resolve().parents[1] / "inference" / "core" / "python"),
                                 os.environ.get("PYTHONPATH", "")])
         found = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=600,
                                env={**os.environ, "PYTHONPATH": path})

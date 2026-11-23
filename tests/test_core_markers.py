@@ -7,7 +7,7 @@ import unittest
 import tokenizers
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "core/python"))
+sys.path.insert(0, str(ROOT / "inference/core/python"))
 
 from core_text_fixtures import byte_level_json, sentencepiece_json, straddling_json  # noqa: E402
 from crit_core.text import (MarkerDecoder, ReasoningFormat, ReasoningSplitter, TextError, TokenText,  # noqa: E402

@@ -1,0 +1,586 @@
+"""The device form of crit's slots: what a model plugin calls on the other slots' plugins with tensors on the engine's
+device, inside its batched step.
+
+A plugin that runs on a device (any of crit_plugins.DEVICES, the CPU too) keeps its slot's host form
+(crit_plugins.slots.INTERFACES, rows of numbers), over the same arithmetic, so its tests compare it with the slot's host
+reference on crit's cases; the model plugin calls its device form below. PluginTestCase.assertImplements checks it has
+both, and Core's loader refuses an engine whose plugin in a computing slot lacks its slot's device form: the host form
+is an oracle, and no engine serves one. Tensors are torch tensors on the engine's device and stream; nothing here imports torch until a
+StepBatch is built.
+
+A step's tokens are packed in row order: row r is a run of consecutive tokens of one sequence (a prompt chunk, a
+decode token, a verify window), tokens StepBatch.starts[r] .. starts[r + 1] - 1, each at its own position in the
+sequence. Every device plugin reads the same StepBatch, so a token's KV slot, its attention window and its recurrent
+state all follow from it.
+"""
+import array
+from dataclasses import dataclass, field
+
+# The row count up to which every projections plugin's matmul keeps each row's bits whatever rows share the call (a
+# step's decode rows, a verify window): DEVICE_INTERFACES["projections"]["matmul"]. A plugin may promise more in its
+# facts (row_invariance rows); invariant_rows() reads it.
+DECODE_ROWS = 8
+
+
+def free_device_bytes(device="cuda"):
+    """The device's free bytes for a placement plan or a pool's size, after handing back what torch's caching allocator
+    holds and nothing uses (crit_plugins.memory: of(device).free(release=True)): a model plugin that re-encodes or
+    converts weights at load leaves those temporaries cached, and the driver counts them as taken, so a KV pool
+    planned from it comes out smaller than the device allows, or refuses to fit. None where the device's memory
+    cannot be read."""
+    from .memory import of
+    return of(device).free(release=True)
+
+
+def release_cached_under(free_below, device="cuda"):
+    """Hand back what torch's caching allocator holds and nothing uses only when the device has fewer than
+    `free_below` bytes free: for a model plugin where a request's temporaries end (a prompt's last chunk, a long
+    score), so that blocks cached from one request leave room for the next one's allocations, the KV a longer prompt
+    takes among them, without releasing after every step (each release waits for the device, and the allocations
+    after it go back to the driver). Returns the bytes released (0 above the threshold), or None where the device's
+    memory cannot be read (crit_plugins.memory: of(device).release(below=free_below))."""
+    import torch
+    from .memory import of
+    if torch.device(device).type != "cuda" or not torch.cuda.is_available() or not torch.cuda.is_initialized():
+        return None
+    return of(device).release(below=free_below)
+
+
+def invariant_rows(projections):
+    """The most rows one matmul call of this projections plugin takes as decode rows, each row's bits those of the row
+    alone: its facts' row_invariance rows, at least DECODE_ROWS. A model plugin splits a step's decode rows (verify
+    windows included) into calls of at most this many; a longer call is prompt rows."""
+    facts = projections.facts() if callable(getattr(projections, "facts", None)) else {}
+    rows = (facts.get("row_invariance") or {}).get("rows")
+    return max(DECODE_ROWS, int(rows)) if rows else DECODE_ROWS
+
+# slot -> {method: what it takes and returns}: the device form a plugin running on a device adds to its host form.
+DEVICE_INTERFACES = {
+    "kv_cache": {
+        "pool": "pool(layers, kv_heads, head_dim, tokens, device, dtype='bf16', *, value_dim=None) -> KVPool: the "
+                "KV of every sequence (KV_POOL: its methods and attributes, which the attention slot's plugin "
+                "reads); value_dim, a keyword, the values' width (the keys' by default; 0 for a pool of keys only, "
+                "with kv:keys)",
+    },
+    "sampler": {
+        "sample": "sample(logits, params) -> tokens: one token per logits row ([rows][vocabulary]), params one dict "
+                  "per row as select()'s (temperature, top_p, top_k, min_p, seed, position, stream, allowed: the "
+                  "row's Allowed, whose mask(device, width) is the tokens it may take)",
+    },
+}
+
+
+# A kv_cache plugin's pool, which another slot's plugin (attention) reads: its methods and attributes. A pool of
+# another kv_cache plugin serves any attention plugin that keeps to them.
+KV_POOL = {
+    "open": "open(sequence): a new sequence, no KV",
+    "close": "close(sequence): the sequence and its KV go",
+    "fork": "fork(sequence, new): a new sequence sharing the sequence's valid KV (copied when either writes into it)",
+    "length": "length(sequence) -> its valid positions",
+    "reserve": "reserve(batch) -> slots: the KV slot of each of the StepBatch's tokens at its position ([tokens] int64)",
+    "write": "write(layer, slots, keys, values): a layer's keys [tokens][kv_heads][head_dim] and values "
+             "[tokens][kv_heads][value_dim] at their slots; a slot below 0 is skipped (no KV a sequence reads "
+             "changes)",
+    "keep": "keep(sequence, length): the valid KV after a step (a verify's accepted rows kept, the rest rolled back)",
+    "gather": "gather(layer, sequence, count) -> (keys, values): the sequence's first count positions of a layer, "
+              "keys [count][kv_heads][head_dim] and values [count][kv_heads][value_dim] in the compute dtype",
+}
+KV_POOL_ATTRIBUTES = ("kv_heads", "head_dim", "value_dim")
+
+# Device forms a plugin offers beyond its slot's, each named by the fact it provides: fact -> {method: what it takes and
+# returns}. A plugin that provides one of these facts has its methods (PluginTestCase.assertImplements checks them, and
+# Core's loader refuses a plugin that provides the fact without them), and a plugin that needs the fact may call them.
+# The methods of a "rounds:<slot>" fact live on the object the slot's device form returns where it returns one (the KV
+# pool of a kv_cache plugin, the state pool of a recurrence plugin) and on the plugin otherwise.
+DEVICE_EXTENSIONS = {
+    # Captured decode rounds (crit_plugins.rounds): the slot's device form takes a RoundBatch capture-safely, and its
+    # per-sequence state follows the round's slots. A plugin whose configuration can keep it out of a captured round
+    # (a device expert cache over a file tier, a table read through Python) also has round_problems() -> [reason, ...]
+    # ([] when it can be captured, no arguments), which the round driver asks before any capture (round_problems):
+    # a reason refuses the round, and the model decodes through step().
+    # A pool of a rounds:<slot> fact with a fixed number of round slots says how many as round_rows (an int);
+    # crit_plugins.rounds.Rounds refuses rounds of more rows when it is built.
+    "rounds:kv_cache": {
+        "bind": "bind(slot, sequence, capacity): round slot `slot` holds `sequence`; its pages are reserved up to "
+                "`capacity` positions, so a captured round never allocates",
+        "unbind": "unbind(slot): the slot holds no sequence",
+        "commit_round": "commit_round(view): each bound slot's valid length becomes its frontier after the round "
+                        "(view.frontier), on the device",
+    },
+    # A KV pool's static FP8 scales per layer (a checkpoint's k_scale and v_scale), on the pool.
+    "kv:scales": {
+        "set_scales": "set_scales(layer, key_scale, value_scale): the layer's stored = value / scale for its keys "
+                      "and values (an fp8 pool), before the layer's first write",
+    },
+    # A pool of sliding-window layers: each sequence a ring of pages (its last positions), the attention reading it with
+    # its window (attention:sliding).
+    "kv:sliding": {
+        "pool": "pool(..., sliding=W, span=None, positions=N): the layers' tokens see their last W positions; each "
+                "sequence keeps a ring of about (W + span) / page pages whatever its length (span: the most positions "
+                "a row writes in one step; positions: the most a sequence reaches), so the pool's `sliding`, `ring` "
+                "and `table_pages`",
+    },
+    # Rows at chosen positions, on the pool: a pool of keys only (pool(..., value_dim=0): an indexer's keys) and a
+    # per-block row cache (a pool whose positions are block numbers: pooled block keys written once per block).
+    "kv:keys": {
+        "rows_at": "rows_at(layer, slots) -> (keys, values): the rows at KV slots (int64, any shape), FP32 "
+                   "[..., kv_heads, dim] each (values [..., kv_heads, 0] in a pool of keys only); device work only",
+        "slots_at": "slots_at(round_slots, positions) -> slots: the KV slots of `positions` of the sequences bound to "
+                    "`round_slots` (both int64, one shape; a position outside its slot's capacity gets a slot no "
+                    "sequence reads), for writing and reading rows inside a captured round; device work only",
+    },
+    "rounds:sampler": {
+        "reserve": "reserve(rows, widest, vocab, device, logprobs=0): every buffer of rounds of up to `rows` rows at up "
+                   "to `widest` drafts over `vocab` logits (with `logprobs` ranked alternatives), once, before any "
+                   "stage or capture; the rules staged so far are kept",
+        "stage": "stage(slot, params): the sampling rules of the request in round slot `slot` (select()'s params), "
+                 "kept in device buffers the round reads; its draws are at the round's output positions "
+                 "(view.out_count + column)",
+        "laws": "laws(rows, widest) -> the laws a sampled round's drafts were drawn from (the driver's "
+                "view.draft_laws): a draft without one (a copy) is verified by the target's own draw",
+        "draft_device": "draft_device(view, logits, depth, targets=None) -> tokens: each row's draft at `depth` from "
+                        "its draft logits ([rows][vocab] FP32): the argmax for greedy rows, a draw from the row's "
+                        "processed law with Core's `draft` purpose for sampled ones, its law kept in view.draft_laws; "
+                        "targets maps a draft vocabulary's columns to target ids; capture-safe",
+        "predictions_device": "predictions_device(view, logits, draft_laws=None) -> predictions: the token each verify "
+                              "column of the round predicts ([rows][width + 1], int64), logits [rows][width + 1][vocab] "
+                              "FP32: the argmax for greedy rows, rejection sampling against draft_laws (the laws "
+                              "draft_device kept; a draft without a law, or whose law gives it no mass, takes the "
+                              "target's own draw) for sampled rows, by Core's law and draws as predictions(), "
+                              "capture-safe",
+        "logprobs_device": "logprobs_device(view, logits, tokens): the log-probabilities of the round's emitted tokens "
+                           "[rows][width + 1] over the logits rows that predicted them, in the arithmetic of the "
+                           "model's step and score paths (torch's FP32 log_softmax, as the driver's own), into "
+                           "view.logprobs (and view.top_ids / view.top_logprobs in Core's order), capture-safe",
+    },
+    # Prompt chunks as captured graphs (crit_plugins.prompt_graphs): the slot's prompt form takes a PromptBatch
+    # capture-safely: it reads the batch's device tensors only, its launches are fixed for the bucket whatever the
+    # sequence's context, and its padding (the tokens past valid_t's real ones) changes no state: no KV but at scratch,
+    # no recurrent step, no routed expert read. A slot whose plugin keeps per-sequence state stages the sequence into
+    # its fixed buffers before each replay and settles it after; the methods live on the object the slot's device
+    # form returns (the KV pool, the state pool) and on the plugin otherwise.
+    "prompts:kv_cache": {
+        "stage_prompt": "stage_prompt(batch): the PromptBatch's sequence (batch.sequence, None: padding only) in the "
+                        "pool's fixed prompt buffers: its pages reserved to batch.frontier + batch.count, its real "
+                        "tokens' KV slots, the padding's at scratch; outside the graph, before each replay",
+        "commit_prompt": "commit_prompt(batch): the sequence's valid length becomes batch.frontier + batch.count; "
+                         "outside the graph, after the replay",
+    },
+    # A drafter that drafts inside a captured round, from the model's device draft head (draft:head-device).
+    "draft:device": {
+        "draft": "draft(view, head, sampler) -> None: view.drafts[:, :width] and, for sampled rows, view.draft_laws "
+                 "([rows][width][vocab], the law each draft was drawn from; one-hot for a greedy or copied draft), "
+                 "capture-safe",
+        "commit_round": "commit_round(view): the drafter's own state keeps the round's accepted prefix",
+    },
+    # A verifier that accepts inside a captured round.
+    "verify:device": {
+        "accept_device": "accept_device(view) -> None: each row's emitted tokens from view.predictions and "
+                         "view.drafts (view.n_emitted, view.n_matched, view.emitted), ending after a stop token and "
+                         "within the row's allowance, capture-safe",
+    },
+}
+
+
+def _rank_of(value):
+    """The order-preserving int32 rank of an FP32 value (its bits, negative ones mirrored), as topk_blocks ranks."""
+    import struct
+    bits = struct.unpack("<i", struct.pack("<f", value))[0]
+    return bits ^ 0x7FFFFFFF if bits < 0 else bits
+
+
+_NEGATIVE_INFINITY = _rank_of(float("-inf"))   # a score at or below it may not be read
+
+
+def topk_blocks(scores, k, positions=None, block_size=None):
+    """The KV blocks each query reads under block-sparse attention (DEVICE_INTERFACES["attention"] forward's blocks,
+    fact attention:blocks), chosen canonically from an indexer's scores: scores [tokens][blocks] (FP32 or wider; -inf
+    for a block the token may not read, NaN read as -inf) -> ids [tokens][k] int32, each token's k highest-scoring
+    blocks, ties going to the lower block id, listed in ascending id order, -1 past the blocks it may read (fewer
+    than k scores above -inf). The same scores give the same ids on any device and in any batch: each score of 32 bits
+    or fewer and its block id become one distinct int64 key, so the order torch.topk leaves equal values in never
+    matters; wider scores (FP64) are compared as they are, by a stable sort (no rounding to FP32 makes new ties).
+    Device work only, so a captured round selects with it. It is the rule in torch operations, some forty launches a
+    call: a sparse attention that scores its own index keys has crit's kernel sparse-indexer, which scores and selects
+    in one launch with the same tie rule and order (kernels/techniques/attention/sparse-indexer).
+
+    With positions ([tokens] int64, each query's position) and block_size (positions per block: an indexer's own
+    block, not the KV page), only the blocks complete at the query's position compete, and the incomplete block
+    holding the position (its tail) is always read: ids [tokens][k + 1], the tail listed after the chosen blocks in
+    id order (-1 where the position ends a block). A query with k or fewer complete blocks so reads every position up
+    to its own: plain causal attention below the budget."""
+    import torch
+    if positions is not None:
+        if not block_size or block_size < 1:
+            raise ValueError("selecting with positions takes the blocks' size in positions (block_size)")
+        complete = (positions.long() + 1) // block_size
+        ids = torch.arange(scores.shape[1], device=scores.device)
+        open_ = ids[None, :] >= complete[:, None]
+        chosen = topk_blocks(scores.masked_fill(open_, float("-inf")), k)
+        tail = torch.where((positions.long() + 1) % block_size != 0, positions.long() // block_size, -1)
+        both = torch.cat([chosen.long(), tail[:, None]], dim=1)
+        big = torch.iinfo(torch.int64).max
+        both = torch.where(both < 0, big, both).sort(dim=-1).values
+        return torch.where(both == big, -1, both).to(torch.int32)
+    tokens, blocks = scores.shape
+    count = min(k, blocks)
+    if scores.dtype == torch.float64:
+        x = torch.where(torch.isnan(scores), torch.full_like(scores, float("-inf")), scores)
+        # Descending and stable: equal scores keep their ascending ids, so the lower id goes first.
+        top, order = torch.sort(x, dim=-1, descending=True, stable=True)
+        ids = torch.where(top[:, :count] > float("-inf"), order[:, :count], blocks)
+    else:
+        x = scores.float()      # 16-bit scores become FP32 exactly
+        x = torch.where(torch.isnan(x), torch.full_like(x, float("-inf")), x) + 0.0     # -0.0 ranks as +0.0
+        bits = x.view(torch.int32)
+        rank = torch.where(bits < 0, bits ^ 0x7FFFFFFF, bits).long()                   # monotone in the score
+        low = blocks - 1 - torch.arange(blocks, device=scores.device)                   # the lower id wins a tie
+        kept = (rank * (1 << 32) + low).topk(count, dim=-1).values
+        ids = torch.where((kept >> 32) > _NEGATIVE_INFINITY, blocks - 1 - (kept & 0xFFFFFFFF), blocks)
+    ids = ids.sort(dim=-1).values
+    ids = torch.where(ids == blocks, -1, ids).to(torch.int32)
+    if k > blocks:
+        ids = torch.cat([ids, ids.new_full((tokens, k - blocks), -1)], dim=1)
+    return ids
+
+
+def csf_decode(fixed, exceptions=None):
+    """E4M3 scale bytes [rows][groups] (uint8) from ModelOpt's CSF encoding (crit_core.model.schemes.csf_scale_shape):
+    fixed uint8 [rows / 16][16 * (1 + groups / 2)], per slab of 16 rows one base byte per row, then each row's 4-bit
+    codes (the low nibble first), scale = base + code (mod 256); exceptions (int32 or uint32 words: position row *
+    groups + col in the low 24 bits, the scale byte in the high 8) replace single scales. On fixed's device (torch), so
+    a store builder decodes on the host and a fill on the device by the same rule; leading dimensions (stacked
+    matrices) decode each."""
+    import torch
+    lead, (slabs, width) = tuple(fixed.shape[:-2]), tuple(fixed.shape[-2:])
+    if width % 16 or width < 32:
+        raise ValueError("CSF fixed rows are 16 * (1 + groups / 2) bytes")
+    groups = (width // 16 - 1) * 2
+    f = fixed.reshape(-1, slabs, width).view(torch.uint8)
+    m, size = f.shape[0], slabs * 16 * groups
+    base = f[:, :, :16].to(torch.int32)
+    packed = f[:, :, 16:].reshape(m, slabs, 16, groups // 2).to(torch.int32)
+    codes = torch.stack((packed & 15, packed >> 4), -1).reshape(m, slabs, 16, groups)
+    out = ((base[..., None] + codes) & 255).to(torch.uint8).reshape(m * size)
+    if exceptions is not None and exceptions.numel():
+        words = exceptions.reshape(m, -1).contiguous().view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+        pos = words & 0xFFFFFF
+        valid = (words != 0xFFFFFFFF) & (pos < size)   # -1: an unused word of a fixed-capacity list
+        index = torch.where(valid, pos + torch.arange(m, device=f.device)[:, None] * size, m * size)
+        padded = torch.cat([out, out.new_zeros(1)])
+        padded.index_copy_(0, index.reshape(-1), (words >> 24).to(torch.uint8).reshape(-1))
+        out = padded[:-1]
+    return out.reshape(*lead, slabs * 16, groups)
+
+
+# Step frames: what Core tells a plugin object, whatever its slot, when it has the method. A plugin whose memory or
+# state follows the requests in flight (an elastic expert cache making room for a prompt step) needs no call from
+# the model plugin for it. Core's native rounds run no Python: a frame is a step() or a score() the model runs.
+# What a plugin takes once the load is over is the ledger's (crit_plugins.memory: Core calls serve()).
+STEP_FRAMES = {
+    "begin_step": "begin_step(prompt_tokens, score=False): Core is about to call the model's step() (prompt_tokens: "
+                  "the prompt tokens its rows prefill, 0 for decode rows alone) or its score() (the text's tokens, "
+                  "with score=True where the method takes it: a score also holds its rows' logits)",
+    "end_step": "end_step(prompts_open): the call returned; prompts_open: whether a row of the step is still "
+                "prefilling, so another prompt step follows",
+}
+
+# The DEVICE_EXTENSIONS facts whose methods live on an object a slot's device form returns: fact -> that slot (its
+# pool). The assembly cannot see them before the model plugin makes one; PluginTestCase.assertImplements checks them.
+# Core's facts whose methods live on the object a slot's device form returns (its pool); a defined fact says so as
+# its "pool" (crit_plugins.contracts).
+POOL_EXTENSIONS = {"rounds:kv_cache": "kv_cache", "prompts:kv_cache": "kv_cache", "kv:scales": "kv_cache",
+                   "kv:keys": "kv_cache"}
+
+
+def capturing():
+    """Whether the current CUDA stream is capturing a graph: False where torch is not loaded or no CUDA device is
+    (torch.cuda.is_current_stream_capturing raises without one), so device forms that also run on the CPU can ask."""
+    import sys
+    torch = sys.modules.get("torch")
+    return bool(torch is not None and torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
+
+
+def extension_missing(fact, plugin, made=()):
+    """The DEVICE_EXTENSIONS methods of `fact` that neither `plugin` nor any object of `made` (what its device form
+    returned: a pool) has."""
+    holders = [plugin, *made]
+    return [name for name in DEVICE_EXTENSIONS.get(fact, {})
+            if not any(callable(getattr(holder, name, None)) for holder in holders)]
+
+
+def pool_missing(pool):
+    """The KV_POOL methods and attributes a kv_cache plugin's pool lacks."""
+    return ([name for name in KV_POOL if not callable(getattr(pool, name, None))]
+            + [name for name in KV_POOL_ATTRIBUTES if not isinstance(getattr(pool, name, None), int)])
+
+
+def device_missing(slot, plugin):
+    """The device-form methods of `slot` that `plugin` lacks (none for a slot without a device form)."""
+    return [name for name in DEVICE_INTERFACES.get(slot, {}) if not callable(getattr(plugin, name, None))]
+
+
+@dataclass
+class StepBatch:
+    """One step's tokens for the device plugins: `sequences` (one per row), `starts` (the first token of each row,
+    rows + 1 entries, the last the token count) and `positions` (each token's position in its sequence), on the host
+    as lists and on the device as tensors (`starts_t` int32, `positions_t` int64, `rows_t` int64: each token's row)."""
+    sequences: list
+    starts: list
+    positions: list
+    device: object = None
+    starts_t: object = field(default=None, repr=False)
+    positions_t: object = field(default=None, repr=False)
+    rows_t: object = field(default=None, repr=False)
+
+    @classmethod
+    def build(cls, rows, device):
+        """A batch from rows of (sequence, first position, token count), in the order the model packed them."""
+        import torch
+        sequences, starts, positions, row_of = [], [0], [], []
+        for r, (sequence, first, count) in enumerate(rows):
+            if count < 1 or first < 0:
+                raise ValueError("a row is one or more tokens at non-negative positions")
+            sequences.append(sequence)
+            starts.append(starts[-1] + count)
+            positions += range(first, first + count)
+            row_of += [r] * count
+        batch = cls(sequences, starts, positions, device)
+        batch.starts_t = torch.tensor(starts, dtype=torch.int32, device=device)
+        batch.positions_t = torch.tensor(positions, dtype=torch.int64, device=device)
+        batch.rows_t = torch.tensor(row_of, dtype=torch.int64, device=device)
+        return batch
+
+    @property
+    def rows(self):
+        return len(self.sequences)
+
+    @property
+    def tokens(self):
+        return self.starts[-1]
+
+    def row(self, r):
+        """(sequence, first token, token count, first position) of row r."""
+        first = self.starts[r]
+        return self.sequences[r], first, self.starts[r + 1] - first, self.positions[first]
+
+    # A StepBatch is built on the host for one step; a RoundBatch (below) lives on the device for captured rounds and
+    # a PromptBatch for captured prompt chunks.
+    round = False
+    prompt = False
+
+
+class RoundBatch(StepBatch):
+    """The tokens of a captured decode round (crit_plugins.rounds) at fixed device addresses: `rows` rows (the round's
+    slots 0 .. rows - 1, packed at the front) of `width + 1` columns each, the pending token then the drafts, at positions
+    frontier[r] + c. Its host lists (sequences, starts, positions) are None: a plugin reads the device tensors only
+    (tokens_t, positions_t, rows_t, starts_t, slots_t, frontier_t), and follows a sequence through the round slot its
+    pools bound it to (DEVICE_EXTENSIONS "rounds:<slot>"). fill() runs inside the captured round; every buffer is
+    allocated once, for up to rows_max rows at up to widest drafts."""
+
+    round = True
+
+    def __init__(self, rows_max, widest, device):
+        import torch
+        if rows_max < 1 or widest < 0:
+            raise ValueError("a round batch holds one row or more at a width of zero or more")
+        cols = widest + 1
+        long = dict(dtype=torch.int64, device=device)
+        super().__init__(None, None, None, device)
+        self.rows_max, self.widest, self.width, self._count = rows_max, widest, 0, 0
+        self._tokens = torch.zeros(rows_max * cols, **long)
+        self._positions = torch.zeros(rows_max * cols, **long)
+        self._rows = torch.zeros(rows_max * cols, **long)
+        self._starts = torch.zeros(rows_max + 1, dtype=torch.int32, device=device)
+        self._row_index = torch.arange(rows_max, **long)[:, None].expand(rows_max, cols).contiguous()
+        self._columns = torch.arange(cols, **long)
+        self._start_index = torch.arange(rows_max + 1, dtype=torch.int32, device=device)
+        self._slots = torch.arange(rows_max, **long)
+        self.tokens_t = self.frontier_t = self.slots_t = None
+
+    def fill(self, rows, width, frontier, columns):
+        """The round of `rows` rows at `width` drafts: frontier [rows] (the position of each row's column 0) and
+        columns [rows][width + 1] (its input tokens), both device tensors; capture-safe. Returns the batch."""
+        if not 1 <= rows <= self.rows_max or not 0 <= width <= self.widest:
+            raise ValueError(f"a round of 1..{self.rows_max} rows at width 0..{self.widest}")
+        cols = width + 1
+        n = rows * cols
+        self._count, self.width = rows, width
+        self.tokens_t = self._tokens[:n]
+        self.tokens_t.view(rows, cols).copy_(columns[:rows, :cols])
+        self.positions_t = self._positions[:n]
+        self.positions_t.view(rows, cols).copy_(frontier[:rows, None] + self._columns[None, :cols])
+        self.rows_t = self._rows[:n]
+        self.rows_t.view(rows, cols).copy_(self._row_index[:rows, :cols])
+        self.starts_t = self._starts[:rows + 1]
+        self.starts_t.copy_(self._start_index[:rows + 1] * cols)
+        self.frontier_t = frontier[:rows]
+        self.slots_t = self._slots[:rows]
+        return self
+
+    @property
+    def rows(self):
+        return self._count
+
+    @property
+    def tokens(self):
+        return self._count * (self.width + 1)
+
+    def row(self, r):
+        raise ValueError("a round batch has no host rows: read its device tensors, and a sequence through its round slot")
+
+
+class PromptBatch(StepBatch):
+    """One sequence's prompt chunk for a captured graph (crit_plugins.prompt_graphs) at fixed device addresses: a
+    bucket of `bucket` tokens (one row), the chunk's `count` real tokens first, then padding (token 0), every token at
+    position frontier + i (the padding's positions continue the chunk's). valid_t marks the real tokens, count_t /
+    last_t / frontier_t hold the count, the last real token's index and the frontier on the device; a plugin's prompt
+    form (DEVICE_EXTENSIONS "prompts:<slot>") reads those tensors only, and its padding changes no state. The host
+    fields (sequence, frontier, count, and the StepBatch fields of the whole bucket) describe the chunk for the plugins'
+    stage_prompt / commit_prompt, outside the graph.
+
+    fill() writes the chunk's host values into pinned staging and moves them in one copy: count_t, last_t, frontier_t
+    and tokens_t are views of one device buffer, side by side. derive() then makes positions_t and valid_t from them on
+    the device; a captured chunk derives them inside its graph, so a replay needs that one copy only. Every buffer is
+    allocated once, for buckets up to tokens_max; a bucket's tensors are the same views at the same addresses on every
+    fill."""
+
+    prompt = True
+    HEAD = 3   # count, last, frontier: the device buffer's first words, the tokens after them
+
+    def __init__(self, tokens_max, device):
+        import torch
+        if tokens_max < 1:
+            raise ValueError("a prompt batch holds one token or more")
+        self.torch = torch
+        long = dict(dtype=torch.int64, device=device)
+        super().__init__([None], [0, 0], range(0), device)
+        self.tokens_max, self.bucket = tokens_max, 0
+        self.sequence, self.frontier, self.count = None, 0, 0
+        self._packed = torch.zeros(self.HEAD + tokens_max, **long)
+        pinned = torch.device(device).type == "cuda"
+        self._staging = torch.zeros(self.HEAD + tokens_max, dtype=torch.int64, pin_memory=pinned)
+        self._host = self._staging.numpy()
+        self._copied = torch.cuda.Event() if pinned else None   # the last copy out of the staging
+        self.count_t, self.last_t, self.frontier_t = self._packed[0:1], self._packed[1:2], self._packed[2:3]
+        self._positions, self._valid = torch.zeros(tokens_max, **long), torch.zeros(tokens_max, dtype=torch.bool,
+                                                                                    device=device)
+        self._rows, self._index = torch.zeros(tokens_max, **long), torch.arange(tokens_max, **long)
+        self._views = {}
+        self.tokens_t = self.valid_t = self._columns = None
+
+    def _use(self, bucket):
+        views = self._views.get(bucket)
+        if views is None:
+            views = self._views[bucket] = (
+                self._packed[self.HEAD:self.HEAD + bucket], self._positions[:bucket], self._valid[:bucket],
+                self._rows[:bucket], self.torch.tensor([0, bucket], dtype=self.torch.int32, device=self.device),
+                self._index[:bucket], [0, bucket])
+        (self.tokens_t, self.positions_t, self.valid_t, self.rows_t, self.starts_t, self._columns,
+         self.starts) = views
+        self.bucket = bucket
+
+    def fill(self, bucket, sequence, frontier, tokens, derive=True):
+        """The chunk `tokens` (host ints; empty: padding only, as a capture's warm-ups run) of `sequence` from position
+        `frontier`, padded to `bucket` tokens: one copy from pinned staging (it waits for the previous copy out of it
+        to finish first), then derive() unless `derive` is false (a captured chunk derives inside its graph). Outside
+        the graph."""
+        count = len(tokens)
+        if not 1 <= bucket <= self.tokens_max or count > bucket or frontier < 0:
+            raise ValueError(f"a chunk of {count} tokens in a bucket of {bucket} (at most {self.tokens_max})")
+        if bucket != self.bucket:
+            self._use(bucket)
+        self.sequence, self.frontier, self.count = sequence, frontier, count
+        self.sequences[0] = sequence
+        self.positions = range(frontier, frontier + bucket)
+        if self._copied is not None:
+            self._copied.synchronize()
+        host, head = self._host, self.HEAD
+        host[0], host[1], host[2] = count, max(count - 1, 0), frontier
+        host[head:head + count] = tokens
+        host[head + count:head + bucket] = 0
+        self._packed[:head + bucket].copy_(self._staging[:head + bucket], non_blocking=True)
+        if self._copied is not None:
+            self._copied.record()
+        if derive:
+            self.derive()
+        return self
+
+    def derive(self):
+        """positions_t (frontier + i) and valid_t (i < count) from frontier_t and count_t, on the device; capture-safe."""
+        self.torch.add(self._columns, self.frontier_t, out=self.positions_t)
+        self.torch.lt(self._columns, self.count_t, out=self.valid_t)
+
+    def row(self, r):
+        if r != 0:
+            raise IndexError("a prompt batch has one row")
+        return self.sequence, 0, self.bucket, self.frontier
+
+
+class Allowed:
+    """The tokens a constrained request's row may take next (structured output, forced calls): Core's matcher of the
+    request's constraint computes them before each step (crit_core.native), the row carries them as StepRow.allowed,
+    and the model plugin hands them to the sampler as the row's params["allowed"], which masks every other token
+    before its rules. Core checks each token a constrained row produces against them. `words` is a bitmask, bit t % 32
+    of word t // 32 for token t (crit::core::TokenMatcher::allowed_bits), over `vocabulary` tokens. It reads as the
+    sorted ids it allows (iteration, len, `in`), the host form's allowed set, and as a device mask (mask)."""
+
+    __slots__ = ("words", "vocabulary", "_ids")
+
+    def __init__(self, words, vocabulary):
+        self.words = words if isinstance(words, array.array) and words.typecode == "I" else array.array("I", words)
+        self.vocabulary = int(vocabulary)
+        if len(self.words) != (self.vocabulary + 31) // 32:
+            raise ValueError(f"an allowed set over {self.vocabulary} tokens is {(self.vocabulary + 31) // 32} words")
+        self._ids = None
+
+    @classmethod
+    def of(cls, tokens, vocabulary):
+        """The allowed set of exactly `tokens`."""
+        words = array.array("I", bytes(4 * ((int(vocabulary) + 31) // 32)))
+        for token in tokens:
+            if not 0 <= token < vocabulary:
+                raise ValueError(f"token {token} is outside the vocabulary of {vocabulary}")
+            words[token // 32] |= 1 << (token % 32)
+        return cls(words, vocabulary)
+
+    def ids(self):
+        """The allowed token ids, ascending."""
+        if self._ids is None:
+            found = []
+            for w, word in enumerate(self.words):
+                while word:
+                    low = word & -word
+                    found.append(32 * w + low.bit_length() - 1)
+                    word ^= low
+            self._ids = found
+        return self._ids
+
+    def __iter__(self):
+        return iter(self.ids())
+
+    def __len__(self):
+        return len(self.ids())
+
+    def __bool__(self):
+        return any(self.words)
+
+    def __contains__(self, token):
+        return 0 <= token < self.vocabulary and bool(self.words[token // 32] >> (token % 32) & 1)
+
+    def mask(self, device, width=None):
+        """A bool tensor of `width` entries (the vocabulary by default) on `device`, True for the tokens allowed; the
+        columns past the vocabulary are never allowed."""
+        import torch
+        width = self.vocabulary if width is None else int(width)
+        if width < self.vocabulary and any(t >= width for t in self.ids()):
+            raise ValueError(f"the allowed set has tokens past the {width} columns of the logits")
+        words = torch.frombuffer(bytearray(self.words.tobytes()), dtype=torch.int32).to(device)
+        bits = torch.arange(32, dtype=torch.int32, device=words.device)
+        found = ((words.unsqueeze(1) >> bits) & 1).flatten().bool()
+        if found.numel() >= width:
+            return found[:width]
+        return torch.cat([found, torch.zeros(width - found.numel(), dtype=torch.bool, device=found.device)])
+
+    def __repr__(self):
+        return f"Allowed({len(self)} of {self.vocabulary})"

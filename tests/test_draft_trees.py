@@ -13,7 +13,7 @@ def load():
     name = "crit_test_draft_trees_tree"
     if name in sys.modules:
         return sys.modules[name]
-    spec = importlib.util.spec_from_file_location(name, ROOT / "inference" / "draft-trees" / "code" / "tree.py")
+    spec = importlib.util.spec_from_file_location(name, ROOT / "inference" / "techniques" / "speculation" / "draft-trees" / "code" / "tree.py")
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
@@ -31,15 +31,23 @@ def random_drafter(seed, vocab=12):
 
 
 class ChainHeadTests(unittest.TestCase):
-    def test_model_templates_chain_head_does_not_claim_a_tree_head(self):
-        # model-template's MTP head drafts one chain a row: it provides draft:head-device and not draft:head-tree, which
-        # draft-trees needs, so the pair is refused at resolve (draft-trees' own tests show the refusal).
+    def test_a_model_plugin_s_chain_head_does_not_claim_a_tree_head(self):
+        # The models core's MTP head drafts one chain a row: a model plugin whose layout has a draft layer provides
+        # draft:head-device and not draft:head-tree, which draft-trees needs, so the pair is refused at resolve
+        # (draft-trees' own tests show the refusal).
         import json
-        manifest = lambda plugin: json.loads((ROOT / "inference" / plugin / "plugin.json").read_text(encoding="utf-8"))
-        template, trees = manifest("model-template"), manifest("draft-trees")
-        self.assertIn("draft:head-device", template["provides"])
-        self.assertNotIn("draft:head-tree", template["provides"])
+        manifest = lambda folder: json.loads((folder / "plugin.json").read_text(encoding="utf-8"))
+        trees = manifest(ROOT / "inference" / "techniques" / "speculation" / "draft-trees")
         self.assertIn("draft:head-tree", trees["needs"])
+        drafting = 0
+        for folder in sorted((ROOT / "models" / "cache").glob("*/plugin.json")):
+            plugin = manifest(folder.parent)
+            layout = json.loads((folder.parent / "layout.json").read_text(encoding="utf-8"))
+            with self.subTest(plugin=plugin["id"]):
+                self.assertEqual("draft:head-device" in plugin.get("provides", []), "draft" in layout)
+                self.assertNotIn("draft:head-tree", plugin.get("provides", []))
+                drafting += "draft" in layout
+        self.assertTrue(drafting)
 
 
 class DraftTreeTests(unittest.TestCase):
