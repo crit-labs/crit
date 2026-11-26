@@ -124,7 +124,7 @@ class DeviceMatrices:
                                      format in ("bf16", "mxfp8") or
                                      (format.startswith("fp8") and self.fp8_activations == "bf16") else "provider",
                                      self.gemv, decode, self.rows, self.tile_rows, self.fp8_activations,
-                                     self.mx_activations)
+                                     self.mx_activations, self.fp8_block_layout)
         found.out_rows = out_rows
         format = "int4_zp" if found.format == "int4_zp" else format   # awq, gptq: crit's INT4 rows
         # Every matrix shape as loaded (stacked ones as the model plugin stacked them), for crit kernels sweep.
@@ -176,6 +176,21 @@ class DeviceMatrices:
             return "fp8" if self.head == "fp8" else None
         return "fp8" if self.trunk == "fp8" and role not in self.trunk_keep else None
 
+    def held_bytes(self, format, rows, columns, stored, role=None):
+        """The device bytes load() holds a target matrix of `rows` x `columns` in that is stored in `format` and takes
+        `stored` bytes so, loaded with `role`: re-encoded where target_encoding says (FP8 codes and one FP32 scale a
+        row, after row_padding's zero rows; the head is never padded), else as stored, as load() decides it, a shape
+        the encoded format does not take included. For a model plugin's device plan, made before its matrices load.
+        role None: a target matrix whose role the plan does not know, priced as one of a role trunk_keep does not
+        name (the kept roles are the small matrices whose outputs pick, a few MiB of a pass)."""
+        target = self.target_encoding(role) if format in device_matrices.ENCODINGS["fp8"] else None
+        if target is None:
+            return int(stored)
+        pad = device_matrices.row_padding(target, rows, columns) if role != HEAD_ROLE else 0
+        if device_matrices.encoding_problem(target, rows + pad, columns):
+            return int(stored)
+        return (rows + pad) * columns + 4 * (rows + pad)   # fp8:channel: a byte a code, an FP32 scale a row
+
     def release_dropped(self):
         """The stored 16-bit copy of a re-encoded target matrix (the head, a trunk matrix), once the model plugin
         dropped it: its device block goes back to the device instead of staying in torch's cache, where the next
@@ -193,6 +208,7 @@ class DeviceMatrices:
     paths = {}
     kernels = {}
     prompt_kernels = {}
+    fp8_block_layout = "plain"            # the `fp8_block_layout` option
     mx_activations, mx_by = "bf16", None   # the `mxfp8_activations` option as create() resolved it (asked_mx)
     crossovers = {}
 
@@ -452,6 +468,7 @@ def create(context, options, parts):
     found.rows = options["decode_rows"]
     found.tile_rows = options["tile_rows"] if options["tile_rows"] == "auto" else int(options["tile_rows"])
     found.fp8_activations = options["fp8_activations"]
+    found.fp8_block_layout = options["fp8_block_layout"]
     found.mx_activations, found.mx_by = asked_mx(options["mxfp8_activations"], quality_mode(), activation("mxfp8"))
     if found.device is not None and str(found.device).startswith("cuda"):
         device_matrices.buffers(found.device)   # the shared buffers memory() declares: each made at its first use

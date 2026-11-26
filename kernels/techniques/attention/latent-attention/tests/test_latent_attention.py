@@ -112,6 +112,40 @@ def test_the_speed_knobs_keep_every_bit():
         la = default
 
 
+def test_the_default_knobs_fit_the_devices_shared_memory_at_a_wide_rotary_key():
+    # Rank 512 with a 128-wide rotary key (a K = V full-attention layer read as latent rows): the window tiles at the
+    # defaults (64 rows, three stages) take 110,784 bytes, past the 101,376 an sm_120 block opts into. The launch
+    # steps the knobs down (a stage, then rows a program) to the first that fits, which keeps a token's bits.
+    global la
+    rank, rope, heads, page = 512, 128, 8, 64
+    cache = Cache(rank, rope, page, [700, 2100], seed=21)
+    q = _q(16, heads, rank + rope, 22)   # windows of 8 columns: 64 query rows a program at the defaults
+    scale = (rank + rope) ** -0.5
+    for fused in (False, True):
+        out = cache.attend(q, [0, 1], [0, 8], [692, 2092], 8, scale=scale, fused=fused)
+        for s, start, first in ((0, 0, 692), (1, 8, 2092)):
+            latent, rope_k = cache.rows(s, first + 8)
+            seen = torch.arange(first + 8, device=dev)[None, :] <= first + torch.arange(8, device=dev)[:, None]
+            want, _ = ref.latent_attention(q[start:start + 8, :, :rank], q[start:start + 8, :, rank:], latent, rope_k,
+                                           seen, scale)
+            torch.testing.assert_close(out[start:start + 8].double(), want, atol=8e-3, rtol=2e-2)
+        # the bits of the knobs it fell back to, launched as given
+        fitted = next(k for (at, _), k in la.FITTED.items() if at[0] == ("fused" if fused else "window")
+                      and at[1:4] == (rank, rope, heads))
+        default = la
+        try:
+            la = load("latent-attention", knobs={"window": fitted})
+            assert torch.equal(cache.attend(q, [0, 1], [0, 8], [692, 2092], 8, scale=scale, fused=fused), out)
+        finally:
+            la = default
+    chunk = _q(70, heads, rank + rope, 23)
+    got = la.prefill(chunk, cache.cache, cache.tables[1], 2000, page, rank=rank, scale=scale)
+    latent, rope_k = cache.rows(1, 2070)
+    seen = torch.arange(2070, device=dev)[None, :] <= 2000 + torch.arange(70, device=dev)[:, None]
+    want, _ = ref.latent_attention(chunk[:, :, :rank], chunk[:, :, rank:], latent, rope_k, seen, scale)
+    torch.testing.assert_close(got.double(), want, atol=8e-3, rtol=2e-2)
+
+
 def test_one_cuda_graph_replays_at_every_length():
     cache = Cache(512, 64, 64, [4000], seed=3)
     q = _q(1, 16, 576, 7)

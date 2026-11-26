@@ -54,3 +54,16 @@
 #else
 #define CRIT_KCORE_HAS_BLOCK_SCALED_MMA 0
 #endif
+
+// The block-scaled MMA with unit scales as an E4M3 block sum (blockscaled_mma.cuh's block_sum_e4m3_fast): only on the
+// specific targets where tests/fast_e4m3_tests.cu has shown it gives the plain e4m3 MMA's bits (PTX leaves both sums'
+// order unspecified, so this is measured, not derived): sm_120a, on an RTX 5090. Another target takes the plain MMA
+// until that test passes there and its architecture joins this list (or a build defines CRIT_KCORE_FAST_E4M3_SUM 1 to
+// run the test itself).
+#ifndef CRIT_KCORE_FAST_E4M3_SUM
+#if CRIT_KCORE_HAS_BLOCK_SCALED_MMA && __CUDA_ARCH_SPECIFIC__ == 1200
+#define CRIT_KCORE_FAST_E4M3_SUM 1
+#else
+#define CRIT_KCORE_FAST_E4M3_SUM 0
+#endif
+#endif

@@ -395,13 +395,17 @@ class PromptCache:
     def _match(self, prompt):
         """((entry, length, the sequence the state pools fork from, the payload there, the mark there or None) of
         the kept sequence with the longest reusable prefix of `prompt`, or None; the longest prefix `prompt` shares
-        with a kept sequence, reusable or not). The last prompt token is always computed."""
+        with a kept sequence, reusable or not). The last prompt token is always computed. A pool may hold a kept
+        sequence's positions from some length on only (resumes_from: a sliding window's ring that has wrapped writes
+        later positions over earlier ones): no resume before it."""
         best, most = None, 0
         for entry in self.kept.values():
             common = min(shared(entry.tokens, prompt), len(prompt) - 1)
             most = max(most, common)
             if common < self.least:
                 continue
+            floor = max((pool.resumes_from(entry.sequence) for pool in self.pools
+                         if callable(getattr(pool, "resumes_from", None))), default=0)
             if not self.at_marks:
                 length, source, payload, mark = common, None, None, None
             else:
@@ -409,9 +413,9 @@ class PromptCache:
                 stood = {position: (found.name, found.payload, found) for position, found in entry.marks.items()}
                 if entry.end is not None:
                     stood[len(entry.tokens)] = (entry.sequence, entry.end[0], None)
-                length = max((p for p in stood if p <= common), default=0)
+                length = max((p for p in stood if floor <= p <= common), default=0)
                 source, payload, mark = stood.get(length, (None, None, None))
-            if length >= self.least and (best is None or length > best[1]):
+            if length >= max(self.least, floor) and (best is None or length > best[1]):
                 best = (entry, length, source, payload, mark)
         return best, most
 

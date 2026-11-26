@@ -5,6 +5,7 @@
   "title": "Weight-only decode GEMVs: NVFP4, FP8, MXFP8, BF16 and INT4 (zero point a group: AWQ, GPTQ) weights times 1 to 16 rows of 16-bit activations",
   "package": "decode_gemv",
   "language": "cuda",
+  "launches": ["crit::kernels::decode_gemv::", "_decode_fp8_kernel", "_decode_kernel", "_dot_kernel", "_fma_kernel", "_reduce_kernel"],
   "operations": [
     "nvfp4-projection",
     "fp8-row-projection",

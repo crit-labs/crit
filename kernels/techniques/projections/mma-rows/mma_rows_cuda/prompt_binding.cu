@@ -1,5 +1,8 @@
 // Torch entry point of the prompt tile (mma_rows.h, enqueue_prompt): mm_rows' checks for any number of rows, the
 // current stream. Nothing allocates and nothing waits for the device, so a CUDA graph captures a call.
+#include <algorithm>
+#include <limits>
+
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/torch.h>
@@ -22,7 +25,8 @@ void same_device(const torch::Tensor& x, const torch::Tensor& t) {
 void mm_prompt(const torch::Tensor& x, const torch::Tensor& w, const std::optional<torch::Tensor>& scales,
                const std::optional<torch::Tensor>& row_scale, int64_t weights, int64_t acts, double input_scale,
                bool blocked, int64_t splits, const std::optional<torch::Tensor>& scratch, torch::Tensor& out,
-               const std::optional<torch::Tensor>& zeros, int64_t group, int64_t glu) {
+               const std::optional<torch::Tensor>& zeros, int64_t group, int64_t glu,
+               const std::optional<torch::Tensor>& partial, const std::optional<torch::Tensor>& counters) {
   TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.scalar_type() == torch::kBFloat16 && x.size(0) >= 1,
               "mm_prompt: x is a 2-D BF16 CUDA tensor [rows][K], one row or more");
   TORCH_CHECK(x.size(0) <= std::numeric_limits<int>::max(), "mm_prompt: at most 2^31 - 1 rows");
@@ -125,6 +129,20 @@ void mm_prompt(const torch::Tensor& x, const torch::Tensor& w, const std::option
                   out.stride(1) == 1,
               "mm_prompt: out is [rows][N] with contiguous rows ([rows][N / 2] with glu)");
   p.glu = static_cast<int>(glu);
+  TORCH_CHECK(partial.has_value() == counters.has_value(), "mm_prompt: partial and counters come together");
+  if (partial.has_value()) {
+    const torch::Tensor& s = *partial;
+    const torch::Tensor& c = *counters;
+    same_device(x, s);
+    same_device(x, c);
+    TORCH_CHECK(s.is_contiguous() && s.scalar_type() == torch::kFloat32 && c.is_contiguous() &&
+                    c.scalar_type() == torch::kInt32,
+                "mm_prompt: partial is FP32 and counters int32 zeros, both contiguous");
+    p.partial = s.data_ptr<float>();
+    p.partial_size = static_cast<std::size_t>(s.numel());
+    p.counters = c.data_ptr<int>();
+    p.counter_count = static_cast<int>(std::min<int64_t>(c.numel(), std::numeric_limits<int>::max()));
+  }
   same_device(x, out);
   p.out = out.data_ptr();
   p.ldo = out.stride(0);
@@ -136,6 +154,20 @@ void mm_prompt(const torch::Tensor& x, const torch::Tensor& w, const std::option
   const c10::cuda::CUDAGuard guard(x.device());
   const cudaError_t e = mr::enqueue_prompt(p, at::cuda::getCurrentCUDAStream());
   TORCH_CHECK(e == cudaSuccess, "mm_prompt: ", cudaGetErrorString(e));
+}
+
+int64_t prompt_ctas(int64_t m, int64_t n, int64_t k, int64_t weights, int64_t acts, int64_t splits,
+                    int64_t partial_elements, int64_t counters) {
+  mr::Problem p;
+  p.M = static_cast<int>(m);
+  p.N = static_cast<int>(n);
+  p.K = static_cast<int>(k);
+  p.weights = static_cast<int>(weights);
+  p.acts = static_cast<int>(acts);
+  p.splits = static_cast<int>(splits);
+  p.partial_size = static_cast<std::size_t>(partial_elements);
+  p.counter_count = static_cast<int>(std::min<int64_t>(counters, std::numeric_limits<int>::max()));
+  return mr::prompt_ctas(p);
 }
 
 int64_t decode_ctas(int64_t weights, int64_t acts) {

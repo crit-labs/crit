@@ -1569,7 +1569,8 @@ class KeepAliveTests(DialectFixture, unittest.TestCase):
 
         def read():  # pings every .05 s while the engine is quiet
             try:
-                found.extend(client.events("/chat/completions", body, .3))
+                # 1.5 s: the role event comes at once, but a loaded Windows runner took over .3 s to send it
+                found.extend(client.events("/chat/completions", body, 1.5))
             except Hung as exc:
                 outcome["hung"] = str(exc)
         thread = threading.Thread(target=read)

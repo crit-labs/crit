@@ -605,10 +605,10 @@ class DeviceExpertsTests(PluginTestCase):
 
 class PromptItemsTests(PluginTestCase):
     """prompt_items auto: an FP4 prompt call's items from the engine's sweep report on this device (the faster of
-    fp4-prompt and fp4-tile at the call's tokens, both passes added), fp4-prompt without one; the option's choices
+    fp4-prompt and fp4-tile at the call's tokens, both passes added), fp4-tile without one; the option's choices
     as asked; decode-sized calls and other arithmetics keep the kernel's width."""
 
-    def test_auto_follows_the_sweep_report_and_keeps_fp4_prompt_without_one(self):
+    def test_auto_follows_the_sweep_report_and_takes_fp4_tile_without_one(self):
         import sys
         experts = self.assemble(USE)["experts"]
         module = sys.modules[type(experts).__module__]
@@ -619,7 +619,7 @@ class PromptItemsTests(PluginTestCase):
             return {"structures": {"fp4-prompt": entries(prompt_us), "fp4-tile": entries(tile_us)}}
         real = module._report
         self.addCleanup(setattr, module, "_report", real)
-        cases = ((None, (32, False)), (report(10.0, 7.0), (64, True)), (report(7.0, 10.0), (32, False)))
+        cases = ((None, (64, True)), (report(10.0, 7.0), (64, True)), (report(7.0, 10.0), (32, False)))
         for found, want in cases:
             module._report = lambda device, found=found: found
             self.assertEqual(experts._prompt_items(4096, 8, 128, 256, 128, "fp4-row"), want, found)

@@ -79,7 +79,10 @@ def load_profile(path, groups, experts, slots):
     if profile.get("kind") != KIND:
         raise ValueError("not a device expert cache profile")
     if (profile["groups"], profile["experts"]) != (groups, experts):
-        raise ValueError("profile built for another routing geometry")
+        raise ValueError(f"profile built for another routing geometry: {profile['groups']} groups x "
+                         f"{profile['experts']} experts, where the cache routes {groups} x {experts} (a group is "
+                         "every routed layer the cache serves, a draft layer's among them: build the profile with "
+                         "the engine's groups)")
     keys = profile["keys"]
     if any(type(k) is not int or not 0 <= k < groups * experts for k in keys) or len(set(keys)) != len(keys):
         raise ValueError("profile keys must be distinct keys of the geometry")

@@ -5,6 +5,7 @@
   "title": "Row-count-independent prompt GEMMs: cuBLASLt pinned to one split-K-free algorithm per shape and format, for 16-bit, FP8, MXFP8, MXFP4 and NVFP4 operands",
   "package": "pinned_gemm",
   "language": "cuda",
+  "launches": [],
   "operations": [
     "nvfp4-projection",
     "fp8-row-projection",

@@ -180,7 +180,7 @@ struct Staged : kc::StagedShape<BM, BN, WM, WN, G, RUN, STAGES, StagedLayout<BM,
     using Shape = kc::StagedShape<BM, BN, WM, WN, G, RUN, STAGES, StagedLayout<BM, BN>::kSub,
                                   StagedLayout<BM, BN>::kWs, StagedLayout<BM, BN>::kAs>;
     using Shape::kThreads, Shape::kWarpRows, Shape::kWarpTokens, Shape::kMT, Shape::kNT, Shape::kOut, Shape::kRowsPer,
-        Shape::kTokensPer, Shape::kStage, Shape::kSmem, Shape::kMinBlocks;
+        Shape::kTokensPer, Shape::kStage, Shape::kSmem, Shape::kMinBlocks, Shape::kMaxBlocks;
     using StagedLayout<BM, BN>::kCodes, StagedLayout<BM, BN>::kA, StagedLayout<BM, BN>::kB,
         StagedLayout<BM, BN>::kWraw, StagedLayout<BM, BN>::kAs, StagedLayout<BM, BN>::kWs, StagedLayout<BM, BN>::kSub;
 };
@@ -198,6 +198,7 @@ __global__ void __launch_bounds__(32 * WM * WN, (Staged<BM, BN, WM, WN, G, RUN, 
     const int wr = (warp / WN) * S::kWarpRows, wt = (warp % WN) * S::kWarpTokens;
     const int blocks = m.cols / 16, shift = acts.block == 32 ? 1 : 0, last = job.first + job.count - 1;
     const bs::NibbleTable table = bs::nibble_table(m.int4 != 0);
+    const int visits = kc::declared_staged_plan<typename S::Shape>(smem, blocks);
 
     for(int tile = BN * int(blockIdx.z); tile < job.count; tile += BN * int(gridDim.z)) {
         // This thread's rows: weight rows (codes and scales: cols a multiple of 64, so a scale row is word aligned)
@@ -253,35 +254,56 @@ __global__ void __launch_bounds__(32 * WM * WN, (Staged<BM, BN, WM, WN, G, RUN, 
                 }
             }
         };
-        // The warp's block sums: one s8 MMA onto the bias a 16 x 8 tile, the exact sum as FP32 (biased_sum).
-        auto sums = [&](const unsigned char* sub, float (&d)[S::kMT][S::kNT][4]) {
-            uint32_t fa[S::kMT][2], fb[S::kNT];
-#pragma unroll
-            for(int mt = 0; mt < S::kMT; ++mt)
-                kc::ldmatrix_x2(fa[mt][0], fa[mt][1], sub + S::kA + 16 * (wr + 16 * mt + lane % 16));
+        // The warp's token fragments of a block (ldmatrix), then a row tile's block sums: one s8 MMA onto the bias a
+        // 16 x 8 tile, the exact sum as FP32 (biased_sum).
+        struct Tokens {
+            uint32_t b[S::kNT];
+        };
+        auto tokens = [&](const unsigned char* stage, int i) {
+            const unsigned char* sub = stage + i * S::kSub;
+            Tokens t;
             if constexpr(S::kNT % 4 == 0) {
 #pragma unroll
                 for(int nt = 0; nt < S::kNT; nt += 4)
-                    kc::ldmatrix_x4(fb[nt], fb[nt + 1], fb[nt + 2], fb[nt + 3], sub + S::kB + 16 * (wt + 8 * nt + lane));
+                    kc::ldmatrix_x4(t.b[nt], t.b[nt + 1], t.b[nt + 2], t.b[nt + 3],
+                                    sub + S::kB + 16 * (wt + 8 * nt + lane));
             } else if constexpr(S::kNT == 2) {
-                kc::ldmatrix_x2(fb[0], fb[1], sub + S::kB + 16 * (wt + lane % 16));
+                kc::ldmatrix_x2(t.b[0], t.b[1], sub + S::kB + 16 * (wt + lane % 16));
             } else {
-                kc::ldmatrix_x1(fb[0], sub + S::kB + 16 * (wt + lane % 8));
+                kc::ldmatrix_x1(t.b[0], sub + S::kB + 16 * (wt + lane % 8));
             }
-            int sums[S::kMT][S::kNT][4];
+            return t;
+        };
+        auto sums = [&](const unsigned char* stage, int i, int mt, const Tokens& t, float (&d)[S::kNT][4]) {
+            const unsigned char* sub = stage + i * S::kSub;
+            uint32_t a0, a1;
+            kc::ldmatrix_x2(a0, a1, sub + S::kA + 16 * (wr + 16 * mt + lane % 16));
 #pragma unroll
-            for(int mt = 0; mt < S::kMT; ++mt)
+            for(int nt = 0; nt < S::kNT; ++nt) {
+                int sum[4];
+                bs::block_sum_s8(a0, a1, t.b[nt], sum);
 #pragma unroll
-                for(int nt = 0; nt < S::kNT; ++nt) bs::block_sum_s8(fa[mt][0], fa[mt][1], fb[nt], sums[mt][nt]);
-#pragma unroll
-            for(int mt = 0; mt < S::kMT; ++mt)
-#pragma unroll
-                for(int nt = 0; nt < S::kNT; ++nt)
-#pragma unroll
-                    for(int i = 0; i < 4; ++i) d[mt][nt][i] = bs::biased_sum(sums[mt][nt][i]);
+                for(int i = 0; i < 4; ++i) d[nt][i] = bs::biased_sum(sum[i]);
+            }
         };
         float x[S::kOut][4];
-        kc::declared_staged<typename S::Shape>(smem, blocks, wr, wt, g, q, issue, decode, sums, x);
+        // A visit's copies and decodes: its slots' blocks (a slot whose lane has no such block copies the first's).
+        auto issue_visit = [&](unsigned char* stage, int first) {
+#pragma unroll
+            for(int i = 0; i < S::kG * S::kRun; ++i) {
+                const int b = kc::staged_block<typename S::Shape>(first, i);
+                issue(stage + i * S::kSub, i == 0 || b < blocks ? b : first);
+            }
+        };
+        auto decode_visit = [&](unsigned char* stage, int first) {
+#pragma unroll
+            for(int i = 0; i < S::kG * S::kRun; ++i) {
+                const int b = kc::staged_block<typename S::Shape>(first, i);
+                if(i == 0 || b < blocks) decode(stage + i * S::kSub, b);
+            }
+        };
+        kc::declared_staged<typename S::Shape>(smem, blocks, visits, false, wr, wt, g, q, issue_visit, decode_visit,
+                                               tokens, sums, x);
         kc::declared_staged_store<typename S::Shape>(x, out, out_ld, row0, tile, m.rows, job.first, job.count, m.post,
                                                      wr, wt, g, q);
         __syncthreads();   // the next token tile's prologue refills the stages
@@ -1263,6 +1285,7 @@ cudaError_t launch_staged(const Matrix* matrices, const GemmJob* jobs, int job_c
     static kc::PerDevice<cudaError_t> optin;   // the kernel's shared memory, raised once a device
     const cudaError_t attribute = kc::shared_memory_optin(optin, kernel, S::kSmem);
     if(attribute != cudaSuccess) return attribute;   // more shared memory than the device gives a CTA
+    if(acts.ld / 16 > S::kMaxBlocks) return cudaErrorInvalidValue;   // more blocks than the plan holds
     const int tiles = (max_count + BN - 1) / BN;
     const dim3 grid(unsigned((max_rows + BM - 1) / BM), unsigned(job_count), unsigned(tiles < 65535 ? tiles : 65535));
     kernel<<<grid, S::kThreads, S::kSmem, stream>>>(matrices, jobs, acts, out, out_ld);

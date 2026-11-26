@@ -317,6 +317,34 @@ class DeviceRecurrenceTests(PluginTestCase):
         both(lambda plugin, pool: pool.close("d"))
         self.assertEqual(backed.backed, 1)
 
+    def test_closing_a_sequence_keeps_another_prompt_rows_final_states_backed_till_their_accept(self):
+        # The Flash-Next build's concurrent requests: a prompt row's final states wait in a free unit of the pool
+        # above the open sequences, and a sequence closing in between trimmed that unit's backing away, so the
+        # accept copied from unbacked memory (CUDA: "Copy range not fully allocated").
+        torch = self.torch
+        from crit_plugins import memory
+        if self.device() != "cuda" or not memory.of("cuda").elastic_ranges:
+            self.skipTest("an elastic range is the CUDA driver's")
+        plain = self.assemble(options={"exact_rows": 64})["recurrence"]
+        elastic = self.assemble(options={"exact_rows": 64, "elastic": True})["recurrence"]
+        rig = Rig(torch, "cuda", *self.shapes()[-1], channels=16, tokens=30, seed=12)
+        pools = rig.pool(plain, widest=2), rig.pool(elastic, widest=2)
+
+        def both(act):
+            return [act(plugin, pool) for plugin, pool in zip((plain, elastic), pools)]
+        for sequence in "abc":
+            both(lambda plugin, pool: pool.open(sequence))
+        both(lambda plugin, pool: rig.step(plugin, pool, [("a", 0, 12)], accept=[None]))
+        self.assertTrue(pools[1].final_units)               # a's final states wait in a free unit of the pool
+        both(lambda plugin, pool: pool.close("c"))
+        both(lambda plugin, pool: pool.close("b"))
+        self.assertGreater(pools[1].elastic.backed, max(pools[1].final_units.values()))
+        both(lambda plugin, pool: pool.accept("a", 12))
+        torch.cuda.synchronize()
+        for layer in (0, 1):
+            self.assertTrue(torch.equal(*both(lambda plugin, pool: pool.state(layer, "a"))))
+            self.assertTrue(torch.equal(*both(lambda plugin, pool: pool.window(layer, "a"))))
+
     def test_closing_the_plugin_gives_every_pools_range_back_to_the_device(self):
         # The Flash-Next build's leak: the device's registry of ranges kept a closed engine's state pools.
         from crit_plugins import memory

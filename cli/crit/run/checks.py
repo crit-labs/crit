@@ -581,6 +581,14 @@ def step_memory_item(counts):
         ("refused", "segments refused (the device lacked the bytes)"),
         ("overflows", "segments past the step arena (a step larger than any the load measured)"),
         ("breaches", "segments that left less free than the VRAM headroom")) if total[key]]
+    if total["overflows"]:   # which kind of step outgrew the arena: the most each kind took, largest first
+        most = {}
+        for s in seen:
+            for kind, took in (s.get("most") or {}).items():
+                most[kind] = max(most.get(kind, 0), int(took or 0))
+        if most:
+            said += "; the most a step took, by kind: " + ", ".join(
+                f"{kind} {took / 2**20:,.0f} MiB" for kind, took in sorted(most.items(), key=lambda kv: -kv[1]))
     if wrong:
         return {"name": "step_memory", "state": "failed",
                 "detail": "; ".join(wrong) + f" over the check's requests ({said}). Core's arena is what the load's "

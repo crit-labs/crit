@@ -47,6 +47,28 @@ class TopRanked(unittest.TestCase):
         self.assertTrue(torch.equal(got[1], want[1]))
         self.assertTrue(torch.equal(got[0], want[0]))
 
+    def test_no_temporary_is_wider_than_the_rows_masks(self):
+        # A long score ranks 128 logit rows of a large vocabulary at once: a temporary of int64 a value (a count of
+        # the masks, 256 MiB at 262,144 tokens) was the allocation that failed on the device, past its headroom.
+        from torch.utils._python_dispatch import TorchDispatchMode
+        from crit_plugins.ranking import top_ranked
+
+        class Widest(TorchDispatchMode):
+            widest = 0
+
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                out = func(*args, **(kwargs or {}))
+                for t in out if isinstance(out, (tuple, list)) else (out,):
+                    if isinstance(t, torch.Tensor):
+                        Widest.widest = max(Widest.widest, t.numel() * t.element_size())
+                return out
+        values = torch.randn(32, 50_000, generator=torch.Generator().manual_seed(7))
+        values[5, :] = values[5].round(decimals=0)          # a row with ties at the k-th value
+        with Widest():
+            top_ranked(values, 20)
+        self.assertLessEqual(Widest.widest, values.numel())  # a bool mask: a byte a value
+        self.same(values, 20)
+
 
 if __name__ == "__main__":
     unittest.main()

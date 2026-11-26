@@ -259,7 +259,9 @@ class StatePool:
         for kept in (self.last, self.finals, self.final_windows, self.final_units):
             kept.pop(sequence, None)
         if self.elastic is not None:   # what lies past the highest open sequence goes back, one sequence's room kept
-            self.elastic.trim(max(self.index.values(), default=-1) + 2)
+            # A free unit that holds another sequence's prompt row's final states till its accept (final_units)
+            # stays backed: its accept copies them from there.
+            self.elastic.trim(max([*self.index.values(), *self.final_units.values()], default=-1) + 2)
 
     def fork(self, sequence, new):
         """A new sequence with the sequence's committed state and window (a flush first)."""

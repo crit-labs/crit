@@ -799,8 +799,9 @@ FUSED_WORKSPACE = 64 << 20        # bytes a fused launch's ring of states may ta
 FUSED_PARTIALS = 128 << 20        # workspace bytes (workspace_floats) a fused launch may take as a window launch
 FUSED_DEPTH = 2                   # groups of slots a fused tile's ring holds (deeper rings measured slower: their
                                   # programs run ahead of the folds, which then trail the last split)
-FUSED_SERIAL = 50                 # a fused launch whose tiles reach this percent of the programs the GPU holds at once
-                                  # runs one program a tile (cuda-fused's knob SERIAL, 0: this; never a bit)
+FUSED_SERIAL = 125                # a fused launch whose tiles reach this percent of the programs the GPU holds at once
+                                  # runs one program a tile (cuda-fused's knob SERIAL, 0: this; never a bit): below it
+                                  # the ring form's programs a split fill the GPU better (measured, RTX 5090: README)
 _CUDA_WINDOW, _CUDA_FUSED, _CUDA_PREFILL, _CUDA_SERIAL = 0, 1, 2, 3
 
 

@@ -38,7 +38,10 @@ STOPS = 8             # stop ids a row in a round slot holds
 TOP = 20              # the alternatives a token's log-probabilities carry at most (max_top_logprobs)
 PROMPT_TAIL = 8       # a prompt chunk ends this many tokens before the prompt's end, where the prompt cache marks
 PROMPT_CUT = 256      # the shortest prompt cut there: a shorter one is prefilled whole in about the cut's time
-SCORE_SLICE = 128     # rows of logits a score holds at once (FP32 [rows][vocabulary])
+SCORE_SLICE = 128     # rows of logits a score holds at once at most (FP32 [rows][vocabulary])
+# The bytes a score's slice holds at once at most (score_slice): its FP32 logits and their log-probabilities, the
+# two copies a slice measured at its peak, 8 bytes a logit; 128 rows of a 131,072-token vocabulary.
+SCORE_BYTES = 128 << 20
 FILL = 8192           # positions of zero KV a calibration writes at once
 PASS = "pass"         # a session's phase in a step of a pass that did not end it (passes.py)
 
@@ -311,6 +314,13 @@ class ComposedModel(Shape):
         # else a device weight like any other.
         self.embed_plan = "tables.embed_tokens" if self._embed_in_place(embed_name) else "embed_tokens"
         tensors[self.embed_plan] = ck.nbytes(embed_name)
+        # A head of padded rows: in speed mode up to a multiple of 16 where the file stores that many (an FP8 head's
+        # rows, quantized-projections' cuBLASLt shape), the logits cut back to the vocabulary
+        head_name = "lm_head" if not tied else prefix + "embed_tokens"
+        self.head_rows = self.vocabulary
+        if self.speed and self.vocabulary % 16:
+            self.head_rows = min(-(-self.vocabulary // 16) * 16, self.matrices.rows(head_name))
+        self._held_bytes(tensors, head_name, tied, tuple(experts_prefixes))
         tensors.update({name: nbytes for name, (nbytes, _) in tables.items()})
         tensors.update({"kv": kv_bytes, "states": state_bytes, "activations": self.activations})
         # A drafter technique's cache positions a round slot: the KV's, a round's width and the rows its pass writes
@@ -363,12 +373,6 @@ class ComposedModel(Shape):
 
         # -- the layers ------------------------------------------------------------------------------------------------
         self.residual.load(prefix)
-        head_name = "lm_head" if not tied else prefix + "embed_tokens"
-        # A head of padded rows: in speed mode up to a multiple of 16 where the file stores that many (an FP8 head's
-        # rows, quantized-projections' cuBLASLt shape), the logits cut back to the vocabulary
-        self.head_rows = self.vocabulary
-        if self.speed and self.vocabulary % 16:
-            self.head_rows = min(-(-self.vocabulary // 16) * 16, self.matrices.rows(head_name))
         self.head = self.matrices.load([head_name], "head", rows=self.head_rows)
         self.rope = Rope(config, self.head_dim, self.device)
         scale = layout.get("embed_scale")
@@ -445,7 +449,10 @@ class ComposedModel(Shape):
         self.state_keys = [k for k in self.pools if k == "states" or k in windows_declared]
         aside = set(self.draft_keys) | set(self.state_keys)
         self.kv_keys = [k for k in self.pools if k not in aside]
-        self.pool = self.pools.get("kv") or self.pools[self.kv_keys[0]]
+        # The pool a kept sequence's length is read from and the prompt cache is priced against: a full one where any
+        # holds every position (a sliding window's ring holds at most its ring of a sequence).
+        self.pool = self.pools.get("kv") or next((self.pools[k] for k in self.kv_keys
+                                                  if not getattr(self.pools[k], "sliding", 0)), self.pools[self.kv_keys[0]])
         self.kv_pools = [self.pools[k] for k in self.kv_keys]
         self.state_pools = [self.pools[k] for k in self.state_keys]
         self.draft_pools = [self.pools[k] for k in self.draft_keys]
@@ -671,6 +678,39 @@ class ComposedModel(Shape):
         files = {"paths": [str(ck.headers[n].shard) for n in names],
                  "offsets": [int(ck.headers[n].data_begin) for n in names], "rows": [int(ck.shape(n)[0]) for n in names]}
         return self.embeddings.open(files, width, torch.bfloat16, self.device, format=fmt)
+
+    def _held_bytes(self, tensors, head_name, tied, experts):
+        """The plan's bytes of each target matrix stored in 16 bits as the projections slot holds it (its held_bytes:
+        quality mode speed's FP8 trunk and head, the roles it keeps, its row padding and the shapes it keeps as
+        stored) instead of its stored bytes, and the head's own device copy where the head is the embedding table
+        (tied): loaded through the slot, it is a matrix of its own beside the table, on the device or off it. A slot
+        without held_bytes holds every matrix as stored. The plan does not know a trunk matrix's role before its block
+        loads it, so each is priced as held_bytes prices a role it does not know; the routed experts are the experts
+        slot's and a draft layer's matrices a drafter's (stored bytes)."""
+        held = getattr(self.parts["projections"], "held_bytes", None)
+        ck, draft = self.ck, (self.draft_prefix,) if self.mtp else ()
+
+        def sixteen(base):   # a matrix stored in 16 bits under its .weight name, as the slot's load takes it (BF16)
+            return self.matrices.has(base) and self.matrices.format(base) == "bf16" and base + ".weight" in ck                 and len(ck.shape(base + ".weight")) == 2
+
+        def bytes_of(base, role, rows=None):
+            stored_rows, columns = ck.shape(base + ".weight")
+            rows = stored_rows if rows is None else min(rows, stored_rows)
+            return held("bf16", rows, columns, rows * columns * 2, role)
+        if held is not None:
+            for name in list(tensors):
+                base = name[:-len(".weight")] if name.endswith(".weight") else None
+                if base is not None and base != head_name and not base.startswith(experts + draft) and sixteen(base):
+                    tensors[name] = bytes_of(base, None)
+        if not sixteen(head_name):   # a quantized head is held as stored: a tied one its stored tensors once more
+            if tied:
+                tensors["head"] = sum(ck.nbytes(n) for n in ck.names() if n.startswith(head_name + "."))
+            return
+        head = bytes_of(head_name, "head", self.head_rows) if held is not None else self.head_rows *             ck.shape(head_name + ".weight")[1] * 2
+        if tied:
+            tensors["head"] = head
+        elif head_name + ".weight" in tensors:
+            tensors[head_name + ".weight"] = head
 
     def _embedding(self, name):
         """The token embeddings through the embeddings slot: on the device where the plan put them, else read in
@@ -1065,6 +1105,7 @@ class ComposedModel(Shape):
             tokens += s.prompt[first + 1:first + 1 + count]
             index += range(at, at + count)
         batch = StepBatch.build(packed, self.device)
+        batch.prompts = frozenset(range(batch.rows))
         ctx = Context(self, batch, [(batch.starts[r], batch.starts[r + 1], True) for r in range(batch.rows)],
                       self._reserve(batch, self.draft_keys))
         x = self._mtp_input(torch.tensor(tokens, dtype=torch.int64, device=self.device),
@@ -1087,8 +1128,8 @@ class ComposedModel(Shape):
             logits = self.rows.matmul(h, matrix, groups).float()
         if logits.shape[-1] > self.vocabulary:
             logits = logits[..., :self.vocabulary]
-        if self.softcap:   # the family's cap on its logits: cap * tanh(logits / cap)
-            logits = self.torch.tanh(logits / self.softcap) * self.softcap
+        if self.softcap:   # the family's cap on its logits: cap * tanh(logits / cap), one FP32 copy, not two
+            logits = (logits / self.softcap).tanh_().mul_(self.softcap)
         return logits
 
     def step_bytes(self):
@@ -1159,8 +1200,11 @@ class ComposedModel(Shape):
 
     def _trim(self, tokens=0):
         """Kept sequences hold only pages no open request has reserved, less those a score of `tokens` takes: the
-        least recently used leave first."""
+        least recently used leave first. Where every KV pool is a sliding window's ring, a kept sequence holds at most
+        its ring and the pools' pages are not the reservations': the pools evict when they run short (on_exhausted)."""
         pool = self.pool
+        if getattr(pool, "sliding", 0):
+            return
         while self.cache.kept and (sum(-(-len(entry.tokens) // pool.page) for entry in self.cache.kept.values())
                                    > pool.pages - self.reservations.reserved - -(-tokens // pool.page)):
             self.cache.evict()
@@ -1469,9 +1513,16 @@ class ComposedModel(Shape):
         fit = int(free // per) // QUANTUM * QUANTUM
         return max(QUANTUM, min(rows, fit))
 
+    def score_slice(self):
+        """The rows of logits score() holds at once: SCORE_SLICE, fewer where their two FP32 copies (the logits and
+        their log-probabilities) would pass SCORE_BYTES (a 262,144-token vocabulary: 64 rows, where 128 rows with a
+        logit cap took 384 MiB, a long score's allocation past the engine's headroom). A row's scores are its own
+        whatever the slice (decode rows' arithmetic)."""
+        return max(1, min(SCORE_SLICE, SCORE_BYTES // (2 * 4 * max(1, int(self.vocabulary)))))
+
     def score(self, ids, first_target, path="", queries=None, top_k=0):
         """A fixed text's scores through the prompt path, in the prompt's spans, each chunk's KV and recurrent state
-        kept for the next; the logits of the scored rows SCORE_SLICE at a time."""
+        kept for the next; the logits of the scored rows score_slice() at a time."""
         torch = self.torch
         sequence = ("score", self.handles)
         wanted = range(first_target - 1, len(ids) - 1)
@@ -1483,10 +1534,12 @@ class ComposedModel(Shape):
             if key not in self.draft_keys:
                 pool.open(sequence)
 
+        slice_rows = self.score_slice()
+
         def rows(start, end, h):
             """The scores of the scored positions among [start, end), from their head rows h."""
-            for lo in range(max(start, wanted.start), end, SCORE_SLICE):
-                hi = min(lo + SCORE_SLICE, end)
+            for lo in range(max(start, wanted.start), end, slice_rows):
+                hi = min(lo + slice_rows, end)
                 logp = torch.log_softmax(self._logits_rows(h[lo - start:hi - start]), -1)
                 nxt = torch.tensor(ids[lo + 1:hi + 1], dtype=torch.int64, device=self.device)
                 target.extend(logp.gather(1, nxt[:, None])[:, 0].tolist())

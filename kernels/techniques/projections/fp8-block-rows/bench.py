@@ -134,14 +134,18 @@ class GemmStaged(Gemm):
     def valid(self, knobs):
         """A warp tile of whole 16 x 8 MMA tiles, at least 2 warps, a CTA's registers within an SM's (an output holds
         GROUP running lanes and the partial sums still needed: 5 registers, 6 with GROUP 4; about 48 more a thread),
-        and the ring within a CTA's shared memory (the GPU's opt-in limit)."""
+        a thread's token copies in one slot, and the plan and the ring within a CTA's shared memory (the GPU's opt-in
+        limit; a stage: each slot's weight rows and scales, then each token's blocks of the visit side by side)."""
         bm, bn, wm, wn, group = knobs["BM"], knobs["BN"], knobs["WM"], knobs["WN"], knobs["GROUP"]
         if bm % (16 * wm) or bn % (8 * wn) or wm * wn < 2:
             return False
+        slots = group * knobs["RUN"]
+        if (32 * wm * wn) % (2 * slots):
+            return False
         outputs = 4 * (bm // wm // 16) * (bn // wn // 8)
-        stage = group * knobs["RUN"] * ((bm + bn) * 36 + 4 * bm)
+        stage = slots * (40 * bm + 4 * bn) + bn * (32 * slots + (32 if slots > 1 else 0))
         regs = (outputs * (6 if group == 4 else 5) + 48 + 7) // 8 * 8
-        return regs <= 208 and 32 * wm * wn * regs <= 65536 and knobs["STAGES"] * stage <= shared_memory_optin()
+        return regs <= 208 and 32 * wm * wn * regs <= 65536 and 2048 + knobs["STAGES"] * stage <= shared_memory_optin()
 
     def check(self, got, want, s):
         """Within FP32 accumulation of the FP64 reference, and the bits of the untuned build's `gemm` (the declared
@@ -164,11 +168,17 @@ class GemmStaged(Gemm):
         module.gemm(self._table(module, s), self._jobs[jk], s["key"][0], s["rows"], s["x"], s["xs"], GROUP, out)
 
     def run(self, module, s):
+        """The staged GEMM on the activations in its visit order (quantize(order=VISIT)'s layout of the same codes and
+        scales, made once a token count: the plugin's prompt rows take it)."""
         table, out = self._table(module, s), self._out(s)
         jk = ("gemm", s["key"], s["rows"])
         if jk not in self._jobs:
             self._jobs[jk] = module.gemm_jobs([(0, 0, s["rows"])], s["x"].device)
-        module.gemm_staged(table, self._jobs[jk], s["key"][0], s["rows"], s["x"], s["xs"], GROUP, out)
+        vk = ("visit", s["key"][1], s["rows"])
+        if vk not in self._jobs:
+            self._jobs[vk] = module.to_visit_order(s["x"], s["xs"])
+        codes, scales = self._jobs[vk]
+        module.gemm_staged(table, self._jobs[jk], s["key"][0], s["rows"], codes, scales, GROUP, out, order=module.VISIT)
         return out
 
 

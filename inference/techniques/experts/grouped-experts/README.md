@@ -107,7 +107,8 @@ MXFP8 layer beside NVFP4 ones) run the tensor arithmetic.
 more) run in the kernel's `fp4-prompt` items of 32 routes or its `fp4-tile` block tile's items of 64. `auto` (the
 default) takes the one the engine's sweep report of grouped-experts timed faster on this device at the call's tokens,
 both passes added (`crit_kernels.select`, the report beside the engine's tuning and swept on this GPU's model), and
-`fp4-prompt` where no report times both; `fp4-prompt` and `fp4-tile` choose one. Every route has the same bits in
+`fp4-tile` where no report times both (on an RTX 5090, untuned, 1.01-1.37x fp4-prompt's speed over both passes from
+128 to 8,192 tokens at 2,560 x 640 and 2,048 x 768); `fp4-prompt` and `fp4-tile` choose one. Every route has the same bits in
 either; the facts name each shape's choice and why (`prompt_items`).
 
 A long prompt chunk runs in parts of the tokens `workspace_mib` holds (the route rows of a call, at most 65,535 kernel

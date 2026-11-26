@@ -5,6 +5,7 @@
   "title": "A routed layer's CPU share joined inside a CUDA stream: the CPU tier's routes posted into a slot of one of the host's handoffs by one kernel, the CPU's rows scattered into the device part's route rows after the join by another, capture-safe",
   "package": "cpu_routes",
   "language": "cuda",
+  "launches": ["post_kernel", "scatter_kernel"],
   "host_include": true,
   "operations": [
     "cpu-route-handoff"

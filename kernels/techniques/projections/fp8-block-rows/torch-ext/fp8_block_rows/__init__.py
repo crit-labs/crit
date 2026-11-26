@@ -13,11 +13,15 @@ from ._crit_aliases import module as _alias
 from ._ops import ops
 
 __all__ = ["NATIVE_BF16_OUT", "matrix_table", "row_jobs", "gemm_jobs", "rows", "gemm", "gemm_staged", "gemm_native",
-           "gemm_native_channel", "quantize", "quantized_values", "MX", "AMAX"]
+           "gemm_native_channel", "quantize", "quantized_values", "to_visit_weights", "visit_positions",
+           "to_visit_order", "MX", "AMAX", "PLAIN", "VISIT"]
 
 NATIVE_BF16_OUT = True   # gemm_native and gemm_native_channel take a BF16 out (the FP32 sums rounded once)
 MX, AMAX = 0, 1                          # activation scale kinds: MXFP8's 2^(floor(log2 amax) - 8), or amax / 448
-_MATRIX = struct.Struct("<QQiiiifi")     # Matrix: codes, scales, rows, cols, scale_rows, scale_k, post, scale_e8m0
+PLAIN, VISIT = 0, 1                      # block orders: plain, or the visit order (activations: gemm_staged's and
+                                         # quantize's; weights: matrix_table's order, to_visit_weights)
+_MATRIX = struct.Struct("<QQiiiifii4x")  # Matrix: codes, scales, rows, cols, scale_rows, scale_k, post, scale_e8m0,
+                                         # order (the weight codes' blocks), padding
 _ROW_JOB = struct.Struct("<ii8i8i")      # RowJob: matrix, tokens, act_row[8], out_row[8]
 _GEMM_JOB = struct.Struct("<iii")        # GemmJob: matrix, first, count
 
@@ -27,18 +31,26 @@ def _device_bytes(packed: bytes, device) -> torch.Tensor:
 
 
 def matrix_table(matrices: Sequence, device=None) -> torch.Tensor:
-    """One Matrix per (codes [rows, cols] uint8 E4M3, scales, scale_rows, scale_k, post) of CUDA tensors. scales are
-    fp32 [ceil(rows / scale_rows), cols / scale_k], or uint8 E8M0 bytes as an MXFP8 checkpoint stores them. The table
-    holds the tensors' pointers: keep them alive while it is used."""
-    packed, channel = b"", True
-    for codes, scales, scale_rows, scale_k, post in matrices:
+    """One Matrix per (codes [rows, cols] uint8 E4M3, scales, scale_rows, scale_k, post[, order]) of CUDA tensors.
+    scales are fp32 [ceil(rows / scale_rows), cols / scale_k], or uint8 E8M0 bytes as an MXFP8 checkpoint stores them.
+    order: PLAIN codes, or VISIT codes (to_visit_weights: each row's blocks of 32 in the visit order, stored once at
+    load), which rows, gemm and gemm_staged read with the same bits and the native GEMMs refuse. The table holds the
+    tensors' pointers: keep them alive while it is used."""
+    packed, channel, visit = b"", True, False
+    for entry in matrices:
+        codes, scales, scale_rows, scale_k, post = entry[:5]
+        order = int(entry[5]) if len(entry) > 5 else PLAIN
         if scales.dtype not in (torch.float32, torch.uint8):
             raise ValueError("scales are fp32 or uint8 E8M0")
+        if order not in (PLAIN, VISIT) or (order == VISIT and codes.size(1) % 32):
+            raise ValueError("a matrix's order is PLAIN or VISIT (whole blocks of 32 a row)")
         packed += _MATRIX.pack(codes.data_ptr(), scales.data_ptr(), codes.size(0), codes.size(1), int(scale_rows),
-                               int(scale_k), float(post), int(scales.dtype == torch.uint8))
+                               int(scale_k), float(post), int(scales.dtype == torch.uint8), order)
         channel = channel and scales.dtype == torch.float32 and int(scale_k) == codes.size(1)
+        visit = visit or order == VISIT
     table = _device_bytes(packed, device or matrices[0][0].device)
     table.crit_channel = channel   # every matrix's scales constant along K: gemm_native may take the channel GEMM
+    table.crit_visit = visit       # a matrix in the visit order: the native GEMMs (plain codes only) refuse the table
     return table
 
 
@@ -68,10 +80,11 @@ def gemm(table, jobs, max_rows, max_count, codes, scales, group, out):
     ops.gemm(table, jobs, max_rows, max_count, codes, scales, group, out)
 
 
-def gemm_staged(table, jobs, max_rows, max_count, codes, scales, group, out):
+def gemm_staged(table, jobs, max_rows, max_count, codes, scales, group, out, order=PLAIN):
     """gemm with shared-memory staging (structure gemm-staged): the same bits, faster on prompt chunks. codes' rows
-    16-byte aligned (cols a multiple of 16)."""
-    ops.gemm_staged(table, jobs, max_rows, max_count, codes, scales, group, out)
+    16-byte aligned (cols a multiple of 16). order: PLAIN activations, or quantize(order=VISIT)'s (faster: a visit's
+    blocks of a token one contiguous piece)."""
+    ops.gemm_staged(table, jobs, max_rows, max_count, codes, scales, group, order, out)
 
 
 def gemm_native(table, jobs, max_rows, max_count, codes, scales, group, out, mx=True):
@@ -82,6 +95,8 @@ def gemm_native(table, jobs, max_rows, max_count, codes, scales, group, out, mx=
     any other scales run the generic path; per-channel scales (a table whose matrices' scales are constant along K and
     one activation scale a token) the channel GEMM (gemm_native_channel). out fp32 or bf16 (the sums times post
     rounded once). codes' rows 16-byte aligned."""
+    if getattr(table, "crit_visit", False):
+        raise ValueError("gemm_native reads plain weight codes: a matrix of this table is in the visit order")
     if not mx and scales.size(1) == 1 and getattr(table, "crit_channel", False):
         return gemm_native_channel(table, jobs, max_rows, max_count, codes, scales, out)
     ops.gemm_native(table, jobs, max_rows, max_count, codes, scales, group, bool(mx), out)
@@ -94,15 +109,59 @@ def gemm_native_channel(table, jobs, max_rows, max_count, codes, scales, out):
     token scale x weight scale x post applied in the epilogue, out fp32 or bf16 (rounded once). Not the declared
     order, not row invariant. gemm_native(mx=False) takes it for such a table (matrix_table's crit_channel) and such
     scales. A matrix that is not channel-scaled gets NaN outputs. codes' rows 16-byte aligned."""
+    if getattr(table, "crit_visit", False):
+        raise ValueError("gemm_native_channel reads plain weight codes: a matrix of this table is in the visit order")
     ops.gemm_native_channel(table, jobs, max_rows, max_count, codes, scales, out)
 
 
-def quantize(x: torch.Tensor, group: int = 32, kind: int = MX):
-    """x [rows, cols] fp32 or bf16 -> (codes uint8 E4M3, scales fp32 per group): crit's declared quantizer."""
+def quantize(x: torch.Tensor, group: int = 32, kind: int = MX, order: int = PLAIN):
+    """x [rows, cols] fp32 or bf16 -> (codes uint8 E4M3, scales fp32 per group): crit's declared quantizer. order
+    PLAIN: codes [rows, cols], scales [rows, cols / group]; VISIT, for gemm_staged only: the same codes with each row's
+    blocks of 32 in the kernel core's visit order (visit_positions), scales [cols / group, rows]."""
     codes = torch.empty(x.shape, dtype=torch.uint8, device=x.device)
-    scales = torch.empty(x.size(0), x.size(1) // group, dtype=torch.float32, device=x.device)
-    ops.quantize(x.contiguous(), group, kind, codes, scales)
+    shape = (x.size(1) // group, x.size(0)) if order == VISIT else (x.size(0), x.size(1) // group)
+    scales = torch.empty(shape, dtype=torch.float32, device=x.device)
+    ops.quantize(x.contiguous(), group, kind, order, codes, scales)
     return codes, scales
+
+
+def visit_positions(cols: int) -> list:
+    """Where the visit order keeps each block of 32 of a row of `cols` codes (the kernel core's VisitOrder): the tree's
+    steps in sibling pairs, a pair's blocks interleaved by their index along the lane, the pairs in the tree's order."""
+    blocks = cols // 32
+    lane_at = [int(f"{at:04b}"[::-1], 2) for at in range(16)]
+    count = [len(range(lane_at[at], blocks, 16)) for at in range(16)]
+    pos = [0] * blocks
+    start = 0
+    for pair in range(8):
+        for at in (2 * pair, 2 * pair + 1):
+            for k in range(count[at]):
+                pos[lane_at[at] + 16 * k] = start + 2 * k + (at & 1)
+        start += count[2 * pair] + count[2 * pair + 1]
+    return pos
+
+
+def to_visit_order(codes: torch.Tensor, scales: torch.Tensor):
+    """Plain activations (codes [rows, cols], scales [rows, groups]) in gemm_staged's visit order: the same bytes as
+    quantize(order=VISIT) gives."""
+    rows, cols = codes.shape
+    pos = torch.tensor(visit_positions(cols), device=codes.device)
+    out = torch.empty_like(codes).view(rows, cols // 32, 32)
+    out[:, pos] = codes.view(rows, cols // 32, 32)
+    return out.view(rows, cols), scales.t().contiguous()
+
+
+def to_visit_weights(codes: torch.Tensor) -> torch.Tensor:
+    """A matrix's codes [rows, cols] (plain) in the visit order, a new tensor: each row's blocks of 32 where the kernel
+    core's VisitOrder keeps them (visit_positions), for matrix_table's order VISIT. The scales stay as they are (they
+    follow a block's index, not its position)."""
+    rows, cols = codes.shape
+    if cols % 32:
+        raise ValueError("the visit order takes whole blocks of 32 a row")
+    pos = torch.tensor(visit_positions(cols), device=codes.device)
+    out = torch.empty_like(codes).view(rows, cols // 32, 32)
+    out[:, pos] = codes.reshape(rows, cols // 32, 32)
+    return out.view(rows, cols)
 
 
 def quantized_values(x: torch.Tensor, group: int = 32, kind: int = MX):

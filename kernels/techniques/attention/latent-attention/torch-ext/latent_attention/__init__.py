@@ -50,6 +50,43 @@ def _knobs(key, rows, structure="window"):
     return _KNOBS[at]
 
 
+# (launch, its geometry, knobs) -> the knobs that fit the device's shared memory (_fitted)
+FITTED = {}
+
+
+def _smaller(knobs):
+    """The knobs one step smaller in shared memory and no other way: a pipeline stage fewer, else half the query rows
+    a program (neither an order knob: a token's bits stay its own), or None at STAGES 1 and BLOCK_M 16."""
+    if int(knobs["STAGES"]) > 1:
+        return {**knobs, "STAGES": int(knobs["STAGES"]) - 1}
+    if int(knobs["BLOCK_M"]) > 16:
+        return {**knobs, "BLOCK_M": int(knobs["BLOCK_M"]) // 2}
+    return None
+
+
+def _fitted(launch, structure, at, knobs):
+    """launch(knobs) with knobs whose tiles this device's shared memory holds: the structure's knobs, else the first
+    of their _smaller steps that fits, found once a geometry (FITTED), since a default or a tuning made on a GPU of
+    more shared memory need not fit this one (the window tiles of rank 512 and rotary width 128 at 64 rows and three
+    stages take 110,784 bytes; sm_120 opts into 101,376). The knobs a sweep selected for the structure
+    (crit_kernels.build.select) are launched as they are, so a configuration that does not fit fails and the sweep
+    drops it."""
+    key = (at, tuple(sorted(knobs.items())))
+    found = FITTED.get(key, knobs)
+    while True:
+        try:
+            out = launch(found)
+        except triton.runtime.errors.OutOfResources as error:
+            selected = structure in (getattr(_crit_tuning, "SELECTED", None) or ())
+            smaller = None if selected or "shared memory" not in str(error) else _smaller(found)
+            if smaller is None:
+                raise
+            found = smaller
+            continue
+        FITTED[key] = found
+        return out
+
+
 def _hardware_fp8(device):
     """The GPU converts E4M3 itself (compute capability 8.9 on)."""
     return torch.cuda.get_device_capability(device) >= (8, 9)
@@ -133,22 +170,24 @@ def prefill(q, cache, table, position, page, *, rank, scale=None, out: Optional[
     if T < 1 or table.dim() != 1:
         raise ValueError("a prompt chunk is one token or more over one page table [pages]")
     device = q.device
-    knobs = _knobs({"R": R, "P": P, "H": H, "PAGE": int(page), "KIND": int(fp8)}, T, "prompt")
-    vsplit = int(knobs["VSPLIT"])
-    bm = int(knobs["BLOCK_M"])
+    key = {"R": R, "P": P, "H": H, "PAGE": int(page), "KIND": int(fp8)}
+    knobs = _knobs(key, T, "prompt")
     out = torch.empty(T, H, R, dtype=q.dtype, device=device) if out is None else out
     on_device = torch.is_tensor(position)
     codes = cache.view(torch.uint8) if fp8 else cache
     dummy = out if lse is None else lse
-    grid = (triton.cdiv(T * H, bm) * vsplit,)
-    _kernels._prompt_kernel[grid](q, codes, scales if fp8 else dummy, table, position if on_device else table, out,
-                                  lse if lse is not None else dummy, sinks if sinks is not None else dummy, table,
-                                  table, T, 0 if on_device else int(position), q.stride(0), q.stride(1), out.stride(0),
-                                  out.stride(1), 0, float(scale if scale is not None else width ** -0.5), H=H, R=R, P=P,
-                                  BLOCK_M=bm, PIECE=int(knobs["PIECE"]), PAGE=page, VSPLIT=vsplit, FP8=fp8,
-                                  HW_FP8=_hardware_fp8(device), SCALES=int(scales.shape[-1]) if fp8 else 2,
-                                  POS_T=on_device, LSE=lse is not None, SINKS=sinks is not None, RAGGED=False,
-                                  num_warps=int(knobs["WARPS"]), num_stages=int(knobs["STAGES"]))
+
+    def launch(k):
+        vsplit, bm = int(k["VSPLIT"]), int(k["BLOCK_M"])
+        _kernels._prompt_kernel[(triton.cdiv(T * H, bm) * vsplit,)](
+            q, codes, scales if fp8 else dummy, table, position if on_device else table, out,
+            lse if lse is not None else dummy, sinks if sinks is not None else dummy, table, table, T,
+            0 if on_device else int(position), q.stride(0), q.stride(1), out.stride(0), out.stride(1), 0,
+            float(scale if scale is not None else width ** -0.5), H=H, R=R, P=P, BLOCK_M=bm, PIECE=int(k["PIECE"]),
+            PAGE=page, VSPLIT=vsplit, FP8=fp8, HW_FP8=_hardware_fp8(device), SCALES=int(scales.shape[-1]) if fp8 else 2,
+            POS_T=on_device, LSE=lse is not None, SINKS=sinks is not None, RAGGED=False, num_warps=int(k["WARPS"]),
+            num_stages=int(k["STAGES"]))
+    _fitted(launch, "prompt", ("prompt", *key.values(), lse is not None, sinks is not None, on_device, device.index), knobs)
     return out
 
 
@@ -189,19 +228,23 @@ def prefill_rows(q, cache, tables, starts, counts, positions, page, *, rank, sca
     if not starts or any(x < 0 or n < 1 or x + n > T for x, n in zip(starts, counts)):
         raise ValueError("each row's tokens lie in q, one row or more")
     device = q.device
-    knobs = _knobs({"R": R, "P": P, "H": H, "PAGE": int(page), "KIND": int(fp8)}, T, "prompt")
-    vsplit, bm = int(knobs["VSPLIT"]), int(knobs["BLOCK_M"])
-    tiles, meta = _ragged_plan(device, bm, H, starts, counts, positions)
+    key = {"R": R, "P": P, "H": H, "PAGE": int(page), "KIND": int(fp8)}
+    knobs = _knobs(key, T, "prompt")
     out = torch.empty(T, H, R, dtype=q.dtype, device=device) if out is None else out
     codes = cache.view(torch.uint8) if fp8 else cache
     dummy = out if lse is None else lse
-    _kernels._prompt_kernel[(tiles.shape[0] * vsplit,)](
-        q, codes, scales if fp8 else dummy, tables, tables, out, lse if lse is not None else dummy,
-        sinks if sinks is not None else dummy, tiles, meta, T, 0, q.stride(0), q.stride(1), out.stride(0),
-        out.stride(1), tables.stride(0), float(scale if scale is not None else width ** -0.5), H=H, R=R, P=P,
-        BLOCK_M=bm, PIECE=int(knobs["PIECE"]), PAGE=page, VSPLIT=vsplit, FP8=fp8, HW_FP8=_hardware_fp8(device),
-        SCALES=int(scales.shape[-1]) if fp8 else 2, POS_T=False, LSE=lse is not None, SINKS=sinks is not None,
-        RAGGED=True, num_warps=int(knobs["WARPS"]), num_stages=int(knobs["STAGES"]))
+
+    def launch(k):
+        vsplit, bm = int(k["VSPLIT"]), int(k["BLOCK_M"])
+        tiles, meta = _ragged_plan(device, bm, H, starts, counts, positions)
+        _kernels._prompt_kernel[(tiles.shape[0] * vsplit,)](
+            q, codes, scales if fp8 else dummy, tables, tables, out, lse if lse is not None else dummy,
+            sinks if sinks is not None else dummy, tiles, meta, T, 0, q.stride(0), q.stride(1), out.stride(0),
+            out.stride(1), tables.stride(0), float(scale if scale is not None else width ** -0.5), H=H, R=R, P=P,
+            BLOCK_M=bm, PIECE=int(k["PIECE"]), PAGE=page, VSPLIT=vsplit, FP8=fp8, HW_FP8=_hardware_fp8(device),
+            SCALES=int(scales.shape[-1]) if fp8 else 2, POS_T=False, LSE=lse is not None, SINKS=sinks is not None,
+            RAGGED=True, num_warps=int(k["WARPS"]), num_stages=int(k["STAGES"]))
+    _fitted(launch, "prompt", ("prompt_rows", *key.values(), lse is not None, sinks is not None, device.index), knobs)
     return out
 
 
@@ -244,35 +287,45 @@ def attend(q, cache, tables, rows, starts, firsts, columns, page, *, rank, count
     key = {"R": R, "P": P, "H": H, "PAGE": int(page), "KIND": int(fp8)}
     knobs = _knobs(key, columns)
     parts = partitions(device, H, R, P, page, int(fp8))
-    bm = max(16, min(int(knobs["BLOCK_M"]), triton.next_power_of_2(columns * H)))
     piece = int(knobs["PIECE"])
+
+    def rows_a_program(k):
+        return max(16, min(int(k["BLOCK_M"]), triton.next_power_of_2(columns * H)))
     out = torch.empty(T, H, R, dtype=q.dtype, device=device) if out is None else out
     partial = B * columns * H * parts
     scale = float(scale if scale is not None else width ** -0.5)
     count_ptr = counts if counts is not None else starts
-    vsplit = int(knobs["VSPLIT"])
     codes = cache.view(torch.uint8) if fp8 else cache
+    at = (*key.values(), columns, counts is not None, device.index)
     if fused is None:
         fused = partial * (R + 2) * 4 > PARTIAL_BYTES
     if fused:
         dummy = out if lse is None else lse
-        _kernels._fused_kernel[(triton.cdiv(columns * H, bm) * vsplit, B)](
-            q, codes, scales if fp8 else dummy, tables, rows, starts, count_ptr, firsts, out,
-            lse if lse is not None else dummy, sinks if sinks is not None else dummy, q.stride(0), q.stride(1),
-            tables.stride(0), tables.shape[1], parts, scale, columns, out.stride(0), out.stride(1), H=H, R=R, P=P,
-            COLS=columns, BLOCK_M=bm, PIECE=piece, PAGE=page, COUNTS=counts is not None, VSPLIT=vsplit, FP8=fp8,
-            HW_FP8=_hardware_fp8(device), SCALES=int(scales.shape[-1]) if fp8 else 2, LSE=lse is not None,
-            SINKS=sinks is not None, num_warps=int(knobs["WARPS"]), num_stages=int(knobs["STAGES"]))
+
+        def launch(k):
+            bm, vsplit = rows_a_program(k), int(k["VSPLIT"])
+            _kernels._fused_kernel[(triton.cdiv(columns * H, bm) * vsplit, B)](
+                q, codes, scales if fp8 else dummy, tables, rows, starts, count_ptr, firsts, out,
+                lse if lse is not None else dummy, sinks if sinks is not None else dummy, q.stride(0), q.stride(1),
+                tables.stride(0), tables.shape[1], parts, scale, columns, out.stride(0), out.stride(1), H=H, R=R, P=P,
+                COLS=columns, BLOCK_M=bm, PIECE=piece, PAGE=page, COUNTS=counts is not None, VSPLIT=vsplit, FP8=fp8,
+                HW_FP8=_hardware_fp8(device), SCALES=int(scales.shape[-1]) if fp8 else 2, LSE=lse is not None,
+                SINKS=sinks is not None, num_warps=int(k["WARPS"]), num_stages=int(k["STAGES"]))
+        _fitted(launch, "window", ("fused", *at, lse is not None, sinks is not None), knobs)
         return out
     po = torch.empty(partial * R, dtype=torch.float32, device=device)
     pm = torch.empty(partial, dtype=torch.float32, device=device)
     pl = torch.empty(partial, dtype=torch.float32, device=device)
-    grid = (triton.cdiv(columns * H, bm) * vsplit, parts, B)
-    _kernels._window_kernel[grid](q, codes, scales if fp8 else pm, tables, rows, starts, count_ptr, firsts, po, pm, pl, q.stride(0),
-                                  q.stride(1), tables.stride(0), tables.shape[1], parts, scale, columns, H=H, R=R, P=P,
-                                  COLS=columns, BLOCK_M=bm, PIECE=piece, PAGE=page, COUNTS=counts is not None,
-                                  VSPLIT=vsplit, FP8=fp8, HW_FP8=_hardware_fp8(device),
-                                  SCALES=int(scales.shape[-1]) if fp8 else 2, num_warps=int(knobs["WARPS"]), num_stages=int(knobs["STAGES"]))
+
+    def launch(k):
+        bm, vsplit = rows_a_program(k), int(k["VSPLIT"])
+        _kernels._window_kernel[(triton.cdiv(columns * H, bm) * vsplit, parts, B)](
+            q, codes, scales if fp8 else pm, tables, rows, starts, count_ptr, firsts, po, pm, pl, q.stride(0),
+            q.stride(1), tables.stride(0), tables.shape[1], parts, scale, columns, H=H, R=R, P=P, COLS=columns,
+            BLOCK_M=bm, PIECE=piece, PAGE=page, COUNTS=counts is not None, VSPLIT=vsplit, FP8=fp8,
+            HW_FP8=_hardware_fp8(device), SCALES=int(scales.shape[-1]) if fp8 else 2, num_warps=int(k["WARPS"]),
+            num_stages=int(k["STAGES"]))
+    _fitted(launch, "window", ("window", *at), knobs)
     _kernels._merge_kernel[(columns, H, B)](po, pm, pl, out, lse if lse is not None else pm,
                                             sinks if sinks is not None else pm, starts, count_ptr, firsts, parts,
                                             out.stride(0), out.stride(1), columns, H=H, R=R, COLS=columns,

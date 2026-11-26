@@ -4,6 +4,7 @@ values."""
 import torch
 
 from crit_kernels import contracts
+from crit_kernels.weight_formats import INT4_GROUP, WEIGHTS, int4_matrix, int4_shapes, int4_values, int4_yardstick
 
 E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
 
@@ -119,6 +120,14 @@ def _fp8_codes(n, k, device):
     codes |= torch.randint(0, 2, (n, k), generator=g, dtype=torch.uint8, device=device) << 7
     row_scale = torch.rand(n, generator=g, device=device) / 64 + 1e-3
     return codes, row_scale
+
+
+def _mx_codes(n, k, device):
+    """MXFP8 rows: the FP8 codes of _fp8_codes and an E8M0 exponent a 32 inputs (scales 2^-9 .. 2^0)."""
+    codes, _ = _fp8_codes(n, k, device)
+    g = torch.Generator(device=device).manual_seed(n * 43 + k)
+    exps = torch.randint(118, 128, (n, k // 32), generator=g, dtype=torch.uint8, device=device)
+    return codes, exps
 
 
 def _fp8_yardstick(cache, s):
@@ -273,7 +282,8 @@ class GemvCuda(_Cached):
                 g = torch.Generator(device=device).manual_seed(n * 41 + k)
                 self._matrices[key] = (torch.randn(n, k, generator=g, device=device) / 16).to(torch.bfloat16)
             else:
-                self._matrices[key] = int4_matrix(n, k, group, device)
+                self._matrices[key] = int4_matrix(
+                    n, k, group, torch.Generator(device=device).manual_seed(n * 47 + k + group))
         held = self._matrices[key]
         s = {"weights": w, "x": _activations(rows, k, device), "group": group, "key": (w, n, k, group, rows),
              "out": torch.empty(rows, n, device=device, dtype=torch.bfloat16)}
@@ -339,7 +349,7 @@ class GemvCuda(_Cached):
         if w == 3:
             weight, x = s["w"], s["x"]
             return lambda: torch.matmul(x, weight.t())
-        return _int4_yardstick(self._matrices, s)
+        return int4_yardstick(self._matrices, s["x"], s["codes"], s["scales"], s["zeros"], s["group"])
 
     def bytes(self, shape, rows):
         w, n, k = int(shape["weights"]), int(shape["N"]), int(shape["K"])

@@ -207,6 +207,17 @@ def quality_terms(correctness, amendments=()):
     return budget, exactness
 
 
+def user_quality_budget(correctness, amendments=()):
+    """The drift limits the user set: the request's quality_budget with each resume's amendment applied in order, the
+    quality mode's defaults left out. What crit run passes crit Eval as its quality budget: Eval applies the mode's
+    limits itself, and a limit passed as the run's own wins over the checkpoint's stored allowance (protocol
+    quality.allowance), so passing the defaults would turn the allowance off."""
+    budget = dict(correctness.get("quality_budget", {}))
+    for change in amendments:
+        budget |= change.get("quality_budget", {})
+    return budget
+
+
 def amendment(value):
     """A resume's change to the run's quality terms, with who approved it."""
     keys(value, {"approved_by"}, {"quality_budget", "exactness"})
@@ -306,9 +317,17 @@ def kv_capacity(data, model, vram_headroom_bytes, reserve_bytes=None, need=0):
     DEFAULT_CONTEXT_TOKENS, 200,000),
     capped by the model's positions and the KV cache that fits on the device next to the companion drafters the
     request names (drafters: folders a candidate may load beside the model). need: the KV the workload's concurrent
-    requests hold at once (kv_need); a wanted context below it is raised to it, never past the model or device."""
+    requests hold at once (kv_need); a wanted context below it is raised to it, never past the model or device.
+    A given kv_tokens beside a device file still records that file (source "given"): Eval reads its rates and
+    limits from it (the prefill ceiling, the TTFT floor), as it does for a derived context."""
     if "kv_tokens" in data:
-        return number(data["kv_tokens"], "KV cache", 1, KV_TOKENS_MAX, integer=True), None
+        tokens = number(data["kv_tokens"], "KV cache", 1, KV_TOKENS_MAX, integer=True)
+        device = Path(text(data["device"], "Device file")).expanduser().resolve() if "device" in data else None
+        if device is None or not device.is_file():
+            return tokens, None
+        probe = read_json(device)
+        return tokens, {"source": "given", **({"device": probe["device"]} if probe.get("device") else {}),
+                        "device_file": str(device), "device_sha256": file_sha(device)}
     if "device" not in data:
         raise ValueError("Request needs device (a crit eval probe result, so the run is built for Eval's max context) "
                          "or an explicit kv_tokens")
@@ -463,8 +482,8 @@ def validate_spec(value):
     hardware = value["hardware_constraints"]
     keys(hardware, {"kv_tokens", "vram_headroom_bytes", "ram_headroom_bytes"}, {"context"})
     number(hardware["kv_tokens"], "KV capacity", 1, KV_TOKENS_MAX, integer=True)
-    if "context" in hardware and (not isinstance(hardware["context"], dict) or hardware["context"].get("source") != "eval"):
-        raise ValueError("A KV capacity basis requires Eval's max context")
+    if "context" in hardware and (not isinstance(hardware["context"], dict) or hardware["context"].get("source") not in ("eval", "given")):
+        raise ValueError("A KV capacity basis is Eval's max context or a given capacity's device file")
     for key in ("vram_headroom_bytes", "ram_headroom_bytes"):
         number(hardware[key], key, 0, 65536 * GIB, integer=True)
     if not isinstance(value["cases"], list) or not 1 <= len(value["cases"]) <= 32:

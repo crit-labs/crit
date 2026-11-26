@@ -36,6 +36,7 @@
 #include "crit_kcore/load.cuh"
 #include "crit_kcore/mma.cuh"
 #include "crit_kcore/mma_fp8.cuh"
+#include "crit_kcore/tile.cuh"
 
 namespace crit::techniques::grouped_experts {
 namespace {
@@ -738,13 +739,22 @@ __global__ void __launch_bounds__(WM * WN * 32) tile_kernel(MmaPass p) {
         unsigned char* ac = base + BHALF;
         unsigned char* as = ac + AROWS * ACW;
         const int st = TERMS == 1 ? ast : ast % steps;   // a later term's step reads the same weights
-        for(int i = threadIdx.x; i < AROWS * 5; i += blockDim.x) {
-            const int j = i / 5, c = i % 5, tile = j >> 4, h = (j >> 3) & 1, gg = j & 7;
+        auto matrix_row = [&](int j, bool& ok) {   // staged row j's matrix row (ok false: a row group past M)
+            const int tile = j >> 4, h = (j >> 3) & 1, gg = j & 7;
             const int g0 = rbase + (tile / TILES) * RT * TILES, tt = tile % TILES;
-            const bool ok = g0 < M;
-            const long long row = !ok ? 0 : GATEUP ? (h ? I : 0) + g0 + 8 * tt + gg : g0 + 16 * tt + 8 * h + gg;
-            if(c < 4) kc::cp_async16(ac + j * ACW + 16 * c, wcodes + row * rowb + 64 * st + 16 * c, ok);
-            else kc::cp_async_ca<8>(as + j * ASW, wscales + row * rows_s + 8 * st, ok);
+            ok = g0 < M;
+            return !ok ? 0LL : GATEUP ? static_cast<long long>((h ? I : 0) + g0 + 8 * tt + gg) : g0 + 16 * tt + 8 * h + gg;
+        };
+        for(int i = threadIdx.x; i < AROWS * 4; i += blockDim.x) {
+            const int j = i >> 2, c = i & 3;
+            bool ok;
+            const long long row = matrix_row(j, ok);
+            kc::cp_async16(ac + j * ACW + 16 * c, wcodes + row * rowb + 64 * st + 16 * c, ok);
+        }
+        for(int j = threadIdx.x; j < AROWS; j += blockDim.x) {
+            bool ok;
+            const long long row = matrix_row(j, ok);
+            kc::cp_async_ca<8>(as + j * ASW, wscales + row * rows_s + 8 * st, ok);
         }
         stage<kFp4>(p, routes, 8 * active, KA, kStepK<kFp4> * ast, kStepK<kFp4>, base);   // commits the group
     };
@@ -773,25 +783,24 @@ __global__ void __launch_bounds__(WM * WN * 32) tile_kernel(MmaPass p) {
             const unsigned char* as = ac + AROWS * ACW;
             uint32_t a[ROWS][4];
             uint2 sa[TILES];
+            const int q = lane >> 3, qr = lane & 7;   // ldmatrix: the lane's matrix and row
 #pragma unroll
             for(int t = 0; t < TILES; ++t) {
+                // matrix q of block m: half q & 1 (rows g, g + 8 of the tile) at chunk 2 m + (q >> 1); lane (g, t4)
+                // gets word t4 of row g of each, a[2t + h][chunk] as the 4-byte reads gave it
+                const unsigned char* row = ac + (((wm * TILES + t) * 2 + (q & 1)) * 8 + qr) * ACW + 16 * (q >> 1);
 #pragma unroll
-                for(int h = 0; h < 2; ++h) {
-                    const unsigned char* row = ac + (((wm * TILES + t) * 2 + h) * 8 + g) * ACW;
-#pragma unroll
-                    for(int i = 0; i < 4; ++i)
-                        a[2 * t + h][i] = *reinterpret_cast<const uint32_t*>(row + 16 * i + 4 * t4);
-                }
+                for(int m = 0; m < 2; ++m)
+                    kc::ldmatrix_x4(a[2 * t][2 * m], a[2 * t + 1][2 * m], a[2 * t][2 * m + 1], a[2 * t + 1][2 * m + 1],
+                                    row + 32 * m);
                 sa[t] = *reinterpret_cast<const uint2*>(as + (((wm * TILES + t) * 2 + (t4 & 1)) * 8 + g) * ASW);
             }
             constexpr int BCW = code_row<kFp4>(kStepK<kFp4>), BSW = scale_row<kFp4>(kStepK<kFp4>);
 #pragma unroll
             for(int n = 0; n < NTW; ++n) {
                 if(n >= act) break;
-                const unsigned char* brow = base + (8 * (n0 + n) + g) * BCW;
-                uint32_t b[4];
-#pragma unroll
-                for(int i = 0; i < 4; ++i) b[i] = *reinterpret_cast<const uint32_t*>(brow + 16 * i + 4 * t4);
+                uint32_t b[4];   // matrix i: the n-tile's 8 route rows at chunk i; lane (g, t4) word t4 of row g
+                kc::ldmatrix_x4(b[0], b[1], b[2], b[3], base + (8 * (n0 + n) + qr) * BCW + 16 * q);
                 const uint2 sb = *reinterpret_cast<const uint2*>(base + 64 * BCW + (8 * (n0 + n) + g) * BSW);
 #pragma unroll
                 for(int m = 0; m < 2; ++m)
@@ -803,6 +812,203 @@ __global__ void __launch_bounds__(WM * WN * 32) tile_kernel(MmaPass p) {
             }
         }
         if(st + 1 == part_end) {   // a part ends: its chain added into total, in part order; the next from zero
+#pragma unroll
+            for(int t = 0; t < TILES; ++t)
+#pragma unroll
+                for(int n = 0; n < NTW; ++n)
+#pragma unroll
+                    for(int i = 0; i < 4; ++i) {
+                        total[t][n][i] = done ? __fadd_rn(total[t][n][i], acc[t][n][i]) : acc[t][n][i];
+                        acc[t][n][i] = 0.0f;
+                    }
+            ++done;
+            part_end = part_step(done + 1);
+        }
+    }
+    if(!live || act == 0) return;
+#pragma unroll
+    for(int t = 0; t < TILES; ++t)
+#pragma unroll
+        for(int n = 0; n < NTW; ++n)
+#pragma unroll
+            for(int i = 0; i < 4; ++i) acc[t][n][i] = total[t][n][i];
+    finish<kFp4, TILES, NTW, GATEUP, ROWS>(p, bundle, wscales, acc, rows, routes + 8 * n0, act, r0, g, t4);
+    }
+}
+
+// fp4-tile's warp-specialized form (PRODUCER 1): tile_kernel's consumer warps, fragments, MMAs and part sums (so its
+// bits), with the block's copies issued by one more warp. The producer runs up to STAGES steps ahead: a step's weight
+// codes are tensor-map boxes of the bundle's rows (TMA, 64-byte rows swizzled as tile.cuh's offset<64>; gate/up: the
+// block's gate rows, then its up rows), the weights' scales and the routes' codes and scales cp.async copies of every
+// lane, all completing the slot's full mbarrier (expect_tx, cp.async.mbarrier.arrive.noinc); a consumer warp done with
+// a slot arrives on its empty mbarrier, so no barrier of the whole block a step. (After the warp-specialized GEMMs of
+// CUTLASS, BSD-3-Clause, as mma-rows' FP4 prompt tile.)
+template <int NT, int TILES, int WM, int WN, int STAGES, bool GATEUP>
+struct WsTile {
+    static constexpr int AROWS = WM * TILES * 16, ASW = 8 + kScalePad;
+    static constexpr int BHALF = half_bytes<kFp4>(128);
+    static constexpr int kW = 0, kB = AROWS * 64, kS = kB + BHALF;
+    static constexpr int SLOT = (kS + AROWS * ASW + 1023) / 1024 * 1024;   // the TMA swizzle's period
+    static constexpr int BOX = GATEUP ? AROWS / 2 : AROWS;                   // rows a box (gate/up: two boxes)
+    static constexpr int SMEM = 1024 + STAGES * SLOT;
+};
+
+template <int NT, int TILES, int WM, int WN, int STAGES, bool GATEUP, int TERMS>
+__global__ void __launch_bounds__((WM * WN + 1) * 32) ws_kernel(MmaPass p, const __grid_constant__ CUtensorMap wmap) {
+    if constexpr(!kHasFp4 || !CRIT_KCORE_HAS_TMA) {
+        (void)p;
+        __trap();
+    } else {
+    using C = WsTile<NT, TILES, WM, WN, STAGES, GATEUP>;
+    constexpr int R = 8 * NT, NTW = NT / WN, ROWS = 2 * TILES, AROWS = C::AROWS, CW = WM * WN;
+    constexpr int ASW = C::ASW, SLOT = C::SLOT;
+    constexpr int RT = GATEUP ? 8 : 16;
+    static_assert(NT % WN == 0 && NT <= 8 && STAGES >= 2, "items of up to 64 routes, two stages or more");
+    static_assert(!GATEUP || TILES % 2 == 0, "FP4's intermediate blocks of 16 rows are tile pairs");
+    static_assert(C::BOX <= 256, "a tensor-map box of at most 256 rows");
+    extern __shared__ __align__(16) unsigned char ws_raw[];
+    unsigned char* smem = ws_raw + ((1024u - (kc::smem_u32(ws_raw) & 1023u)) & 1023u);
+    __shared__ int routes[R];
+    __shared__ __align__(8) uint64_t bars[2 * STAGES];
+    uint64_t* full = bars;
+    uint64_t* empty = bars + STAGES;
+    const int u = blockIdx.y;
+    if(u >= *p.item_count) return;
+    for(int j = threadIdx.x; j < R; j += blockDim.x) routes[j] = p.item_routes[static_cast<long long>(u) * R + j];
+    if(threadIdx.x == 0) {
+#pragma unroll
+        for(int s = 0; s < STAGES; ++s) {
+            kc::mbarrier_init(full + s, 33);   // the producer's lanes, each once its copies landed, and its TMA
+            kc::mbarrier_init(empty + s, CW);
+        }
+        kc::fence_barrier_init();
+    }
+    __syncthreads();
+    int active = 0;
+#pragma unroll
+    for(int n = 0; n < NT; ++n)
+        if(routes[8 * n] >= 0) active = n + 1;
+    const Layout& L = p.layout;
+    const std::uint8_t* bundle = p.store + static_cast<long long>(p.item_slot[u]) * L.bytes;
+    const int H = L.hidden, I = L.inter;
+    const int K = GATEUP ? H : I, M = GATEUP ? I : H;
+    const std::uint8_t* wscales = bundle + (GATEUP ? L.gate_up_scale : L.down_scale);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
+    const int P = k_parts(K), KA = TERMS * K;
+    auto part_step = [&](int q) { return q * (KA / kGroup) / P; };
+    const int rbase = blockIdx.x * WM * RT * TILES;
+    const int steps = K / kStepK<kFp4>, asteps = TERMS * steps, rows_s = K / 16;
+
+    if(warp == CW) {
+        // The producer: step ast into slot ast % STAGES once every consumer warp released it.
+        const int brow = KA / 2, bsrow = KA / 16;   // a route's codes and scales (every term's)
+        const std::uint8_t* bscales = static_cast<const std::uint8_t*>(p.scales);
+        const int routes_live = 8 * active;
+        for(int ast = 0; ast < asteps; ++ast) {
+            const int slot = ast % STAGES;
+            if(ast >= STAGES) kc::mbarrier_wait(empty + slot, uint32_t((ast / STAGES - 1) & 1));
+            unsigned char* base = smem + slot * SLOT;
+            unsigned char* as = base + C::kS;
+            const int st = TERMS == 1 ? ast : ast % steps;
+            auto matrix_row = [&](int j, bool& ok) {
+                const int tile = j >> 4, h = (j >> 3) & 1, gg = j & 7;
+                const int g0 = rbase + (tile / TILES) * RT * TILES, tt = tile % TILES;
+                ok = g0 < M;
+                return !ok ? 0LL
+                           : GATEUP ? static_cast<long long>((h ? I : 0) + g0 + 8 * tt + gg) : g0 + 16 * tt + 8 * h + gg;
+            };
+            if(lane == 0) {   // the step's weight codes: the block's rows as boxes (rows past the matrix read zero)
+                kc::mbarrier_arrive_expect_tx(full + slot, uint32_t(AROWS * 64));
+                kc::tma_load_3d(base + C::kW, &wmap, 64 * st, rbase, p.item_slot[u], full + slot);
+                if constexpr(GATEUP)
+                    kc::tma_load_3d(base + C::kW + C::BOX * 64, &wmap, 64 * st, I + rbase, p.item_slot[u], full + slot);
+            }
+            for(int j = lane; j < AROWS; j += 32) {
+                bool ok;
+                const long long row = matrix_row(j, ok);
+                kc::cp_async_ca<8>(as + j * ASW, wscales + row * rows_s + 8 * st, ok);
+            }
+            // the routes' codes and scales of the step, stage()'s layout
+            constexpr int cw = code_row<kFp4>(kStepK<kFp4>), sw = scale_row<kFp4>(kStepK<kFp4>);
+            unsigned char* bstage = base + C::kB;
+            unsigned char* sbase = bstage + 64 * cw;
+            const int k0 = kStepK<kFp4> * ast;
+            for(int i = lane; i < routes_live * 4; i += 32) {
+                const int j = i >> 2, c = (i & 3) * 16, r = routes[j];
+                kc::cp_async16(bstage + j * cw + c,
+                               p.codes + static_cast<long long>(r >= 0 ? r : 0) * brow + k0 / 2 + c, r >= 0);
+            }
+            for(int j = lane; j < routes_live; j += 32) {
+                const int r = routes[j];
+                kc::cp_async_ca<8>(sbase + j * sw, bscales + static_cast<long long>(r >= 0 ? r : 0) * bsrow + k0 / 16,
+                                   r >= 0);
+            }
+            kc::cp_async_mbarrier_arrive(full + slot);
+        }
+        kc::cp_async_wait_all();
+        return;
+    }
+
+    const int wm = warp / WN, wn = warp % WN;
+    const int r0 = rbase + wm * RT * TILES;
+    const bool live = r0 < M;
+    int rows[ROWS];
+#pragma unroll
+    for(int t = 0; t < TILES; ++t) {
+        rows[2 * t] = GATEUP ? r0 + 8 * t + g : r0 + 16 * t + g;
+        rows[2 * t + 1] = GATEUP ? I + r0 + 8 * t + g : r0 + 16 * t + 8 + g;
+    }
+    const int n0 = wn * NTW;
+    const int act = active - n0 < 0 ? 0 : (active - n0 > NTW ? NTW : active - n0);
+    float acc[TILES][NTW][4], total[TILES][NTW][4];
+#pragma unroll
+    for(int t = 0; t < TILES; ++t)
+#pragma unroll
+        for(int n = 0; n < NTW; ++n)
+#pragma unroll
+            for(int i = 0; i < 4; ++i) acc[t][n][i] = 0.0f;
+    int done = 0, part_end = part_step(1);
+    for(int st = 0; st < asteps; ++st) {
+        const int slot = st % STAGES;
+        kc::mbarrier_wait(full + slot, uint32_t((st / STAGES) & 1));
+        if(live && act > 0) {
+            const unsigned char* base = smem + slot * SLOT;
+            const unsigned char* as = base + C::kS;
+            const unsigned char* bb = base + C::kB;   // the routes' codes and scales
+            uint32_t a[ROWS][4];
+            uint2 sa[TILES];
+            const int q = lane >> 3, qr = lane & 7;
+#pragma unroll
+            for(int t = 0; t < TILES; ++t) {
+                // tile_kernel's staged row j = (tile * 2 + half) * 8 + row: in the boxes gate/up's half h of tile t
+                // is at row h * BOX + 8 t + row, down's at row j
+                const int tg = wm * TILES + t;
+                const int sr = GATEUP ? (q & 1) * C::BOX + 8 * tg + qr : (tg * 2 + (q & 1)) * 8 + qr;
+#pragma unroll
+                for(int m = 0; m < 2; ++m)
+                    kc::ldmatrix_x4(a[2 * t][2 * m], a[2 * t + 1][2 * m], a[2 * t][2 * m + 1], a[2 * t + 1][2 * m + 1],
+                                    base + C::kW + kc::tile::offset<64>(sr, (q >> 1) + 2 * m));
+                sa[t] = *reinterpret_cast<const uint2*>(as + (((wm * TILES + t) * 2 + (t4 & 1)) * 8 + g) * ASW);
+            }
+            constexpr int BCW = code_row<kFp4>(kStepK<kFp4>), BSW = scale_row<kFp4>(kStepK<kFp4>);
+#pragma unroll
+            for(int n = 0; n < NTW; ++n) {
+                if(n >= act) break;
+                uint32_t b[4];
+                kc::ldmatrix_x4(b[0], b[1], b[2], b[3], bb + (8 * (n0 + n) + qr) * BCW + 16 * q);
+                const uint2 sb = *reinterpret_cast<const uint2*>(bb + 64 * BCW + (8 * (n0 + n) + g) * BSW);
+#pragma unroll
+                for(int m = 0; m < 2; ++m)
+#pragma unroll
+                    for(int t = 0; t < TILES; ++t)
+                        kc::mma_nvf4_m16n8k64(acc[t][n], a[2 * t][2 * m], a[2 * t + 1][2 * m], a[2 * t][2 * m + 1],
+                                              a[2 * t + 1][2 * m + 1], b[2 * m], b[2 * m + 1],
+                                              m ? sa[t].y : sa[t].x, m ? sb.y : sb.x);
+            }
+        }
+        __syncwarp();
+        if(lane == 0) kc::mbarrier_arrive(empty + slot);   // the warp is done with the slot
+        if(st + 1 == part_end) {
 #pragma unroll
             for(int t = 0; t < TILES; ++t)
 #pragma unroll
@@ -855,7 +1061,7 @@ cudaError_t launch(const MmaPass& base, const Items& items, cudaStream_t stream)
     return cudaGetLastError();
 }
 
-template <int NT, bool GATEUP, int TILES, int WM, int WN, int STAGES, int TERMS>
+template <int NT, bool GATEUP, int TILES, int WM, int WN, int STAGES, int TERMS, int PRODUCER = 0>
 cudaError_t launch_tile(const MmaPass& base, const Items& items, cudaStream_t stream) {
     MmaPass p = base;
     p.chunk = kStepK<kFp4>;   // the routes staged a step at a time
@@ -864,14 +1070,29 @@ cudaError_t launch_tile(const MmaPass& base, const Items& items, cudaStream_t st
     const dim3 grid((M + rows_per_block - 1) / rows_per_block, items.capacity);
     const size_t bytes = STAGES * static_cast<size_t>(half_bytes<kFp4>(kStepK<kFp4>) +
                                                       WM * TILES * 16 * (64 + kCodePad + 8 + kScalePad));
+    if constexpr(PRODUCER != 0) {
+        using C = WsTile<NT, TILES, WM, WN, STAGES, GATEUP>;
+        const Layout& L = p.layout;
+        const int K = GATEUP ? L.hidden : L.inter;
+        CUtensorMap wmap{};
+        // the store's matrices of this pass, one a slot: [slots][rows][K / 2] bytes (the slot count only bounds reads)
+        if(kc::make_tensor_map_3d(&wmap, CU_TENSOR_MAP_DATA_TYPE_UINT8, p.store + (GATEUP ? L.gate_up : L.down),
+                                  uint64_t(1) << 24, uint64_t(GATEUP ? 2 * L.inter : L.hidden), uint64_t(K / 2),
+                                  uint64_t(K / 2), uint64_t(L.bytes), uint32_t(C::BOX), 64u,
+                                  CU_TENSOR_MAP_SWIZZLE_64B) != CUDA_SUCCESS)
+            return cudaErrorInvalidValue;
+        auto kernel = ws_kernel<NT, TILES, WM, WN, STAGES, GATEUP, TERMS>;
+        static kc::PerDevice<cudaError_t> optin_ws;
+        if(const cudaError_t e = kc::shared_memory_optin(optin_ws, kernel, C::SMEM); e != cudaSuccess) return e;
+        kernel<<<grid, (WM * WN + 1) * 32, C::SMEM, stream>>>(p, wmap);
+        return cudaGetLastError();
+    }
+    auto kernel = tile_kernel<NT, TILES, WM, WN, STAGES, GATEUP, TERMS>;
     if(bytes > 48 * 1024) {
         static kc::PerDevice<cudaError_t> optin;
-        if(const cudaError_t e =
-               kc::shared_memory_optin(optin, tile_kernel<NT, TILES, WM, WN, STAGES, GATEUP, TERMS>, int(bytes));
-           e != cudaSuccess)
-            return e;
+        if(const cudaError_t e = kc::shared_memory_optin(optin, kernel, int(bytes)); e != cudaSuccess) return e;
     }
-    tile_kernel<NT, TILES, WM, WN, STAGES, GATEUP, TERMS><<<grid, WM * WN * 32, bytes, stream>>>(p);
+    kernel<<<grid, WM * WN * 32, bytes, stream>>>(p);
     return cudaGetLastError();
 }
 
@@ -902,15 +1123,27 @@ cudaError_t built(const MmaPass& p, const Items& items, cudaStream_t stream) {
     }
 }
 
+// fp4-tile's TILES 0: 2 row tiles a warp for gate/up, 4 for down (on an RTX 5090 at 128 to 8,192 tokens, 2560 x 640 x
+// 512 experts top 10 and 2048 x 768 x 128 top 8, down with 4 took 0.81-1.02x the time of 2; gate/up with 4 up to
+// 1.09x, so it keeps 2).
+template <bool GATEUP, int TILES>
+constexpr int tile_tiles() { return TILES ? TILES : GATEUP ? 2 : 4; }
+
+// fp4-tile's PRODUCER 0: the warp-specialized form for gate/up, the block's cp.async ring for down (on an RTX 5090 at
+// 512 to 8,192 tokens, 2560 x 640 x 512 experts top 10 and 2048 x 768 x 128 top 8: gate/up 1.02-1.36x faster
+// warp-specialized, down 0.83-1.16x of the ring at its best TILES 2, slower from 2,048 tokens).
+template <bool GATEUP, int PRODUCER>
+constexpr int tile_producer() { return PRODUCER ? PRODUCER - 1 : GATEUP ? 1 : 0; }
+
 // fp4-tile: items of 64 routes through the block tile, by the operands' terms.
-template <bool BUILT, bool GATEUP, int WM, int WN, int TILES, int STAGES>
+template <bool BUILT, bool GATEUP, int WM, int WN, int TILES, int STAGES, int PRODUCER>
 cudaError_t built_tile(const MmaPass& p, const Items& items, cudaStream_t stream) {
     if constexpr(!BUILT || 8 % WN != 0) {
         (void)p, (void)items, (void)stream;
         return cudaErrorNotSupported;
     } else {
-        return p.terms == 2 ? launch_tile<8, GATEUP, TILES, WM, WN, STAGES, 2>(p, items, stream)
-                            : launch_tile<8, GATEUP, TILES, WM, WN, STAGES, 1>(p, items, stream);
+        return p.terms == 2 ? launch_tile<8, GATEUP, TILES, WM, WN, STAGES, 2, PRODUCER>(p, items, stream)
+                            : launch_tile<8, GATEUP, TILES, WM, WN, STAGES, 1, PRODUCER>(p, items, stream);
     }
 }
 
@@ -949,8 +1182,8 @@ cudaError_t dispatch_fp4(const MmaPass& p, const Items& items, int tokens, int t
     // Items of 64 routes a call asks the block tile for (Workspace(tile=True)): fp4-tile
     {
             switch(crit_lookup_fp4_tile(GATEUP ? 1 : 0, H, I, rows)) {
-#define CRIT_GX_FP4T(index, wm, wn, tiles, stages) \
-    case index: return built_tile<kBuiltFp4Tile, GATEUP, wm, wn, tiles, stages>(p, items, stream);
+#define CRIT_GX_FP4T(index, wm, wn, tiles, stages, producer) \
+    case index: return built_tile<kBuiltFp4Tile, GATEUP, wm, wn, tile_tiles<GATEUP, tiles>(), stages, tile_producer<GATEUP, producer>()>(p, items, stream);
                 CRIT_CONFIGS_fp4_tile(CRIT_GX_FP4T)
 #undef CRIT_GX_FP4T
                 default: return cudaErrorInvalidConfiguration;

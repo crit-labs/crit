@@ -1454,10 +1454,15 @@ class ExpertOffload:
         if device is not None:
             out["device"] = device
         out["diagnosis"] = diagnosis(out)
+        self.save_trace()
+        return {"expert_offload": out}
+
+    def save_trace(self):
+        """With trace_path, write the recorded decode routes there: at every telemetry() call and when the engine
+        closes, so a serve stopped without its telemetry read (Ctrl+C after a corpus) still leaves its trace."""
         trace = self._option("trace_path")
         if trace and self.cache is not None:
             Path(trace).write_text(json.dumps(self.routes()), encoding="utf-8")
-        return {"expert_offload": out}
 
     def _device_shares(self):
         """Who holds the device's memory now, from Core's reading of it (crit_plugins.memory), in bytes: the
@@ -1480,10 +1485,11 @@ class ExpertOffload:
                 "tensors": (report.get("tensors") or [])[:3]}
 
     def close(self):
-        try:
-            self.save_profile()
-        except Exception:   # a profile that cannot be written never keeps the engine from closing
-            pass
+        for save in (self.save_profile, self.save_trace):
+            try:
+                save()
+            except Exception:   # a profile or trace that cannot be written never keeps the engine from closing
+                pass
         if self._elastic():
             self.memory.ungive(f"expert-offload:{id(self)}")
         if self.dispatch is not None:

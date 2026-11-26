@@ -67,7 +67,7 @@ class GroupedExperts:
             self.prompt_arithmetic = "same"
         self.speed = speed
         # FP4 prompt calls' items: fp4-prompt's 32 routes, fp4-tile's 64 (the block tile), or auto: the faster of the
-        # two in the engine's sweep report on this device, fp4-prompt where there is none (_prompt_items)
+        # two in the engine's sweep report on this device, fp4-tile where there is none (_prompt_items)
         self.prompt_items = options.get("prompt_items", "auto")
         if self.prompt_items not in PROMPT_ITEMS:
             raise ValueError(f"grouped-experts: prompt_items is one of {', '.join(PROMPT_ITEMS)}, not "
@@ -444,12 +444,14 @@ class GroupedExperts:
         """(width, tile) of a call's items: None, False (the kernel's width_for) but for an FP4 prompt-sized call
         (8 routes an expert or more, an FP4 tensor-core arithmetic), whose items prompt_items picks: fp4-prompt
         (32), fp4-tile (64 through the block tile), or auto: the one the engine's sweep report on this device timed
-        faster at the call's tokens over both passes (crit_kernels.select.fastest), fp4-prompt without a report."""
+        faster at the call's tokens over both passes (crit_kernels.select.fastest), fp4-tile without a report (on
+        an RTX 5090 its untuned build took 0.73-0.99x fp4-prompt's time over a layer's two passes from 128 to 8,192
+        tokens, at 2,560 x 640 and 2,048 x 768)."""
         if arithmetic not in FP4_MMA or tokens * top < 8 * experts:
             return None, False
         chosen, why = self.prompt_items, "the prompt_items option"
         if chosen == "auto":
-            chosen, why = "fp4-prompt", "no sweep report of both structures on this device"
+            chosen, why = "fp4-tile", "no sweep report of both structures on this device"
             report = _report(self.device)
             if report is not None:
                 from crit_kernels import select

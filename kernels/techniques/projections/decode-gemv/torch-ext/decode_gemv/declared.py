@@ -1,7 +1,7 @@
 """decode-gemv's declared decode rows (structures rows-int-block and rows-fp8-block): the kernel core's declared rows
 on its declared multiply paths, which int-block-experts' and fp8-block-rows' rows forward to (their kernel.json
 aliases), the same bits. The records are those packages' (int-block-experts: Matrix codes, scales, rows, cols, post,
-int4; fp8-block-rows: codes, scales, rows, cols, scale_rows, scale_k, post, scale_e8m0; RowJob matrix, tokens,
+int4; fp8-block-rows: codes, scales, rows, cols, scale_rows, scale_k, post, scale_e8m0, order; RowJob matrix, tokens,
 act_row[8], out_row[8]), so a table either package packs runs here too."""
 import struct
 from typing import Sequence
@@ -11,7 +11,7 @@ import torch
 from ._ops import ops
 
 _INT_MATRIX = struct.Struct("<QQiifi")
-_FP8_MATRIX = struct.Struct("<QQiiiifi")
+_FP8_MATRIX = struct.Struct("<QQiiiifii4x")   # ..., scale_e8m0, order, padding
 _ROW_JOB = struct.Struct("<ii8i8i")
 
 
@@ -29,13 +29,16 @@ def int_block_table(matrices: Sequence, device=None) -> torch.Tensor:
 
 def fp8_block_table(matrices: Sequence, device=None) -> torch.Tensor:
     """One record per (codes [rows, cols] uint8 E4M3, scales fp32 or uint8 E8M0 [ceil(rows / scale_rows),
-    cols / scale_k], scale_rows, scale_k, post) of CUDA tensors (fp8-block-rows' matrix_table)."""
+    cols / scale_k], scale_rows, scale_k, post[, order]) of CUDA tensors (fp8-block-rows' matrix_table; order 1: the
+    codes' blocks of 32 a row in the kernel core's visit order)."""
     packed = b""
-    for codes, scales, scale_rows, scale_k, post in matrices:
+    for entry in matrices:
+        codes, scales, scale_rows, scale_k, post = entry[:5]
+        order = int(entry[5]) if len(entry) > 5 else 0
         if scales.dtype not in (torch.float32, torch.uint8):
             raise ValueError("scales are fp32 or uint8 E8M0")
         packed += _FP8_MATRIX.pack(codes.data_ptr(), scales.data_ptr(), codes.size(0), codes.size(1), int(scale_rows),
-                                   int(scale_k), float(post), int(scales.dtype == torch.uint8))
+                                   int(scale_k), float(post), int(scales.dtype == torch.uint8), order)
     return _device_bytes(packed, device or matrices[0][0].device)
 
 

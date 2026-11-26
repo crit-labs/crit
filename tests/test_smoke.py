@@ -239,6 +239,14 @@ class SmokeTests(unittest.TestCase):
                                profile="strict")["decode_matches_prefill"]
         self.assertEqual(rounded["state"], "failed", rounded)
         self.assertIn("; rounding: decoded through the prompt path the rows match prefill", rounded["detail"])
+        self.assertNotIn("the plugins whose prompt rows", rounded["detail"])
+        # With the plugins' levels in its facts, the item names those whose prompt rows are not their decode bits.
+        levels = {"exactness": {"plugins": {"projections-x": {"decode": "row-exact", "prompt": "row-exact"},
+                                            "norms-y": {"decode": "row-exact", "prompt": "exact"},
+                                            "experts-z": {"decode": "row-exact", "prompt": "repeatable"}}}}
+        named = self.results("decode_rounding", facts={**hook, **levels}, only={"decode_matches_prefill"},
+                             profile="strict")["decode_matches_prefill"]
+        self.assertIn("(prompt below exact): experts-z, projections-x.", named["detail"])
         fault = self.results("offset", facts=hook, only=decode)
         for name in decode:
             with self.subTest(test=name):

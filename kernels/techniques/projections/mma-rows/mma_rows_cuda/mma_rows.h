@@ -50,6 +50,7 @@
 // both sums in split order first. The values are those of the two projections stored and an activation product
 // applied to them, to the activation's rounding.
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
 
@@ -102,6 +103,8 @@ struct Problem {
   float* partial = nullptr;          // splits > 1: partial_elements(M, N, splits)
   int* counters = nullptr;           // splits > 1: row_tiles(N, 1, warps) zeros (left zero; calls of more than 32
                                      // rows take one group a warp)
+  std::size_t partial_size = 0;      // the prompt tile: FP32 elements `partial` holds (0: its splits in one CTA)
+  int counter_count = 0;             // the prompt tile: `counters` zeros (left zero)
   const float* act_scale = nullptr;  // set by enqueue: the FP8 row scales in scratch
   const std::uint8_t* zeros = nullptr;   // kInt4Zp: zero points [N][K / group]
   int group = 0;                         // kInt4Zp: inputs a scale and zero point cover
@@ -127,10 +130,14 @@ cudaError_t enqueue_quantize_nvfp4(const void* x, int64_t ldx, int M, int K, flo
                                    std::uint8_t* codes, std::uint8_t* blocked_scales, cudaStream_t stream);
 
 // The prompt tile (prompt_tile.cu): out [M][N] for any number of activation rows M >= 1, every element with the bits
-// enqueue() gives it at any row count (the same Problem: weights, scales, acts, splits; `groups`, `warps`, `partial`
-// and `counters` are not read), each decoded weight reused for kPromptTokens rows a CTA. Quantized activations take
-// scratch_bytes(M, K) of scratch, as enqueue()'s pre-pass does.
+// enqueue() gives it at any row count (the same Problem: weights, scales, acts, splits; `groups` and `warps` are not
+// read), each decoded weight reused for kPromptTokens rows a CTA. Quantized activations take scratch_bytes(M, K) of
+// scratch, as enqueue()'s pre-pass does. With splits > 1, `partial` (partial_size FP32 elements) and `counters`
+// (counter_count zeros, left zero) let a tile's splits run in several CTAs (the same additions in the same order);
+// without them, or where they are too small, a CTA runs all of its tile's splits.
 constexpr int kPromptTokens = 64;   // activation rows a prompt-tile CTA takes, untuned (knob PT)
 cudaError_t enqueue_prompt(const Problem& p, cudaStream_t stream);
+// The CTAs enqueue_prompt() launches for the projection of p (its pre-pass not counted; 0 for an invalid problem).
+int prompt_ctas(const Problem& p);
 
 }  // namespace crit::kernels::mma_rows

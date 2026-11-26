@@ -173,6 +173,13 @@ __device__ __forceinline__ void mbarrier_arrive(uint64_t* bar) {
     asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" ::"r"(smem_u32(bar)) : "memory");
 #endif
 }
+// An arrival on `bar` once every cp.async this thread issued before it has landed (cp.async.mbarrier.arrive.noinc:
+// the barrier's count includes it, set at init), so a producer's cp.async copies complete a stage as TMA ones do.
+__device__ __forceinline__ void cp_async_mbarrier_arrive(uint64_t* bar) {
+#if CRIT_KCORE_HAS_TMA
+    asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n" ::"r"(smem_u32(bar)) : "memory");
+#endif
+}
 // Arrive and add `bytes` to the phase's expected transaction count (the TMA copies that complete it).
 __device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* bar, uint32_t bytes) {
 #if CRIT_KCORE_HAS_TMA
@@ -275,6 +282,42 @@ inline CUresult make_tensor_map_2d(CUtensorMap* map, CUtensorMapDataType type, c
     const cuuint32_t step[2] = {1, 1};
     return encode(map, type, 2, const_cast<void*>(base), dims, strides, box, step, CU_TENSOR_MAP_INTERLEAVE_NONE,
                   swizzle_mode, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+}
+
+// A 3-D tiled tensor map (host) over `depth` row-major [rows][cols] matrices of `type`, rows `row_bytes` apart and
+// matrices `matrix_bytes` apart (both multiples of 16): a slot store's matrices, one a bundle. Boxes of box_rows x
+// box_cols elements of one matrix, out-of-bounds elements read as zero; as make_tensor_map_2d otherwise.
+inline CUresult make_tensor_map_3d(CUtensorMap* map, CUtensorMapDataType type, const void* base, uint64_t depth,
+                                   uint64_t rows, uint64_t cols, uint64_t row_bytes, uint64_t matrix_bytes,
+                                   uint32_t box_rows, uint32_t box_cols,
+                                   CUtensorMapSwizzle swizzle_mode = CU_TENSOR_MAP_SWIZZLE_NONE) {
+    static PFN_cuTensorMapEncodeTiled_v12000 encode = [] {
+        void* fn = nullptr;
+        cudaDriverEntryPointQueryResult status{};
+#if CUDART_VERSION >= 12050
+        if(cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &fn, 12000, cudaEnableDefault, &status) != cudaSuccess)
+            fn = nullptr;
+#else
+        if(cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &fn, cudaEnableDefault, &status) != cudaSuccess) fn = nullptr;
+#endif
+        return reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(fn);
+    }();
+    if(!encode) return CUDA_ERROR_NOT_FOUND;
+    const cuuint64_t dims[3] = {cols, rows, depth};
+    const cuuint64_t strides[2] = {row_bytes, matrix_bytes};
+    const cuuint32_t box[3] = {box_cols, box_rows, 1};
+    const cuuint32_t step[3] = {1, 1, 1};
+    return encode(map, type, 3, const_cast<void*>(base), dims, strides, box, step, CU_TENSOR_MAP_INTERLEAVE_NONE,
+                  swizzle_mode, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+}
+// The box at element coordinates (x inner, y, z outer) of a 3-D tensor map -> shared, completing on `bar`.
+__device__ __forceinline__ void tma_load_3d(void* dst, const void* map, int x, int y, int z, uint64_t* bar) {
+#if CRIT_KCORE_HAS_TMA
+    asm volatile("cp.async.bulk.tensor.3d." CRIT_KCORE_TMA_DST ".global.tile.mbarrier::complete_tx::bytes [%0], "
+                 "[%1, {%2, %3, %4}], [%5];\n" ::"r"(smem_u32(dst)),
+                 "l"(map), "r"(x), "r"(y), "r"(z), "r"(smem_u32(bar))
+                 : "memory");
+#endif
 }
 
 // ------------------------------------------------------------------------------------------- programmatic launch

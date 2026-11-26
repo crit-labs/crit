@@ -84,6 +84,20 @@ class ExactPromptTests(PluginTestCase):
         alone = torch.cat([plugin.matmul(x[r:r + 1].clone(), m, torch.float32) for r in range(2048)])
         self.assertTrue(torch.equal(found, alone))
 
+    def test_a_quantized_prompt_past_the_scratch_s_rows_keeps_every_row_s_decode_bits(self):
+        """W8A8 and W4A4 prompt rows past what the scratch holds (192 rows at K 10240) go through the workspace in
+        fewer calls, a narrow matrix's splits of K in several CTAs: every row the bits of its decode rows."""
+        torch = self.torch
+        for format, options in (("fp8:channel", {}), ("nvfp4", {})):
+            plugin = self.assemble(options={**options, **TILE}, context=OnCuda())["projections"]
+            m = plugin.load(self.stored(format, 320, 10240), format)
+            self.assertEqual((m.path, m.gemm), ("mma", "tile"))
+            x = torch.randn(1000, 10240, generator=self.g).cuda().to(torch.bfloat16)
+            decode = torch.cat([plugin.matmul(x[r:r + 16], m, torch.float32) for r in range(0, 1000, 16)])
+            self.assertTrue(torch.equal(plugin.matmul(x, m, torch.float32), decode), format)
+            self.assertTrue(torch.equal(plugin.matmul(x[:500], m, torch.float32), decode[:500]), format)
+            del m
+
     def test_w4a4_rows_on_the_fp4_mma_keep_their_decode_bits_in_prompts(self):
         """gemv fp4: W4A4 decode rows on the block-scaled FP4 MMA, their prompt rows through mma-rows' FP4 prompt tile
         with the same bits, in any chunk and past a scratch's rows; a matrix the FP4 MMA does not take keeps the tile."""

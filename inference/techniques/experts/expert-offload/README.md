@@ -227,7 +227,8 @@ assert choose_misses("bf16", True) == "link"                # a format the CPU t
 Nothing needs setting. To see what a setting is worth before changing an engine:
 
 1. Serve with `record_routes: 250000` and `trace_path: routes.json`, and send a few requests of the kind the engine
-   will serve (a general corpus, never Eval's prompts).
+   will serve (a general corpus, never Eval's prompts): `crit run ... record-routes --candidate ID --corpus FILE`
+   does both on a run's candidate.
 2. `crit plugins offload --model M --device-file DEVICE --context TOKENS --trace routes.json --out offload.json`
    replays the trace through the cache's residency at several sizes and copy budgets (two seconds each) and writes
    the options; put `offload.json` in the package and set `settings: offload.json`.

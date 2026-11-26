@@ -5,6 +5,7 @@
   "title": "Latent (MLA) attention in Triton: decode tokens and verify windows of every query head over a paged cache of compressed rows (a latent and a rotary key a position, the latent the value too), split over KV partitions and merged, with sinks",
   "package": "latent_attention",
   "language": "triton",
+  "launches": ["_fused_kernel", "_merge_kernel", "_prompt_kernel", "_window_kernel"],
   "capabilities": ["8.0", "8.6", "8.9", "9.0", "10.0", "11.0", "12.0"],
   "operations": ["latent-attention"],
   "structures": {

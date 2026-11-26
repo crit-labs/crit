@@ -16,6 +16,7 @@
 // loads first) for int_rows_kernel; WARPS (4, 8, 16), AHEAD (rounds of loads in flight), STREAM for fp8_rows_kernel.
 #pragma once
 #include "crit_kcore/blockscaled_mma.cuh"
+#include "crit_kcore/blockscaled_order.cuh"
 #include "crit_kcore/formats.cuh"
 #include "crit_kcore/multiply.cuh"
 
@@ -46,6 +47,7 @@ struct Fp8BlockMatrix {   // codes [rows][cols] E4M3; scales [ceil(rows / scale_
     int rows = 0, cols = 0, scale_rows = 1, scale_k = 32;
     float post = 1.0f;
     int scale_e8m0 = 0;
+    int order = 0;           // the codes' blocks of 32 a row: 0 in order, 1 in blockscaled_order.cuh's VisitOrder
 };
 struct Fp8BlockActs {     // codes [row][ld] E4M3, scales [row][lds] FP32, one per `group` codes (a multiple of 32)
     const std::uint8_t* codes = nullptr;
@@ -197,6 +199,13 @@ __global__ void __launch_bounds__(32 * WARPS) fp8_rows_kernel(const Matrix* matr
     const float* xs0 = acts.scales + std::size_t(act_row[2 * q]) * std::size_t(acts.lds);
     const float* xs1 = acts.scales + std::size_t(act_row[2 * q + 1]) * std::size_t(acts.lds);
     const int blocks = m.cols / kBlock;
+    // Where a row's block b sits: in order, or in the visit order where the matrix is stored that way (the same codes,
+    // so the same bits).
+    const blockscaled::VisitOrder visit(blocks);
+    auto at = [&](int b) {
+        if constexpr(requires { m.order; }) return m.order ? visit.position(b) : b;
+        else return b;
+    };
     float acc[kSlots][4];
 #pragma unroll
     for(int s = 0; s < kSlots; ++s)
@@ -211,8 +220,8 @@ __global__ void __launch_bounds__(32 * WARPS) fp8_rows_kernel(const Matrix* matr
 #pragma unroll
             for(int s = 0; s < kSlots; ++s) {
                 const int b = min(base + kLanes * u + warp + WARPS * s, blocks - 1);
-                fa[u][s] = fp8_weight_fragment<STREAM>(wa, b, q);
-                fb[u][s] = fp8_weight_fragment<STREAM>(wb, b, q);
+                fa[u][s] = fp8_weight_fragment<STREAM>(wa, at(b), q);
+                fb[u][s] = fp8_weight_fragment<STREAM>(wb, at(b), q);
                 fx[u][s] = fp8_fragment(xg, b, q);
                 const int wk = b * kBlock / m.scale_k, xk = b * kBlock / acts.group;
                 w0[u][s] = multiply::ScaleGrid::at(wsa, wk, m.scale_e8m0);

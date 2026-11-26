@@ -249,10 +249,11 @@ def engine_facts(engine):
                 out[key] = dict(value)
         elif key == "kernels":
             # crit's kernels the plugins run (crit_plugins.kernels): per kernel its source (tuned: built with the
-            # engine's tuning; built: with its default knobs; fallback), the tuning file and, for a fallback, why.
+            # engine's tuning or a shipped table for this GPU; built: with its default knobs; fallback), the tuning
+            # file, the shipped table (crit_kernels.shipped) and, for a fallback, why.
             if isinstance(value, dict) and all(isinstance(k, str) and isinstance(v, dict) and
                                                v.get("source") in ("tuned", "built", "fallback") for k, v in value.items()):
-                out[key] = {k: {f: v[f] for f in ("source", "tuning", "reason", "plugins") if f in v}
+                out[key] = {k: {f: v[f] for f in ("source", "tuning", "shipped", "reason", "plugins") if f in v}
                             for k, v in value.items()}
         elif key == "exactness":
             # The exactness of the engine's rows (crit_plugins.Assembly.exactness): the levels its configuration

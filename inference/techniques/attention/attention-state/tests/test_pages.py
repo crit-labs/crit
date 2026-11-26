@@ -24,6 +24,23 @@ class KVPoolTests(PluginTestCase):
         pool.write(layer, slots, keys, values)
         return batch, keys, values
 
+    def test_a_wrapped_ring_says_where_a_fork_of_it_may_resume(self):
+        # A sliding window's ring holds its last pages: once it wraps, a fork kept to an earlier length would read
+        # positions later ones wrote over (keep() frees nothing of a wrapped ring), so the prompt cache asks first.
+        kv = self.assemble(options={"page": 16})["kv_cache"]
+        pool = kv.pool([0], 1, 8, 256, "cpu", "fp32", page=16, sliding=40, span=24, positions=2048)
+        pool.open("a")
+        done = 0
+        for count in [24] + [1] * 40:
+            pool.reserve(StepBatch.build([("a", done, count)], "cpu"))
+            done += count
+        self.assertEqual(pool.resumes_from("a"), 0)                     # 64 positions: the ring has not wrapped
+        for _ in range(160):
+            pool.reserve(StepBatch.build([("a", done, 1)], "cpu"))
+            done += 1
+        oldest = (-(-done // 16) - pool.ring) * 16                      # the first position the ring still holds
+        self.assertEqual(pool.resumes_from("a"), oldest + 40)
+
     def test_a_step_of_many_sequences_writes_each_where_it_reads_back(self):
         pool, device = self.pool()
         for sequence in "abc":

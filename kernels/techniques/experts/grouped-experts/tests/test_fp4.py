@@ -163,3 +163,20 @@ def test_other_fp4_knobs_give_every_route_the_same_bits():
         want = fp4_rows(experts, x, ids, width)
         got = fp4_rows(experts, x, ids, width, other)
         assert torch.equal(got.view(torch.int32), want.view(torch.int32)), width
+
+
+@pytest.mark.kernels_ci
+@pytest.mark.parametrize("H, I", [(1024, 384), (2560, 640)])
+def test_fp4_tiles_two_mainloops_give_every_route_the_same_bits(H, I):
+    # fp4-tile's block ring (PRODUCER 1) and its warp-specialized form (2: TMA boxes of the weights, mbarriers), each
+    # pass, a partly filled last item and several k parts
+    ring = load("grouped-experts", knobs={"fp4-tile": {"PRODUCER": 1}})
+    ws = load("grouped-experts", knobs={"fp4-tile": {"PRODUCER": 2, "TILES": 2}})
+    experts = Experts("nvfp4", E=6, H=H, I=I, seed=11, a4=True)
+    g = torch.Generator().manual_seed(13)
+    x = torch.randn(150, experts.H, generator=g).bfloat16().to(dev)
+    ids, _ = routes(150, 4, experts.E, g, holes=True)
+    want = fp4_rows(experts, x, ids, 64, gx, tile=True)
+    for other in (ring, ws):
+        got = fp4_rows(experts, x, ids, 64, other, tile=True)
+        assert torch.equal(got.view(torch.int32), want.view(torch.int32))

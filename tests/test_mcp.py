@@ -30,7 +30,7 @@ class ToolTests(unittest.TestCase):
         parser = family_parser("run")
         actions = next(a for a in parser._actions if hasattr(a, "choices") and isinstance(a.choices, dict)).choices
         self.assertEqual({name for name in self.tools if name.startswith("crit_run_")},
-                         {"crit_run_" + action for action in actions})
+                         {"crit_run_" + action.replace("-", "_") for action in actions})
         plan = self.tools["crit_run_plan"].definition(30)
         self.assertEqual(plan["title"], "crit run plan")
         schema = plan["inputSchema"]

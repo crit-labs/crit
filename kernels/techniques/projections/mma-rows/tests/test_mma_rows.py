@@ -329,10 +329,11 @@ def test_the_fp4_mma_captures_with_its_pre_pass_and_refuses_what_it_cannot_read(
 
 # Knobs other than the defaults (one build for every structure). The decode tile's and the FP4 MMA's plan comes from
 # them (groups, warps and splits; the split is part of the sums' order, the rest is speed only); HOIST and the prompt
-# tile's warps and rows a CTA only change when loads run and which outputs a CTA computes, never an output's chain.
+# tile's warps, rows a CTA, parts, stages, weights ahead and row groups a warp only change when loads run and which
+# outputs a CTA computes, never an output's chain.
 OTHER_KNOBS = {"decode-tile": {"GROUPS": 2, "WARPS": 2, "SPLITS": 3},
                "fp4-tile": {"WARPS": 2, "SPLITS": 4, "HOIST": 4},
-               "prompt-tile": {"PW": 4, "PT": 32}}
+               "prompt-tile": {"PW": 4, "PT": 32, "PK": 2, "PS": 2, "PF": 0, "PR": 2}}
 
 
 def test_other_knobs_plan_from_the_tuning_and_keep_the_default_bits():
@@ -356,6 +357,13 @@ def test_other_knobs_plan_from_the_tuning_and_keep_the_default_bits():
             prompt = torch.empty_like(want)
             other.mm_prompt(x[:rows], w, prompt, weights, scales, row_scale, acts, INPUT_SCALE, blocked, 3, scratch)
             assert torch.equal(prompt, want), ("prompt", weights, acts, rows)
+            assert other.prompt_ctas(rows, 1000, 2048, weights, acts, 3, 1 << 20, 64) == 2 * other.prompt_ctas(
+                rows, 1000, 2048, weights, acts, 3)   # PK 2: two CTAs a tile
+            prompt.zero_()
+            other.mm_prompt(x[:rows], w, prompt, weights, scales, row_scale, acts, INPUT_SCALE, blocked, 3, scratch,
+                            partial=torch.empty(1 << 20, dtype=torch.float32, device=dev),
+                            counters=torch.zeros(64, dtype=torch.int32, device=dev))
+            assert torch.equal(prompt, want), ("prompt in parts", weights, acts, rows)
     if mr.fp4_mma(dev):
         assert other.plan(1024, 2048, "nvfp4", dev, acts="nvfp4_mma") == (1, 2, 4)
         stored, _ = matrix("nvfp4", 1024, 2048, True)

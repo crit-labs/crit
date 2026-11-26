@@ -16,7 +16,7 @@
 // Built outside crit's kernel build (tests/fp8_block_tests.cu with plain nvcc): the default knobs only.
 #define CRIT_CONFIGS_rows(X) X(0, 16, 2, 0)
 #define CRIT_CONFIGS_gemm(X) X(0, 8, 4, 0)
-#define CRIT_CONFIGS_gemm_staged(X) X(0, 128, 64, 4, 2, 2, 1, 4)
+#define CRIT_CONFIGS_gemm_staged(X) X(0, 64, 128, 2, 4, 2, 1, 4)
 #define CRIT_CONFIGS_gemm_native(X) X(0, 128, 128, 2, 4, 64, 3, 8, 0)
 #define CRIT_CONFIGS_gemm_native_channel(X) X(0, 128, 128, 2, 4, 128, 3, 8, 1)
 #define CRIT_CONFIGS_gemm_native_blocks(X) X(0, 128, 128, 2, 4, 128, 2, 8, 1)
@@ -104,6 +104,8 @@ __global__ void __launch_bounds__(32 * kGemmWarps) gemm_kernel(const Matrix* mat
     const std::uint8_t* wsa = static_cast<const std::uint8_t*>(m.scales) + std::size_t(ra / m.scale_rows) * sld;
     const std::uint8_t* wsb = static_cast<const std::uint8_t*>(m.scales) + std::size_t(rb / m.scale_rows) * sld;
     const int blocks = m.cols / kBlock, last = job.first + job.count - 1;
+    const bs::VisitOrder visit(blocks);   // where a visit-order matrix keeps a row's block b
+    const bool w_visit = m.order == kVisitOrder;
     for(int tile = kGemmTokens * int(blockIdx.z); tile < job.count; tile += kGemmTokens * int(gridDim.z)) {
         const std::uint8_t* xg[kTiles];
         const float* xs[kTiles][2];
@@ -123,7 +125,8 @@ __global__ void __launch_bounds__(32 * kGemmWarps) gemm_kernel(const Matrix* mat
 #pragma unroll
             for(int o = 0; o < 4 * kTiles; ++o) acc[o] = 0.0f;
             auto block = [&](int b) {
-                const uint2 a_g = fragment(wa, b, q), a_g8 = fragment(wb, b, q);
+                const int wb_at = w_visit ? visit.position(b) : b;
+                const uint2 a_g = fragment(wa, wb_at, q), a_g8 = fragment(wb, wb_at, q);
                 const int wk = b * kBlock / m.scale_k, xk = b * kBlock / acts.group;
                 const float w0 = weight_scale(wsa, wk, m.scale_e8m0), w1 = weight_scale(wsb, wk, m.scale_e8m0);
 #pragma unroll
@@ -161,35 +164,64 @@ __global__ void __launch_bounds__(32 * kGemmWarps) gemm_kernel(const Matrix* mat
 // ---------------------------------------------------------------------------------------------------- staged GEMM
 
 // The prompt GEMM with shared-memory staging (structure gemm-staged) on the kernel core's declared mainloop
-// (declared_staged.cuh: the cp.async ring of GroupVisits, the declared steps, the tree). This kernel's stage: a block's
-// 32 bytes of every weight row and token, the weight scales' words and the token scales, all asynchronous; the decode
-// turns the stage's weight scales to FP32 (pair_slot order); the block sums are one e4m3 m16n8k32 MMA with a zero
-// accumulator per 16 x 8 tile (block_sum_e4m3, crit's fragment order). Every output has the declared order's bits: the
-// same as `gemm` and `rows`, whatever the knobs.
-template<int BM, int BN>
+// (declared_staged.cuh: the cp.async ring of GroupVisits, the declared steps, the tree). This kernel's stage, a visit's
+// blocks: their 32 bytes of every weight row, copied a word at a time into the MMA's operand order (a thread's four A
+// registers one 16-byte read, no moves), and of every token (16-byte copies; with the activations in the visit order,
+// Acts::order kVisitOrder, a token's blocks of a visit are one contiguous piece), the words of the CTA's distinct
+// weight scale rows (one for an FP8 block checkpoint's 128 x 128 blocks: the CTA's rows then share their scale
+// products) and the token scales, all asynchronous; one stage ahead the weight scales become FP32 in pair_slot order;
+// the block sums are one e4m3 m16n8k32 with a zero accumulator per 16 x 8 tile (block_sum_e4m3_fast, crit's fragment
+// order: on an sm_120a GPU the block-scaled kind with unit scales, the same bits). Every output has the declared
+// order's bits: the same as `gemm` and `rows`, whatever the knobs and the activations' order.
+template<int BM, int BN, int SLOTS>
 struct StagedLayout {
-    // A block of a stage: weight rows [BM][32], tokens [BN][32], the weight scales' words [BM] as copied, the token
-    // scales [BN], the weight scales decoded [BM] (pair_slot).
-    static constexpr int kA = 0, kB = BM * kBlock, kWraw = kB + BN * kBlock, kAs = kWraw + 4 * BM, kWs = kAs + 4 * BN;
+    // A block of a stage: weight rows [BM / 16][512] in the operand order (operand_byte), the words of the CTA's
+    // distinct weight scale rows [BM at most] as copied, the token scales [BN], the weight scales as FP32 [BM]
+    // (pair_slot; only [0] where the CTA's rows share one).
+    static constexpr int kA = 0, kWraw = BM * kBlock, kAs = kWraw + 4 * BM, kWs = kAs + 4 * BN;
     static constexpr int kSub = kWs + 4 * BM;
+    // After the visit's SLOTS sub-stages its tokens: each token's blocks of the visit side by side (one contiguous
+    // piece in shared memory, so the copies of a visit-order piece merge into wide L2 requests), a token every
+    // kTokenStride bytes: SLOTS 32-byte blocks and 32 more past one block, so the fragment reads of a half warp (four
+    // tokens) fall in different banks.
+    static constexpr int kTokenStride = SLOTS * kBlock + (SLOTS > 1 ? kBlock : 0), kExtra = BN * kTokenStride;
 };
+// The byte of weight row r's word w (of a block) in a stage: 16-row tiles of 512 bytes, thread (g, q)'s A registers
+// (row g word 2q, row g + 8 word 2q, row g word 2q + 1, row g + 8 word 2q + 1) at 16 (4 g + q).
+__host__ __device__ constexpr int operand_byte(int r, int w) {
+    return (r >> 4) * 512 + 4 * (16 * (r & 7) + 2 * w + ((r >> 3) & 1));
+}
+// Weight copy i of a block (8 BM of them, a word each) is row staged_row(i)'s word i % 8: a warp's 32 copies four rows'
+// 32 bytes (rows g, g + 1, g + 8, g + 9 of a tile), stored in 32 different banks.
+__host__ __device__ constexpr int staged_row(int i) {
+    const int lane = i & 31, c = i >> 5;
+    return 16 * (c >> 2) + 8 * ((lane >> 3) & 1) + 2 * (c & 3) + (lane >> 4);
+}
 template<int BM, int BN, int WM, int WN, int G, int RUN, int STAGES>
-struct Staged : kc::StagedShape<BM, BN, WM, WN, G, RUN, STAGES, StagedLayout<BM, BN>::kSub, StagedLayout<BM, BN>::kWs,
-                                StagedLayout<BM, BN>::kAs>,
-                StagedLayout<BM, BN> {
-    using Shape = kc::StagedShape<BM, BN, WM, WN, G, RUN, STAGES, StagedLayout<BM, BN>::kSub,
-                                  StagedLayout<BM, BN>::kWs, StagedLayout<BM, BN>::kAs>;
+struct Staged : kc::StagedShape<BM, BN, WM, WN, G, RUN, STAGES, StagedLayout<BM, BN, G * RUN>::kSub,
+                                StagedLayout<BM, BN, G * RUN>::kWs, StagedLayout<BM, BN, G * RUN>::kAs,
+                                StagedLayout<BM, BN, G * RUN>::kExtra>,
+                StagedLayout<BM, BN, G * RUN> {
+    using L = StagedLayout<BM, BN, G * RUN>;
+    using Shape = kc::StagedShape<BM, BN, WM, WN, G, RUN, STAGES, L::kSub, L::kWs, L::kAs, L::kExtra>;
     using Shape::kThreads, Shape::kWarpRows, Shape::kWarpTokens, Shape::kMT, Shape::kNT, Shape::kOut, Shape::kRowsPer,
-        Shape::kTokensPer, Shape::kStage, Shape::kSmem, Shape::kMinBlocks;
-    using StagedLayout<BM, BN>::kA, StagedLayout<BM, BN>::kB, StagedLayout<BM, BN>::kWraw, StagedLayout<BM, BN>::kAs,
-        StagedLayout<BM, BN>::kWs, StagedLayout<BM, BN>::kSub;
-    static constexpr int kCopies = 2 * (BM + BN), kCopiesPer = (kCopies + kThreads - 1) / kThreads;
+        Shape::kTokensPer, Shape::kStage, Shape::kSmem, Shape::kMinBlocks, Shape::kMaxBlocks;
+    using L::kA, L::kWraw, L::kAs, L::kWs, L::kSub, L::kTokenStride;
+    static constexpr int kB = (G * RUN) * kSub;   // the visit's tokens
+    static constexpr int kSlots = G * RUN;   // blocks a visit
+    static constexpr int kACopies = 8 * BM, kAPer = (kACopies + kThreads - 1) / kThreads;
+    // A visit's token copies: 16-byte halves of each token's blocks, a token's in slot order (contiguous in the visit
+    // order), and its token scales (a token's per slot).
+    static constexpr int kBCopies = 2 * kSlots * BN, kBPer = (kBCopies + kThreads - 1) / kThreads;
+    static constexpr int kSCopies = kSlots * BN, kSPer = (kSCopies + kThreads - 1) / kThreads;
+    static_assert(kThreads % (2 * kSlots) == 0, "a thread's token copies keep their slot");
 };
 
 template<int BM, int BN, int WM, int WN, int G, int RUN, int STAGES>
 __global__ void __launch_bounds__(32 * WM * WN, (Staged<BM, BN, WM, WN, G, RUN, STAGES>::kMinBlocks))
     staged_kernel(const Matrix* matrices, const GemmJob* jobs, Acts acts, float* out, int out_ld) {
     using S = Staged<BM, BN, WM, WN, G, RUN, STAGES>;
+    using Shape = typename S::Shape;
     extern __shared__ __align__(16) unsigned char smem[];
     const GemmJob job = jobs[blockIdx.y];
     const Matrix m = matrices[job.matrix];
@@ -198,97 +230,146 @@ __global__ void __launch_bounds__(32 * WM * WN, (Staged<BM, BN, WM, WN, G, RUN, 
     const int tid = int(threadIdx.x), warp = tid / 32, lane = tid % 32, g = lane / 4, q = lane % 4;
     const int wr = (warp / WN) * S::kWarpRows, wt = (warp % WN) * S::kWarpTokens;
     const int blocks = m.cols / kBlock, last = job.first + job.count - 1;
+    const int visits = kc::declared_staged_plan<Shape>(smem, blocks);
+    const bs::VisitOrder order(blocks);
+    const bool visit_order = acts.order == kVisitOrder, w_visit = m.order == kVisitOrder;
     const std::size_t sld = std::size_t(m.cols / m.scale_k) * (m.scale_e8m0 ? 1u : 4u);
     const std::uint8_t* wscales = static_cast<const std::uint8_t*>(m.scales);
+    const bool e8m0 = m.scale_e8m0 != 0;
     // Block -> scale column divisions as multiply-highs (exact for blocks and divisors below 2^16).
     const unsigned w_div = unsigned(m.scale_k / kBlock), a_div = unsigned(acts.group / kBlock);
     const unsigned w_mul = w_div > 1 ? unsigned((0x100000000ull + w_div - 1) / w_div) : 0u;
     const unsigned a_mul = a_div > 1 ? unsigned((0x100000000ull + a_div - 1) / a_div) : 0u;
-    const unsigned w_size = m.scale_e8m0 ? 1u : 4u;
+    const unsigned w_size = e8m0 ? 1u : 4u;
+    auto w_col = [&](int b) { return w_div > 1 ? __umulhi(unsigned(b), w_mul) : unsigned(b); };
+    auto a_col = [&](int b) { return a_div > 1 ? int(__umulhi(unsigned(b), a_mul)) : b; };
+    // A slot's block, or the visit's first where its lane has no such block (copied, never used).
+    auto block_of = [&](int first, int i) {
+        const int b = kc::staged_block<Shape>(first, i);
+        return i == 0 || b < blocks ? b : first;
+    };
+    // This thread's weight copies (words of rows: the CTA's for every token tile).
+    const std::uint8_t* a_src[S::kAPer];
+    int a_dst[S::kAPer];
+#pragma unroll
+    for(int u = 0; u < S::kAPer; ++u) {
+        const int i = tid + u * S::kThreads, r = staged_row(i), w = i & 7;
+        a_src[u] = m.codes + std::size_t(min(row0 + r, m.rows - 1)) * std::size_t(m.cols) + 4 * w;
+        a_dst[u] = S::kA + operand_byte(r, w);
+    }
+    // The CTA's distinct weight scale rows (a scale row a block of scale_rows rows): thread r copies the r-th, and
+    // decodes its own row's (index w_of, its word's byte w_byte for E8M0).
+    const int srow0 = row0 / m.scale_rows, n_w = (min(row0 + BM, m.rows) - 1) / m.scale_rows - srow0 + 1;
+    const bool uniform = n_w == 1;
+    const std::uint8_t* w_row[S::kRowsPer];
+    int w_of[S::kRowsPer], w_byte[S::kRowsPer];
+#pragma unroll
+    for(int u = 0; u < S::kRowsPer; ++u) {
+        const int r = tid + u * S::kThreads;
+        w_row[u] = wscales + std::size_t(srow0 + min(r, n_w - 1)) * sld;
+        w_of[u] = min(row0 + r, m.rows - 1) / m.scale_rows - srow0;
+        w_byte[u] = int((reinterpret_cast<std::uintptr_t>(wscales) + std::size_t(srow0 + w_of[u]) * sld) & 3u);
+    }
+    // This thread's token copy slots: copy j is token j / (2 kSlots)'s half (j % 2) of slot (j % (2 kSlots)) / 2 (the
+    // same slot for all of a thread's copies), and scale copy j token j % BN's of slot j / BN.
+    const int b_slot = (tid % (2 * S::kSlots)) / 2;
 
     for(int tile = BN * int(blockIdx.z); tile < job.count; tile += BN * int(gridDim.z)) {
-        // This thread's copies: 16-byte pieces of rows and tokens, its weight rows' and tokens' scale rows.
-        const std::uint8_t* copy_src[S::kCopiesPer];
-        int copy_dst[S::kCopiesPer];
+        const std::uint8_t* b_src[S::kBPer];
+        int b_dst[S::kBPer];
 #pragma unroll
-        for(int u = 0; u < S::kCopiesPer; ++u) {
-            const int i = tid + u * S::kThreads, r = i / 2, h = i % 2;
-            if(r < BM) {
-                copy_src[u] = m.codes + std::size_t(min(row0 + r, m.rows - 1)) * std::size_t(m.cols) + 16 * h;
-                copy_dst[u] = S::kA + r * kBlock + 16 * h;
-            } else {
-                copy_src[u] = acts.codes + std::size_t(min(job.first + tile + (r - BM), last)) * std::size_t(acts.ld) +
-                              16 * h;
-                copy_dst[u] = S::kB + (r - BM) * kBlock + 16 * h;
-            }
+        for(int u = 0; u < S::kBPer; ++u) {
+            const int j = tid + u * S::kThreads, t = j / (2 * S::kSlots), h = j % 2;
+            b_src[u] = acts.codes + std::size_t(min(job.first + tile + t, last)) * std::size_t(acts.ld) + 16 * h;
+            b_dst[u] = S::kB + t * S::kTokenStride + 32 * b_slot + 16 * h;
         }
-        const std::uint8_t* w_row[S::kRowsPer];
-        const float* a_row[S::kTokensPer];
+        // The token scales: [tokens][groups] (plain) or [groups][tokens] (the visit order's), token t's at t_scale.
+        const float* t_scale[S::kSPer];
+        int t_dst[S::kSPer];
 #pragma unroll
-        for(int u = 0; u < S::kRowsPer; ++u)
-            w_row[u] = wscales + std::size_t(min(row0 + tid + u * S::kThreads, m.rows - 1) / m.scale_rows) * sld;
+        for(int u = 0; u < S::kSPer; ++u) {
+            const int j = tid + u * S::kThreads, t = min(job.first + tile + j % BN, last);
+            t_scale[u] = acts.scales + (visit_order ? std::size_t(t) : std::size_t(t) * std::size_t(acts.lds));
+            t_dst[u] = (j / BN % S::kSlots) * S::kSub + S::kAs + 4 * (j % BN);
+        }
+        // A visit's copies into its stage.
+        auto issue = [&](unsigned char* stage, int first) {
 #pragma unroll
-        for(int u = 0; u < S::kTokensPer; ++u)
-            a_row[u] = acts.scales + std::size_t(min(job.first + tile + tid + u * S::kThreads, last)) *
-                                         std::size_t(acts.lds);
-        auto w_scale_at = [&](int u, int b) {
-            return w_row[u] + std::size_t(w_size) * (w_div > 1 ? __umulhi(unsigned(b), w_mul) : unsigned(b));
+            for(int i = 0; i < S::kSlots; ++i) {
+                const int b = block_of(first, i);
+                unsigned char* sub = stage + i * S::kSub;
+                const std::size_t at = std::size_t(kBlock) * std::size_t(w_visit ? order.position(b) : b);
+#pragma unroll
+                for(int u = 0; u < S::kAPer; ++u)
+                    if(S::kACopies % S::kThreads == 0 || tid + u * S::kThreads < S::kACopies)
+                        kc::cp_async_ca<4>(sub + a_dst[u], a_src[u] + at);
+                const unsigned col = w_size * w_col(b);
+#pragma unroll
+                for(int u = 0; u < S::kRowsPer; ++u)   // the word holding the scale (E8M0 bytes: any alignment)
+                    if(tid + u * S::kThreads < n_w) {
+                        const std::uintptr_t word = reinterpret_cast<std::uintptr_t>(w_row[u] + col);
+                        kc::cp_async_ca<4>(sub + S::kWraw + 4 * (tid + u * S::kThreads),
+                                           reinterpret_cast<const void*>(word & ~std::uintptr_t(3)));
+                    }
+            }
+            // This thread's token slots: their blocks where the visit order or the plain layout keeps them.
+            const int bb = block_of(first, b_slot);
+            const std::size_t b_at = std::size_t(kBlock) * std::size_t(visit_order ? order.position(bb) : bb);
+#pragma unroll
+            for(int u = 0; u < S::kBPer; ++u)
+                if(S::kBCopies % S::kThreads == 0 || tid + u * S::kThreads < S::kBCopies)
+                    kc::cp_async16(stage + b_dst[u], b_src[u] + b_at);
+#pragma unroll
+            for(int u = 0; u < S::kSPer; ++u)
+                if(S::kSCopies % S::kThreads == 0 || tid + u * S::kThreads < S::kSCopies) {
+                    const int col = a_col(block_of(first, (tid + u * S::kThreads) / BN % S::kSlots));
+                    kc::cp_async_ca<4>(stage + t_dst[u], t_scale[u] + (visit_order ? std::size_t(col) *
+                                                                       std::size_t(acts.lds) : std::size_t(col)));
+                }
         };
-        // A block's copies into one sub-stage.
-        auto issue = [&](unsigned char* sub, int b) {
+        // A landed visit's weight scales to FP32 in pair_slot order (only ws[0] where the rows share one).
+        auto decode = [&](unsigned char* stage, int first) {
 #pragma unroll
-            for(int u = 0; u < S::kCopiesPer; ++u)
-                if(S::kCopies % S::kThreads == 0 || tid + u * S::kThreads < S::kCopies)
-                    kc::cp_async16(sub + copy_dst[u], copy_src[u] + std::size_t(kBlock) * std::size_t(b));
+            for(int i = 0; i < S::kSlots; ++i) {
+                const int b = kc::staged_block<Shape>(first, i);
+                if(i > 0 && b >= blocks) continue;
+                unsigned char* sub = stage + i * S::kSub;
+                float* ws = reinterpret_cast<float*>(sub + S::kWs);
+                const unsigned* raw = reinterpret_cast<const unsigned*>(sub + S::kWraw);
+                const unsigned wc = w_col(b);
 #pragma unroll
-            for(int u = 0; u < S::kRowsPer; ++u) {
-                const int r = tid + u * S::kThreads;
-                if(BM % S::kThreads == 0 || r < BM) {   // the word holding the scale (E8M0 bytes: any alignment)
-                    const std::uintptr_t at = reinterpret_cast<std::uintptr_t>(w_scale_at(u, b));
-                    kc::cp_async_ca<4>(sub + S::kWraw + 4 * r, reinterpret_cast<const void*>(at & ~std::uintptr_t(3)));
+                for(int u = 0; u < S::kRowsPer; ++u) {
+                    const int r = tid + u * S::kThreads;
+                    if(uniform ? r == 0 : BM % S::kThreads == 0 || r < BM) {
+                        const unsigned word = raw[w_of[u]];
+                        ws[bs::pair_slot(r)] = e8m0 ? kc::e8m0_value(word >> (8 * ((w_byte[u] + wc) & 3u)))
+                                                    : __uint_as_float(word);
+                    }
                 }
             }
-            const int ak = a_div > 1 ? int(__umulhi(unsigned(b), a_mul)) : b;
-#pragma unroll
-            for(int u = 0; u < S::kTokensPer; ++u) {
-                const int r = tid + u * S::kThreads;
-                if(BN % S::kThreads == 0 || r < BN) kc::cp_async_ca<4>(sub + S::kAs + 4 * r, a_row[u] + ak);
-            }
         };
-        // A landed sub-stage's weight scales to FP32, by the threads that copied them.
-        auto decode = [&](unsigned char* sub, int b) {
-            float* ws = reinterpret_cast<float*>(sub + S::kWs);
-#pragma unroll
-            for(int u = 0; u < S::kRowsPer; ++u) {
-                const int r = tid + u * S::kThreads;
-                if(BM % S::kThreads == 0 || r < BM) {
-                    const unsigned word = *reinterpret_cast<const unsigned*>(sub + S::kWraw + 4 * r);
-                    const unsigned at = unsigned(reinterpret_cast<std::uintptr_t>(w_scale_at(u, b)) & 3u);
-                    ws[bs::pair_slot(r)] = m.scale_e8m0 ? kc::e8m0_value(word >> (8 * at)) : __uint_as_float(word);
-                }
-            }
+        // The warp's token fragments of a block, then a row tile's block sums: one e4m3 MMA from zero a 16 x 8 tile.
+        struct Tokens {
+            uint2 b[S::kNT];
         };
-        // The warp's block sums: one e4m3 MMA from zero a 16 x 8 tile.
-        auto sums = [&](const unsigned char* sub, float (&d)[S::kMT][S::kNT][4]) {
-            uint2 fa[S::kMT][2], fb[S::kNT];
-#pragma unroll
-            for(int mt = 0; mt < S::kMT; ++mt) {
-                const int r = wr + 16 * mt + g;
-                fa[mt][0] = *reinterpret_cast<const uint2*>(sub + S::kA + r * kBlock + 8 * q);
-                fa[mt][1] = *reinterpret_cast<const uint2*>(sub + S::kA + (r + 8) * kBlock + 8 * q);
-            }
+        auto tokens = [&](const unsigned char* stage, int i) {
+            Tokens t;
 #pragma unroll
             for(int nt = 0; nt < S::kNT; ++nt)
-                fb[nt] = *reinterpret_cast<const uint2*>(sub + S::kB + (wt + 8 * nt + g) * kBlock + 8 * q);
+                t.b[nt] = *reinterpret_cast<const uint2*>(stage + S::kB + (wt + 8 * nt + g) * S::kTokenStride +
+                                                          kBlock * i + 8 * q);
+            return t;
+        };
+        auto sums = [&](const unsigned char* stage, int i, int mt, const Tokens& t, float (&d)[S::kNT][4]) {
+            const uint4 a = *reinterpret_cast<const uint4*>(stage + i * S::kSub + S::kA + (wr / 16 + mt) * 512 +
+                                                            16 * (4 * g + q));
 #pragma unroll
-            for(int mt = 0; mt < S::kMT; ++mt)
-#pragma unroll
-                for(int nt = 0; nt < S::kNT; ++nt) bs::block_sum_e4m3(fa[mt][0], fa[mt][1], fb[nt], d[mt][nt]);
+            for(int nt = 0; nt < S::kNT; ++nt) bs::block_sum_e4m3_fast(a.x, a.y, a.z, a.w, t.b[nt].x, t.b[nt].y, d[nt]);
         };
         float x[S::kOut][4];
-        kc::declared_staged<typename S::Shape>(smem, blocks, wr, wt, g, q, issue, decode, sums, x);
-        kc::declared_staged_store<typename S::Shape>(x, out, out_ld, row0, tile, m.rows, job.first, job.count, m.post,
-                                                     wr, wt, g, q);
+        kc::declared_staged<Shape>(smem, blocks, visits, uniform, wr, wt, g, q, issue, decode, tokens, sums, x);
+        kc::declared_staged_store<Shape>(x, out, out_ld, row0, tile, m.rows, job.first, job.count, m.post, wr, wt, g,
+                                         q);
         __syncthreads();   // the next token tile's prologue refills the stages
     }
 }
@@ -1119,12 +1200,18 @@ __global__ void quantize_kernel(const void* x, int bf16, int ld_x, int rows, int
     } else {
         scale = __fdiv_rn(amax, 448.0f);
     }
-    std::uint8_t* codes = const_cast<std::uint8_t*>(acts.codes) + std::size_t(row) * std::size_t(acts.ld) + std::size_t(k0);
-    for(int k = 0; k < acts.group; ++k)
-        codes[k] = scale > 0.0f
-                       ? std::uint8_t(__nv_cvt_float_to_fp8(__fdiv_rn(value(k), scale), __NV_SATFINITE, __NV_E4M3))
-                       : std::uint8_t(0);
-    const_cast<float*>(acts.scales)[std::size_t(row) * std::size_t(acts.lds) + std::size_t(i % groups)] = scale;
+    std::uint8_t* codes = const_cast<std::uint8_t*>(acts.codes) + std::size_t(row) * std::size_t(acts.ld);
+    const bs::VisitOrder order(cols / kBlock);
+    for(int k = 0; k < acts.group; ++k) {
+        const int at = k0 + k, b = at / kBlock;   // the code's block, where the activations' order keeps it
+        codes[(acts.order == kVisitOrder ? order.position(b) * kBlock : b * kBlock) + at % kBlock] =
+            scale > 0.0f
+                ? std::uint8_t(__nv_cvt_float_to_fp8(__fdiv_rn(value(k), scale), __NV_SATFINITE, __NV_E4M3))
+                : std::uint8_t(0);
+    }
+    const_cast<float*>(acts.scales)[acts.order == kVisitOrder
+                                        ? std::size_t(i % groups) * std::size_t(acts.lds) + std::size_t(row)
+                                        : std::size_t(row) * std::size_t(acts.lds) + std::size_t(i % groups)] = scale;
 }
 
 // quantize_kernel's codes decoded and scaled at once: out = BF16(FP32(code) * scale), a thread a group.
@@ -1192,7 +1279,11 @@ __global__ void quantized_values_warp_kernel(const void* x, int bf16, int ld_x, 
     out[std::size_t(row) * std::size_t(ld_out) + std::size_t(k)] = __float2bfloat16(__fmul_rn(decoded, scale));
 }
 
-bool bad_acts(const Acts& a) { return !a.codes || !a.scales || a.group <= 0 || a.group % kBlock || a.ld % 8; }
+// The visit order is the staged GEMM's and the quantizer's only (visit_ok).
+bool bad_acts(const Acts& a, bool visit_ok = false) {
+    return !a.codes || !a.scales || a.group <= 0 || a.group % kBlock || a.ld % 8 ||
+           (a.order != kPlainOrder && !(visit_ok && a.order == kVisitOrder));
+}
 
 template<int kRowWarps, int kAhead, int STREAM>
 void launch_rows(const Matrix* matrices, const RowJob* jobs, int job_count, int max_rows, const Acts& acts,
@@ -1219,6 +1310,7 @@ cudaError_t launch_staged(const Matrix* matrices, const GemmJob* jobs, int job_c
     static kc::PerDevice<cudaError_t> optin;   // the kernel's shared memory, raised once a device
     const cudaError_t attribute = kc::shared_memory_optin(optin, kernel, S::kSmem);
     if(attribute != cudaSuccess) return attribute;   // more shared memory than the device gives a CTA
+    if(acts.ld / kBlock > S::kMaxBlocks) return cudaErrorInvalidValue;   // more blocks than the plan holds
     const int tiles = (max_count + BN - 1) / BN;
     const dim3 grid(unsigned((max_rows + BM - 1) / BM), unsigned(job_count), unsigned(tiles < 65535 ? tiles : 65535));
     kernel<<<grid, S::kThreads, S::kSmem, stream>>>(matrices, jobs, acts, out, out_ld);
@@ -1330,7 +1422,7 @@ cudaError_t enqueue_gemm(const Matrix* matrices, const GemmJob* jobs, int job_co
 
 cudaError_t enqueue_gemm_staged(const Matrix* matrices, const GemmJob* jobs, int job_count, int max_rows,
                                 int max_count, const Acts& acts, float* out, int out_ld, cudaStream_t stream) {
-    if(!matrices || !jobs || job_count < 0 || max_rows < 0 || max_count < 0 || !out || bad_acts(acts) ||
+    if(!matrices || !jobs || job_count < 0 || max_rows < 0 || max_count < 0 || !out || bad_acts(acts, true) ||
        acts.ld % 16 || reinterpret_cast<std::uintptr_t>(acts.codes) % 16)
         return cudaErrorInvalidValue;
     if(job_count == 0 || max_rows == 0 || max_count == 0) return cudaSuccess;
@@ -1428,7 +1520,8 @@ cudaError_t enqueue_gemm_native_channel(const Matrix* matrices, const GemmJob* j
 
 cudaError_t enqueue_quantize(const void* x, bool bf16, int ld_x, int rows, int cols, ScaleKind kind, const Acts& acts,
                              cudaStream_t stream) {
-    if(!x || rows < 0 || cols < 0 || bad_acts(acts) || cols % acts.group) return cudaErrorInvalidValue;
+    if(!x || rows < 0 || cols < 0 || bad_acts(acts, true) || cols % acts.group) return cudaErrorInvalidValue;
+    if(acts.order == kVisitOrder && (cols % kBlock || acts.lds < rows)) return cudaErrorInvalidValue;
     const int n = rows * (cols / acts.group);
     if(n == 0) return cudaSuccess;
     quantize_kernel<<<(n + 127) / 128, 128, 0, stream>>>(x, bf16 ? 1 : 0, ld_x, rows, cols, kind, acts);

@@ -18,6 +18,7 @@
 #include <cstdint>
 
 #include "crit_kcore/mma.cuh"
+#include "crit_kcore/mma_fp8.cuh"
 
 namespace crit::kcore::blockscaled {
 
@@ -25,6 +26,27 @@ namespace crit::kcore::blockscaled {
 // 8q.. 8q+7 (crit's fragment order on mma.cuh's E4M3 MMA). Traps where the instruction does not exist.
 __device__ __forceinline__ void block_sum_e4m3(uint2 a_g, uint2 a_g8, uint2 b, float (&d)[4]) {
     mma_e4m3_m16n8k32_zero(d, a_g.x, a_g8.x, a_g.y, a_g8.y, b.x, b.y);
+}
+
+// The same block sum on the sm_120 family's block-scaled kind::mxf8f6f4 m16n8k32 with unit E8M0 scales where it gives
+// the plain MMA's bits (mma_fp8.cuh's fast MMA, twice the plain e4m3's rate on an RTX 5090), the plain one elsewhere:
+// arch.cuh's CRIT_KCORE_FAST_E4M3_SUM, set only for the targets where tests/fast_e4m3_tests.cu passed (it compares the
+// two sums bit for bit over every code byte, NaNs included, and large, subnormal and near-one cancelling blocks;
+// measured before on an RTX 5090 for 8.6e9 block sums of six distributions), and fp8-block-rows' tests check its
+// staged GEMM (this sum) against its register GEMM (block_sum_e4m3) bit for bit on the target: so the declared order
+// holds on either.
+__device__ __forceinline__ void block_sum_e4m3_fast(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
+                                                    uint32_t b1, float (&d)[4]) {
+#if CRIT_KCORE_FAST_E4M3_SUM
+    mma_e4m3_m16n8k32_fast_zero(d, a0, a1, a2, a3, b0, b1);
+#else
+    mma_e4m3_m16n8k32_zero(d, a0, a1, a2, a3, b0, b1);
+#endif
+}
+// The fast MMA itself, without the guard (tests/fast_e4m3_tests.cu compares it with the plain one).
+__device__ __forceinline__ void block_sum_e4m3_unguarded(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                                         uint32_t b0, uint32_t b1, float (&d)[4]) {
+    mma_e4m3_m16n8k32_fast_zero(d, a0, a1, a2, a3, b0, b1);
 }
 
 // 0x4B400000 is 1.5 * 2^23 as FP32: an integer s with |s| < 2^22 added to it as an integer gives the FP32 value

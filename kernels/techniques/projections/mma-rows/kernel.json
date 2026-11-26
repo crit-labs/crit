@@ -5,6 +5,7 @@
   "title": "Projections of 1 to 64 rows on tensor cores in one fixed tile (NVFP4, FP8, MXFP8, BF16 weights; BF16, FP8 or NVFP4 activations), the block-scaled FP4 MMA, a prompt tile with the decode tile's bits, and the activations' quantizers",
   "package": "mma_rows",
   "language": "cuda",
+  "launches": ["crit::kernels::mma_rows::"],
   "operations": [
     "nvfp4-projection",
     "nvfp4-activation-quantization",
@@ -177,7 +178,7 @@
       "bench": "bench.py:Fp4Tile"
     },
     "prompt-tile": {
-      "what": "any number of rows with the decode tile's bits (mm_prompt): each output the same chain of mma.m16n8k16 the decode tile runs, a CTA of PW warps reusing each decoded weight for PT rows staged in shared memory (cp.async, two buffers)",
+      "what": "any number of rows with the decode tile's bits (mm_prompt): each output the same chain of mma.m16n8k16 the decode tile runs, a CTA of PW warps reusing each decoded weight for PT rows staged in shared memory (cp.async, PS buffers); with partial and counters, a tile's splits of K in PK CTAs (part 0 adds its splits' chains, every later split's chain is stored on its own, the tile's last CTA adds them in split order), so short prompts and narrow matrices fill the GPU",
       "call": "mm_prompt",
       "rows": [
         1,
@@ -212,6 +213,44 @@
           ],
           "default": 64,
           "what": "activation rows a CTA (8 an MMA column)"
+        },
+        "PK": {
+          "values": [
+            0,
+            1,
+            2,
+            4,
+            8,
+            16,
+            32
+          ],
+          "default": 0,
+          "what": "CTAs a tile's splits of K run in (speed only: part 0 adds its splits' chains, every later split's chain is stored on its own, the tile's last CTA adds them in split order), capped at the plan's splits and at what the caller's partial buffer holds; 0: the fewest splits a CTA whose CTAs fit one wave of the multiprocessors' resident CTAs (a grid that fills them keeps one part; from a third of them, only while a CTA keeps 1,024 values of K, and never for a BF16 matrix's one-tile weight stream); 1: one CTA runs them all"
+        },
+        "PS": {
+          "values": [
+            2,
+            3
+          ],
+          "default": 3,
+          "what": "sub-steps of activations staged in shared memory: 2 (a barrier before and after each sub-step's MMAs) or 3 (one barrier a sub-step) (speed only)"
+        },
+        "PF": {
+          "values": [
+            0,
+            1
+          ],
+          "default": 1,
+          "what": "1: a step's weights loaded a step ahead (two steps in registers); 0: at the step, the multiprocessor's other warps hiding the load (speed only)"
+        },
+        "PR": {
+          "values": [
+            0,
+            1,
+            2
+          ],
+          "default": 0,
+          "what": "16-row groups a warp: each staged B fragment read once for them, 2 loading the weights at the step (PF 0); 0: two where their grid takes no more waves of resident CTAs, times their twice the work, than one group's (a sixteenth more allowed), K has 8 steps or more and the call is not a BF16 matrix's one-tile weight stream (speed only: each accumulator's MMAs in the same order)"
         }
       },
       "yardstick": {
@@ -265,6 +304,19 @@
           ],
           "default": 128,
           "what": "tokens a CTA (8 an MMA column)"
+        },
+        "PK": {
+          "values": [
+            0,
+            1,
+            2,
+            4,
+            8,
+            16,
+            32
+          ],
+          "default": 0,
+          "what": "CTAs a tile's splits of K run in, as prompt-tile's PK (part 0 keeps its running total, every later split's chain is stored on its own, the tile's last CTA adds them in split order; speed only); 0: prompt-tile's rule"
         }
       },
       "yardstick": {

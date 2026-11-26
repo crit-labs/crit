@@ -76,6 +76,13 @@ def position_bytes(layers, kv_heads, head_dim, dtype="bf16", value_dim=None):
 BACK = 256
 
 
+def prompt_row(batch, r, window):
+    """Whether a step's row r is a prompt row (StepBatch.prompt_row: the model's mark, else more than `window`
+    tokens), not a window row."""
+    asked = getattr(batch, "prompt_row", None)
+    return asked(r, window) if callable(asked) else batch.row(r)[2] > window
+
+
 class FreshBuffer:
     """A prompt chunk's keys and values as the projections gave them, one buffer for a plugin's pools: `data` the
     uint8 device buffer, `tag` (pool, layer, tokens, reserve) of the write that holds it now, so a pool reads it only
@@ -86,8 +93,9 @@ class FreshBuffer:
 
 
 class KVPool:
-    """window: the most tokens of a row read as a window row (decode tokens, verify windows, short prompt pieces: the
-    attention plugins' split-KV reader); a longer row is a prompt row. step_rows > 0 keeps a step's buffers at fixed
+    """window: the most tokens of a row read as a window row (decode tokens, verify windows: the attention
+    plugins' split-KV reader); a longer row is a prompt row, and so is a shorter prompt chunk the model marks
+    (prompt_row). step_rows > 0 keeps a step's buffers at fixed
     addresses (step buffers): reserve() writes the slots of up to step_tokens tokens, and the first token, column
     count, first position, first partial row and page table of up to step_rows window rows (`windows`, in row order),
     into the same device tensors every step, so a model can capture a decode step in a CUDA graph and replay it after
@@ -295,6 +303,14 @@ class KVPool:
             self.lengths[sequence] = int(self.round_lengths[self.slot_of[sequence]])
         return self.lengths[sequence]
 
+    def resumes_from(self, sequence):
+        """The least length a fork of `sequence` may be kept to and resume from with every position its window reads
+        still held: 0, or for a ring that has wrapped, its oldest position held plus the window (positions before
+        that were written over by later ones, which keep() cannot take back)."""
+        if not self._wrapped(sequence):
+            return 0
+        return (self.reached[sequence] - self.ring) * self.page + self.sliding
+
     def keep(self, sequence, length):
         """The sequence's valid KV is its first `length` positions; pages past them are freed (a sequence a round slot
         holds keeps its pages up to its capacity)."""
@@ -384,7 +400,7 @@ class KVPool:
         tables (unused entries at the dump page), into the step buffers in one asynchronous copy each; every row's table
         also as device_tables (for gather())."""
         torch = self.torch
-        windows = [r for r in range(batch.rows) if batch.row(r)[2] <= self.window]
+        windows = [r for r in range(batch.rows) if not prompt_row(batch, r, self.window)]
         if len(slots) > self.step_tokens or len(windows) > self.step_rows:
             raise ValueError(f"a step of {len(slots)} tokens and {len(windows)} rows of up to {self.window} "
                              f"tokens is larger than the pool's step buffers ({self.step_tokens} tokens, "

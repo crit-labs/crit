@@ -18,6 +18,10 @@ def test_resource_records_and_limits():
     failures, spills = gates.check_limits(records)
     assert len(failures) == 2 and len(spills) == 1
     assert gates.check_limits([("90a", "k", 255, 48 * 1024, 0)]) == ([], [])
+    # From sm_90 cuobjdump counts the system's reserved 1 KiB in SHARED: a 48 KiB kernel reads 50176 and fits
+    assert gates.check_limits([("90", "k", 64, 48 * 1024 + 1024, 0), ("120", "k", 64, 48 * 1024 + 1024, 0)]) == ([], [])
+    assert len(gates.check_limits([("90", "k", 64, 48 * 1024 + 1025, 0)])[0]) == 1
+    assert len(gates.check_limits([("80", "k", 64, 48 * 1024 + 1024, 0)])[0]) == 1
 
 
 def test_controls_fail_their_gates():

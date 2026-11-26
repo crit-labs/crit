@@ -35,7 +35,10 @@ beside the tuned record as name + UNTUNED.
 Each request is recorded (loaded()), and the engine's facts carry the record under "kernels": per kernel the source it
 came from (tuned: built with the engine's tuning table; built: built with its default knobs; fallback) and, for a
 fallback, why. A tuning table swept on a GPU of another compute capability (the sweep records it) is not applied: the
-kernel is built with its default knobs, recorded as built with the reason, and stderr says so once.
+kernel is built with its default knobs, recorded as built with the reason, and stderr says so once. On a GPU of the
+compute capability a kernel's shipped table was swept on (crit_kernels.shipped: tunings/<capability>.json in the
+kernel's folder, measured by earlier sweeps), the shapes the engine's tuning lacks take the table's entries: the
+record says tuned and names the table under "shipped". A kernel asked for with tuned=False takes no table.
 
 The engine also says how exact its rows must be (use_exactness(), from the configuration's "exactness": a level of
 crit_plugins.exactness for the decode rows and one for the prompt rows). A plugin that can compute a phase's rows in
@@ -182,13 +185,15 @@ def _warn_fallback(name, plugin, reason):
           f"CUDA toolkit (nvcc) and ninja; `crit kernels build {name}` shows the build's errors.", file=sys.stderr)
 
 
-def _record(name, source, plugin, reason=None, tuning=None):
+def _record(name, source, plugin, reason=None, tuning=None, shipped=None):
     """Record a request of kernel `name` in the active engine's record (loaded())."""
     if source == "fallback":
         _warn_fallback(name, plugin, reason or "unavailable")
     record = {"source": source}
     if tuning:
         record["tuning"] = str(tuning)
+    if shipped:
+        record["shipped"] = str(shipped)
     if reason:
         record["reason"] = reason
     requests = current().kernels
@@ -198,10 +203,26 @@ def _record(name, source, plugin, reason=None, tuning=None):
     return record
 
 
-def _outcome(key, label, source, plugin, reason=None, tuning=None):
+def _outcome(key, label, source, plugin, reason=None, tuning=None, shipped=None):
     """A build's outcome: recorded for the engine asking, and kept with the module for the next engine that asks."""
-    _built[key] = (source, reason, tuning)
-    return _record(label, source, plugin, reason, tuning)
+    _built[key] = (source, reason, tuning, shipped)
+    return _record(label, source, plugin, reason, tuning, shipped)
+
+
+def _shipped(name, data):
+    """The shipped table (crit_kernels.shipped) a build of kernel `name` with tuning `data` takes entries from on this
+    GPU, or None."""
+    try:
+        from crit_kernels import build as build_module
+        from crit_kernels import shipped
+    except ImportError:
+        return None
+    try:
+        _, manifest = build_module.find(name)
+        _, where, taken = shipped.apply(name, manifest, data)
+    except Exception:  # noqa: BLE001 - the record only: the build itself says what is wrong
+        return None
+    return where if taken else None
 
 
 _manifests = {}   # (plugin folder, plugin.json's mtime and size) -> its checked manifest
@@ -302,8 +323,8 @@ def load_kernel(name, *, folder, tuned=True):
     key = (name, str(tuning)) if tuned else (name, UNTUNED)
     with _lock:
         if key in _modules:
-            source, reason, built_tuning = _built[key]
-            _record(label, source, plugin, reason, built_tuning)
+            source, reason, built_tuning, built_shipped = _built[key]
+            _record(label, source, plugin, reason, built_tuning, built_shipped)
             if _modules[key] is not None:
                 from crit_kernels import build as build_module
                 _report_aliases(build_module, _modules[key])
@@ -325,17 +346,22 @@ def load_kernel(name, *, folder, tuned=True):
             if foreign:   # swept on another GPU: its choices are no evidence here, so the default knobs
                 build_module.warn_foreign_tuning(name, foreign)
                 data = None
-            module = load(name, tuning=data)
+            import inspect
+            takes = "shipped" in inspect.signature(load).parameters
+            module = load(name, tuning=data, **({} if tuned or not takes else {"shipped": False}))
         except Exception as error:  # noqa: BLE001 - any failure to build or import is a fallback with its reason
             text = str(error).strip()
             reason = f"{type(error).__name__}: {text.splitlines()[-1] if text else ''}"[:300]
             _outcome(key, label, "fallback", plugin, reason)
             _modules[key] = None
             return None
-        if foreign:
+        table = _shipped(name, data) if tuned else None
+        if foreign and not table:
             _outcome(key, label, "built", plugin, f"default knobs: {foreign}")
+        elif foreign:
+            _outcome(key, label, "tuned", plugin, f"{foreign}: the shipped table for this GPU instead", shipped=table)
         else:
-            _outcome(key, label, "tuned" if tuning else "built", plugin, tuning=tuning)
+            _outcome(key, label, "tuned" if tuning or table else "built", plugin, tuning=tuning, shipped=table)
         if hasattr(build_module, "alias_loaded"):
             _report_aliases(build_module, module)
         _modules[key] = module

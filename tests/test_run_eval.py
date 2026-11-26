@@ -377,5 +377,23 @@ class UnservableEvalTests(RunFixture, unittest.TestCase):
             evaluation.evaluate(self.store, self.run_id, candidate, self.root, ["speed"])
 
 
+class BaselineTests(RunFixture, unittest.TestCase):
+    def test_a_baseline_is_a_candidates_newest_completed_result_or_a_path_in_the_run_folder(self):
+        candidate = self.candidate()["candidate_id"]
+        folder = self.directory / "candidates" / candidate
+        for attempt, outcome in (("attempt-0002", "completed"), ("attempt-0003", "failed")):
+            (folder / "eval").mkdir(parents=True, exist_ok=True)
+            (folder / "eval" / f"{attempt}.json").write_text(json.dumps({"attempt": attempt}), encoding="utf-8")
+            (folder / "attempts" / attempt).mkdir(parents=True, exist_ok=True)
+            (folder / "attempts" / attempt / "result.json").write_text(json.dumps({"outcome": outcome}),
+                                                                       encoding="utf-8")
+        found = evaluation.baseline_result
+        self.assertEqual(found(self.store, self.run_id, candidate), {"attempt": "attempt-0002"})
+        relative = f"candidates/{candidate}/eval/attempt-0003.json"   # as crit prints it, from any working directory
+        self.assertEqual(found(self.store, self.run_id, relative), {"attempt": "attempt-0003"})
+        with self.assertRaisesRegex(ValueError, "no Eval result there"):
+            found(self.store, self.run_id, "candidates/nope/eval/attempt-0001.json")
+
+
 if __name__ == "__main__":
     unittest.main()

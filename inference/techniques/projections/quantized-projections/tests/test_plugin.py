@@ -74,6 +74,34 @@ class QuantizedProjectionsTests(PluginTestCase):
         with self.assertRaisesRegex(ValueError, "quality mode 'fast' is not one of preserve, speed"):
             kernels.use_quality_mode("fast")
 
+    def test_a_plan_prices_each_matrix_at_the_bytes_load_holds_it_in(self):
+        # quality mode speed: trunk and head auto are fp8, trunk_keep's default leaves the router as stored
+        from crit_plugins import kernels
+        self.addCleanup(kernels.use_quality_mode, None)
+        torch = __import__("torch")
+        kernels.use_quality_mode("speed")
+        p = self.assemble()["projections"]
+        codec = p.held_bytes.__globals__["device_matrices"]
+        w = torch.randn(40, 96, generator=torch.Generator().manual_seed(3), dtype=torch.float32).to(torch.bfloat16)
+
+        def encoded(rows):   # the bytes of the codes and scales the encoder makes of `rows` zero-padded rows
+            weight = torch.cat([w, w.new_zeros(rows - 40, 96)]) if rows > 40 else w[:rows]
+            return codec.stored_bytes(*codec.reencode({"weight": weight}, "bf16", "fp8"))
+        stored = lambda rows, columns=96: rows * columns * 2   # noqa: E731
+        self.assertEqual(p.held_bytes("bf16", 32, 96, stored(32), "down"), encoded(32))
+        self.assertEqual(p.held_bytes("bf16", 32, 96, stored(32)), encoded(32))   # a role the plan does not know
+        self.assertEqual(p.held_bytes("bf16", 40, 96, stored(40), "o"), encoded(48))   # padded to 48 rows
+        self.assertEqual(p.held_bytes("bf16", 32, 96, stored(32), "router"), stored(32))   # trunk_keep
+        self.assertEqual(p.held_bytes("bf16", 32, 90, stored(32, 90), "gate"), stored(32, 90))   # 90 columns
+        self.assertEqual(p.held_bytes("bf16", 32, 96, stored(32), "head"), encoded(32))
+        self.assertEqual(p.held_bytes("bf16", 40, 96, stored(40), "head"), stored(40))   # the head is never padded
+        self.assertEqual(p.held_bytes("nvfp4", 32, 96, 1234, "down"), 1234)   # stored quantized: as stored
+        self.assertEqual(self.assemble(options={"trunk_keep": "down"})["projections"].held_bytes(
+            "bf16", 32, 96, stored(32), "down"), stored(32))
+        kernels.use_quality_mode("preserve")
+        p = self.assemble()["projections"]
+        self.assertEqual([p.held_bytes("bf16", 32, 96, stored(32), r) for r in ("down", "head")], [stored(32)] * 2)
+
     def test_the_formats_differ(self):
         w = matrix(2, 64, seed=4)
         decoded = {options.get("format", "int8"): self.assemble(options=options)["projections"]

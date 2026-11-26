@@ -8,7 +8,8 @@ compile step; its package is copied and its tuning written beside it.
 
 Knobs: each structure in kernel.json declares compile-time knobs (CUDA) or launch parameters (Triton) with the values a
 sweep may try and a default. A tuning table (crit kernels sweep) names, per shape key and row range, the knob values to
-use. The build writes it where the kernel's code reads it:
+use; on a GPU of the compute capability a kernel's shipped table was swept on (crit_kernels.shipped), the table fills
+the shapes the tuning lacks. The build writes it where the kernel's code reads it:
 
 - CUDA: crit_tuning.h (included by the kernel's sources) defines, per structure S (its id with '-' as '_'),
   CRIT_CONFIGS_S(X) listing X(index, knob values in kernel.json order) for every configuration the table uses (index 0
@@ -371,7 +372,8 @@ def tuning_module(manifest, tuning):
             "    return compiled\n")
 
 
-IGNORED = {"tests", "benchmarks", "bench.py"}   # a kernel's files that never reach its build
+IGNORED = {"tests", "benchmarks", "bench.py", "tunings"}   # a kernel's files that never reach its build (tunings:
+# its shipped tables, crit_kernels.shipped, which reach a build as its tuning)
 # A workbench folder's own files at its top (crit kernels new, crit eval workbench): its measurement adapter and
 # harness, the copy of the build crit-eval profiles, and their results.
 WORKBENCH = {"kernel.py", "harness.py", "build", "check.json", "bench.json", "profile.json", "profile-ncu.txt"}
@@ -910,7 +912,7 @@ def _cuda_variants(out, package, manifest, variants, archs):
 
 
 def build(kernel_id, *, tuning=None, knobs=None, configs=None, sweep=False, root=None, verbose=False, archs=None,
-          variants=None):
+          variants=None, shipped=True):
     """Compile (CUDA) or stage (Triton) kernel_id and return (package folder, package name, build key) without
     importing it. tuning: a tuning dict for this kernel (None: its default tuning); knobs: {structure: {knob: value}},
     a single configuration per structure, which replaces the tuning; configs: {structure: [knob dicts]}, several
@@ -919,7 +921,9 @@ def build(kernel_id, *, tuning=None, knobs=None, configs=None, sweep=False, root
     CRIT_SWEEP_BUILD; archs: compile for these architectures (nvcc names: 80, 86, 89, 90a, 100a, 120a) instead of the
     current device's, to check that the kernel builds for every one it claims (such a build is not for loading; a
     mixed kernel compiles its kernel.json "cuda" "check" variants); variants: a mixed kernel's CUDA variants to compile
-    now rather than on first use (a sweep's builds, before it holds the GPU)."""
+    now rather than on first use (a sweep's builds, before it holds the GPU); shipped: with tuning (or none), the table
+    the kernel carries for this GPU's compute capability fills the shapes the tuning lacks (crit_kernels.shipped; False:
+    the tuning as given, or the default knobs: an untuned build)."""
     folder, manifest = find(kernel_id, root)
     if manifest["language"] != "cuda":   # every launched Triton kernel says which arguments follow the request
         from .specialization import problems
@@ -949,7 +953,11 @@ def build(kernel_id, *, tuning=None, knobs=None, configs=None, sweep=False, root
         foreign = foreign_tuning(tuning) if (tuning and not archs) else None
         if foreign:   # given explicitly (crit kernels build --tuning, gates --tuning): kept, with a warning
             warn_foreign_tuning(kernel_id, foreign, kept=True)
-        tuning = check_tuning(manifest, tuning) if tuning else default_tuning(manifest)
+        if shipped and not archs:   # the shapes the tuning lacks from the table swept on this capability, if any
+            from . import shipped as shipped_tables
+            tuning = shipped_tables.apply(kernel_id, manifest, tuning, root)[0]
+        else:
+            tuning = check_tuning(manifest, tuning) if tuning else default_tuning(manifest)
     swept = sorted(configs) if (sweep and configs) else sorted(knobs) if (sweep and knobs) else []
     key = _build_key(folder, manifest, tuning, sweep, archs, swept)
     out = cache_root() / f"{kernel_id}-{key}"
@@ -1059,18 +1067,25 @@ def import_build(out, package):
         return module
 
 
-def load(kernel_id, *, tuning=None, knobs=None, configs=None, sweep=False, root=None, verbose=False):
+def load(kernel_id, *, tuning=None, knobs=None, configs=None, sweep=False, root=None, verbose=False, shipped=True):
     """The kernel's Python package, built for this machine (build()) and imported."""
     out, package, _ = build(kernel_id, tuning=tuning, knobs=knobs, configs=configs, sweep=sweep, root=root,
-                            verbose=verbose)
+                            verbose=verbose, shipped=shipped)
     return import_build(out, package)
 
 
 def select(module, structure, index):
     """Make a build made with configs= run configuration `index` of `structure` for every call (-1: back to its
-    table). CUDA: crit_select_<S> in its library; Triton: its _crit_tuning.SELECTED."""
+    table). CUDA: crit_select_<S> in its library; Triton: its _crit_tuning.SELECTED. `index` counts the build's
+    configurations, the structure's defaults first (a configs= entry equal to the defaults is that first one, not
+    one more): an index past them is refused, naming them, where a launch raised IndexError at its first call."""
     import ctypes
     tuning_module_ = sys.modules.get(module.__name__ + "._crit_tuning")
+    if tuning_module_ is not None and index >= 0 and structure in getattr(tuning_module_, "TUNING", {}):
+        built = tuning_module_.TUNING[structure]["configs"]
+        if index >= len(built):
+            raise IndexError(f"{structure} was built with {len(built)} configurations (its defaults first, a configs= "
+                             f"entry equal to them not again), not {index + 1}: {built}")
     if tuning_module_ is not None:
         if index < 0:
             tuning_module_.SELECTED.pop(structure, None)

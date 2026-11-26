@@ -54,4 +54,29 @@ struct GroupVisits {
     }
 };
 
+// The visit order of a dot's blocks: a layout of a row's blocks (activation codes the staged GEMM reads, VISIT) in
+// which a visit of sibling lanes is one contiguous piece. The tree's steps in pairs (2p, 2p + 1: sibling lanes l and
+// l + 8), each pair's blocks interleaved by k (step 2p's block k, then step 2p + 1's), the pairs in the tree's order.
+// A visit of G = 2 lanes and RUN blocks of each is then 64 RUN contiguous bytes of an E4M3 row, where the plain
+// layout's are 32-byte pieces 256 bytes apart (L2 serves 64-byte pieces at about twice the rate of 32-byte ones on an
+// RTX 5090). position(b): where block b of the plain layout sits; a bijection of 0 .. blocks - 1.
+struct VisitOrder {
+    int c = 0, mask = 0;   // blocks / 16, and the tree steps whose lane has one more block (bit at)
+    __host__ __device__ explicit VisitOrder(int blocks) : c(blocks >> 4), mask(0) {
+        const int rem = blocks & 15;
+        for(int at = 0; at < 16; ++at)
+            if(lane_at(at) < rem) mask |= 1 << at;
+    }
+    __host__ __device__ int position(int b) const {
+        const int at = lane_at(b & 15), pair = at >> 1;
+        const unsigned before = unsigned(mask) & ((1u << (2 * pair)) - 1u);
+#ifdef __CUDA_ARCH__
+        const int extra = __popc(before);
+#else
+        const int extra = __builtin_popcount(before);
+#endif
+        return 2 * c * pair + extra + 2 * (b >> 4) + (at & 1);
+    }
+};
+
 }  // namespace crit::kcore::blockscaled

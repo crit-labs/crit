@@ -19,19 +19,29 @@ namespace crit::techniques::fp8_block {
 // One matrix: codes [rows][cols] E4M3; scales [ceil(rows / scale_rows)][cols / scale_k], FP32 or (scale_e8m0) MXFP8's
 // E8M0 bytes as stored (MXFP8: 1, 32; 128 x 128 blocks: 128, 128; per row: 1, cols). cols and scale_k multiples of 32.
 // An E8M0 byte e is the scale 2^(e - 127), the same value as its FP32 decoding, so both give the same bits.
+// order: the codes' blocks of 32 a row in order (kPlainOrder), or in the kernel core's visit order (kVisitOrder: a
+// row's blocks at VisitOrder(cols / 32).position(b), stored that way once at load, so the staged GEMM's visit of
+// sibling lanes reads one contiguous 64-byte piece of a row): rows, gemm and gemm_staged read either, with the same
+// bits; the native GEMMs read the plain layout only.
 struct Matrix {
     const std::uint8_t* codes = nullptr;
     const void* scales = nullptr;
     int rows = 0, cols = 0, scale_rows = 1, scale_k = 32;
     float post = 1.0f;
     int scale_e8m0 = 0;
+    int order = 0;
 };
 
 // Quantized activations: codes [row][ld] E4M3, scales [row][lds] FP32, one per `group` codes (a multiple of 32).
+// Activations: codes [rows][ld] E4M3, scales FP32 per group. order kPlainOrder: a row's blocks of 32 in order, scales
+// [rows][lds]; kVisitOrder (the staged GEMM's and quantize's only): a row's blocks in the kernel core's visit order
+// (blockscaled_order.cuh's VisitOrder: a visit of sibling lanes one contiguous piece), scales [groups][lds], lds the
+// tokens' stride.
+constexpr int kPlainOrder = 0, kVisitOrder = 1;
 struct Acts {
     const std::uint8_t* codes = nullptr;
     const float* scales = nullptr;
-    int ld = 0, lds = 0, group = 32;
+    int ld = 0, lds = 0, group = 32, order = kPlainOrder;
 };
 
 enum class ScaleKind : int { mx = 0, amax = 1 };

@@ -39,7 +39,8 @@ def fused(x, stored, weights, acts, blocked, splits, prompt=False):
     if prompt:
         scratch = torch.empty(mr.scratch_bytes(m, k), dtype=torch.uint8, device=dev)
         return mr.mm_prompt(x, w, out, weights, scales, row_scale, acts, INPUT_SCALE, blocked, splits, scratch,
-                            glu=True)
+                            glu=True, partial=torch.empty(1 << 20, dtype=torch.float32, device=dev),
+                            counters=torch.zeros(1 << 14, dtype=torch.int32, device=dev))
     return mr.mm_rows(x, w, out, weights, scales, row_scale, acts, INPUT_SCALE, blocked, 1, 4, splits,
                       *buffers(m, n, k, splits), glu=True)
 

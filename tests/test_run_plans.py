@@ -1857,9 +1857,15 @@ class RoundAccountTests(PlanFixture, unittest.TestCase):
     def test_candidate_1_starts_with_the_cpu_tier_where_the_cpu_beats_the_link(self):
         recon = self.directory / "work" / "recon.json"
         recon.parent.mkdir(parents=True, exist_ok=True)
-        placement = {"scenario": "sparse_device_host", "plain_pass_floor_ms": {"link": 20.0, "cpu": 12.0, "split": 10.0}}
+        # A probe that measured no CPU expert lane and no turn to the host prices the CPU's floors as lower bounds:
+        # they ask nothing.
+        placement = {"scenario": "sparse_device_host", "plain_pass_floor_ms": {"link": 20.0, "cpu": 12.0, "split": 10.0},
+                     "host_turn_us": None, "rates_gbs": {"link": 26.8}}
         recon.write_text(json.dumps({"gathered": {"placement": placement}}), encoding="utf-8")
         first = plan(levers=[], forecast=None)
+        self.assertNotIn("cpu_tier", self.store.plan(self.run_id, first)["inputs"])
+        placement.update(host_turn_us=40.0, rates_gbs={"link": 26.8, "cpu_expert_lane": {"tokens_1": 30.0}})
+        recon.write_text(json.dumps({"gathered": {"placement": placement}}), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "candidate 1 starts with the CPU expert tier"):
             self.store.plan(self.run_id, first)
         tier = {**lever("cpu-tier"), "kind": "requirement", "serves": "recon's starting design", "changes": {}}

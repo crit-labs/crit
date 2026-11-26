@@ -5,6 +5,7 @@
   "title": "Integer block expert projections in crit's declared order: 4-bit weights against per-block quantized activations, decode rows and a prompt GEMM with the CPU rows' bits",
   "package": "int_block_experts",
   "language": "cuda",
+  "launches": ["crit::techniques::int_block::"],
   "operations": [
     "integer-block-rows"
   ],
@@ -172,7 +173,8 @@
           "values": [
             16,
             32,
-            64
+            64,
+            128
           ],
           "default": 64,
           "what": "tokens a CTA"
@@ -212,6 +214,7 @@
         },
         "STAGES": {
           "values": [
+            3,
             4
           ],
           "default": 4,

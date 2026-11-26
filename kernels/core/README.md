@@ -76,9 +76,10 @@ Moves bytes, changes no value: `smem_u32`; `ldg16` (zeros when invalid), `ld_str
 `cp_async_ca<4|8|16>`, `cp_async_commit`, `cp_async_wait<N>`) and `CpAsyncRing<STAGES>` (the multistage ring:
 `slot`, `commit`, `wait`); `ldmatrix_x1/x2/x4` and `_trans`; the shared-memory swizzles (`swizzle<B, M, S>`,
 `swizzle_128b/64b/32b`, the TMA's modes); mbarriers (`mbarrier_init`, `fence_barrier_init`, `mbarrier_arrive`,
-`mbarrier_arrive_expect_tx`, `mbarrier_wait`), the TMA (`tma_load_1d`, `tma_load_2d`, `tma_store_2d` with
+`mbarrier_arrive_expect_tx`, `mbarrier_wait`, and `cp_async_mbarrier_arrive`: a thread's cp.async copies completing an
+mbarrier as TMA copies do), the TMA (`tma_load_1d`, `tma_load_2d`, `tma_load_3d`, `tma_store_2d` with
 `fence_proxy_async`, `tma_store_commit` / `tma_store_wait`, `tma_prefetch_map`) and the host's `make_tensor_map_2d`
-(cuTensorMapEncodeTiled through the runtime's entry point); programmatic dependent launch (`griddep_wait`,
+and `make_tensor_map_3d` (a slot store's matrices, one a bundle; cuTensorMapEncodeTiled through the runtime's entry point); programmatic dependent launch (`griddep_wait`,
 `griddep_launch_dependents`, host `launch_programmatic`). Triton: `grouped_tile` (the grouped program order of an
 output's tiles, for L2 reuse). Forms after CUTLASS (BSD-3-Clause) and FlashInfer (Apache-2.0), written from the PTX
 ISA.
@@ -191,8 +192,14 @@ butterfly, for a GEMM that keeps a warp-wide declared order.
 crit's declared order for a block-scaled dot (each block summed exactly or on the tensor cores, one FP32 step a block
 on lane b % 16, the 16 lanes reduced by the halving tree), in a form a GEMM can hold: `lane_at` and `GroupVisits<G,
 RUN>` visit the blocks lane by lane in the order the tree consumes the lanes, so an output keeps one running lane and
-four partial sums (folded with reduce's `fold16`, the bits of 16 lanes kept to the end). `block_sum_e4m3` (a
-zero-accumulator E4M3 MMA in crit's fragment order), `block_sum_s8` + `biased_sum` (the s8 MMA on a biased
+four partial sums (folded with reduce's `fold16`, the bits of 16 lanes kept to the end); `VisitOrder` is a layout of a
+row's blocks in which a visit of sibling lanes is one contiguous piece (activations a staged GEMM reads, and weights
+stored that way once at load). `block_sum_e4m3`
+(a zero-accumulator E4M3 MMA in crit's fragment order), `block_sum_e4m3_fast` (the same sum on sm_120a's block-scaled
+MMA with unit scales: twice the rate, the same bits measured; only where arch.cuh's `CRIT_KCORE_FAST_E4M3_SUM` lists the
+target, sm_120a, whose `tests/fast_e4m3_tests.cu` compares the two sums bit for bit over 9.4e8 blocks of every code
+byte, random codes with NaNs and infinities, large, subnormal and cancelling blocks: elsewhere the plain MMA until the
+test passes there), `block_sum_s8` + `biased_sum` (the s8 MMA on a biased
 accumulator: the exact block sum is one FP32 subtraction), `step` (the declared fma), `nibbles_to_s8x4` (four E2M1 x 2
 or INT4 codes to int8 in three byte permutes) and `pair_slot` (rows g and g + 8 side by side for 8-byte scale loads).
 
@@ -200,12 +207,16 @@ or INT4 codes to int8 in three byte permutes) and `pair_slot` (rows g and g + 8 
 
 The declared block order's staged prompt GEMM, its mainloop once for every format: `StagedShape` (a CTA's BM rows x BN
 tokens, WM x WN warps, G lanes and RUN blocks a visit, STAGES of the cp.async ring, the technique's sub-stage layout)
-and `declared_staged`, the ring of GroupVisits, the stage decoded one iteration ahead, the declared step a block and
-lane, the lanes folded by fold16 as they finish; `declared_staged_store` writes a tile's outputs times the row's post.
-A technique gives three callables: the asynchronous copies of a block into a sub-stage, the conversions of a landed
-one (codes to the MMA's operand type, scale words to FP32 in pair_slot order) and the warp's block sums as FP32 (one
-e4m3 MMA from zero, or the s8 MMA onto blockscaled_mma.cuh's exact-sum bias). fp8-block-rows' and int-block-experts'
-`gemm-staged` are its two users: each output keeps the declared order's bits.
+and `declared_staged`, the visits planned once a CTA (`declared_staged_plan`: each visit's first block in a table in
+front of the ring), the ring advanced by compares, a visit copied and decoded at once and decoded one iteration ahead,
+a block's sums and the declared steps a row tile at a time (shared scale products, one a token, where the CTA's rows
+share a weight scale), the lanes folded by fold16 as they finish; `declared_staged_store` writes a tile's outputs
+times the row's post. A technique gives four callables: the asynchronous copies of a visit into its stage (its G RUN
+sub-stages and EXTRA bytes for what it keeps a visit at once, such as each token's blocks side by side), the
+conversions of a landed visit (codes to the MMA's operand type, scale words to FP32 in pair_slot order), the warp's
+token fragments of a block and a row tile's block sums as FP32 (one e4m3 MMA from zero, or the s8 MMA onto
+blockscaled_mma.cuh's exact-sum bias). fp8-block-rows' and int-block-experts' `gemm-staged` are its two users: each
+output keeps the declared order's bits.
 
 ## tile (`tile.cuh`)
 

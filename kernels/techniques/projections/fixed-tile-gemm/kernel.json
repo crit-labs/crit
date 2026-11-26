@@ -5,6 +5,7 @@
   "title": "A row-invariant prompt GEMM in Triton: 16-bit x [M][K] times dense [N][K] on tensor cores in fixed tiles with one K loop, whatever M is",
   "package": "fixed_tile_gemm",
   "language": "triton",
+  "launches": ["_mm_kernel", "_split_kernel", "_split_sum_kernel", "gemm_kernel", "split_sum_kernel"],
   "capabilities": [
     "8.0",
     "8.6",

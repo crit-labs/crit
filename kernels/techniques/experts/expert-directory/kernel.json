@@ -5,6 +5,7 @@
   "title": "A device expert cache's directory on the device: one routed layer's plan over a step's routes (clock or recent residency, admission limits, the CPU tier, prompt ring slots) and the fills that copy the admitted bundles into the slots by SM loads, capture-safe",
   "package": "expert_directory",
   "language": "cuda",
+  "launches": ["fill_kernel", "plan_kernel", "program_exceptions_kernel", "program_kernel"],
   "operations": [
     "expert-residency"
   ],
@@ -47,7 +48,7 @@
       ],
       "exactness": "declared",
       "yardstick": {
-        "library": "torch ops: store.index_copy_(0, slots, source.index_select(0, keys)), a gather into a staging tensor and a scatter into the slots"
+        "library": "torch ops: store.index_copy_(0, slots, source.index_select(0, keys)), a gather into a staging tensor and a scatter into the slots, over the same mapped host store"
       },
       "bench": "bench.py:Fill"
     },

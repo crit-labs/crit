@@ -9,6 +9,236 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-11-26
+
+### Overview
+
+crit 0.24.0 makes crit's own kernels faster and ships their tunings. A kernel folder may now carry the tunings
+sweeps measured on one compute capability (`tunings/<capability>.json`), which a build takes after the engine's own
+tuning; `crit kernels ship` merges a sweep into it, and mma-rows ships the RTX 5090's, merged from 19 sweeps. On an
+RTX 5090, every output's bits unchanged: mma-rows' prompt tile splits K across CTAs, gives a warp two row groups and
+stages three sub-steps (1.94x at 16 rows, 1.04-1.16x at 2,048 and 8,192), fp8-block-rows' staged prompt GEMM is
+1.16-1.39x faster from 512 tokens on the kernel core's reworked declared mainloop, grouped-experts' FP4 prompt layers
+run `fp4-tile` by default on a warp-specialized gate/up mainloop (1.29-1.55x over 0.23.0, beside FlashInfer's fused
+MoE), and paged-kv-attention's fused prompt reader takes its faster form (short steps 1.3-3.6x). `crit kernels rank`
+orders the kernels by their share of a trace, so a sweep starts where the engine spends its time. The Gemma 4 31B
+speed build's fixes land: closing an engine frees its captured rounds (a same-host reload at the same context ran out
+of memory), kept prompts survive sliding-window rings and resume only where every pool still holds them, a score's
+logit slices and the device plan's matrix bytes are sized right, short prompt chunks read through the prompt reader,
+and `crit run` passes crit Eval only the quality limits the user set, so a checkpoint's stored activation allowance
+applies. `crit run` gains `ablate --quality`, `record-routes` and `switch-check`, and the README carries the
+Qwen3.8-Flash-Next case study. Core's engine ABI stays 10. crit 0.24.0 needs crit-eval 0.8.2.
+
+### Added
+
+- Shipped tunings (`crit_kernels.shipped`): a kernel folder may carry `tunings/<capability>.json`, the tuning tables
+  sweeps measured on GPUs of one compute capability, keyed by each structure's shape key (never a model), each entry
+  naming the sweep it came from (the kernel source digest, the GPU, the capability, the day). On a GPU of that
+  capability a build takes, per structure and shape, the engine's own tuning first, then the table, then the default
+  knobs, so an engine whose tuning lacks a shape still gets the table's entry; on any other GPU nothing changes. A
+  plugin's record says `tuned` and names the table under `shipped`; `load_kernel(..., tuned=False)`, the sweep's
+  untuned build, gates' and `crit kernels report`'s default builds take no table. `crit kernels sweep` leaves out the
+  shapes a table covers (it logs how many, and writes their entries and report rows into its tuning and report,
+  marked shipped), builds nothing where every shape is covered, and sweeps them all with `--no-shipped`; its tuning
+  now records the day it was swept. `crit kernels ship ID --tuning SWEEP/ID.json` merges a finished sweep into the
+  table for its capability (an entry swept on the current kernel source wins over one from an earlier source, else
+  the later sweep), dropping entries whose knobs kernel.json no longer has; a tuning without its provenance is
+  refused. A table that fails `check_tuning` is ignored with a warning, and a CPU test checks every shipped table
+  against its kernel.json.
+- mma-rows ships a tuning for compute capability 12.0 (`tunings/12.0.json`, the RTX 5090's), merged by `crit kernels
+  ship` from 19 earlier RTX 5090 sweeps: 84 decode-tile and prompt-tile shapes, 15 fp4-tile and 12 fp4-prompt-tile.
+  An engine on such a GPU whose own tuning lacks a shape gets the table's entry instead of the default knobs.
+
+- `crit kernels rank`: crit's kernels ranked by their share of a kernel trace's time (a kernels report from `crit
+  eval kernels` or `crit run ... profile`), per phase and over all, from the launches each `kernel.json` now declares
+  (`launches`: a crit namespace with `::`, or a name as written, read without template arguments and anonymous
+  namespaces; `crit_kernels.launches`). It names a launch two kernels declare, one none declares and the kernels that
+  launched nothing, and tests/test_launches.py holds every kernel's launches to its sources. AGENTS.md sweeps from the
+  top of the ranking: a build had swept the 11 kernels its plugins load, decode-gemv among them, which launched
+  nothing, and paged attention for 45 minutes at 3.6% of the time, where its trace ranks expert-directory 40.6%,
+  mma-rows 26.7% and grouped-experts 15.0%.
+- `crit run ablate --quality` (with `--data`): the first round scores every variant's Eval quality texts against the
+  reference as the gate's pre-check does, at the run's quality mode and budget with the segment's amendments, and each
+  variant's row keeps its state, the budget it used and its worst set, so an option that approximates the model is
+  judged by its drift beside its speed.
+- `crit run ... record-routes`: a candidate's routing trace over a general corpus, as a command. It serves an unsealed
+  candidate under a check attempt with the plugin of its selection that records routes (`record_routes`,
+  `trace_path`), answers each prompt of the corpus once, closes the engine, which writes the trace, and keeps the trace
+  as the attempt's evidence, what `crit plugins offload --trace` replays and a residency profile is built from.
+- `crit run ... switch-check`: the switching check AGENTS.md asks for after sealing, as a command. It serves the
+  candidate (the run's selected one by default) through crit serve's engine and chat API in the process, switches to
+  another sealed candidate (the newest by default) and back with a greedy reply each, writes `work/switch-check.json`
+  and fails where the candidate's replies before and after differ.
+- The `crit smoke` verdict that a decode gap is rounding names the plugins whose prompt rows run another arithmetic than
+  their decode rows (the engine's `exactness.plugins` below exact), the only places such a gap can grow in, and says
+  how to find the one (`crit run ablate --smoke-test decode_matches_prefill --set`, each in turn on one arithmetic).
+- `crit run ablate` says a single pass that judged a change is not confirmed and asks for `--rounds 2`, and AGENTS.md
+  asks the same of a change the next plan acts on: an engine that warms slowly (an expert cache filling, a drafter's
+  acceptance settling) moves by more than the 3% noise between passes (one build read +12% decode, then 76.2 against
+  76.3 tok/s).
+- `crit run serve --check`'s `step_memory`, where a step outgrew Core's step arena, names the most each kind of step
+  took (prompt, score, decode), largest first, so the kind that outgrew it is told without a rerun.
+
+### Fixed
+
+- `crit run create` with an explicit `kv_tokens` and a `device` file records the device file
+  (`hardware_constraints.context`, source `given`), so the run's Evals price the prefill ceiling and the TTFT floor
+  from its rates; it was dropped, and such Evals reported no ceiling and no prefill fraction.
+- `crit_plugins.ranking.top_ranked` finds a row's ties at its k-th value from its k + 1 highest values and gathers its
+  candidates from the rows in place, so no temporary is wider than a bool mask of the rows: the int64 count of the
+  masks (256 MiB for 128 rows of a 262,144-token vocabulary) and a copy of the rows were a long score's allocations
+  past the engine's headroom. The ranking is unchanged, bit for bit.
+- attention-state reads a prompt chunk of up to its `window` (16) tokens through the prompt reader, as it reads a
+  longer one, where the model marks it a prompt chunk (`StepBatch.prompts`, which model-template's row groups set):
+  it read such a chunk as window rows, in the decode's reduction, so with `prompt_reader` prefill (speed's
+  `row-exact` prompt rows) a short prompt's rows did not have the bits of the same rows in a longer prompt, which
+  that level promises. Each reader matches float64 attention at head widths 64 to 256; a model that amplifies
+  rounding (a 31B model with sliding layers of 256-wide heads) showed the two reductions 4.1 nats apart on its
+  short prefixes, and an engine took the decode reader for every prompt to avoid it.
+- The prompt cache resumes no kept sequence before where every pool still holds it (`resumes_from`): a sliding
+  window's ring that wrapped (a reply past the ring's spare positions) keeps only its last pages, so a follow-up that
+  shared less than its window back from there read positions later ones had written over.
+- model-template prices kept prompts against a full KV pool, and where every KV pool is a sliding window's ring
+  leaves eviction to the pools: it priced them against the first pool, a ring, so a kept 8,192-token prompt (512
+  pages against the ring's 270) was evicted as soon as it was kept and every follow-up turn was prefilled whole.
+- model-template's device plan prices each target matrix stored in 16 bits at the bytes the projections slot holds
+  it in (quantized-projections' new `held_bytes`: quality mode speed's FP8 trunk and head, its `trunk_keep` roles, its
+  row padding and the shapes it keeps as stored), and counts a tied head, a device matrix of its own beside the
+  embedding table: it priced them at their stored bytes and the tied head at none, so a speed engine with BF16
+  attention or head was planned at up to twice their bytes, and one whose table the plan put off the device was
+  short of its head. A projections slot without `held_bytes` is priced as before.
+- latent-attention launches with knobs this device's shared memory holds: where a structure's knobs (its defaults, or
+  a tuning made on a GPU of more shared memory) do not fit, it steps them down, a pipeline stage and then half the
+  query rows a program, to the first that fits, once a geometry (`FITTED`); neither is an order knob, so a token's
+  bits are unchanged. At rank 512 with a 128-wide rotary key the window tiles at the defaults took 110,784 bytes
+  against sm_120's 101,376, and every launch failed. A sweep's selected configuration is launched as it is, so one
+  that does not fit is still dropped.
+- model-template's score slices its logits by bytes (`score_slice`: at most 128 rows, fewer where their two FP32
+  copies would pass 128 MiB: 64 rows at a 262,144-token vocabulary) and caps logits without a copy of their own. A
+  slice's peak, measured on the GPU, was 8 bytes a logit, 12 with a logit cap: 384 MiB for 128 rows of Gemma 4's
+  capped 262,144-token vocabulary, now 128 MiB; models up to a 131,072-token vocabulary keep 128 rows. Scores are
+  unchanged, bit for bit (a row's logits are its own whatever the slice).
+- `crit_kernels.build.select` refuses a configuration index past a build's configurations, naming them (the
+  structure's defaults first; a `configs=` entry equal to them is not built twice), where the kernel's first launch
+  raised a bare IndexError.
+- `StepEngine.close()` drops its native rounds after closing them, so the round driver's captured graphs and their
+  memory pools free with the close: they stayed reserved (4.2 GiB for Gemma 4 31B at 200,000 tokens) until the engine
+  object went, and crit serve's same-host reload at the same context ran out of memory.
+- `crit run ... eval`, `crit serve --check`'s pre-check and `crit run ablate --quality` pass crit Eval only the quality
+  limits the user set (the request's `quality_budget` with every resume's amendment, `records.user_quality_budget`),
+  none when the user set none. They passed the quality mode's defaults as the run's own budget, and a limit passed as
+  the run's wins over the checkpoint's stored allowance (crit Eval's protocol quality.allowance), so a speed run of a
+  checkpoint with quantized activations was judged without it. Eval records the same resolved thresholds as before,
+  so `checks --from-eval` and plans compare as they did. The agent brief passes `--quality-budget` only when the user
+  set one.
+
+- `crit run ... eval --baseline` takes a candidate's id (its newest completed Eval result) or a result's path in the
+  run folder, as crit prints them (`candidates/ID/eval/ATTEMPT.json`), where it read a path from the working
+  directory only and such a baseline lost the Eval to "JSON file not found".
+- `crit run ... plan` asks candidate 1 to start with the CPU expert tier only where recon priced the CPU on a probe
+  that measured its expert lane and the turn to the host: without them the CPU's floors are lower bounds, and the plan
+  check took one (18.3 ms against the link's 30.7 on a 6-core host behind WSL2) for a win the ablation then measured
+  21% slower. RUN_RECORDS.md's plan rule 16 says so.
+- `crit run ablate`: an interrupted ablation settles its attempt and keeps the variants it served. A variant
+  interrupted while served left an empty entry the report could not combine (IndexError), the attempt never settled,
+  and every later serve of the run was refused until its cleanup was settled by hand.
+- `crit_plugins.ablation` reads an option variant that failed where the engine as built failed too as unmeasured, with
+  the reason, not as the option breaking the engine.
+- device-expert-cache refuses a residency profile of another routing geometry naming both geometries and what a group
+  counts (a profile over 48 routed layers against a cache of 49 groups, the draft layer's experts among them), where
+  the message named neither.
+- expert-offload writes the recorded routes to `trace_path` when the engine closes too, where only a `telemetry()`
+  call wrote them, so a serve stopped after its corpus left no trace (a 10-minute recording over 32 prompts wrote
+  nothing).
+- recurrent-state-recovery keeps the units that hold another sequence's prompt-row final states backed until their
+  accept when a sequence closes: an elastic pool trimmed them, and under concurrent requests the accept copied from
+  unbacked memory.
+- token-constraints' captured rounds compute in the engine's scratch, which Core closes with the engine; they made a
+  scratch of their own that outlived it, and a reopened engine found token-sampling's scratch still held.
+- `crit kernels sweep decode-gemv` runs again: gemv-cuda's bench calls the weight formats and INT4 helpers that the
+  alias structures' retirement took out of decode-gemv's bench (a NameError). They live in one module now,
+  `crit_kernels.weight_formats`, which mma-rows' bench reads too (its inputs unchanged), and tests/test_bench_shapes.py
+  finds every structure's shapes on the CPU.
+
+### Changed
+
+- mma-rows' sweep no longer builds prompt-tile configurations that compile to the same kernel: PR 2 always loads the
+  weights at the step, so PR 2 with PF 1 is the kernel of PR 2 with PF 0 and only that one is swept (504 to 420
+  configurations). PK, the parts of K a launch runs in, is a launch argument of both prompt tiles, now declared a
+  run-time knob of their benches, so a build's consecutive configurations share their compiled kernels: 60 distinct
+  prompt-tile kernels and 16 fp4-prompt-tile kernels (of 112 configurations) instead of one a configuration.
+- The kernel core's `block_sum_e4m3_fast` takes the block-scaled MMA only where `CRIT_KCORE_FAST_E4M3_SUM` lists the
+  target (sm_120a), and the plain e4m3 MMA elsewhere: its bits are measured, not specified, and a new device test
+  (`kernels/core/tests/fast_e4m3_tests.cu`) compares the two sums bit for bit over 9.4e8 blocks (every code byte,
+  random codes with NaNs and infinities, large, subnormal and cancelling blocks); it passed on an RTX 5090, where
+  nothing changes. sm_121a takes the plain MMA until the test passes there.
+- fp8-block-rows reads a matrix stored once in the visit order (`to_visit_weights`, `matrix_table`'s order `VISIT`, a
+  record field `order` of fp8-block-rows' and decode-gemv's tables): `rows`, `gemm` and `gemm_staged` give the plain
+  layout's bits, the native GEMMs refuse such a table. On an RTX 5090 the staged GEMM is 1.0-1.53x faster at 32 and
+  128 tokens (24576 x 4096 at 32 tokens 230 -> 150 us) and 0.97-1.0x from 512, the decode rows 0.66-0.90x, so the
+  plain layout stays the default; quantized-projections' new `fp8_block_layout` option (default `plain`) takes it for
+  fp8:block matrices on the staged prompt GEMM.
+- grouped-experts' fp4-tile (FP4 prompt items of 64 routes) runs gate/up on a warp-specialized mainloop (new knob
+  `PRODUCER`, 0: warp-specialized for gate/up, the block's cp.async ring for down): a producer warp issues a block's
+  copies up to STAGES steps ahead, the weights' codes as TMA boxes of a 3-D tensor map over the store, the scales and
+  routes by cp.async on the slot's mbarrier, and the consumer warps release slots on mbarriers instead of a block
+  barrier a step; every route's bits unchanged. On an RTX 5090 gate/up passes are 1.02-1.36x faster and FP4 prompt
+  layers 1.02-1.20x (512 experts top 10 at 512 tokens 1,350 -> 1,121 us beside FlashInfer's fused MoE 1,098; at
+  2,048 1,484 -> 1,317 against its 1,330). The kernel core gains `make_tensor_map_3d`, `tma_load_3d` and
+  `cp_async_mbarrier_arrive`.
+- paged-kv-attention's fused CUDA launch (the exact prompt reader) runs its serial form from 125 percent of the
+  programs the device holds at once (`FUSED_SERIAL`, cuda-fused's `SERIAL` 0), where it took it from 50: below that
+  the ring form's programs a split fill the GPU better. On an RTX 5090 over 56 prompt steps of 64 to 1,024 tokens the
+  faster form is now taken within 2.6% on average (9.8% before), short steps 1.3-3.6x faster (one 512-token prompt
+  over 2 KV heads of 256: 121 -> 91 us; 128 tokens at 16,384 cached over 8 heads of 128: 1,013 -> 279 us). The same
+  bits either way.
+- expert-directory's bench (`bench.py:Fill`) times the fill from mapped host memory (pinned, at its
+  cudaHostGetDevicePointer address), as an engine's store is read, and its yardstick over the same mapping; it timed
+  the fill from device memory, 15 to 22 times faster than the link allows, so a sweep ranked grids by a speed no
+  engine sees. The README records the fill against the link on an RTX 5090: 25.6 to 26.7 GB/s at every grid from 32
+  to 256 blocks and every load width, the copy engine's rate from the same memory (faster for one to four bundles),
+  four blocks enough to hold it, and what a fill on a side branch costs the work beside it (+1.6% at 4 blocks, +45%
+  at 85).
+- fp8-block-rows' declared staged GEMM (`gemm-staged`, the exact prompt path of FP8 block checkpoints) is 1.16-1.39x
+  faster at its defaults on an RTX 5090 from 512 tokens and 0.94-1.66x below (12288 x 5120 at 2,048 tokens 1,428 ->
+  1,082 us), every output's bits unchanged: the kernel core's declared mainloop plans its visits once a CTA and copies a visit at once,
+  the weight rows land in the MMA's operand order, a CTA copies its distinct weight scale rows once and shares the scale
+  products of rows on one, each token's blocks of a visit lie side by side, and quantized-projections quantizes the
+  prompt rows into the GEMM's new visit order (`quantize(..., order=VISIT)`, `gemm_staged(..., order=VISIT)`: a token's
+  blocks of a visit one contiguous piece, which L2 serves at twice the rate); its default tiles are 64 x 128 (128 x 32
+  to 48 tokens, 64 x 64 to 96), and on sm_120a its block sums run on the block-scaled MMA with unit scales (the plain
+  MMA's bits, measured). int-block-experts' staged GEMM runs on the same mainloop, 0.98-1.09x.
+- grouped-experts' FP4 prompt layers run fp4-tile by default (the plugin's `prompt_items` auto without a sweep report),
+  with three staged steps, its fragments read by ldmatrix and 4 row tiles a warp for the down pass: on an RTX 5090
+  a 512-expert 2560 x 640 layer at 2,048 / 8,192 tokens 1.29x / 1.55x faster than before, a 128-expert 2048 x 768 one
+  1.39x / 1.51x, every route's bits unchanged.
+- mma-rows' prompt tile runs a tile's splits of K in several CTAs (knob `PK`; partial sums and counters given to
+  `mm_prompt`, which quantized-projections passes): part 0 adds its splits' chains, every later split's chain is
+  stored on its own and the tile's last CTA adds them in split order, so every output keeps the decode tile's bits.
+  Untuned, it takes the fewest splits a CTA that still fits one wave of resident CTAs; `prompt_ctas()` reports a
+  call's CTAs. Over both test checkpoints' matrices on an RTX 5090 the tile is 1.94x faster at 16 rows (geomean), 1.30x
+  at 512 and level from 2,048; a 336 x 10240 FP8 matrix's 16-row prompt went from 3 CTAs and 164 us to 96 and 26 us.
+- mma-rows' prompt tile gives a warp two 16-row groups (knob `PR`; its default a rule from the grid's waves, K's steps
+  and the weight format), each staged B fragment read once for both and each step's weights loaded at the step
+  (knob `PF`): on an RTX 5090, against 0.23.0's prompt tile, 1.11-1.16x on FP8 and MXFP8 weights and 1.04-1.05x on
+  BF16 and NVFP4 at 2,048 and 8,192 rows (the 248320-row FP8 head 1.13x), the bits unchanged. Its parts' default no longer splits short-K matrices or
+  a BF16 matrix's weight stream, where it had been up to 15% slower than one CTA a tile.
+- mma-rows' FP4 prompt tile runs a tile's splits of K in several CTAs too (knob `PK`, its own kernel instance):
+  1.05-1.7x on a 320 x 10240 NVFP4 matrix's 16 to 256 prompt rows; quantized-projections passes it the partial sums
+  and quantizes its prompts past the scratch into the workspace.
+- mma-rows' prompt tile stages three sub-steps of activations with one barrier a sub-step (knob `PS`, default 3; 2
+  is the former two buffers): 1-6% less time on BF16, FP8 and MXFP8 weights from 512 rows, NVFP4 level.
+- quantized-projections' W8A8 and W4A4 prompt rows on the prompt tile quantize into the shared 64 MB workspace once
+  they outgrow the 4 MB scratch, instead of a call per scratchful (192 rows at K 10240) that read the matrix again
+  each time: a 2,048-row prompt of a 336 x 10240 FP8 matrix took 1,756 us, now 213 us.
+- The README lists crit's own kernels among what crit solves (templates from a shared core, tuned on your machine for
+  your GPU and model) and carries the Qwen3.8-Flash-Next case study: a 117 GB mixture of experts on the 32 GB RTX 5090
+  from crit's library as released (crit-labs/ranked-expert-cache-mtp3).
+- AGENTS.md: FP8 prompt activations are the rung between a 4-bit format's stored ones and BF16, and quality variants
+  are compared against Eval's budget spread in either quality mode.
+- crit Eval's reference measures the checkpoint's activation allowance by default (crit-eval 0.8.2), which `crit run
+  eval` passes on: a speed run of a checkpoint that declares quantized activations is judged against it.
+
 ## [0.23.0] - 2026-11-23
 
 ### Overview

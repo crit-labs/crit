@@ -16,7 +16,7 @@ from ..records import retry_denied, utc_now, verification_scope
 from .records import (
     HEADROOM_REASONS, LIFECYCLES, LINEAGE, MAX_CANDIDATES, SAFETY_WINDOW_MINUTES, STOP_REASONS, WEIGHTS, amendment,
     attempt_process_cap,
-    candidate_projection, quality_mode, quality_terms, digest, evidence, file_sha,
+    candidate_projection, quality_mode, quality_terms, user_quality_budget, digest, evidence, file_sha,
     header, headroom_record, ident,
     ineligibility, inputs, inventory, keys, load_run, now, number, read_candidates, read_json, record,
     request_spec, safe_path, segment, text, timestamp, validate_attempt_reservation, validate_attempt_result,
@@ -1098,6 +1098,7 @@ class RunStore:
         correctness = run["spec"]["correctness"]
         amended = amendments(root, bounds["segment_id"])
         quality_budget, exactness = quality_terms(correctness, amended)
+        user_budget = user_quality_budget(correctness, amended)
         mode = quality_mode(correctness)
         from crit_plugins.exactness import PHASES, setting
         levels = setting(None, mode)
@@ -1121,8 +1122,11 @@ class RunStore:
             f"{quality_budget['kld_mean_max']}, p99 KLD ≤ {quality_budget['kld_p99_max']} against Eval's reference; "
             f"speculative exactness {exactness}" + (
                 f"; these terms amend the request (approved by {amended[-1]['approved_by']})" if amended else "") +
-            f". Spend it on speed. crit run ... eval applies it; pass --quality-mode {mode} --quality-budget "
-            f"'{json.dumps(quality_budget)}' --exactness {exactness} to the crit eval commands you run yourself.",
+            f". Spend it on speed. crit run ... eval applies it; pass --quality-mode {mode}"
+            + (f" --quality-budget '{json.dumps(user_budget)}'" if user_budget else "") +
+            f" --exactness {exactness} to the crit eval commands you run yourself" + (
+                "" if user_budget else " (no --quality-budget: Eval applies the mode's limits, and the checkpoint's "
+                "stored allowance where it has one)") + ".",
             f"- Row exactness (configuration.exactness, apart from the speculative exactness above): this mode gives a "
             f"candidate that sets none decode rows {levels['decode']} and prompt rows {levels['prompt']}, " + (
                 "so each prompt row has the bits of the same token decoded and every plugin takes its exact path. Ask "

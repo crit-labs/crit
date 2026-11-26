@@ -5,6 +5,7 @@
   "title": "Sparse indexer in Triton: each query token's score over the compressed keys it may see (index heads' weighted ReLU of their query-key products, on the tensor cores), then the positions of its top k keys, by radix select",
   "package": "sparse_indexer",
   "language": "triton",
+  "launches": ["select_kernel"],
   "capabilities": [
     "8.0",
     "8.6",

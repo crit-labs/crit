@@ -51,7 +51,7 @@ def _speed(kernel_id, folder, manifest, chosen, timer, log, ceilings=None):
     from . import floors
     import torch
     from .sweep import _bench_class
-    module = kbuild.load(kernel_id)
+    module = kbuild.load(kernel_id, shipped=False)   # the default build: its default knobs, no shipped table
     out = {}
     for s, shapes in chosen.items():
         spec = manifest["structures"][s]

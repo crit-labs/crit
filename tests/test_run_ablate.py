@@ -366,6 +366,78 @@ class AblateTests(run_measure.MeasureFixture, unittest.TestCase):
         self.assertIn("the engine reports the plugins None", result["variants"][0]["detail"])
         self.assertEqual([row["verdict"] for row in result["blame"]], ["unmeasured", "unmeasured"])
 
+    def test_an_option_is_not_blamed_for_a_serve_the_engine_as_built_failed_too(self):
+        # Every variant failing alike (here an engine that does not report its plugins; in a build, a serve refused
+        # for another attempt's unsettled cleanup) says nothing about the option: it is unmeasured, not "breaks".
+        candidate = self.plugin_package(engine=run_measure.ADAPTER)
+        result = ablate(self.store, self.run_id, candidate, smoke=False, sets=["draft-three.width=1"])
+        self.assertEqual([row["state"] for row in result["variants"]], ["failed", "failed"])
+        (row,) = result["blame"]
+        self.assertEqual((row["plugin"], row["verdict"]), ("set:draft-three.width=1", "unmeasured"), row)
+        self.assertIn("as built", row["detail"])
+
+    def test_an_interrupted_ablation_settles_its_attempt_and_keeps_the_variants_it_served(self):
+        # Ctrl+C or SIGTERM while a variant is served: the variant leaves no empty entry the report cannot combine,
+        # the attempt settles as interrupted (an unsettled one refuses every later serve of the run) and the interrupt
+        # goes on.
+        import crit.run.ablate as ablate_module
+        candidate = self.plugin_package()
+        served = ablate_module._variant
+        calls = []
+
+        def second_interrupts(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:
+                raise KeyboardInterrupt
+            return served(*args, **kwargs)
+
+        ablate_module._variant = second_interrupts
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                ablate(self.store, self.run_id, candidate, names=["full", "base"], repetitions=1, smoke=False)
+        finally:
+            ablate_module._variant = served
+        (report,) = (self.folder / "logs").glob("ablation-*.json")
+        self.assertEqual([row["name"] for row in read_json(report)["variants"]], ["full"])
+        attempt = report.stem.removeprefix("ablation-")
+        result = read_json(self.folder / "attempts" / attempt / "result.json")
+        self.assertEqual((result["outcome"], result["cleanup_settled"]), ("interrupted", True))
+
+    def test_quality_scores_each_variant_on_evals_quality_texts_and_needs_the_data(self):
+        candidate = self.plugin_package()
+        with self.assertRaisesRegex(ValueError, "--quality scores Eval's quality texts: give --data"):
+            ablate(self.store, self.run_id, candidate, quality=True)
+        import crit.run.ablate as ablate_module
+        from unittest import mock
+        seen = {}
+
+        def item(engine, info, prepared, protocol, data, mode, budget, log):
+            seen.update(mode=mode, budget=budget, data=data)
+            return {"name": "precheck_quality", "state": "passed", "detail": "within", "budget_used": 0.38,
+                    "worst_set": "long-32768/prompt"}
+        judge = {"prepared": {"speed": []}, "model": "m", "kv_tokens": 4096, "protocol": {}, "data": "d", "mode": "speed",
+                 "budget": {"kld_mean_max": 0.4}}
+        lines = []
+        with mock.patch("crit_eval.run.adapters.open_engine", lambda *a, **k: (None, {})), \
+                mock.patch("crit_eval.run.precheck.quality_item", item):
+            found = ablate_module._quality(judge, 1, "run/candidate", lines.append, "set:x.keep=8")
+        self.assertEqual(found, {"state": "passed", "detail": "within", "budget_used": 0.38,
+                                 "worst_set": "long-32768/prompt"})
+        self.assertEqual(seen, {"mode": "speed", "budget": {"kld_mean_max": 0.4}, "data": "d"})
+        self.assertIn("set:x.keep=8: quality passed, 38% of the drift budget", lines[-1])
+
+    def test_a_single_pass_that_judged_a_change_asks_for_rounds_before_it_is_acted_on(self):
+        import contextlib
+        import io
+        from crit.run.ablate import _one_pass
+        rows = [{"plugin": "attn-slow", "verdict": "slows"}, {"plugin": "draft-three", "verdict": "neutral"}]
+        for rounds, said in ((1, True), (2, False)):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                _one_pass(rounds, rows)
+            self.assertEqual("one pass judged attn-slow;" in err.getvalue(), said, err.getvalue())
+            self.assertNotIn("draft-three", err.getvalue())
+
     def test_a_candidate_whose_plugins_are_all_plain_has_nothing_to_switch(self):
         candidate = self.served()
         result = ablate(self.store, self.run_id, candidate, smoke=False)

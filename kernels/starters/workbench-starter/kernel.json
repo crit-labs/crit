@@ -5,6 +5,7 @@
   "title": "The kernel workbench's starter matmul: BF16, or E4M3 with row and column scales, FP32 out, one warp an output row",
   "package": "workbench_starter",
   "language": "cuda",
+  "launches": ["matmul_kernel"],
   "operations": [
     "fp8-row-projection"
   ],
