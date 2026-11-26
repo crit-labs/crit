@@ -561,9 +561,9 @@ class ServeCheckTests(run_measure.MeasureFixture, unittest.TestCase):
         self.assertIn("precheck_long_honesty failed", check["rationale"])
 
     def test_the_gate_precheck_judges_drift_by_the_runs_budget(self):
-        # The pre-check's quality item judges as crit run eval does: the run's budget over its mode's, not Eval's
-        # defaults.
-        from crit.run.records import load_run, quality_terms
+        # The pre-check's quality item judges as crit run eval does: only the limits the user set, so Eval applies its
+        # mode's own and the checkpoint's stored allowance (a default passed as the run's would turn it off).
+        from crit.run.records import load_run
         root = self.store.directory(self.run_id)
         data = root / "eval-data"
         data.mkdir()
@@ -572,9 +572,16 @@ class ServeCheckTests(run_measure.MeasureFixture, unittest.TestCase):
         with patch("crit_eval.run.precheck.run_precheck", lambda *args, **options: asked.update(options) or []):
             served._precheck(SimpleNamespace(kv_tokens=4096, server=None), load_run(root), root, data, 9,
                              lambda line: None)
-        run = load_run(root)
-        self.assertEqual(asked["quality_budget"], quality_terms(run["spec"]["correctness"])[0])
-        self.assertIn("kld_mean_max", asked["quality_budget"])
+        self.assertIsNone(asked["quality_budget"])   # the request sets no budget of its own
+
+    def test_only_the_limits_the_user_set_reach_eval(self):
+        from crit.run.records import quality_terms, user_quality_budget
+        correctness = {"quality_mode": "speed", "quality_budget": {"kld_p99_max": 5.0}}
+        changes = [{"quality_budget": {"kld_mean_max": 0.5}, "approved_by": "the user"}]
+        self.assertEqual(user_quality_budget(correctness, changes), {"kld_p99_max": 5.0, "kld_mean_max": 0.5})
+        self.assertEqual(user_quality_budget({"quality_mode": "speed"}), {})
+        merged = quality_terms(correctness, changes)[0]
+        self.assertIn("ppl_ratio_max", merged)   # crit's own record of the terms keeps the mode's defaults
 
 
 if __name__ == "__main__":

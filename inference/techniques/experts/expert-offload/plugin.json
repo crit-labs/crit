@@ -194,7 +194,7 @@
     "trace_path": {
       "type": "str",
       "default": "",
-      "description": "with record_routes, write the recorded routes there at every telemetry() call"
+      "description": "with record_routes, write the recorded routes there at every telemetry() call and when the engine closes"
     },
     "workers": {
       "type": "int",

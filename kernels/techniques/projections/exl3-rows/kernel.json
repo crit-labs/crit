@@ -5,6 +5,7 @@
   "title": "EXL3 projections: 1 to 16 rows times trellis tiles decoded on the fly between the matrix's Hadamard rotations, a prompt's rows with the same bits, and a dequantization to BF16",
   "package": "exl3_rows",
   "language": "cuda",
+  "launches": ["crit::techniques::exl3_rows::"],
   "operations": [
     "exl3-projection"
   ],

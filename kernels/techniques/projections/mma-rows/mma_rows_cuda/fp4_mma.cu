@@ -1,6 +1,7 @@
 // The block-scaled FP4 MMA path of mma-rows: see fp4_mma.h and the kernel's comment below.
 #include "fp4_mma.h"
 #include "crit_tuning.h"
+#include "prompt_parts.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -259,10 +260,12 @@ cudaError_t by_rows(const Problem& p, cudaStream_t stream) {
 // the operands zero) and of both operands' scale bytes (bulk copies of their 128-row tiles), completing on the
 // stage's full mbarrier. A producer warp issues a stage once the PW consumer warps have released it; each consumer
 // (PR tiles of 16 matrix rows over all the CTA's tokens) reads its fragments by ldmatrix at fixed offsets, a pair of
-// token columns ahead of their MMAs and the next step's weights during a step's last MMAs. A CTA runs every split of
-// K itself, one after another, with a running total an output, so it needs no partial or counter buffers: a chain's
-// first MMA of a split starts from zero right after the chain before it joined its total, so a split's boundary
-// costs the MMAs no pause. Whole tiles of 16-bit outputs leave through the ring in 16-byte stores. CTAs of one row
+// token columns ahead of their MMAs and the next step's weights during a step's last MMAs. A CTA runs its splits of
+// K one after another, with a running total an output: a chain's first MMA of a split starts from zero right after
+// the chain before it joined its total, so a split's boundary costs the MMAs no pause. With partial sums and
+// counters, a tile's splits run in several CTAs (grid z, knob PK; prompt_parts.h): part 0 keeps its running total
+// and stores it, every later part stores each of its splits' chains on its own, and the tile's last CTA adds them in
+// split order, the same additions. Whole tiles of 16-bit outputs leave through the ring in 16-byte stores. CTAs of one row
 // tile are neighbours in the grid (the tokens along x), so they read its weights from L2.
 template <bool SPLIT, int PW, int PR, int PT>
 struct PromptTile {
@@ -307,10 +310,12 @@ __device__ __forceinline__ uint32_t staged_scale(int r) {
   return uint32_t((r >> 7) * 1024 + (r & 31) * 16 + ((r >> 5) & 3) * 4);
 }
 
-// One CTA: PW consumer warps x PR tiles of 16 matrix rows (blockIdx.y) times PT tokens (blockIdx.x) over all of K,
-// and a producer warp. SPLIT: the plan has more than one split of K (a running total beside each split's chain). PW,
-// PR and PT are speed knobs (kernel.json, structure fp4-prompt-tile): no output's chain depends on them.
-template <bool SPLIT, int PW, int PR, int PT>
+// One CTA: PW consumer warps x PR tiles of 16 matrix rows (blockIdx.y) times PT tokens (blockIdx.x) over part
+// blockIdx.z of K's splits, and a producer warp. SPLIT: the plan has more than one split of K (a running total beside
+// each split's chain); PARTS: the splits run in gridDim.z parts (an instance of its own, so the one-part kernel's
+// registers stay as they were). PW, PR, PT and PK are speed knobs (kernel.json, structure fp4-prompt-tile): no
+// output's chain depends on them.
+template <bool SPLIT, bool PARTS, int PW, int PR, int PT>
 __global__ void __launch_bounds__(32 * (PW + 1), 1)
     fp4_prompt_kernel(const Problem p, const __grid_constant__ PromptMaps maps) {
   using C = PromptTile<SPLIT, PW, PR, PT>;
@@ -323,6 +328,10 @@ __global__ void __launch_bounds__(32 * (PW + 1), 1)
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gid = lane >> 2, tig = lane & 3, quarter = lane >> 3;
   const int t0 = blockIdx.x * PT, n0 = blockIdx.y * C::kRows;
   const int steps = p.K / kFp4Step;
+  const int parts = PARTS ? (int)gridDim.z : 1, part = PARTS ? (int)blockIdx.z : 0;
+  const int sp_lo = part * p.splits / parts, sp_hi = (part + 1) * p.splits / parts;   // this CTA's splits
+  const int st_lo = sp_lo * steps / p.splits, st_hi = sp_hi * steps / p.splits;     // and steps
+  __shared__ int last;
   if (threadIdx.x == 0) {
 #pragma unroll
     for (int s = 0; s < ST; ++s) {
@@ -343,9 +352,9 @@ __global__ void __launch_bounds__(32 * (PW + 1), 1)
     // The matrix's scale tiles under the CTA's rows.
     const int tiles = min((p.N + 127) / 128, (n0 + C::kRows + 127) / 128) - (n0 >> 7);
     const uint32_t bytes = uint32_t((C::kRows + PT) * 64 + (tiles + 1) * 1024);
-    for (int st = 0; st < steps; ++st) {
-      const int s = st % ST;
-      if (st >= ST) kc::mbarrier_wait(empty + s, uint32_t((st / ST - 1) & 1));
+    for (int st = st_lo; st < st_hi; ++st) {   // the ring counts the CTA's steps from its first
+      const int r = st - st_lo, s = r % ST;
+      if (r >= ST) kc::mbarrier_wait(empty + s, uint32_t((r / ST - 1) & 1));
       unsigned char* stage = base + s * C::kStage;
       kc::mbarrier_arrive_expect_tx(full + s, bytes);
       kc::tma_load_2d(stage + C::kW, &maps.w, st * 64, n0, full + s);
@@ -435,16 +444,34 @@ __global__ void __launch_bounds__(32 * (PW + 1), 1)
   // weights') during this step's last MMAs. `first` (a split's first step): each chain starts from zero in its first
   // MMA, right after the chain before it joined the total (fp4_kernel's reduce: the splits' sums added in order), so
   // a split's boundary costs the MMAs no pause.
+  // The tile's partial sums (parts > 1): slot `slot`, a consumer thread's (g, t, i) at ((g G + t) 4 + i) 32 PW + its
+  // index; chain (g, t) of the split before `split` stored on its own (a later part's split boundary).
+  constexpr int kTileSums = 32 * PW * PR * G * 4;
+  const int tile = blockIdx.y * gridDim.x + blockIdx.x;
+  auto slot_at = [&](int slot) { return p.partial + ((size_t)slot * gridDim.x * gridDim.y + tile) * kTileSums; };
+  auto keep = [&](int slot, int g, int t) {
+    float* at = slot_at(slot) + (g * G + t) * 4 * (32 * PW) + threadIdx.x;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) __stcg(at + i * (32 * PW), c[g][t][i]);
+  };
+  int split = sp_lo, bound = st_lo;   // the next split and its first step
+  // A split's boundary for chain (g, t): part 0 joins the chain before to its total (fp4_kernel's reduce), a later
+  // part stores it (nothing before its first split).
+  auto boundary = [&](int g, int t) {
+    if (part == 0) join(g, t, false);
+    else if (split > sp_lo) keep(1 + split - 1 - first_part_splits(p.splits, parts), g, t);
+  };
   auto step = [&](int st, auto first) {
-    const unsigned char* stage = base + (st % ST) * C::kStage;
-    const unsigned char* next = base + ((st + 1) % ST) * C::kStage;
-    const bool more = st + 1 < steps;
+    const int r = st - st_lo;   // the step's ring slot counts from the CTA's first step
+    const unsigned char* stage = base + (r % ST) * C::kStage;
+    const unsigned char* next = base + ((r + 1) % ST) * C::kStage;
+    const bool more = st + 1 < st_hi;
     constexpr int set = 0, ahead = C::kAhead ? 1 : 0;   // fixed register sets: the step's own, the next step's
 #pragma unroll
     for (int q = 0; q < G; ++q) {
       const int m = q / (G / 2), j = q % (G / 2), slot = q & 1;
       if (q == G - 2 && more) {
-        kc::mbarrier_wait(full + (st + 1) % ST, uint32_t(((st + 1) / ST) & 1));
+        kc::mbarrier_wait(full + (r + 1) % ST, uint32_t(((r + 1) / ST) & 1));
         if constexpr (C::kAhead) load_a(next, ahead);
       }
       if (q + 1 < G) fetch(stage, q + 1);
@@ -456,7 +483,8 @@ __global__ void __launch_bounds__(32 * (PW + 1), 1)
         for (int g = 0; g < PR; ++g) {
           float (&sum)[4] = c[g][2 * j + h];
           if (decltype(first)::value && m == 0) {
-            if constexpr (SPLIT) join(g, 2 * j + h, false);
+            if constexpr (PARTS) boundary(g, 2 * j + h);
+            else if constexpr (SPLIT) join(g, 2 * j + h, false);
             mma_fp4_first(sum, fa[set][g][m][0], fa[set][g][m][1], fa[set][g][m][2], fa[set][g][m][3], fb[slot][2 * h],
                           fb[slot][2 * h + 1], sfa[set][g][m], sfb[slot][h]);
           } else {
@@ -467,7 +495,7 @@ __global__ void __launch_bounds__(32 * (PW + 1), 1)
       }
     }
     __syncwarp();
-    if (lane == 0) kc::mbarrier_arrive(empty + st % ST);   // the warp is done with the stage
+    if (lane == 0) kc::mbarrier_arrive(empty + r % ST);   // the warp is done with the stage
     if constexpr (C::kAhead) {   // the next step's fragments become the step's own
 #pragma unroll
       for (int g = 0; g < PR; ++g)
@@ -484,8 +512,7 @@ __global__ void __launch_bounds__(32 * (PW + 1), 1)
   kc::mbarrier_wait(full, 0u);
   load_a(base, 0);
   fetch(base, 0);
-  int split = 0, bound = 0;   // the next split and its first step
-  for (int st = 0; st < steps; ++st) {
+  for (int st = st_lo; st < st_hi; ++st) {
     if (st == bound) {
       step(st, std::true_type{});
       bound = ++split * steps / p.splits;
@@ -493,11 +520,46 @@ __global__ void __launch_bounds__(32 * (PW + 1), 1)
       step(st, std::false_type{});
     }
   }
-  if constexpr (SPLIT) {   // the last split's chains join their totals: c holds the finished sums
+  if constexpr (SPLIT) {
+    if (part == 0) {   // the last split's chains join their totals: c holds the finished sums (part 0's)
 #pragma unroll
-    for (int g = 0; g < PR; ++g)
+      for (int g = 0; g < PR; ++g)
 #pragma unroll
-      for (int t = 0; t < G; ++t) join(g, t, true);
+        for (int t = 0; t < G; ++t) join(g, t, true);
+    }
+    if (PARTS && parts > 1) {   // part 0's total, or a later part's last chain; the tile's last CTA adds them in order
+#pragma unroll
+      for (int g = 0; g < PR; ++g)
+#pragma unroll
+        for (int t = 0; t < G; ++t)
+          if (t < live) keep(part == 0 ? 0 : 1 + sp_hi - 1 - first_part_splits(p.splits, parts), g, t);
+      __threadfence();
+      prompt_consumers_sync(32 * PW);
+      if (threadIdx.x == 0) last = atomicAdd(p.counters + tile, 1) == parts - 1;
+      prompt_consumers_sync(32 * PW);
+      if (!last) return;
+      __threadfence();
+      if (threadIdx.x == 0) p.counters[tile] = 0;   // every part has counted: ready for the next call
+      const int slots = part_slots(p.splits, parts);
+#pragma unroll
+      for (int g = 0; g < PR; ++g)
+#pragma unroll
+        for (int t = 0; t < G; ++t)
+#pragma unroll
+          for (int i = 0; i < 4; ++i)
+            if (t < live) c[g][t][i] = __ldcg(slot_at(0) + ((g * G + t) * 4 + i) * (32 * PW) + threadIdx.x);
+#pragma unroll 2
+      for (int s = 1; s < slots; ++s) {
+        const float* at = slot_at(s) + threadIdx.x;
+#pragma unroll
+        for (int g = 0; g < PR; ++g)
+#pragma unroll
+          for (int t = 0; t < G; ++t)
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+              if (t < live) c[g][t][i] += __ldcg(at + ((g * G + t) * 4 + i) * (32 * PW));
+      }
+    }
   }
   // c[g][t][i]: matrix row n0 + r0 + 16 g + gid + 8 (i >> 1), token t0 + 8 t + 2 tig + (i & 1).
   // A whole tile of 16-bit outputs (store()'s and store_glu()'s values) leaves through the ring: each lane's values
@@ -568,18 +630,43 @@ __global__ void __launch_bounds__(32 * (PW + 1), 1)
 #endif
 }
 
+// The launch's grid: tokens along x, row tiles along y, the parts of a tile's splits along z: the tuning's PK, or
+// untuned (PK 0) prompt_parts' rule where the tiles fill a sixteenth of the resident CTAs at most. A part's ring fill,
+// producer and stored chains cost the FP4 tile more than the decode-rate tiles: on an RTX 5090 a 320 x 10240 matrix
+// (3 to 6 tiles) took 1.1-1.7x less time from 16 to 256 rows in parts, while 12 to 40 tiles (320 x 10240 at 512
+// rows, 2560 x 2560 and 5120 x 17408 at 16 to 512) took 0.35-1.13x the time.
 template <bool SPLIT, int PW, int PR, int PT>
-cudaError_t launch_prompt_fp4(const Problem& p, const PromptMaps& maps, cudaStream_t stream) {
+dim3 prompt_fp4_grid(const Problem& p, int knob) {
   using C = PromptTile<SPLIT, PW, PR, PT>;
-  auto kernel = fp4_prompt_kernel<SPLIT, PW, PR, PT>;
-  static kc::PerDevice<cudaError_t> optin;
-  const cudaError_t set = kc::shared_memory_optin(optin, kernel, C::kSmem);
+  dim3 grid((p.M + PT - 1) / PT, (p.N + C::kRows - 1) / C::kRows);
+  if (SPLIT && grid.y <= 65535u) {
+    // The one-part kernel's residency (its shared memory opted in first: the occupancy of more than the default is
+    // asked of a kernel that may take it).
+    static const int slots = [] {
+      static kc::PerDevice<cudaError_t> optin;
+      auto one = fp4_prompt_kernel<SPLIT, false, PW, PR, PT>;
+      return kc::shared_memory_optin(optin, one, C::kSmem) == cudaSuccess
+                 ? multiprocessors() * resident(one, C::kThreads, C::kSmem)
+                 : 0;
+    }();
+    if (knob > 0 || 16L * grid.x * grid.y <= slots)
+      grid.z = prompt_parts(p, grid.x * grid.y, grid.x, 32 * PW * PR * C::kGroups * 4, slots, knob);
+  }
+  return grid;
+}
+
+template <bool SPLIT, int PW, int PR, int PT>
+cudaError_t launch_prompt_fp4(const Problem& p, const PromptMaps& maps, int knob, cudaStream_t stream) {
+  using C = PromptTile<SPLIT, PW, PR, PT>;
+  const dim3 grid = prompt_fp4_grid<SPLIT, PW, PR, PT>(p, knob);
+  if (grid.y > 65535u) return cudaErrorInvalidValue;
+  auto kernel = grid.z > 1 ? fp4_prompt_kernel<true, true, PW, PR, PT> : fp4_prompt_kernel<SPLIT, false, PW, PR, PT>;
+  static kc::PerDevice<cudaError_t> optin, optin_parts;
+  const cudaError_t set = kc::shared_memory_optin(grid.z > 1 ? optin_parts : optin, kernel, C::kSmem);
   if (set != cudaSuccess) return set;
   int major = 0, device = 0;
   cudaGetDevice(&device);
   cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
-  const dim3 grid((p.M + PT - 1) / PT, (p.N + C::kRows - 1) / C::kRows);
-  if (grid.y > 65535u) return cudaErrorInvalidValue;
   cudaLaunchAttribute attribute[1];
   cudaLaunchConfig_t config{};
   config.gridDim = grid;
@@ -598,8 +685,13 @@ cudaError_t launch_prompt_fp4(const Problem& p, const PromptMaps& maps, cudaStre
 // The launch's tensor maps (the driver's encoding: host arithmetic, no device call), then the kernel. The copies want
 // both operands' codes and scale tiles at 16-byte addresses, as the decode tile's 16-byte loads do.
 template <int PW, int PR, int PT>
-cudaError_t prompt_fp4_config(const Problem& p, cudaStream_t stream) {
+cudaError_t prompt_fp4_config(const Problem& p, int knob, cudaStream_t stream, int* ctas) {
   using C = PromptTile<false, PW, PR, PT>;
+  if (ctas) {   // its CTAs counted, nothing launched
+    const dim3 grid = p.splits > 1 ? prompt_fp4_grid<true, PW, PR, PT>(p, knob) : prompt_fp4_grid<false, PW, PR, PT>(p, knob);
+    *ctas = grid.x * grid.y * grid.z;
+    return cudaSuccess;
+  }
   const uint64_t row_bytes = uint64_t(p.K) / 2;
   PromptMaps maps{};
   auto map = [&](CUtensorMap* m, const void* codes, int rows) {
@@ -607,8 +699,8 @@ cudaError_t prompt_fp4_config(const Problem& p, cudaStream_t stream) {
                                   uint32_t(m == &maps.w ? C::kRows : PT), 64u, CU_TENSOR_MAP_SWIZZLE_64B) == CUDA_SUCCESS;
   };
   if (!map(&maps.w, p.w, p.N) || !map(&maps.x, p.scratch, p.M)) return cudaErrorInvalidValue;
-  return p.splits > 1 ? launch_prompt_fp4<true, PW, PR, PT>(p, maps, stream)
-                      : launch_prompt_fp4<false, PW, PR, PT>(p, maps, stream);
+  return p.splits > 1 ? launch_prompt_fp4<true, PW, PR, PT>(p, maps, knob, stream)
+                      : launch_prompt_fp4<false, PW, PR, PT>(p, maps, knob, stream);
 }
 
 }  // namespace
@@ -635,6 +727,19 @@ cudaError_t enqueue_fp4(const Problem& given, cudaStream_t stream) {
   }
 }
 
+// The configuration crit_tuning.h's table names for this matrix and row count (0, the defaults, where it names none);
+// the splits come with p (plan()'s for acts nvfp4_mma, the decode tile's). ctas: its CTAs counted instead.
+cudaError_t dispatch_prompt_fp4(const Problem& p, cudaStream_t stream, int* ctas) {
+  switch (crit_lookup_fp4_prompt_tile(p.N, p.K, p.M)) {
+#define CRIT_FP4_PROMPT_CONFIG(index, pw, pr, pt, pk) \
+  case index:                                         \
+    return prompt_fp4_config<pw, pr, pt>(p, pk, stream, ctas);
+    CRIT_CONFIGS_fp4_prompt_tile(CRIT_FP4_PROMPT_CONFIG)
+#undef CRIT_FP4_PROMPT_CONFIG
+    default: return cudaErrorInvalidValue;
+  }
+}
+
 cudaError_t enqueue_prompt_fp4(const Problem& given, cudaStream_t stream) {
   Problem p = given;
   auto unaligned = [](const void* at) { return reinterpret_cast<std::uintptr_t>(at) % 16 != 0; };
@@ -646,14 +751,12 @@ cudaError_t enqueue_prompt_fp4(const Problem& given, cudaStream_t stream) {
   uint8_t* scales = p.scratch + ((size_t)p.M * p.K / 2 + 15) / 16 * 16;
   const cudaError_t e = enqueue_quantize_nvfp4(p.x, p.ldx, p.M, p.K, p.input_scale, p.input_rcp, codes, scales, stream);
   if (e != cudaSuccess) return e;
-  // The configuration crit_tuning.h's table names for this matrix and row count (0, the defaults, where it names
-  // none); the splits come with p (plan()'s for acts nvfp4_mma, the decode tile's).
-  switch (crit_lookup_fp4_prompt_tile(p.N, p.K, p.M)) {
-#define CRIT_FP4_PROMPT_CONFIG(index, pw, pr, pt)   case index:                                         return prompt_fp4_config<pw, pr, pt>(p, stream);
-    CRIT_CONFIGS_fp4_prompt_tile(CRIT_FP4_PROMPT_CONFIG)
-#undef CRIT_FP4_PROMPT_CONFIG
-    default: return cudaErrorInvalidValue;
-  }
+  return dispatch_prompt_fp4(p, stream, nullptr);
+}
+
+int prompt_fp4_ctas(const Problem& p) {
+  int ctas = 0;
+  return dispatch_prompt_fp4(p, nullptr, &ctas) == cudaSuccess ? ctas : 0;
 }
 
 bool fp4_mma(cudaStream_t stream) {

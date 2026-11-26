@@ -5,6 +5,7 @@
   "title": "Row operations around a model's blocks: head clips, small products, sink-gated outputs, scaled adds, summary mixes, gated joins with low-rank gates and span attention, one Triton launch a call (two where a reduction spans programs)",
   "package": "row_ops",
   "language": "triton",
+  "launches": ["gate_down_kernel", "gate_up_kernel", "gated_join_kernel", "head_clip_kernel", "mix_kernel", "mix_parts_kernel", "pair_norm_kernel", "scaled_add_kernel", "sink_gate_kernel", "small_product_kernel", "span_merge_kernel", "span_part_kernel"],
   "operations": [
     "head-clip",
     "small-product",

@@ -95,7 +95,7 @@ Triton kernels for attention over paged KV caches, used by crit's attention-stat
   group before its own, which hold earlier tickets and run already. A fused launch whose partials would fit
   `FUSED_PARTIALS` bytes (workspace_floats of every split its page tables hold, no `offsets`, no caller workspace) runs
   as the window launch and the staged merge instead (the same bits; `FUSED_PARTIALS` 0 keeps every fused launch on its
-  ring): its tile's folds run one after another, where the merge spreads over the GPU. Where a fused launch's tiles fill the GPU by themselves (`FUSED_SERIAL`, 50 percent of the programs the device holds at once, cuda-fused's knob `SERIAL`) it runs its **serial form** instead: one program a tile, which walks its row's splits in turn and folds each into the tile's running state as it ends (the merge's steps on the split's state as a split program writes it, its outputs rounded to BF16), the queries of 64 query rows in shared memory, the running outputs in registers up to 128 value columns a program and in the launch's workspace past them. The same states folded in the same order: the split launch's bits, with no partials, ring or sync words, and the tile's keys and values read once a tile as a prompt chunk reads them. A step's prompt rows in the decode's reduction (prompt_reader decode, pieces of up to 64 columns) are such launches: the exact prompt path. Trees, `lse`, `offsets`, `counts`, `fresh` rows, every page kind and FP16 queries as the
+  ring): its tile's folds run one after another, where the merge spreads over the GPU. Where a fused launch's tiles fill the GPU by themselves (`FUSED_SERIAL`, 125 percent of the programs the device holds at once, cuda-fused's knob `SERIAL`) it runs its **serial form** instead: one program a tile, which walks its row's splits in turn and folds each into the tile's running state as it ends (the merge's steps on the split's state as a split program writes it, its outputs rounded to BF16), the queries of 64 query rows in shared memory, the running outputs in registers up to 128 value columns a program and in the launch's workspace past them. The same states folded in the same order: the split launch's bits, with no partials, ring or sync words, and the tile's keys and values read once a tile as a prompt chunk reads them. A step's prompt rows in the decode's reduction (prompt_reader decode, pieces of up to 64 columns) are such launches: the exact prompt path. Trees, `lse`, `offsets`, `counts`, `fresh` rows, every page kind and FP16 queries as the
   flash launch takes them; head widths 64, 128 and 256. A column's bits depend on its own query, keys and values, the
   page kind, `BLOCK_N` and `CHUNK` only: not on the rows beside it, the warps or the tile (the same alone, in any
   window, packed, fused or split). Prompt chunks (`prefill`): the chunk as one row, its positions split on the device
@@ -311,6 +311,38 @@ heads a KV head the ring measured faster at 2,048 tokens too: SERIAL is a speed 
 rows stay on reader split by default: one row at 4K positions took 19.0 us there against 39.5 on the CUDA window
 launch (16 rows: 128 against 97). `prefill_rows` (reader split's prompt rows in one launch): 8 rows of 256 tokens at
 4,096 cached, 3,088 a launch a row against 1,850; 4 x 512, 1,578 against 1,025.
+
+The form rule, measured again (2026-11-25, RTX 5090, CUDA graph replays after an L2-flushing write, median of 15; both
+forms checked bit for bit against the cuda window launch and its merge). Over 56 steps of 64 to 1,024 tokens at 0 to
+16,384 cached positions on the four geometries below, the ring form is faster up to about one and a quarter times the
+programs the device holds and the serial form past it: FUSED_SERIAL 125 takes the faster form within 2.6% on average
+(worst 1.34x) where 50 took it within 9.8% (worst 1.55x), 28.9 against 33.0 ms over the 56. Short steps it moved, us:
+
+| Heads, pages | Rows x tokens @ cached | serial (50) | ring (125) |
+| --- | --- | --- | --- |
+| 24 / 2 x 256, BF16 | 1 x 512 @ 0 | 121.5 | 91.3 |
+| 24 / 2 x 256, FP8 | 1 x 512 @ 0 | 141.9 | 97.4 |
+| 24 / 2 x 256, BF16 | 1 x 512 @ 4,096 | 863 | 582 |
+| 32 / 8 x 128, BF16 | 1 x 256 @ 4,096 | 277 | 164 |
+| 32 / 8 x 128, BF16 | 1 x 128 @ 16,384 | 1,013 | 279 |
+
+Long steps keep the serial form, at 0.51 to 0.68x of FlashInfer 0.7.3's batch prefill on the same pages (us):
+
+| Heads, pages | Rows x tokens @ cached | exact (cuda serial) | FlashInfer |
+| --- | --- | --- | --- |
+| 24 / 2 x 256, BF16 | 1 x 2,048 @ 1,024 | 1,190 | 654 |
+| 24 / 2 x 256, BF16 | 1 x 8,192 @ 0 | 7,361 | 4,281 |
+| 24 / 2 x 256, FP8 | 1 x 2,048 @ 1,024 | 1,637 | 767 |
+| 56 / 8 x 128, INT8 | 1 x 2,048 @ 1,024 | 1,035 | 707 |
+| 32 / 8 x 128, BF16 | 1 x 2,048 @ 1,024 | 687 | 474 |
+
+What holds them, and what did not pay: the cache's split (CHUNK 128 positions for 256-wide heads, from the decode
+rule) is part of a column's bits, and each split's end folds its state into the tile's running one; the same launch
+at splits of 1,024 takes 816 us at 2,048 tokens (1,168 at 128), so a third of the time is the folds and the fresh
+state after each, which the bits fix. The tile holds 250 registers a thread and two CTAs an SM, the tensor pipe 37%
+busy. The launch knobs measured no faster than the defaults (2 or 3 stages 1.33-1.36x slower, 8 warps 1.18x, 2 warps
+1.24x, VSPLIT 2 even); reading a block's page a block ahead (the page table off the copies' path) took 8 x 256 @ 4,096
+from 2,295 to 2,136 us but FP8 pages from 1,654 to 2,868 (registers), and was left out.
 
 ## Yardstick
 

@@ -175,6 +175,19 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(shared([1, 2, 3], [1, 2, 4, 5]), 2)
         self.assertEqual(cache.telemetry()["prompt_cache"]["hits"], 1)
 
+    def test_no_resume_before_where_a_pool_still_holds_a_kept_sequence(self):
+        # A sliding window's ring that wrapped holds a kept sequence from some length on (resumes_from): a prompt that
+        # shares less of it is prefilled whole, where it resumed over positions later ones had written over.
+        pool, ring = Pool(), Pool()
+        ring.resumes_from = lambda sequence: 6 if sequence in (1, 4) else 0
+        cache = PromptCache([pool, ring])
+        self.serve(cache, [pool, ring], 1, [5, 6, 7, 8, 1, 2], [9, 9])
+        self.assertEqual(cache.open(2, [5, 6, 7, 8, 3, 3, 4]), 0)            # shares 4, the ring holds from 6
+        self.assertEqual(cache.open(3, [5, 6, 7, 8, 1, 2, 9, 9, 4]), 8)      # shares 8: resumed
+        marked = PromptCache([pool, ring], at_marks=True)
+        self.serve(marked, [pool, ring], 4, [5, 6, 7, 8, 1, 2], [9, 9], marks=(4,))
+        self.assertEqual(marked.open(5, [5, 6, 7, 8, 1, 3]), 0)            # its mark at 4 is before the ring's 6
+
     def test_the_last_prompt_token_is_always_computed(self):
         pool = Pool()
         cache = PromptCache([pool])

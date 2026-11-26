@@ -46,7 +46,7 @@
       "default": 16,
       "min": 1,
       "max": 64,
-      "description": "Most tokens of a row read as a window row (decode tokens, verify windows, short prompt pieces: the attention plugins' split-KV reader, and the step buffers' rows); a longer row is a prompt row"
+      "description": "Most tokens of a row read as a window row (decode tokens, verify windows: the attention plugins' split-KV reader, and the step buffers' rows); a longer row is a prompt row, and so is a shorter prompt chunk the model marks (StepBatch.prompts), whose rows keep the bits of the same rows in a longer chunk"
     },
     "round_rows": {
       "type": "int",

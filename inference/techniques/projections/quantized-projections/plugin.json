@@ -157,6 +157,15 @@
       ],
       "description": "the decode rows' kernel: auto, each matrix's fastest measured one: FP8 matrices' 16-bit decode rows (W8A16) on decode-gemv's dot GEMV (a Triton program of 16 rows by a block of the matrix on tensor cores, a fixed split of K added in order; faster than the tile from 8 rows on, level below; K a multiple of 128), W4A4 decode rows on mma-rows' block-scaled FP4 MMA (the sm_120 family; K a multiple of 128), every other matrix as mma (the facts' decode_kernels name each role's); mma, mma-rows' tensor-core tile (every format, the weights read once a call whatever the rows, the prompt rows' quantized activations; K a multiple of 32), else as native; fp4, as mma with W4A4 decode rows on mma-rows' block-scaled FP4 MMA where the device has it (the sm_120 family; K a multiple of 128): with prompt_gemm tile those matrices' prompt rows go through mma-rows' FP4 prompt tile with the FP4 decode rows' bits, at several times the BF16 prompt tile's rate; native, decode-gemv's CUDA-core GEMVs (its Triton GEMV for NVFP4 matrices whose width is no multiple of 32); triton, its Triton GEMV for NVFP4 (BF16 rows then run a row at a time through torch); where no kernel is here, the torch fallbacks (the matrix's exact values, one row at a time). Each keeps FP32 sums and a row's bits alone and batched; their orders differ, so a process uses one a matrix. crossover: each matrix's decode calls of up to its measured crossover on decode-gemv's CUDA-core GEMV, longer ones on mma-rows' tile (as mma): the crossover is the most rows at which the GEMV's tuned time is no more than the tile's at every row count both sweeps timed at the matrix's shape (their reports beside the engine's tuning, CRIT_KERNEL_TUNING, swept on this device's model), 0 without them or for decode rows on quantized activations (every call on the tile); a row then keeps its bits across calls of up to the crossover and across longer ones, not between the two (the facts' row_invariance rows is the crossover, decode_crossover names it per role), so it suits single-sequence decoding without verify windows; not with prompt_gemm tile."
     },
+    "fp8_block_layout": {
+      "type": "choice",
+      "default": "plain",
+      "choices": [
+        "plain",
+        "visit"
+      ],
+      "description": "how an fp8:block matrix's codes are held: plain, as stored; visit, each row's blocks of 32 stored once at load in the kernel core's visit order (fp8-block-rows' to_visit_weights), which its decode rows and staged prompt GEMM read with the same bits: on an RTX 5090 the staged GEMM 1.08-1.53x faster at 32 to 128 tokens and 0.97-1.01x past 512, the decode rows 0.66-0.90x, so plain stays the default; a matrix on the native prompt GEMM (prompt_gemm native or pinned) stays plain"
+    },
     "mxfp8_activations": {
       "type": "choice",
       "default": "auto",

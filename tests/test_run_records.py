@@ -102,10 +102,14 @@ class RunRecordTests(RunFixture, unittest.TestCase):
         self.assertEqual(sized["kv_tokens"], 10240)
         self.assertEqual((sized["context"]["concurrency_tokens"], sized["context"]["context_tokens"],
                           sized["context"]["bound"]), (10240, 8192, "requested"))
-        # An explicit capacity is taken as given.
+        # An explicit capacity is taken as given; the device file beside it is still recorded, so Eval prices the
+        # prefill ceiling and the TTFT floor from its rates (it read no device where a run gave kv_tokens).
         explicit = self.store.create(data | {"device": str(device), "kv_tokens": 65536})["run"]["spec"]["hardware_constraints"]
         self.assertEqual(explicit["kv_tokens"], 65536)
-        self.assertNotIn("context", explicit)
+        self.assertEqual(explicit["context"], {"source": "given", "device": "fixture gpu", "device_file": str(device),
+                                               "device_sha256": file_sha(device)})
+        alone = self.store.create(data | {"kv_tokens": 65536})["run"]["spec"]["hardware_constraints"]
+        self.assertNotIn("context", alone)
         # A device file of two GPUs (crit eval probe --devices) names them, and their memory holds more context.
         one = {"device": "fixture gpu", "memory_free_bytes": 13 * GIB // 4 + 8192 + 32 * 100000}
         device.write_text(json.dumps({**one, "devices": [{**one, "index": 0}, {**one, "index": 1}]}), encoding="utf-8")

@@ -319,6 +319,101 @@ class RowGroupTests(PluginTestCase):
         self.assertEqual(found, [(0, 8, False), (8, 10, False), (10, 15, True), (15, 17, False)])
         self.assertEqual(groups.rows(17), [(0, 8, False), (8, 16, False), (16, 17, False)])
 
+    def test_a_steps_prompt_chunks_are_marked_on_its_batch_however_short(self):
+        # attention-state reads a row of up to its window as a window row unless the batch marks it a prompt chunk:
+        # the marks are the groups' prompt rows (a 3-token chunk, a one-token row decode_via_prompt names), so a short
+        # chunk's attention keeps the bits of the same rows in a longer chunk.
+        from crit_plugins import StepBatch
+        groups = template("rows").RowGroups(_Projections())
+        batch = StepBatch.build([("a", 9, 1), ("b", 0, 3), ("c", 4, 1), ("d", 0, 40)], "cpu")
+        self.assertIsNone(batch.prompts)
+        self.assertEqual([batch.prompt_row(r, 16) for r in range(4)], [False, False, False, True])
+        groups.of(batch, via_prompt={2})
+        self.assertEqual(batch.prompts, {1, 2, 3})
+        self.assertEqual([batch.prompt_row(r, 16) for r in range(4)], [False, True, True, True])
+
+
+
+class DevicePlanTests(PluginTestCase):
+    def test_the_plan_prices_each_matrix_at_the_bytes_the_projections_slot_holds_it_in(self):
+        # Gemma 4's NVFP4 checkpoint keeps attention and the head in BF16, which quality mode speed holds in FP8: the
+        # plan counted them at their stored bytes, and the tied head (a matrix of its own beside the embedding table,
+        # which the plan may put off the device) not at all.
+        from types import SimpleNamespace
+        model = template("model")
+        shapes = {"model.layers.0.self_attn.q_proj.weight": (64, 32), "model.layers.0.mlp.down_proj.weight": (32, 64),
+                  "model.layers.0.mlp.experts.0.down_proj.weight": (32, 64), "model.embed_tokens.weight": (100, 32)}
+        formats = {"model.layers.0.self_attn.q_proj": "bf16", "model.layers.0.mlp.down_proj": "nvfp4",
+                   "model.layers.0.mlp.experts.0.down_proj": "bf16", "model.embed_tokens": "bf16"}
+        asked = []
+
+        def held(fmt, rows, columns, stored, role=None):   # a slot that holds 16-bit matrices in half their bytes
+            asked.append((rows, columns, role))
+            return stored // 2
+        engine = object.__new__(model.ComposedModel)
+        engine.ck = type("Ck", (), {"shape": lambda self, n: shapes[n], "names": lambda self: list(shapes),
+                                    "nbytes": lambda self, n: 999, "__contains__": lambda self, n: n in shapes})()
+        engine.matrices = SimpleNamespace(has=lambda b: b in formats, format=lambda b: formats[b])
+        engine.parts, engine.mtp, engine.head_rows = {"projections": SimpleNamespace(held_bytes=held)}, False, 96
+        tensors = {name: 999 for name in shapes if "embed" not in name}
+        engine._held_bytes(tensors, "model.embed_tokens", True, ("model.layers.0.mlp.experts",))
+        self.assertEqual(tensors, {"model.layers.0.self_attn.q_proj.weight": 64 * 32,   # 16-bit: held bytes
+                                   "model.layers.0.mlp.down_proj.weight": 999,          # quantized: as stored
+                                   "model.layers.0.mlp.experts.0.down_proj.weight": 999,   # the experts slot's
+                                   "head": 96 * 32})                                    # the tied head's rows
+        self.assertEqual(asked, [(64, 32, None), (96, 32, "head")])
+        # A slot without held_bytes holds every matrix as stored; the tied head is still a copy of its own.
+        engine.parts = {"projections": SimpleNamespace()}
+        tensors = {"model.layers.0.self_attn.q_proj.weight": 999}
+        engine._held_bytes(tensors, "model.embed_tokens", True, ())
+        self.assertEqual(tensors, {"model.layers.0.self_attn.q_proj.weight": 999, "head": 96 * 32 * 2})
+
+
+class LogitTests(PluginTestCase):
+    def test_capped_logits_keep_their_bits_in_one_fp32_copy(self):
+        # A score's slice of a 262,144-token vocabulary held three FP32 copies of its logits with the cap (12 bytes a
+        # logit, measured: 384 MiB at 128 rows), two without; the cap now takes no copy of its own.
+        from types import SimpleNamespace
+        import torch
+        model = template("model")
+        engine = object.__new__(model.ComposedModel)
+        head = torch.randn(40, 8, generator=torch.Generator().manual_seed(1))
+        engine.torch, engine.head, engine.vocabulary, engine.softcap = torch, head, 37, 30.0
+        engine.rows = SimpleNamespace(rows=lambda n: None, matmul=lambda h, m, groups: (h @ m.T).to(torch.bfloat16))
+        h = torch.randn(5, 8, generator=torch.Generator().manual_seed(2)) * 40
+        want = (h @ head.T).to(torch.bfloat16).float()[..., :37]
+        got = engine._logits_rows(h)
+        self.assertTrue(torch.equal(got, torch.tanh(want / 30.0) * 30.0))
+        self.assertEqual(got.dtype, torch.float32)
+
+    def test_a_scores_slice_of_logits_is_sized_by_its_bytes(self):
+        # Two FP32 copies a logit at a slice's peak: 128 rows up to a 131,072-token vocabulary, 64 at 262,144.
+        model = template("model")
+        engine = object.__new__(model.ComposedModel)
+        for vocabulary, rows in ((32000, 128), (131072, 128), (151936, 110), (262144, 64), (10 ** 9, 1)):
+            engine.vocabulary = vocabulary
+            self.assertEqual(engine.score_slice(), rows, vocabulary)
+            self.assertLessEqual(rows * vocabulary * 8, max(model.SCORE_BYTES, vocabulary * 8))
+
+
+class PromptCacheTrimTests(PluginTestCase):
+    def test_kept_sequences_are_priced_against_a_full_pool_and_never_a_ring(self):
+        # A model whose first KV pool is a sliding window's ring: an 8k kept prompt counted 512 pages against the
+        # ring pool's 270 and was evicted as soon as it was kept (every follow-up prefilled whole).
+        from types import SimpleNamespace
+        model = template("model")
+        engine = object.__new__(model.ComposedModel)
+        evicted = []
+        engine.cache = SimpleNamespace(kept={"a": SimpleNamespace(tokens=list(range(8192)))},
+                                       evict=lambda: evicted.append(engine.cache.kept.popitem()))
+        engine.reservations = SimpleNamespace(reserved=0)
+        engine.pool = SimpleNamespace(page=16, pages=270, sliding=1024)
+        engine._trim()
+        self.assertEqual(evicted, [])                    # all pools rings: the pools evict when short (on_exhausted)
+        engine.pool = SimpleNamespace(page=16, pages=270, sliding=0)
+        engine._trim()
+        self.assertEqual(len(evicted), 1)                # a full pool of 270 pages cannot hold its 512
+
 
 if __name__ == "__main__":
     sys.exit(unittest.main())

@@ -7,10 +7,11 @@ import math
 import torch
 
 from crit_kernels.gates import shared_memory_optin
+from crit_kernels.weight_formats import WEIGHTS as FORMATS
+from crit_kernels.weight_formats import INT4_GROUP, int4_matrix, int4_shapes, int4_values, int4_yardstick
 
 E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
-WEIGHTS = {"nvfp4": 0, "fp8": 1, "bf16": 3, "int4_zp": 4}
-INT4_GROUP = 128   # a shape's group where it names none (AWQ's and GPTQ's usual)
+WEIGHTS = {name: code for name, code in FORMATS.items() if name != "mxfp8"}   # the formats these rows multiply
 INPUT_SCALE = 500.0   # NVFP4 activations' input scale: randn blocks' scales well inside E4M3's range
 
 
@@ -41,44 +42,6 @@ def _nvfp4_values(codes, scales, lo, hi):
     c = codes[lo:hi].long()
     w = torch.stack((table[c & 15], table[c >> 4]), dim=-1).reshape(c.shape[0], -1)
     return (w.view(c.shape[0], -1, 16) * scales[lo:hi].double()[..., None]).reshape(c.shape[0], -1)
-
-
-def int4_shapes(model):
-    """The model's AWQ or GPTQ matrices (qweight int32: AWQ [K][N / 8], GPTQ [K / 8][N]) as int4_zp keys."""
-    quant = model.quantization or {}
-    method = str(quant.get("quant_method", "")).lower()
-    if method not in ("awq", "gptq") or int(quant.get("bits", 4)) != 4:
-        return []
-    group = int(quant.get("group_size") or INT4_GROUP)
-    found = []
-    for name, (dtype, shape) in model.tensors.items():
-        if name.endswith(".qweight") and dtype == "I32" and len(shape) == 2:
-            n, k = (shape[1] * 8, shape[0]) if method == "awq" else (shape[1], shape[0] * 8)
-            if group > 0 and group % 32 == 0 and k % group == 0:
-                found.append({"name": name[:-8], "weights": WEIGHTS["int4_zp"], "N": n, "K": k, "group": group})
-    return found
-
-
-def _int4_yardstick(cache, s):
-    """torch's W4A16 INT4 group GEMM (torch._weight_int4pack_mm, tinygemm): the same codes repacked once, a BF16 scale
-    and offset a group ((code - 8) * scale + offset, offset (8 - zero) * scale). None where torch lacks it or refuses
-    the shape."""
-    if not hasattr(torch, "_weight_int4pack_mm") or not hasattr(torch, "_convert_weight_to_int4pack"):
-        return None
-    codes, scales, x = s["stored"][0], s["stored"][1], s["x"]
-    zeros, group = s["zeros"], s["group"]
-    n, k = codes.shape[0], codes.shape[1] * 2
-    if ("int4pack", n, k, group) not in cache:
-        try:
-            packed = torch._convert_weight_to_int4pack(codes.contiguous(), 8)
-            sz = torch.stack((scales.float(), (8 - zeros.float()) * scales.float()), -1)
-            sz = sz.transpose(0, 1).contiguous().to(torch.bfloat16)
-            torch._weight_int4pack_mm(x, packed, group, sz)
-        except (RuntimeError, TypeError):
-            return None
-        cache[("int4pack", n, k, group)] = (packed, sz)
-    packed, sz = cache[("int4pack", n, k, group)]
-    return lambda: torch._weight_int4pack_mm(x, packed, group, sz)
 
 
 def _chunked(x, rows_of, n, chunk=8192):
@@ -119,16 +82,11 @@ class DecodeTile:
             g = torch.Generator(device=device).manual_seed(n * 31 + k + WEIGHTS[fmt])
             if fmt == "int4_zp":
                 group = int(shape.get("group") or INT4_GROUP)
-                codes = torch.randint(0, 256, (n, k // 2), generator=g, dtype=torch.uint8, device=device)
-                scales = ((torch.rand(n, k // group, generator=g, device=device) + 0.5) / 64).to(torch.float16)
-                zeros = torch.randint(0, 17, (n, k // group), generator=g, dtype=torch.uint8, device=device)
+                codes, scales, zeros = int4_matrix(n, k, group, g)
                 stored = (codes, scales, None, zeros, group)
 
                 def rows_of(lo, hi):
-                    c = codes[lo:hi].long()
-                    q = torch.stack((c & 15, c >> 4), dim=-1).reshape(c.shape[0], -1).double()
-                    return ((q - zeros[lo:hi].double().repeat_interleave(group, 1)) *
-                            scales[lo:hi].double().repeat_interleave(group, 1))
+                    return int4_values(codes, scales, zeros, group, lo, hi)
             elif fmt == "nvfp4":
                 codes = torch.randint(0, 256, (n, k // 2), generator=g, dtype=torch.uint8, device=device)
                 scales = (torch.rand(n, k // 16, generator=g, device=device) * 0.4 + 0.1).to(torch.float8_e4m3fn)
@@ -185,7 +143,7 @@ class DecodeTile:
         to BF16 once, what an engine without the tile runs: it reads twice the weight bytes."""
         fmt, n, k = s["weights"], s["out"].shape[1], s["x"].shape[1]
         if fmt == "int4_zp":
-            return _int4_yardstick(self._matrices, s)
+            return int4_yardstick(self._matrices, s["x"], s["stored"][0], s["stored"][1], s["zeros"], s["group"])
         if fmt == "nvfp4":
             try:
                 import flashinfer
@@ -285,10 +243,21 @@ class Fp4Tile(DecodeTile):
 
 
 class PromptTile(DecodeTile):
-    """mm_prompt on the decode tile's matrices with the matrix's plan (its splits), 64 to 2,048 rows; the check takes
-    the first, a middle and the last row against FP64 (a vocabulary head's FP64 outputs for 2,048 rows would not fit
-    the device; the tests check every row against the decode tile bit for bit)."""
+    """mm_prompt on the decode tile's matrices with the matrix's plan (its splits), 64 to 2,048 rows, given the
+    partial sums and counters quantized-projections shares (64 MB, 16,384), so PK's splits in several CTAs run as an
+    engine runs them; the check takes the first, a middle and the last row against FP64 (a vocabulary head's FP64
+    outputs for 2,048 rows would not fit the device; the tests check every row against the decode tile bit for
+    bit)."""
     structure = "prompt-tile"
+    PARTIAL, COUNTERS = 16 << 20, 1 << 14
+    # PK is the launch's `knob` argument (prompt_tile.cu launch_tile -> prompt_parts.h), no template argument: the
+    # configurations that differ in it alone compile to the same code.
+    runtime = ("PK",)
+
+    def valid(self, knobs):
+        """PR 2 always loads the weights at the step (launch_config instantiates launch_tile with PF 0 for it), so PR 2
+        with PF 1 is the same kernel as PR 2 with PF 0: only the PF 0 one is swept."""
+        return not (knobs["PR"] == 2 and knobs["PF"] == 1)
 
     def _reference_input(self, s):
         return s["x"][self._sampled(s)]
@@ -304,8 +273,11 @@ class PromptTile(DecodeTile):
         w, scales, row_scale = s["stored"]
         if "plan" not in s:
             s["plan"] = module.plan(w.shape[0], s["x"].shape[1], s["weights"], s["x"].device)
+            s["partial"] = torch.empty(self.PARTIAL, dtype=torch.float32, device=s["x"].device)
+            s["counters"] = torch.zeros(self.COUNTERS, dtype=torch.int32, device=s["x"].device)
         return module.mm_prompt(s["x"], w, s["out"], s["weights"], scales, row_scale, "bf16", INPUT_SCALE, False,
-                                s["plan"][2], None, s["zeros"], s["group"])
+                                s["plan"][2], None, s["zeros"], s["group"], partial=s["partial"],
+                                counters=s["counters"])
 
 
 class Fp4PromptTile(Fp4Tile):
@@ -314,6 +286,9 @@ class Fp4PromptTile(Fp4Tile):
     quantized activations (the tests check every row against the FP4 decode tile bit for bit). The yardstick is
     Fp4Tile's: cuBLASLt's NVFP4 GEMM on the same weight bytes."""
     structure = "fp4-prompt-tile"
+    # PK is prompt_fp4_config's `knob` argument (fp4_mma.cu -> prompt_fp4_grid -> prompt_parts.h), no template
+    # argument: the configurations that differ in it alone compile to the same code.
+    runtime = ("PK",)
 
     def valid(self, knobs):
         """A warp's accumulators, half its running totals and its fragments within its registers (168 a thread with 8

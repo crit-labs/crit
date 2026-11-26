@@ -50,6 +50,10 @@ ARCH_LIMITS = {
     "120": (255, 48 * 1024, 99 * 1024), "121": (255, 48 * 1024, 99 * 1024),
 }
 
+# The shared bytes the system reserves a block from sm_90 on, which cuobjdump's SHARED counts beside the kernel's own
+# (a kernel of 48 KiB static shared reads 50176 there, and compiles and launches): no part of the static limit.
+RESERVED_SHARED = 1024
+
 _SMEM = {}   # the answer of shared_memory_optin(), once a process
 
 
@@ -285,7 +289,9 @@ def check_limits(records):
     """(failures, spills) of resource_usage() records against ARCH_LIMITS."""
     failures, spills = [], []
     for arch, function, registers, shared, local in records:
-        regs, static, _ = ARCH_LIMITS.get(str(arch).rstrip("af"), ARCH_LIMITS["80"])
+        number = str(arch).rstrip("af")
+        regs, static, _ = ARCH_LIMITS.get(number, ARCH_LIMITS["80"])
+        shared -= RESERVED_SHARED if number.isdigit() and int(number) >= 90 else 0
         if registers > regs:
             failures.append(f"sm_{arch} {function}: {registers} registers a thread, the most is {regs}")
         if shared > static:
@@ -365,7 +371,7 @@ def gates(kernel_id, *, model=None, shapes=None, structures=None, tuning=None, a
     loaded = Model(model) if model else None
     module = kbuild.load(kernel_id, tuning=tuning, root=root)
     # The untuned build, as the sweep hands it to its benches (bench.default): some compare bits with it.
-    default = module if tuning is None else kbuild.load(kernel_id, root=root)
+    default = kbuild.load(kernel_id, root=root, shipped=False)
     report = {"kernel": kernel_id, "structures": {}}
     for s in chosen:
         spec = manifest["structures"][s]

@@ -79,6 +79,14 @@ even with saturation. Its host twin is in [fp8_block.h](code/fp8_block.h), with 
 for error bounds; the order written out as device functions, and the kernels that keep it, are crit's
 `fp8-block-rows` kernel.
 
+`fp8_block_layout` chooses how an fp8:block matrix's codes are held: `plain` (the default) as stored, or `visit`:
+each row's blocks of 32 stored once at load in the kernel core's visit order, which the decode rows and the staged
+prompt GEMM read with the same bits (a visit's two blocks of a row one contiguous 64-byte piece). On an RTX 5090
+(FP32 128 x 128 scales, activations in the visit order) the staged GEMM is 1.08-1.53x faster at 32 to 128 tokens
+(24576 x 4096 at 32 tokens 230 -> 150 us), even at 512 and 0.97-0.99x from 2,048, while the decode rows run 0.66-0.90x
+(their 16 lanes read in parallel from 8 parts of the row): an engine that prefills short chunks and decodes little
+may take it. A matrix on the native prompt GEMM stays plain (it reads plain codes).
+
 The order rests on one property of the tensor core: an output's block sum depends only on its own row and token, the
 same way at every position of the tile. PTX does not specify the internal accumulation, so the kernel's own fixture
 checks the property: three kernels built differently move rows and tokens across tile positions and companions and
@@ -364,8 +372,11 @@ prompt row's output then has the bits the same row gets as a decode row, alone o
 any chunk, padded bucket or shared pass, and the facts say so: `row_invariance` `prompt_exact` true (and
 `prompt_rows`), with `prompt_arithmetic` and `prompt_activations` the decode rows'. A matrix the decode tile does not
 take, or a build of `mma-rows` without the prompt tile, multiplies its prompt rows through the provider and the facts
-say `prompt_exact` false. Quantized activations (W8A8, W4A4) go through the shared activation scratch, as many rows a
-call as it holds.
+say `prompt_exact` false. A tile's splits of K run in several CTAs on the shared partial sums and counters (the same
+additions in split order, the FP4 prompt tile's too), so short prompts and narrow matrices fill the GPU. Quantized activations (W8A8, W4A4, on
+either prompt tile) go through the shared activation scratch, and past the rows it holds through the shared workspace, as many rows a call
+as it holds (on an RTX 5090 a 2,048-row prompt of a 336 x 10240 FP8 matrix took 1,756 us in 11 scratch-sized calls,
+213 us in one).
 
 `gemv: fp4` is `gemv: mma` with W4A4 decode rows on `mma-rows`' block-scaled FP4 MMA where the device has it (the
 sm_120 family, K a multiple of 128; the path `mma_fp4`), every other matrix on the tile. With `prompt_gemm: tile`
@@ -440,7 +451,9 @@ multiple of 16: a stacked product with a 24-row sink projection) is padded with 
 (`row_padding`), its products its own rows (a view of the padded product), and one whose columns it does not take
 stays as stored under the facts' `trunk_kept`; the re-encoded ones are recorded under
 `trunk_encoding` (stored and encoded format, matrices, bytes before and after, roles, what chose it). Their stored
-16-bit copies go back to the device as the head's does (`release_dropped`). Like the FP8 head these are target
+16-bit copies go back to the device as the head's does (`release_dropped`). A model plugin's device plan, made before its matrices load, prices each
+of them at `held_bytes(format, rows, columns, stored, role)`: the bytes `load()` will hold it in, re-encoded, padded or
+as stored by the same rules (a role it does not know priced as a trunk role). Like the FP8 head these are target
 weights, so a run whose `weights_policy` is `as_stored` sets `trunk` to `stored`.
 
 ## Worked example

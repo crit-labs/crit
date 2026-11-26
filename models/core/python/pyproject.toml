@@ -6,13 +6,13 @@ build-backend = "setuptools.build_meta"
 # (https://github.com/crit-labs/crit-eval) both read.
 [project]
 name = "crit-models"
-version = "0.23.0"
+version = "0.24.0"
 description = "crit Models' Python side: a decoder's mechanisms from its config.json, the rules over them, and the harness of a model plugin's tests"
 license = "Apache-2.0"
 # A copy of the root LICENSE (CI compares them): license files must sit inside the project directory.
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
-dependencies = ["crit-core==0.23.0"]
+dependencies = ["crit-core==0.24.0"]
 
 [project.urls]
 Repository = "https://github.com/crit-labs/crit"

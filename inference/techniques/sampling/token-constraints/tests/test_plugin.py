@@ -19,6 +19,17 @@ class TokenConstraintsTests(PluginTestCase):
         self.assertAlmostEqual(math.fsum(law.values()), 1.0)
         self.assertEqual(sampler.select([ROW], {"temperature": 0.0, "allowed": [3, 4]}), [4])
 
+    def test_its_rounds_compute_in_the_engines_scratch(self):
+        # The round form must take the engine's scratch, which Core closes with the engine: a scratch of its own
+        # outlives the engine, and a reopened engine finds its range still held.
+        import sys
+        import types
+        sampler = self.assemble()["sampler"]
+        module = sys.modules[type(sampler).__module__]
+        scratch = object()
+        made = module.create(types.SimpleNamespace(scratch=scratch), {"rounds": "torch"}, {})
+        self.assertIs(made._round_sampling().inner.scratch, scratch)
+
     def test_a_rejected_draft_is_repaired_inside_the_language(self):
         sampler = self.assemble()["sampler"]
         rule = {"temperature": 1.0, "seed": 2, "allowed": [0, 2, 5]}

@@ -1,5 +1,7 @@
 """Tune one of crit's kernels for a model on this GPU: build every knob configuration, check each against its reference,
-time it on the model's own shapes, and write the tuning table the kernel's build reads.
+time it on the model's own shapes, and write the tuning table the kernel's build reads. The shapes the kernel's shipped
+table for this GPU's compute capability covers (crit_kernels.shipped) are not swept (shipped=False sweeps them): their
+entries and report rows come from the table.
 
 Each structure in kernel.json names a bench (kernel.json "bench": "bench.py:Class" in the kernel's folder), a class
 with:
@@ -96,7 +98,7 @@ def _build_one(args):
     os.environ.setdefault("MAX_JOBS", "1")
     try:
         if configs is None:   # the untuned build (a mixed kernel's CUDA variants the benches call)
-            kbuild.build(kernel_id, root=root, variants=variants)
+            kbuild.build(kernel_id, root=root, variants=variants, shipped=False)
         else:
             kbuild.build(kernel_id, configs=configs, sweep=True, root=root, variants=variants)
         return configs, None
@@ -296,9 +298,11 @@ def _worker_signals():
 
 
 def sweep(kernel_id, *, model=None, shapes=None, structures=None, out=None, jobs=None, root=None, lock=None,
-          warmup=3, repeat=25, chunk=24, matrices=None, log=print):
+          warmup=3, repeat=25, chunk=24, matrices=None, log=print, shipped=True):
     """Tune kernel_id. model: a checkpoint folder (its shapes come from each bench's shapes()); shapes: {structure:
-    [shape dicts]} instead. Returns the tuning dict (also written to out/<kernel_id>.json with a report beside it)."""
+    [shape dicts]} instead. shipped: leave out the shapes the table the kernel carries for this GPU's compute
+    capability covers (crit_kernels.shipped), their entries and report rows taken from it (False: sweep every shape).
+    Returns the tuning dict (also written to out/<kernel_id>.json with a report beside it)."""
     import torch
     from .model import Model
     folder, manifest = kbuild.find(kernel_id, root)
@@ -330,6 +334,13 @@ def sweep(kernel_id, *, model=None, shapes=None, structures=None, out=None, jobs
                 unique.append(shape)
         shape_sets[s] = unique
         log(f"{kernel_id}/{s}: {len(unique)} shapes")
+    table, covered = _covered(kernel_id, manifest, chosen, shape_sets, root, log) if shipped else (None, {})
+    if covered and not any(shape_sets[s] for s in chosen):   # every shape is in the table: nothing to build
+        log(f"{kernel_id}: every shape is covered by its shipped tuning: nothing built")
+        empty = {"schema": kbuild.TUNING_SCHEMA, "kernel": kernel_id, "structures": {}}
+        tuning, report = _with_shipped(manifest, chosen, empty, {"kernel": kernel_id, "structures": {}, "dropped": {}},
+                                       table, covered)
+        return _finish(kernel_id, root, torch, tuning, report, out)
     # Each structure is swept with the others on their defaults, its configurations in builds of `chunk` (one compile
     # of the binding and the knob-independent sources a build), each picked at run time (select()).
     plan = []   # (structure, configurations the build holds, [(index in the build, configuration)])
@@ -412,9 +423,55 @@ def sweep(kernel_id, *, model=None, shapes=None, structures=None, out=None, jobs
         f"{len(failed)} configurations failed to build")
     tuning, report = choose(manifest, swept, shape_sets, results, dropped, benches)
     _add_yardsticks(manifest, report, library)
+    if covered:
+        tuning, report = _with_shipped(manifest, chosen, tuning, report, table, covered)
+    return _finish(kernel_id, root, torch, tuning, report, out)
+
+
+def _covered(kernel_id, manifest, chosen, shape_sets, root, log, capability=None):
+    """(the kernel's shipped table for this GPU or None, {structure: shape keys it covers}), each covered shape taken
+    out of shape_sets (crit_kernels.shipped)."""
+    from . import shipped as shipped_tables
+    table, where = shipped_tables.table(kernel_id, capability or kbuild.device_arch()[1], root)
+    covered = {}
+    if table is None:
+        return None, covered
+    for s in chosen:
+        spec = manifest["structures"][s]
+        have = shipped_tables.keys(table, s)
+        found = {shipped_tables.shape_key(spec, shape) for shape in shape_sets[s]}
+        hit = found & have
+        if not hit:
+            continue
+        shape_sets[s] = [shape for shape in shape_sets[s] if shipped_tables.shape_key(spec, shape) not in hit]
+        covered[s] = hit
+        log(f"{kernel_id}/{s}: {len(hit)} of {len(found)} shapes covered by the shipped tuning {where} (compute "
+            f"capability {table['capability']}): not swept (--no-shipped sweeps them)")
+    return table, covered
+
+
+def _with_shipped(manifest, chosen, tuning, report, table, covered):
+    """The sweep's tuning and report with the shipped table's entries and report rows for the covered shapes, the
+    tuning's "shipped" naming those keys (so `crit kernels ship` does not take them for the sweep's own)."""
+    from . import shipped as shipped_tables
+    filled, taken = shipped_tables.fill(manifest, tuning, table, only=covered)
+    structures = {s: filled["structures"][s] for s in chosen if s in tuning["structures"] or s in taken}
+    tuning = dict(tuning, structures=structures,
+                  shipped={s: [json.loads(k) for k in sorted(keys)] for s, keys in taken.items()})
+    rows = dict(report.get("structures") or {})
+    for s, keys in taken.items():
+        rows[s] = list(rows.get(s) or []) + shipped_tables.report_rows(table, s, manifest["structures"][s], keys)
+    return tuning, dict(report, structures=rows)
+
+
+def _finish(kernel_id, root, torch, tuning, report, out):
+    """The tuning with what it was swept on (the kernel's source, the GPU, its compute capability, the day), written
+    with its report to out."""
+    import datetime
     tuning["source"] = kbuild.source_digest(kernel_id, root)
     tuning["device"] = torch.cuda.get_device_name()
     tuning["capability"] = kbuild.device_arch()[1]
+    tuning["date"] = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
     if out:
         out = Path(out)
         out.mkdir(parents=True, exist_ok=True)
@@ -473,7 +530,7 @@ def _measure_all(kernel_id, root, lock, torch, warmup, repeat, manifest, plan, s
                     break
             if default_module is None and (untuned is None or untuned.done()):
                 # The untuned build: benches may compare bits with it or plan calls with it.
-                default_module = kbuild.load(kernel_id, root=root)
+                default_module = kbuild.load(kernel_id, root=root, shipped=False)
                 for bench in benches.values():
                     bench.default = default_module
             if ready and default_module is not None:

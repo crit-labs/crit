@@ -5,6 +5,7 @@
   "title": "Recurrent layers of hybrid models: gated delta (two-pass chunked prefill in FP32 or on tensor cores, column scan, pool rows of many sequences with a device commit), Mamba-2 and the short causal convolution",
   "package": "recurrent_scans",
   "language": "cuda",
+  "launches": ["crit::recurrent_kernels::"],
   "operations": [
     "gated-delta",
     "causal-conv",

@@ -34,23 +34,27 @@ class RowGroups:
     def of(self, batch, via_prompt=()):
         """[(first, end, prompt)] of a StepBatch, RoundBatch or PromptBatch: each prompt chunk alone, one-token rows
         decode_rows at a time; the one-token rows `via_prompt` names (the batch's row indices: decode rows of a
-        request that asks decode_via_prompt) each alone as a one-token prompt chunk, the prompt rows' arithmetic."""
+        request that asks decode_via_prompt) each alone as a one-token prompt chunk, the prompt rows' arithmetic. A
+        StepBatch's prompt chunks are marked on it (StepBatch.prompts), so the plugins that read short rows as decode
+        rows (attention's window rows) give them the prompt rows' arithmetic too."""
         step = self.decode_rows
         if getattr(batch, "prompt", False):   # a captured prompt chunk: one chunk, its bucket's rows
             return [(0, batch.tokens_t.shape[0], True)]
         if batch.round:
             return [(first, min(first + step, batch.tokens), False) for first in range(0, batch.tokens, step)]
-        groups, run = [], None
+        groups, run, prompts = [], None, set()
         for r in range(batch.rows):
             first, end = batch.starts[r], batch.starts[r + 1]
             if end - first > 1 or r in via_prompt:
                 groups.append((first, end, True))
+                prompts.add(r)
                 run = None
             elif run is not None and run[1] == first and run[1] - run[0] < step:
                 run = groups[-1] = (run[0], end, False)
             else:
                 run = (first, end, False)
                 groups.append(run)
+        batch.prompts = frozenset(prompts)
         return groups
 
     def rows(self, count):

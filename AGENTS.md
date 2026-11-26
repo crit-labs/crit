@@ -143,8 +143,9 @@ its launch command in `configuration.engine`, and `crit run` records, checks, me
   `operations.json` says what each device operation computes and how a kernel is checked against it.
 - **[Kernels](kernels/README.md):** crit's kernels are templates in `kernels/techniques/<family>/<id>/`, built on this machine
   for its GPU; `crit kernels sweep ID --model MODEL` tunes each one's knobs (warps, tiles, splits, stages) on the
-  model's shapes against the operation's reference. Sweep the kernels the selection's plugins load into the candidate's source
-  (`--out tuning`; `--matrices` with the candidate's serve --check report tunes exactly the shapes it loaded) and name that folder in the configuration (`"kernel_tuning": "tuning"`), so the package carries it;
+  model's shapes against the operation's reference. Sweep the kernels the selection's plugins load into the candidate's source,
+  the largest share of a kernel trace first (`crit kernels rank --trace` on `crit eval kernels`' report; a kernel
+  that launched nothing in it pays no sweep) (`--out tuning`; `--matrices` with the candidate's serve --check report tunes exactly the shapes it loaded) and name that folder in the configuration (`"kernel_tuning": "tuning"`), so the package carries it;
   `CRIT_KERNEL_TUNING` is for a quick try, and no package or launcher carries it. Pick each operation's kernel in [three levels](kernels/README.md#levels):
   (1) crit's kernel wherever one covers the operation, swept for the model; (2) only where crit has none, a
   [library's](kernels/README.md#libraries); (3) where neither fits, a kernel the engine writes. A crit kernel that trails its
@@ -215,6 +216,10 @@ Each round:
    threshold, a width, a buffer size) the same way, never from a guess. Without `--data`, the run's own case (often
    one short prompt) judges a drafting plugin, and one that loses on long prompts or other languages looks neutral.
    A change under the single pass's 3% noise is no result: measure it again with `--rounds 4` on just those variants.
+   A larger change from one pass is not confirmed either: an engine that warms slowly (an expert cache, a drafter's
+   acceptance) can move by more between passes, so a change the next plan keeps or drops is measured with
+   `--rounds 2` or more first. An option that approximates the model (fewer routes, a narrower KV) is judged by
+   its drift too: `--quality` scores each variant's Eval quality texts against the run's drift budget.
 4. **Evaluate** on the rungs that have an Eval, with `--baseline` set to the run's first Eval result, then
    `crit eval kernels` and `crit eval status RESULT --baseline PARENT_RESULT --kernels KERNELS`. Read every report
    status gives before the next plan ([Eval's reports](docs/BUILDING_ENGINES.md#run-the-common-eval-suite)). A failed
@@ -281,7 +286,8 @@ How to judge a round:
   allows) re-encoded dense weights are the starting arithmetic, judged together by the Eval, not levers to justify
   one by one. In `preserve`, measure each precision change per group of layers before building on it: `crit eval run
   --package P --only quality --quality-mode preserve --attribute-drift` with the model plugin's `exact_variants`.
-  A difference inside the quality spread (`budget_spread`) is no measurement.
+  A difference inside the quality spread (`budget_spread`) is no measurement, in either mode: compare two variants'
+  budget used against the 5th-95th percentile spread Eval prints beside it before reading one as better.
 - **Exactness is a setting.** `configuration.exactness` says how exact the engine's rows are, for the `decode` and
   the `prompt` rows, on [the kernels' scale](kernels/README.md#exactness): `declared`, `exact`, `row-exact` or
   `repeatable`. A candidate that sets none takes its run's quality mode's: `exact` in `preserve` (a prompt row has
@@ -299,7 +305,9 @@ How to judge a round:
   quantized-projections' `head` and `trunk` to `stored`. In `speed` the KV pages, the MTP layer and the experts'
   arithmetic follow the mode too (8- and 4-bit where they pay); 4-bit dense weights are a lever to measure. The plan's `prompt_activations` are
   written into the candidate's configuration: an activation option left on `auto` takes them, and Core refuses an
-  engine that serves others at load, naming the option that chose them. Budget the KV cache from what the engine
+  engine that serves others at load, naming the option that chose them. Where a 4-bit format's `stored` activations
+  fail quality, `fp8` (8-bit activations on the 4-bit weights) is the rung before `bf16`; measure it before giving
+  up the tensor-core rate. Budget the KV cache from what the engine
   takes (`crit plugins resolve PACKAGE --model M --context N`: its plugins' answer from the checkpoint's headers,
   in seconds, no load; every load is held to it), not from recon.md's figure, which is Eval's protocol price; state
   it in the plan (`kv_bytes_per_token`): creating the candidate refuses a plan its engine does not match, and
@@ -336,7 +344,8 @@ holds the cached path to the fresh one's answers); keep model allocations across
 (`context.serving`); keep request state private to a session; honor cancellation and cleanup through Core's
 decisions (`commit`, `retire`). A cancel must settle within crit serve's fixed one-second grace, or the host is
 retired with its weights: size prompt chunks so the slowest, at the full context, finishes well inside it. After sealing, verify candidate switching with `crit serve`: serve the selected
-candidate, switch to another sealed one and back, and compare a greedy reply before and after. Report anything
+candidate, switch to another sealed one and back, and compare a greedy reply before and after (`crit run ...
+switch-check` does all three). Report anything
 unverified.
 
 ## 5. Critique and hand off

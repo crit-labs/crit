@@ -5,6 +5,7 @@
   "title": "Routed SwiGLU experts over a slot store of expert bundles on BF16 tensor cores, every stored format, decode rows and prompt chunks with the same bits",
   "package": "grouped_experts",
   "language": "cuda",
+  "launches": ["crit::techniques::grouped_experts::"],
   "operations": [
     "grouped-expert-projection"
   ],
@@ -404,11 +405,12 @@
         },
         "TILES": {
           "values": [
+            0,
             2,
             4
           ],
-          "default": 2,
-          "what": "MMA row tiles a warp owns, sharing each B fragment"
+          "default": 0,
+          "what": "MMA row tiles a warp owns, sharing each B fragment; 0: 2 for gate/up, 4 for down"
         },
         "STAGES": {
           "values": [
@@ -416,8 +418,17 @@
             3,
             4
           ],
-          "default": 2,
-          "what": "128-k steps of weights and routes in the block's cp.async ring (default 2 with TILES 2: 36 KiB a block, within every GPU's shared memory without opting in)"
+          "default": 3,
+          "what": "128-k steps of weights and routes in the block's cp.async ring (default 3 with TILES 2: 54 KiB a block, opted in on the sm_120 family the FP4 MMA runs on; on an RTX 5090 1.00-1.05x of 2 over a layer's two passes from 128 to 8,192 tokens)"
+        },
+        "PRODUCER": {
+          "values": [
+            0,
+            1,
+            2
+          ],
+          "default": 0,
+          "what": "the mainloop: 1 the block's cp.async ring (every warp copies a step, a block barrier a step), 2 warp-specialized (one more warp issues a step's copies up to STAGES steps ahead: the weights' codes as TMA boxes of a 3-D tensor map over the store, the scales and routes by cp.async, all completing the slot's mbarrier; the consumers release slots on mbarriers, no block barrier); 0: 2 for gate/up, 1 for down (on an RTX 5090 at 512 to 8,192 tokens gate/up 1.02-1.36x faster warp-specialized, down 0.83-1.16x of the ring at its best); speed only, the same chains"
         }
       },
       "yardstick": {

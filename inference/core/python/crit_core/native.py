@@ -1462,6 +1462,7 @@ class StepEngine(_Runtime):
         super().close()
         if getattr(self, "rounds", None) is not None:
             self.rounds.close()
+            self.rounds = None   # its round driver holds the captured graphs and their pools until it goes
         if getattr(self, "_matchers", None) is not None:
             self._matchers.close()
             self._matchers = None

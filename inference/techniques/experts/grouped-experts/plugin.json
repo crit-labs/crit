@@ -75,7 +75,7 @@
         "fp4-prompt",
         "fp4-tile"
       ],
-      "description": "the items an FP4 prompt call's routes are grouped in (fp4, fp4-row, fp4-row2 at 8 routes an expert or more): fp4-prompt (crit's kernel's structure of 32-route items), fp4-tile (64-route items through its block tile, the weights staged in shared memory and shared by its warps), or auto (the default): the one the engine's sweep report of grouped-experts on this device timed faster at the call's tokens over both passes (crit_kernels.select), fp4-prompt where no report times both. A route's bits are the same in either. The facts name the choice for each shape (prompt_items)"
+      "description": "the items an FP4 prompt call's routes are grouped in (fp4, fp4-row, fp4-row2 at 8 routes an expert or more): fp4-prompt (crit's kernel's structure of 32-route items), fp4-tile (64-route items through its block tile, the weights staged in shared memory and shared by its warps), or auto (the default): the one the engine's sweep report of grouped-experts on this device timed faster at the call's tokens over both passes (crit_kernels.select), fp4-tile where no report times both. A route's bits are the same in either. The facts name the choice for each shape (prompt_items)"
     },
     "workspace_mib": {
       "type": "int",

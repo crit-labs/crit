@@ -31,7 +31,8 @@ import time
 
 from . import ladder
 from .attempt import Attempt, Expired, packaged, remaining, unsealed
-from .records import file_sha, ident, load_run, now, quality_mode, quality_terms, read_json, safe_path
+from .records import (file_sha, ident, load_run, now, quality_mode, quality_terms, read_json, safe_path,
+                      user_quality_budget)
 from .served import Served
 from .store import amendments
 
@@ -173,6 +174,27 @@ def settle_abandoned(store, run_id, root, folder, name, journal):
                    "lock was free and the journal untouched)"})
 
 
+def baseline_result(store, run_id, value):
+    """The Eval result --baseline names: a candidate of the run (its newest completed Eval result), a path in the run
+    folder (candidates/ID/eval/ATTEMPT.json, as crit prints them), or any other path, absolute or from the working
+    directory."""
+    from .checks import eval_results
+    root = store.directory(run_id)
+    text = str(value)
+    if (root / "candidates" / text).is_dir() and "/" not in text and "\\" not in text:
+        found = eval_results(root / "candidates" / text)
+        if not found:
+            raise ValueError(f"--baseline {text}: the candidate has no completed Eval result")
+        return read_json(found[-1])
+    path = Path(text)
+    if not path.is_absolute() and not path.is_file() and (root / path).is_file():
+        path = safe_path(root, text)
+    if not path.is_file():
+        raise ValueError(f"--baseline {text}: no Eval result there, in the run folder or from the working directory; "
+                         "give a candidate's id for its newest completed Eval")
+    return read_json(path)
+
+
 def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, seconds=None, label=None, stage=None,
              certify=False, budget_seconds=None, resume=None):
     """Reserve, score the data's quality texts on the run's model unless stored, serve the candidate, run Eval on it
@@ -223,7 +245,10 @@ def evaluate(store, run_id, candidate_id, data, parts=None, baseline=None, secon
     earlier = resumable(store, run_id, root, folder, None if resume is True else resume) if resume else None
     attempt = Attempt(store, run_id, candidate_id, "eval", seconds, "eval", "Eval", "Eval")
     reservation = attempt.reservation
-    budget, exactness = quality_terms(run["spec"]["correctness"], amendments(root, reservation["segment_id"]))
+    changes = amendments(root, reservation["segment_id"])
+    _, exactness = quality_terms(run["spec"]["correctness"], changes)
+    # Only the limits the user set: Eval applies its mode's own, and the checkpoint's stored allowance where none is set.
+    budget = user_quality_budget(run["spec"]["correctness"], changes) or None
     options = dict(label=label, device=device, baseline=baseline, quality_budget=budget, exactness=exactness,
                    quality_mode=quality_mode(run["spec"]["correctness"]),
                    context_tokens=constraints["kv_tokens"], context_basis=basis,
@@ -311,8 +336,9 @@ def _measure(store, run_id, candidate_id, attempt, deadline_at, model, data, out
             from crit_eval.quality.fixed import STORE
             from crit_eval.quality.packages import fetch, source
             # A published package's scores, when the data holds none and the source has them. Both quality modes judge
-            # against the same scores: no run reads the allowance a package may carry beside them (protocol
-            # quality.allowance), so its absence is no reason to fetch again.
+            # against the same scores. Speed's limits also read the allowance (protocol quality.allowance): a package
+            # carries it when it has one, and score_data measures it by default where the data holds scores without
+            # it, so its absence is no reason to fetch again.
             if source() is not None and not (data / STORE / "index.json").is_file():
                 fetch(model, data, source(), log)
             with own_allocator_env():

@@ -63,6 +63,18 @@ def parser():
     tune.add_argument("--matrices", type=Path, help="with --model: the matrix shapes the engine loaded instead of the "
                       "checkpoint's tensors and their likely stacks: a candidate's serve --check report "
                       "(logs/serve-check-attempt-N.json), an engine's facts, or a list of {N, K, format}")
+    tune.add_argument("--no-shipped", action="store_true",
+                      help="also sweep the shapes the kernel's shipped tuning for this GPU's compute capability covers "
+                           "(by default they are taken from it, not swept)")
+    ship = sub.add_parser("ship", help="Merge a finished sweep's tuning (and its report beside it) into the tuning "
+                                       "table the kernel carries for the compute capability it was swept on "
+                                       "(<kernel folder>/tunings/<capability>.json), which builds and sweeps on that "
+                                       "capability use for the shapes it covers")
+    ship.add_argument("kernel")
+    ship.add_argument("--tuning", type=Path, required=True, help="the <kernel>.json crit kernels sweep wrote")
+    ship.add_argument("--report", type=Path, help="its report (default: <kernel>.report.json beside it)")
+    ship.add_argument("--date", help="the day it was swept (YYYY-MM-DD) for a tuning that names none (default: the "
+                                     "file's date)")
     gate = sub.add_parser("gates", help="Run the gates beyond the reference check over a kernel's structures: NaN and "
                                         "infinities, repeated calls and untouched inputs, the rows at tile edges, FP32 "
                                         "sums, and every architecture's register and shared-memory limits, each gate "
@@ -78,6 +90,11 @@ def parser():
     gate.add_argument("--limits-only", action="store_true", help="only the limits gate: build for every architecture "
                                                                   "and check each one's limits, with no GPU (CI's check)")
     gate.add_argument("--controls", action="store_true", help="run the planted controls instead: each must fail its gate")
+    ranked = sub.add_parser("rank", help="crit's kernels by the share of a kernel trace's time they took (crit eval "
+                                         "kernels, crit run ... profile), from each kernel.json's launches: what to "
+                                         "sweep first, and the kernels that launched nothing")
+    ranked.add_argument("--trace", type=Path, required=True, help="a kernels report: {phases: {PHASE: {kernels: "
+                        "[{kernel, ms}]}}}")
     rep = sub.add_parser("report", help="Every kernel's gates and speed against its yardstick library on the shapes of "
                                         "the models given (each structure's distinct shapes over them, at most --most)")
     rep.add_argument("kernel", nargs="*", help="only these kernels (default: all of crit's)")
@@ -102,7 +119,8 @@ def main(argv=None):
     args = command.parse_args(argv)
     try:
         if args.command is None:
-            print("crit Kernels: crit's kernel templates (list, build, sweep, gates, report) and the kernel workbench (new)")
+            print("crit Kernels: crit's kernel templates (list, build, sweep, ship, gates, report) and the kernel "
+                  "workbench (new)")
             print("Guide: kernels/README.md in the crit repository")
             print("Use kernels --help. Nothing is downloaded; build and sweep compile crit's kernel sources here.")
             return 0
@@ -122,6 +140,10 @@ def main(argv=None):
                             "bits_of": {s: spec["bits_of"] for s, spec in sorted(m.get("structures", {}).items())
                                         if spec.get("bits_of") is not None},
                             "folder": str(folder)} for kid, (folder, m) in manifests().items()}
+        elif args.command == "rank":
+            from .launches import rank, render
+            result = rank(read_json(args.trace))
+            print(render(result), file=sys.stderr)
         elif args.command == "build":
             from .build import build, read_tuning
             out, package, key = build(args.kernel, tuning=read_tuning(args.tuning) if args.tuning else None,
@@ -138,8 +160,12 @@ def main(argv=None):
             matrices = loaded_matrices(args.matrices) if args.matrices else None
             tuning, report = sweep(args.kernel, model=args.model, shapes=shapes, structures=args.structure,
                                    out=args.out, jobs=args.jobs, lock=args.lock, repeat=args.repeat, chunk=args.chunk,
-                                   matrices=matrices, log=lambda line: print(line, file=sys.stderr))
+                                   matrices=matrices, log=lambda line: print(line, file=sys.stderr),
+                                   shipped=not args.no_shipped)
             result = {"tuning": str(args.out / f"{args.kernel}.json"), "report": report}
+        elif args.command == "ship":
+            from .shipped import ship
+            result = ship(args.kernel, args.tuning, args.report, args.date)
         elif args.command == "gates":
             from .gates import controls, gates
             if args.controls:

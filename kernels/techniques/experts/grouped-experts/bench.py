@@ -460,5 +460,6 @@ class Fp4Tile(_Fp4):
 
     def valid(self, knobs):
         from crit_kernels import gates
-        stage = 64 * (64 + 16) + 64 * (8 + 8) + knobs["WM"] * knobs["TILES"] * 16 * (64 + 16 + 8 + 8)
+        tiles = knobs["TILES"] or 4   # 0: 2 for gate/up, 4 for down (the larger bounds the block)
+        stage = 64 * (64 + 16) + 64 * (8 + 8) + knobs["WM"] * tiles * 16 * (64 + 16 + 8 + 8)
         return 8 % knobs["WN"] == 0 and knobs["STAGES"] * stage <= gates.shared_memory_optin()

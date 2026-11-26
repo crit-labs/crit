@@ -1750,8 +1750,10 @@ def _check_stale_rejections(plan):
 
 # Where recon's placement prices misses computed on the CPU (alone or split with the link) below misses
 # copied over the link, candidate 1 starts with the CPU expert tier (expert-offload, which decides it itself, or the
-# tier on its own), or the plan names the measurement that rejects it.
-CPU_TIER = "inference:host-expert-tier"
+# tier on its own), or the plan names the measurement that rejects it. Only a price the probe measured asks it: a
+# probe without the CPU expert lane prices the CPU at host memory's read rate and, without the turn to the host, at no
+# turn a layer, so its CPU floors are lower bounds, not a win over the link.
+CPU_TIER ="inference:host-expert-tier"
 CPU_TIER_PROVIDERS = ("inference:expert-offload", CPU_TIER)
 CPU_TIER_GAP = "placement:cpu"
 
@@ -1768,6 +1770,8 @@ def _cpu_wins(root):
     if placement.get("scenario") not in ("sparse_device_host", "sparse_device_host_disk") or not cpu or \
             not floors.get("link") or cpu >= floors["link"]:
         return None
+    if not placement.get("host_turn_us") or not (placement.get("rates_gbs") or {}).get("cpu_expert_lane"):
+        return None   # the CPU's floors are bounds the probe did not measure (above)
     return {key: floors[key] for key in ("link", "cpu", "split") if key in floors}
 
 

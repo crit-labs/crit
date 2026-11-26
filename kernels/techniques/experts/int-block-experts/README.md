@@ -148,6 +148,13 @@ bits), tuned kernel against the library (us), and the register `gemm`'s tuned ti
 | 2560 x 640 | 12.3 / 8.2 (0.67), `gemm` 18.4 | 14.3 / 8.2 (0.57), 22.5 | 44.7 / 8.2 (0.18), 106.5 | 153.6 / 20.4 (0.13), 399.4 |
 
 The staged GEMM is 1.5 to 3.6 times the register GEMM's speed, still 1.5 to 11 times slower than cuBLASLt's FP4 GEMM.
+On the kernel core's reworked declared mainloop (2026-11-24: visits planned once a CTA, copied and decoded a visit at
+once, a row tile's sums at a time; the same bits) it is 0.98-1.09x the speed it had at its defaults on an RTX 5090
+(1280 x 2560 at 32 / 2,048 / 8,192 tokens 66.4 / 62.6, 148.1 / 144.0, 582.2 / 575.8 us; 2560 x 640 21.1 / 19.4,
+76.4 / 72.3, 281.2 / 264.9; 0.98x at 512 tokens on 2560 x 640). Its copies are what fp8-block-rows' were before: 8 bytes of a row's codes
+and a scale word a row and block, 16 bytes a token, each its own L2 request; the visit order and the tokens side by
+side that lifted fp8-block-rows (its README) need its INT8 activations quantized into that order and, for the weights,
+a layout repacked at load.
 Most of that gap is the arithmetic the yardstick does not do: cuBLASLt multiplies 4-bit activations on FP4 tensor
 cores that apply the block scales themselves (about 4 times the INT8 MMA rate on an RTX 5090), while the declared
 order takes INT8 activations, one INT8 MMA a 16-element block (half of what an m16n8k32 does) and three FP32

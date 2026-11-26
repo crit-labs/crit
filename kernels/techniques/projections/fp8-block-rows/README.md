@@ -24,7 +24,7 @@ run the prompt kernel on a handful of rows to stay exact.
 | Numerics | bitwise equal to the declared order's reference kernel on the target GPU (`tests/fp8_block_tests.cu`); within 2e-7 of FP64 relative to the products' magnitude on an RTX 5090. The tensor core's internal block sum is not specified by PTX, so the bits hold on one GPU architecture: check on yours |
 | Determinism | same bits on a repeat; an output independent of its job's other tokens and of the kernel that computed it (`rows`, `gemm`, `gemm-staged`; `gemm-native` and `gemm-native-channel` give that up, see below) |
 | Outputs | FP32; the prompt GEMMs `gemm_native` and `gemm_native_channel` also BF16 (an FP32 out's value rounded once to nearest even: `out` of dtype bfloat16 selects it) |
-| Measured speed | RTX 5090: decode rows read 13.1 MB MXFP8 matrices at 0.85-1.03 TB/s for 1-8 tokens, back to back, about a plain streaming read's rate at that size (1.07-1.13 TB/s); prompt GEMM 79-97 TFLOPS on 512-4096 tokens x 5120 x 2560, without shared-memory staging yet |
+| Measured speed | RTX 5090: decode rows read 13.1 MB MXFP8 matrices at 0.85-1.03 TB/s for 1-8 tokens, back to back, about a plain streaming read's rate at that size (1.07-1.13 TB/s); prompt GEMM 79-97 TFLOPS on 512-4096 tokens x 5120 x 2560 in registers, the staged GEMM 180-255 TFLOPS from 512 tokens on an FP8 block checkpoint's layout (The staged GEMM) |
 | Yardstick | cuBLASLt's MXFP8 GEMM (torch._scaled_mm, E4M3 with blocked E8M0 scales on both operands, FP32 output) on the same bytes, the activations' power-of-two group scales converted to E8M0 once outside the timed call (kernel.json `yardstick`, the sweep's library_us). RTX 5090, `crit kernels sweep`, tuned vs cuBLASLt in us. Decode rows at 1 / 2 / 4 / 8 tokens: 5120 x 2560 14.3 / 14.3 / 14.3 / 14.3 against 22.5 (1.58x cuBLASLt's speed), 12288 x 5120 47.1 / 47.4 / 49.1 / 49.1 against 65.5 / 67.6 / 69.6 / 65.5 (1.33-1.43x). Prompt GEMM at 32 / 128 / 512 / 2048 tokens: 5120 x 2560 51 / 57 / 156 / 537 against 22 / 22 / 27 / 132 (0.17-0.44x), 12288 x 5120 137 / 268 / 743 / 2457 against 51 / 53 / 182 / 557 (0.20-0.37x): the prompt GEMM is 2.3-6x slower than cuBLASLt (whose rows change with the token count), the gap to close |
 
 ## Structures and knobs
@@ -36,7 +36,7 @@ decode CTA, 8 warps of 4 n-tiles a GEMM CTA).
 | --- | --- | --- |
 | rows | decode rows, 1 to 8 tokens a job | WARPS (4, 8, 16: the 16 lanes over them), AHEAD (1-4 rounds of loads in flight), STREAM (weight codes with L1::no_allocate) |
 | gemm | the prompt GEMM, any token count | WARPS (2-16, 16 weight rows each), TILES (1-8 n-tiles of 8 tokens a warp pass), UNROLL (0: the compiler's, 1, 2, 4) |
-| gemm-staged | the prompt GEMM with shared-memory staging (`gemm_staged`, the same bits) | BM, BN (32-128 weight rows, 16-64 tokens a CTA), WM, WN (warps along each), GROUP (1, 2 sibling lanes a stage), RUN (1, 2 blocks of each lane a stage), STAGES (the cp.async ring) |
+| gemm-staged | the prompt GEMM with shared-memory staging (`gemm_staged`, the same bits, plain or visit-order activations) | BM, BN (32-128 weight rows, 16-128 tokens a CTA), WM, WN (warps along each), GROUP (1, 2 sibling lanes a stage), RUN (1, 2 blocks of each lane a stage), STAGES (3, 4: the cp.async ring) |
 | gemm-native | the prompt GEMM accumulated in the tensor cores (`gemm_native`): NOT the declared order, not row invariant | TM, TN (64-256 tokens, weight rows a CTA), WM, WN (warps along each), BK (64, 128 bytes of K a stage), STAGES (3, 4), GROUP (weight-row tiles a group of the CTA order), EPI (0: stores from registers while the next tile loads, 1: through shared memory) |
 | gemm-native-channel | the prompt GEMM of per-channel matrices (`gemm_native_channel`; `gemm_native(mx=False)` takes it for them): NOT the declared order, not row invariant | TM, TN (64-256), WM, WN, BK (64, 128), STAGES (2-4), GROUP, EPI, as gemm-native's |
 | gemm-native-blocks | the prompt GEMM of scales that change along K (`gemm_native(mx=False)` for every other table: 128 x 128 FP32 blocks, MXFP8 with activation scales that are not powers of two): NOT the declared order, not row invariant | as gemm-native-channel's; default_rows: 1-512 tokens 64 x 64 tiles, 4 stages |
@@ -86,38 +86,94 @@ a copy of crit's quantized-projections host code).
 
 ## The staged GEMM
 
-`gemm-staged` is the prompt GEMM rebuilt from crit's kernel core (`kernels/core/include/crit_kcore/blockscaled_*.cuh`
-on `mma.cuh` and `load.cuh`), the mechanisms of a multistage tensor-core GEMM (CUTLASS's mainloop, BSD-3-Clause;
-written anew, no code copied) in the declared order. The blocks are visited lane by lane in the order the halving tree
-takes the lanes (`GroupVisits`, GROUP sibling lanes and RUN blocks of each a visit), so an output holds its running
-lanes and the tree's partial sums (5 registers) instead of 16 lanes, and every lane still takes its blocks in
-increasing order. Each visit is one stage of a cp.async ring: the blocks' 32 bytes of every weight row and token, the
-weight scales' words (E8M0 bytes at any alignment, or FP32) and the token scales; the CTA decodes a stage's weight
-scales to FP32 one stage ahead of its MMAs. A warp runs one e4m3 m16n8k32 MMA with a zero accumulator a 16 x 8 tile
-and block (`block_sum_e4m3`, crit's fragment order: the same k positions as the reference kernel), then the declared
-step. Its outputs are `gemm`'s and `rows`' bits (the bench checks every configuration against the untuned `gemm`, and
-tests/fp8_block_tests.cu against the reference kernel); row invariant. `gemm_staged` takes `gemm`'s arguments;
-activation rows 16-byte aligned.
+`gemm-staged` is the prompt GEMM on the kernel core's declared mainloop (`declared_staged.cuh`, on
+`blockscaled_*.cuh`, `mma.cuh` and `load.cuh`), the mechanisms of a multistage tensor-core GEMM (CUTLASS's mainloop,
+BSD-3-Clause; written anew, no code copied) in the declared order. The blocks are visited lane by lane in the order the
+halving tree takes the lanes (`GroupVisits`, GROUP sibling lanes and RUN blocks of each a visit, planned once a CTA
+into a table in shared memory), so an output holds its running lanes and the tree's partial sums (5 registers)
+instead of 16 lanes, and every lane still takes its blocks in increasing order. Each visit is one stage of a cp.async
+ring, copied and decoded a visit at once:
 
-RTX 5090, `crit kernels sweep fp8-block-rows --structure gemm-staged` (137 configurations) on the shapes above, cold
-L2, tuned kernel against cuBLASLt's MXFP8 GEMM (us), and the register `gemm`'s tuned time for comparison:
+- the weight rows' 32 bytes of each block, copied a word at a time into the MMA's operand order (a 16-row tile's
+  thread reads its four A registers as one 16-byte word, where two 8-byte reads needed four register moves an MMA);
+- the tokens' blocks of the visit side by side, a token every 96 bytes (two blocks and a pad that keeps a half warp's
+  fragment reads in different banks). With the activations in the **visit order** (`quantize(..., order=VISIT)`,
+  `gemm_staged(..., order=VISIT)`: each row's blocks of 32 in the kernel core's `VisitOrder`, sibling lanes' blocks
+  interleaved, the scales [groups][tokens]) a token's blocks of a visit are one contiguous 64-byte piece, which L2
+  serves at twice the rate of the plain layout's 32-byte pieces 256 bytes apart (an RTX 5090: 7.2 against 3.7 TB/s,
+  and only into contiguous shared memory: the same piece split over two areas runs at 3.7), and its token scales one
+  contiguous row;
+- the words of the CTA's distinct weight scale rows only (one for an FP8 block checkpoint's 128 x 128 blocks, where
+  every row of a CTA copied the same word, 32 serialized copies a warp), decoded one stage ahead to FP32; where the
+  CTA's rows share one scale row its scale products are one a token (`step`'s product, rounded the same), not one an
+  output.
 
-| Shape (N x K) | 32 | 128 | 512 | 2,048 tokens |
-| --- | --- | --- | --- | --- |
-| 5120 x 2560 | 22.5 / 20.5 (0.91), `gemm` 51.2 | 30.7 / 22.5 (0.73), 57.3 | 81.9 / 26.6 (0.33), 155.6 | 303.1 / 131.1 (0.43), 536.6 |
-| 12288 x 5120 | 71.6 / 51.2 (0.72), `gemm` 137.2 | 161.1 / 53.2 (0.33), 268.3 | 389.1 / 182.3 (0.47), 743.4 | 1,355.1 / 555.1 (0.41), 2,456.6 |
+A warp runs one e4m3 m16n8k32 MMA with a zero accumulator a 16 x 8 tile and block (`block_sum_e4m3_fast`, crit's
+fragment order: on sm_120a the block-scaled kind::mxf8f6f4 with unit scales, whose block sums are the plain MMA's on
+an RTX 5090 over 8.6e9 measured blocks of six code distributions, NaNs and subnormals included; elsewhere the plain
+e4m3 MMA), a row tile at a time, then the declared step. Its outputs are `gemm`'s and `rows`' bits, in either
+activation order (the bench checks every configuration against the untuned `gemm`, tests/test_fp8_block_rows.py both
+orders and three weight scale layouts, tests/fp8_block_tests.cu the kernel against the reference kernel); row
+invariant. `gemm_staged` takes `gemm`'s arguments and an order; activation rows 16-byte aligned. quantized-projections
+quantizes an fp8:block matrix's prompt rows into the visit order for it.
 
-The staged GEMM is 1.7 to 2.3 times the register GEMM's speed; it reaches 0.8 of cuBLASLt only at 32 tokens. What
-holds it back is measured, not the arithmetic: from registers alone, the declared order's block MMA and FP32 step run
-58 G MMAs a second (a microbenchmark of `block_sum_e4m3` and `step`, 95% of the e4m3 MMA rate, 61 G); the kernel
-reaches 22 G at 2,048 tokens. An output needs 5 registers (its running lane and four partial sums of the tree), so a CTA
-holds at most 128 x 64 outputs at two warps a scheduler: 43 multiply-adds a byte of L2 traffic, read as 32-byte pieces
-of rows (the lane-major order visits blocks 512 bytes apart), with each block's fragments loaded from shared memory
-just before its MMAs. On 2,048 x 5120 x 2560 the MMAs on fragments from shared memory alone take 162 us, the barriers
-add 18 and the copies another 95 (303 in the sweep with a cold L2), against cuBLASLt's 131 us with larger tiles. The
-remaining levers: fragment double-buffering in registers freed from the producer's state, the weights repacked once
-at load in the lane-major visiting order (contiguous reads), and warp-specialized producers (bulk 32-byte TMA copies
-measured 10 times slower than cp.async for this gather on an RTX 5090, so not those).
+Untuned defaults: 64 x 128 tiles of 2 x 4 warps, GROUP 2, RUN 1, 4 stages, and by default_rows 128 x 32 of 4 x 1 warps
+to 48 tokens and 64 x 64 of 2 x 2 to 96 (a sweep on the shapes below: the 128-token tile reads each weight byte half as
+often, and its tokens' visit-order pieces are its wide copies).
+
+RTX 5090, an FP8 block checkpoint's layout as quantized-projections runs it (FP32 128 x 128 weight scales, activations
+per 128 by the amax quantizer from BF16, the visit order), random codes, cold L2 (a 256 MB write before each), CUDA
+graph replay, median; the build before these changes (its defaults, 128 x 64 tiles) / this one (its defaults) in us
+(speedup), and cuBLASLt's MXFP8 GEMM (the yardstick, E8M0 scales per 32 on the same codes), every output of both
+builds checked bit for bit against the register `gemm` first:
+
+| Shape (N x K) | 32 | 128 | 512 | 2,048 | 8,192 tokens |
+| --- | --- | --- | --- | --- | --- |
+| 5120 x 2560 | 43.6 / 39.5 (1.10x), 25.7 | 41.6 / 44.2 (0.94x), 29.2 | 86.2 / 74.3 (1.16x), 31.3 | 311.9 / 247.5 (1.26x), 121.5 | 1,180.3 / 920.1 (1.28x), 438.9 |
+| 12288 x 5120 | 122.5 / 115.3 (1.06x), 60.2 | 184.0 / 152.2 (1.21x), 68.2 | 410.2 / 321.9 (1.27x), 162.4 | 1,428.1 / 1,082.0 (1.32x), 535.1 | 5,468.8 / 4,129.4 (1.32x), 2,152.1 |
+| 6144 x 4096 | 68.1 / 55.6 (1.23x), 41.0 | 68.2 / 60.5 (1.13x), 40.1 | 197.2 / 150.1 (1.31x), 82.6 | 626.0 / 457.4 (1.37x), 227.9 | 2,307.8 / 1,679.6 (1.37x), 817.7 |
+| 4096 x 4096 | 62.6 / 49.5 (1.27x), 33.4 | 63.7 / 54.0 (1.18x), 35.4 | 129.7 / 101.0 (1.28x), 41.5 | 436.8 / 318.1 (1.37x), 172.7 | 1,554.7 / 1,133.4 (1.37x), 553.4 |
+| 24576 x 4096 | 250.5 / 228.0 (1.10x), 92.8 | 321.9 / 193.3 (1.66x), 98.8 | 768.7 / 565.3 (1.36x), 236.0 | 2,578.6 / 1,984.2 (1.30x), 881.3 | 10,101.3 / 8,299.1 (1.22x), 3,401.6 |
+| 4096 x 12288 | 168.5 / 113.2 (1.49x), 84.6 | 174.3 / 123.5 (1.41x), 87.2 | 365.2 / 267.4 (1.37x), 113.8 | 1,256.3 / 901.7 (1.39x), 461.3 | 4,516.5 / 3,241.8 (1.39x), 1,759.9 |
+
+The MXFP8 layout (E8M0 scales per 32 a row: no shared scale products) gains less, 1.01-1.18x (5120 x 2560 at 2,048
+tokens 296.7 / 260.8, 12288 x 5120 1,376.9 / 1,176.3), and at 128 tokens on 5120 x 2560 it is 0.87x (41.6 / 47.7), as
+the block layout's 0.94x there: the 128-token tile is the wrong pick for that point, which a sweep fixes. The staged
+GEMM now reaches 0.41-0.75 of cuBLASLt (0.34-0.70 before, at the same defaults) and 2.4-3.3 times the register `gemm`'s
+speed from 512 tokens (1.2-2.6 below), 180-255 TFLOPS.
+
+What holds it now (ncu, 5120 x 2560 x 2,048): latency, not bandwidth. A CTA holds 64 x 128 outputs at two warps a
+scheduler (5 registers an output, 250 a thread); the schedulers issue 35% of cycles, waiting on fixed-latency
+dependencies (the MMA's results into the steps) and shared-memory reads, at 20 instructions an MMA; L2 is at 57% of
+its throughput. A build without the code copies runs at 185 us, one without the MMAs at 236, both at 249: neither half
+alone is the limit. Tried and measured slower or level: the tree's even half parked in shared memory (one register an output
+fewer) for 16 warps (0.80-0.88x), 16-warp tiles without it (0.77-0.80x at 128 registers a thread), RUN 2 with 3
+stages (0.93-1.03x), straight-line visits without a slot's check and the shared-product path chosen at compile time
+(1.00-1.01x, twice the code), the visit order while a token's blocks still went to separate sub-stages (1.00-1.02x),
+the faster MMA alone (1.05-1.11x: the loop was issue-bound).
+
+**Weights in the visit order.** A matrix's codes may be stored once at load in the visit order too
+(`to_visit_weights`, `matrix_table`'s order `VISIT`: each row's blocks at `VisitOrder(cols / 32).position(b)`, the
+scales unchanged), which `rows`, `gemm` and `gemm_staged` read with the same bits (tests/test_fp8_block_rows.py:
+every output against the plain layout's, E8M0 and FP32 scales, a K of unequal lanes); the native GEMMs read plain codes
+and refuse such a table. A visit's two blocks of a weight row are then one 64-byte piece. RTX 5090, the layout above,
+the same method, us plain / visit weights (activations in the visit order; every output checked against the plain
+`gemm` first):
+
+| Shape (N x K) | 32 | 128 | 512 | 2,048 | 8,192 tokens | decode rows, 8 tokens |
+| --- | --- | --- | --- | --- | --- | --- |
+| 5120 x 2560 | 39.6 / 37.2 | 45.7 / 42.1 | 78.4 / 78.0 | 266.4 / 268.9 | 981.2 / 998.0 | 18.9 / 20.9 |
+| 12288 x 5120 | 117.3 / 98.6 | 158.3 / 146.0 | 338.6 / 334.2 | 1,159.8 / 1,174.2 | 4,375.0 / 4,452.8 | 66.7 / 90.8 |
+| 6144 x 4096 | 53.9 / 53.6 | 62.0 / 62.0 | 160.0 / 161.8 | 489.9 / 500.4 | 1,778.3 / 1,821.3 | 29.3 / 45.7 |
+| 4096 x 4096 | 49.8 / 49.5 | 56.4 / 53.9 | 107.6 / 109.2 | 342.7 / 350.9 | 1,204.6 / 1,233.4 | 21.6 / 27.2 |
+| 24576 x 4096 | 230.0 / 150.1 | 203.0 / 176.8 | 576.2 / 545.3 | 2,022.9 / 2,025.1 | 8,064.7 / 8,145.2 | 94.8 / 121.3 |
+| 4096 x 12288 | 113.2 / 113.2 | 137.8 / 135.7 | 287.4 / 293.5 | 965.2 / 987.8 | 3,440.1 / 3,540.6 | 60.0 / 90.4 |
+
+The staged GEMM gains where it was waiting on the weights' L2 pieces at few tokens (1.0-1.53x at 32 and 128), is even
+at 512 and 0.97-0.99x from 2,048 (the copies' issue, not their pieces, holds it there); the decode rows lose
+(0.66-0.90x: a CTA's 16 lanes read in parallel from 8 parts of a row, where the plain layout's are one run). So the
+plain layout stays the default, and quantized-projections takes the visit order only where asked
+(`fp8_block_layout: visit`).
 
 ## The native GEMM
 

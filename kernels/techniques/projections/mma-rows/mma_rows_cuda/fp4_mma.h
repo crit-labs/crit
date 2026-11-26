@@ -26,8 +26,11 @@ inline std::size_t fp4_scratch_bytes(int M, int K) {
 cudaError_t enqueue_fp4(const Problem& p, cudaStream_t stream);
 
 // The FP4 prompt tile: out [M][N] for any number of rows M >= 1, every element with the bits enqueue_fp4() gives it
-// at any row count (the same Problem: weights, blocked scales, input scale, splits; `warps`, `partial` and `counters`
-// are not read), each weight reused for the CTA's tokens. fp4_scratch_bytes(M, K) of scratch.
+// at any row count (the same Problem: weights, blocked scales, input scale, splits; `warps` is not read), each weight
+// reused for the CTA's tokens. fp4_scratch_bytes(M, K) of scratch; `partial` (partial_size) and `counters`
+// (counter_count) let a tile's splits run in several CTAs, as enqueue_prompt()'s.
 cudaError_t enqueue_prompt_fp4(const Problem& p, cudaStream_t stream);
+// The CTAs enqueue_prompt_fp4() launches for the projection of p (its quantizer not counted; 0 on an error).
+int prompt_fp4_ctas(const Problem& p);
 
 }  // namespace crit::kernels::mma_rows

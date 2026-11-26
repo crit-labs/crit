@@ -125,6 +125,27 @@ class DeviceMatrixTests(PluginTestCase):
         with self.assertRaisesRegex(ValueError, "FP32 scales"):
             self.plugin.load({**stored, "scale": scale[:1]}, "fp8:block")
 
+    def test_fp8_block_layout_visit_keeps_every_rows_bits(self):
+        """fp8_block_layout visit: an fp8:block matrix's codes stored once in the visit order give the plain layout's
+        bits on its decode rows and its staged prompt GEMM; on the native prompt GEMM (prompt_gemm auto) the matrix
+        stays plain."""
+        torch = self.torch
+        g = torch.Generator().manual_seed(18)
+        scale = (torch.rand(2, 5, generator=g) * 1e-3 + 1e-4).cuda()   # 128 x 128 blocks, K of 20 blocks of 32
+        codes = (torch.randn(200, 640, generator=g) * 50).clamp(-440, 440).cuda().to(torch.float8_e4m3fn)
+        stored = {"weight": codes, "scale": scale, "block": (128, 128)}
+        x = torch.randn(40, 640, generator=torch.Generator().manual_seed(19)).cuda().to(torch.bfloat16)
+        outs = {}
+        for layout in ("plain", "visit"):
+            plugin = self.assemble(options={"prompt_gemm": "provider", "fp8_block_layout": layout})["projections"]
+            m = plugin.load(stored, "fp8:block")
+            self.assertEqual(m.layout, layout)
+            outs[layout] = {n: plugin.matmul(x[:n], m, torch.float32) for n in (1, 8, 9, 40)}
+        for n in outs["plain"]:
+            self.assertTrue(torch.equal(outs["plain"][n].view(torch.int32), outs["visit"][n].view(torch.int32)), n)
+        native = self.assemble(options={"prompt_gemm": "auto", "fp8_block_layout": "visit"})["projections"]
+        self.assertEqual(native.load(stored, "fp8:block").layout, "plain")
+
     def test_prompt_gemm_auto_follows_the_sweeps_report_and_keeps_its_rule_without_one(self):
         """prompt_gemm auto (_auto_gemm on crit_kernels.select): without a report for the shape the measured rule
         (NATIVE_AUTO: native for every kind); with one, native where the native GEMM's tuned times are no slower than

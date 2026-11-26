@@ -5,6 +5,9 @@
   "title": "Matched FP8 projections: E4M3 weights (MXFP8, 128 x 128 or row scales) against per-group E4M3 activations, decode rows and a prompt GEMM with the same bits for every output",
   "package": "fp8_block_rows",
   "language": "cuda",
+  "launches": [
+    "crit::techniques::fp8_block::"
+  ],
   "operations": [
     "fp8-matched-pair"
   ],
@@ -132,7 +135,7 @@
       "bench": "bench.py:Gemm"
     },
     "gemm-staged": {
-      "what": "prompt GEMM with shared-memory staging: a CTA BM weight rows x BN tokens, the blocks visited lane by lane in the tree's order through a STAGES-deep cp.async ring, a warp BM / WM rows x BN / WN tokens (one e4m3 m16n8k32 MMA with a zero accumulator a 16 x 8 tile and block), each lane folded into the tree as it finishes: the declared order's bits, the same as gemm and rows",
+      "what": "prompt GEMM with shared-memory staging: a CTA BM weight rows x BN tokens, the blocks visited lane by lane in the tree's order (the visits planned once a CTA) through a STAGES-deep cp.async ring, a visit's weight rows copied in the MMA's operand order, its token blocks side by side (one contiguous piece a token where the activations are in quantize's visit order, order VISIT), the weight scales once a distinct scale row (an FP8 block checkpoint's CTA rows then share their scale products), a warp BM / WM rows x BN / WN tokens (one e4m3 m16n8k32 MMA with a zero accumulator a 16 x 8 tile and block: the block-scaled kind with unit scales on sm_120a, the same bits), each lane folded into the tree as it finishes: the declared order's bits, the same as gemm and rows; weights plain or stored once in the visit order (matrix_table order VISIT: a visit's blocks of a row one 64-byte piece), which gemm and rows read too",
       "call": "gemm_staged",
       "rows": [
         1,
@@ -140,9 +143,11 @@
       ],
       "tune_rows": [
         32,
+        64,
         128,
         512,
-        2048
+        2048,
+        8192
       ],
       "key": [
         "N",
@@ -156,16 +161,17 @@
             64,
             128
           ],
-          "default": 128,
+          "default": 64,
           "what": "weight rows a CTA"
         },
         "BN": {
           "values": [
             16,
             32,
-            64
+            64,
+            128
           ],
-          "default": 64,
+          "default": 128,
           "what": "tokens a CTA"
         },
         "WM": {
@@ -173,7 +179,7 @@
             2,
             4
           ],
-          "default": 4,
+          "default": 2,
           "what": "warps along the rows (a warp BM / WM rows)"
         },
         "WN": {
@@ -182,7 +188,7 @@
             2,
             4
           ],
-          "default": 2,
+          "default": 4,
           "what": "warps along the tokens (a warp BN / WN tokens)"
         },
         "GROUP": {
@@ -199,16 +205,43 @@
             2
           ],
           "default": 1,
-          "what": "blocks of each lane a stage carries, in the lane's order (fewer barriers a block, no more registers)"
+          "what": "blocks of each lane a stage carries, in the lane's order (fewer barriers a block, no more registers; with GROUP 2 a token's piece of a visit-order row 64 RUN bytes)"
         },
         "STAGES": {
           "values": [
+            3,
             4
           ],
           "default": 4,
-          "what": "stages of the shared-memory ring (STAGES - 1 in flight; one value swept, the template takes 3 and more)"
+          "what": "stages of the shared-memory ring (STAGES - 1 in flight)"
         }
       },
+      "default_rows": [
+        {
+          "rows": [
+            1,
+            48
+          ],
+          "knobs": {
+            "BM": 128,
+            "BN": 32,
+            "WM": 4,
+            "WN": 1
+          }
+        },
+        {
+          "rows": [
+            49,
+            96
+          ],
+          "knobs": {
+            "BM": 64,
+            "BN": 64,
+            "WM": 2,
+            "WN": 2
+          }
+        }
+      ],
       "yardstick": {
         "library": "cuBLASLt's MXFP8 GEMM (torch._scaled_mm, E4M3 with blocked E8M0 scales, FP32 output); the activations' power-of-two group scales converted to E8M0 once outside the timed call, the global 0.5 left out"
       },

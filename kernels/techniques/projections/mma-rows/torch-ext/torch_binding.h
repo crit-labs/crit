@@ -32,10 +32,17 @@ bool fp4_mma(const torch::Tensor& like);
 int64_t fp4_scratch_bytes(int64_t rows, int64_t k);
 // out [M][N] for any number of rows M >= 1, each element with mm_rows' bits for the same matrix, activations and
 // splits (the prompt tile: each decoded weight reused for 64 rows a CTA). Quantized activations take scratch (M * K * 2
-// + M * 4 bytes, rounded to 16); no partial sums or counters.
+// + M * 4 bytes, rounded to 16). partial (FP32) and counters (int32 zeros, left zero), given together, let a tile's
+// splits run in several CTAs where they hold the partial sums (the same bits; without them a CTA runs every split).
 void mm_prompt(const torch::Tensor& x, const torch::Tensor& w, const std::optional<torch::Tensor>& scales,
                const std::optional<torch::Tensor>& row_scale, int64_t weights, int64_t acts, double input_scale,
-               bool blocked, int64_t splits, const std::optional<torch::Tensor>& scratch, torch::Tensor& out, const std::optional<torch::Tensor>& zeros, int64_t group, int64_t glu);
+               bool blocked, int64_t splits, const std::optional<torch::Tensor>& scratch, torch::Tensor& out,
+               const std::optional<torch::Tensor>& zeros, int64_t group, int64_t glu,
+               const std::optional<torch::Tensor>& partial, const std::optional<torch::Tensor>& counters);
+// The CTAs mm_prompt launches for m rows of an n x k matrix with these weights, activations and splits, given
+// partial_elements of partial and `counters` counters (its pre-pass not counted).
+int64_t prompt_ctas(int64_t m, int64_t n, int64_t k, int64_t weights, int64_t acts, int64_t splits,
+                    int64_t partial_elements, int64_t counters);
 // CTAs a multiprocessor of the current device holds of mm_rows' one-row kernel for `weights` and `acts` (the FP4
 // MMA's for acts 3, the decode tile's otherwise): plan()'s splits fill them.
 int64_t decode_ctas(int64_t weights, int64_t acts);

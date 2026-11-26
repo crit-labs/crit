@@ -5,6 +5,7 @@
   "title": "Core's sampling law on the device: a draw per logits row by Core's rules and Philox draws, rejection-sampling verify predictions and log-probabilities; an exact top-64 fast path and the full-vocabulary law by prefix searches, spread over several blocks a row",
   "package": "token_sampling",
   "language": "cuda",
+  "launches": ["crit::techniques::token_sampling::"],
   "core_include": true,
   "operations": [
     "sampling"

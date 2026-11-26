@@ -138,7 +138,9 @@ def parser():
     sub.add_argument("--data", type=Path, required=True, help="Eval data directory prepared from the run's model")
     sub.add_argument("--only", action="append", choices=["speed", "quality", "exactness", "context", "heldout", "history", "followup"],
                      help="Run only these Eval parts (repeatable); default all")
-    sub.add_argument("--baseline", type=Path, metavar="RESULT", help="Earlier Eval result to show KPI changes against")
+    sub.add_argument("--baseline", metavar="RESULT", help="Earlier Eval result to show KPI changes against: a "
+                     "candidate's id (its newest completed Eval), a result's path in the run folder "
+                     "(candidates/ID/eval/ATTEMPT.json) or any other path")
     sub.add_argument("--label")
     sub.add_argument("--seconds", type=float, help="Reservation length (default: to the segment's deadline; each "
                                                    "request is bounded by the rates the engine measured)")
@@ -197,6 +199,9 @@ def parser():
                      "exactness=LEVEL, exactness.prompt=LEVEL or exactness.decode=LEVEL among them asks that level of the engine's "
                      "rows (declared, exact, row-exact, repeatable). "
                      "An external candidate takes OPTION=VALUE[;...] on the options its configuration.engine declares")
+    sub.add_argument("--quality", action="store_true", help="With --data: also score each variant's Eval quality "
+                     "texts against the reference by the run's drift budget (first round), so an option that "
+                     "approximates the model is judged by its drift as well as its speed")
     sub.add_argument("--no-smoke", action="store_true", help="Leave out crit smoke on each variant")
     sub.add_argument("--smoke-test", action="append", help="Run only this crit smoke test on each variant (repeatable)")
     sub.add_argument("--seconds", type=float, help="Reservation length (default: the check process cap)")
@@ -225,6 +230,23 @@ def parser():
     sub.add_argument("--failure", help="Retained failure message")
     sub = subs.add_parser("select", help="Select a sealed eligible candidate")
     sub.add_argument("--candidate", required=True)
+    sub = subs.add_parser("record-routes", help="Serve a candidate with its routing plugin recording routes (options "
+                                                "record_routes and trace_path), answer every prompt of a general "
+                                                "corpus once and keep the trace crit plugins offload --trace replays")
+    sub.add_argument("--candidate", required=True)
+    sub.add_argument("--corpus", type=Path, required=True, help="A JSON list of prompts: texts, {\"text\"} or "
+                     "{\"messages\"}; general text unrelated to Eval")
+    sub.add_argument("--out", type=Path, help="Where the trace goes (default: work/routes/CANDIDATE.json)")
+    sub.add_argument("--routes", type=int, default=250000, help="Decode routes the plugin keeps (default 250000)")
+    sub.add_argument("--max-tokens", type=int, default=384, help="Tokens of each reply (default 384)")
+    sub.add_argument("--seconds", type=float, help="Reservation length (default: the check process cap)")
+    sub = subs.add_parser("switch-check", help="After sealing: serve the selected candidate through crit serve, switch "
+                                               "to another sealed candidate and back, and compare the selected one's "
+                                               "greedy replies (AGENTS.md); written to work/switch-check.json")
+    sub.add_argument("--candidate", help="The candidate served first and last (default: the run's selected one)")
+    sub.add_argument("--other", help="The sealed candidate switched to (default: the newest other sealed one)")
+    sub.add_argument("--prompt", help="The user message each greedy reply answers")
+    sub.add_argument("--max-tokens", type=int, default=64, help="Tokens of each reply (default 64)")
     sub = subs.add_parser("resume", help="Open a new segment for more candidates, optionally amending the quality terms")
     sub.add_argument("--candidates", type=int, required=True, help="Candidates on the candidate ladder this segment "
                      "builds (no working time budget)")
@@ -362,9 +384,10 @@ def act(command, args):
             for record in result:
                 warn_exploratory(store, args.id, args.candidate, record["benchmark_id"])
         elif args.action == "eval":
-            from .evaluation import evaluate, summary
+            from .evaluation import baseline_result, evaluate, summary
             result = evaluate(store, args.id, args.candidate, args.data, args.only,
-                              read_json(args.baseline) if args.baseline else None, args.seconds, args.label,
+                              baseline_result(store, args.id, args.baseline) if args.baseline else None,
+                              args.seconds, args.label,
                               stage=args.stage if args.stage in (None, "full") else int(args.stage),
                               certify=args.certify,
                               budget_seconds=args.budget_minutes * 60 if args.budget_minutes else None,
@@ -379,7 +402,7 @@ def act(command, args):
             from .ablate import ablate
             result = ablate(store, args.id, args.candidate, args.seconds, args.variant, args.repetitions,
                             smoke=not args.no_smoke, smoke_tests=args.smoke_test, data=args.data, seeds=args.seeds,
-                            sets=args.set, rounds=args.rounds)
+                            sets=args.set, rounds=args.rounds, quality=args.quality)
         elif args.action == "kernels":
             from .external import kernels
             result = kernels(store, args.id, args.candidate, args.seconds, args.nvcc)
@@ -388,6 +411,14 @@ def act(command, args):
             result = profile(store, args.id, args.candidate, args.seconds, args.nvcc, args.hipcc, args.case,
                              args.tokens, family_rules(args.families))
             print(render(result), file=sys.stderr)
+        elif args.action == "record-routes":
+            from .routes import record_routes
+            result = record_routes(store, args.id, args.candidate, args.corpus, args.out, args.routes, args.max_tokens,
+                                   args.seconds)
+        elif args.action == "switch-check":
+            from .switch import PROMPT, switch_check
+            result = switch_check(store, args.id, args.candidate, args.other, args.prompt or PROMPT, args.max_tokens,
+                                  project=args.project, log=lambda line: print(line, file=sys.stderr, flush=True))
         elif args.action == "seal":
             failure = {"message": args.failure} if args.failure else None
             result = store.seal(args.id, args.candidate, args.lifecycle, failure)

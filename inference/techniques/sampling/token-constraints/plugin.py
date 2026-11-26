@@ -93,6 +93,7 @@ class ConstrainedSampler:
             from .token_sampling import device_rounds
             inner = device_rounds.RoundSampling()
             inner.kernel = self.kernel
+            inner.scratch = getattr(self, "scratch", None)   # the engine's scratch, closed with the engine
             self._rounds = RoundMasks(inner)
         return self._rounds
 
@@ -289,4 +290,5 @@ def _allowed(torch, words, masked, bits, rows, width, vocabulary):
 def create(context, options, parts):
     found = ConstrainedSampler()
     found.kernel = options["rounds"]
+    found.scratch = getattr(context, "scratch", None)   # the engine's scratch: every launch computes in it
     return found

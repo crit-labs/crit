@@ -34,14 +34,17 @@ def top_ranked(values, k):
     rows = values.shape[0]
     ranked = values.new_empty(rows, k)
     order = torch.empty(rows, k, dtype=torch.int64, device=values.device)
-    threshold = values.topk(k, dim=-1, sorted=True).values[:, -1:]
+    # The k + 1 highest: a row has exactly k candidates where its (k + 1)-th value is below its k-th. No temporary
+    # wider than the rows' masks (a count of them would be int64 a value: twice an FP32 row's bytes).
+    top = values.topk(k + 1, dim=-1, sorted=True).values
+    threshold = top[:, k - 1:k]
     at = values >= threshold                  # every entry the first k can hold: those past the k-th value and its ties
-    counts = at.sum(-1)
-    bad = torch.isnan(values).any(-1) | (counts != k)
+    bad = torch.isnan(values).any(-1) | (top[:, k] == top[:, k - 1])
     plain = (~bad).nonzero()[:, 0]
     if plain.numel():                         # exactly k candidates: in index order, then sorted stably
-        index = at[plain].nonzero()[:, 1].view(-1, k)
-        found = values[plain].gather(1, index)
+        whole = plain.numel() == rows         # every row: its masks as they are; never a copy of the rows' values
+        index = (at if whole else at[plain]).nonzero()[:, 1].view(-1, k)
+        found = values[plain[:, None], index]
         found, by = found.sort(dim=-1, descending=True, stable=True)
         ranked[plain], order[plain] = found, index.gather(1, by)
     for r in bad.nonzero()[:, 0].tolist():   # ties at the k-th value (or a NaN): the row's candidates, or the row

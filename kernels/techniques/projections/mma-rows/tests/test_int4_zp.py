@@ -63,6 +63,11 @@ def test_int4_rows_multiply_by_the_exact_values_and_keep_their_bits(shape, group
         mr.mm_prompt(x, stored[0], prompt, "int4_zp", stored[1], None, "bf16", 1.0, False, splits, None, stored[2],
                      group)
         assert torch.equal(prompt, full), splits
+        prompt.zero_()   # a tile's splits in several CTAs: the same bits
+        mr.mm_prompt(x, stored[0], prompt, "int4_zp", stored[1], None, "bf16", 1.0, False, splits, None, stored[2],
+                     group, partial=torch.empty(1 << 22, dtype=torch.float32, device=dev),
+                     counters=torch.zeros(1 << 14, dtype=torch.int32, device=dev))
+        assert torch.equal(prompt, full), ("parts", splits)
 
 
 def test_the_staged_tile_gives_the_register_tiles_bits():
@@ -79,6 +84,25 @@ def test_the_staged_tile_gives_the_register_tiles_bits():
                 got = call(staged, x[:rows].clone(), stored, group, splits=splits)
                 assert torch.equal(got, want[:rows]), (index, rows, splits)
     kbuild.select(staged, "decode-tile", -1)
+
+
+def test_the_prompt_tiles_row_groups_give_the_decode_tiles_bits():
+    # PR 1 and 2 (16-row groups a warp: two read each B fragment once for both, loading weights at the step), in
+    # one build; every output the decode tile's, the hi and lo MMAs of each group in the decode tile's order.
+    built = kbuild.load("mma-rows", configs={"prompt-tile": [{"PR": 1}, {"PR": 2}, {"PR": 2, "PW": 4}]})
+    n, k, group = 520, 2048, 128
+    stored, _ = int4_matrix(n, k, group, seed=11)
+    x = activations(200, k, seed=12)
+    for splits in (1, 3):
+        want = torch.cat([call(mr, x[i:i + 64], stored, group, splits=splits) for i in range(0, 200, 64)])
+        for index in range(1, 4):
+            kbuild.select(built, "prompt-tile", index)
+            got = torch.empty(200, n, dtype=torch.float32, device=dev)
+            built.mm_prompt(x, stored[0], got, "int4_zp", stored[1], None, "bf16", 1.0, False, splits, None,
+                            stored[2], group, partial=torch.empty(1 << 22, dtype=torch.float32, device=dev),
+                            counters=torch.zeros(1 << 14, dtype=torch.int32, device=dev))
+            assert torch.equal(got, want), (index, splits)
+    kbuild.select(built, "prompt-tile", -1)
 
 
 def test_int4_calls_capture_and_refuse_what_they_cannot_read():

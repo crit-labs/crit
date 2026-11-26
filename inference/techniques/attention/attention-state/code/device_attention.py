@@ -5,7 +5,8 @@ Arithmetic comes from crit's paged-kv-attention kernels (crit_plugins.kernels: b
 tuned knobs or the defaults), then from torch where they do not load; FlashInfer serves nothing unless the plugins'
 option flashinfer is "auto" (a yardstick to compare with: its paged prefill for eager prompt rows of 16-bit and FP8
 pages, and with decode "flashinfer" a step's window rows). A row of up to the pool's `window` tokens is a window row
-(decode tokens, verify windows), a longer one a prompt row:
+(decode tokens, verify windows), a longer one a prompt row, and so is a shorter one the model marks a prompt chunk
+(StepBatch.prompts: a short prompt chunk's rows keep the bits of the same rows in a longer one):
 
 - prompt rows: with prompt_reader "decode", as window rows of up to 64 columns through crit's split-KV reader, each
   program folding its partitions as the merge does (fused, no partials): a prompt token's bits are those of the same
@@ -455,7 +456,9 @@ class DeviceAttention:
             chosen = set(windows)
             rest = [r for r in range(batch.rows) if r not in chosen]
         else:
-            short = [r for r in range(batch.rows) if batch.row(r)[2] <= pool.window]
+            # Window rows: decode tokens and verify windows (a prompt chunk, however short, is a prompt row: its rows
+            # the bits of the same rows in a longer chunk).
+            short = [r for r in range(batch.rows) if not kv_pages.prompt_row(batch, r, pool.window)]
             # decode "split" (the default): a step's window rows as a round reads them (the split-KV reader, else its
             # torch fallback), so a decode row's bits are the same in a step and in a round; else torch's gathered
             # SDPA.
@@ -463,7 +466,7 @@ class DeviceAttention:
                 meta, extent = self._step_windows(pool, batch, short, q.device)
                 self._windows(layer, q, pool, meta, scale, blocks, block_size, parents, out, found,
                               reader == "split", extent)
-                rest = [r for r in range(batch.rows) if batch.row(r)[2] > pool.window]
+                rest = [r for r in range(batch.rows) if kv_pages.prompt_row(batch, r, pool.window)]
             else:
                 rest = list(range(batch.rows))
         if rest:

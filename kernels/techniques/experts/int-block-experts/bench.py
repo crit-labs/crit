@@ -176,14 +176,14 @@ class GemmStaged(Gemm):
     def valid(self, knobs):
         """A warp tile of whole 16 x 8 MMA tiles, at least 2 warps, a CTA's registers within an SM's (an output holds
         GROUP running lanes and the partial sums still needed: 5 registers, 6 with GROUP 4; about 48 more a thread),
-        and the ring within a CTA's shared memory (the GPU's opt-in limit)."""
+        and the visit plan (2 KB) and the ring within a CTA's shared memory (the GPU's opt-in limit)."""
         bm, bn, wm, wn, group = knobs["BM"], knobs["BN"], knobs["WM"], knobs["WN"], knobs["GROUP"]
         if bm % (16 * wm) or bn % (8 * wn) or wm * wn < 2:
             return False
         outputs = 4 * (bm // wm // 16) * (bn // wn // 8)
         stage = group * knobs["RUN"] * (32 * bm + 20 * bn)
         regs = (outputs * (6 if group == 4 else 5) + 48 + 7) // 8 * 8
-        return regs <= 208 and 32 * wm * wn * regs <= 65536 and knobs["STAGES"] * stage <= shared_memory_optin()
+        return regs <= 208 and 32 * wm * wn * regs <= 65536 and 2048 + knobs["STAGES"] * stage <= shared_memory_optin()
 
     def reference(self, s):
         if s["key"] not in self._references:

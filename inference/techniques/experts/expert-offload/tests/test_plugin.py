@@ -74,6 +74,30 @@ class ExpertOffloadTests(PluginTestCase):
             # a selection that does not name the three: every plugin's code, as before
             self.assertIsNone(offload.packing_folders(plugins, {"plugins": {"use": {"model": "toy-model"}}}))
 
+    def test_closing_the_engine_writes_the_recorded_routes_to_trace_path(self):
+        # A serve stopped after a corpus, its telemetry never read, still leaves the trace crit plugins offload
+        # --trace replays.
+        import json
+        import tempfile
+
+        class Cache:
+            def routes(self):
+                return [(1, [3, 5])]
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as temp:
+            trace = Path(temp) / "routes.json"
+            experts = offload.ExpertOffload.__new__(offload.ExpertOffload)
+            experts.settings, experts.options = {}, {"trace_path": str(trace), "profile_save": ""}
+            experts.cache, experts.store, experts.dispatch, experts._scratch = Cache(), None, None, None
+            experts.memory, experts.part = None, None
+            experts._elastic = lambda: False
+            experts.save_profile = lambda: None
+            experts.close()
+            self.assertEqual(json.loads(trace.read_text(encoding="utf-8")), [[1, [3, 5]]])
+
     def test_the_cache_takes_every_byte_past_the_margin(self):
         self.assertEqual(offload.cache_slots(24 * GB + 1000, 2 * GB, 2780176), (22 * GB + 1000) // 2780176 - 1)
         self.assertEqual(offload.cache_slots(GB, 2 * GB, 2780176), 0)

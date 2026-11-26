@@ -353,7 +353,14 @@ def settings(report_variants, noise=NOISE):
             row["in_engine"] = {kpi: effect[0] for kpi, effect in effects["in_engine"].items()}
             row["breaks"] = sorted(_failed(variant) - _failed(full))
         _paired_rows(row, effects)
-        row["verdict"] = _verdict(effects["in_engine"], noise, bool(row["breaks"]) or variant.get("state") == "failed")
+        if variant.get("state") == "failed" and full is None:
+            # The engine as built did not serve either: what stopped both is not the option's doing (a refused serve,
+            # a load that fails with every option), so nothing is blamed on it.
+            row["verdict"] = "unmeasured"
+            row["detail"] = "the engine as built (full) was not measured either, so the option is not judged"
+        else:
+            row["verdict"] = _verdict(effects["in_engine"], noise,
+                                      bool(row["breaks"]) or variant.get("state") == "failed")
         out.append(row)
     return out
 

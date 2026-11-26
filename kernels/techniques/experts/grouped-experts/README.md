@@ -112,15 +112,17 @@ the call's token count:
 | `prompt-wide` | 64 routes (`Workspace(width=64)`) | 1,024, 4,096 | 2, 4, 8 (4) | 1, 2, 4 (1) | 0-4 (0) | 64, 128 (128) | |
 | `fp4-decode` | 8 routes, FP4 MMA, operands from global memory | 1, 2, 4, 8, 32 | 2, 4, 8 (4) | 1, 2, 4 (1; gate/up 2) | 1-4, 6 (3) | | FETCH 0, 1 (1 at one token, else 0) |
 | `fp4-prompt` | 32 or 64 routes, FP4 MMA, staged by cp.async | 256, 1,024, 4,096 | 2, 4, 8 (4) | 1, 2, 4 (2) | 1-4 (2) | 128, 256, 512 (256) | |
-| `fp4-tile` | 64 routes a call asks it for (tile), FP4 MMA, weights and routes staged by cp.async (WM, WN, STAGES below) | 2,048, 4,096, 8,192 | | 2, 4 (2) | | | |
+| `fp4-tile` | 64 routes a call asks it for (tile), FP4 MMA, weights and routes staged a step at a time, by a block ring or a producer warp (WM, WN, STAGES, PRODUCER below) | 2,048, 4,096, 8,192 | | 2, 4 (2) | | | |
 | `fp8-decode` | 8 routes, E4M3 MMA, operands from global memory | 1, 2, 4, 8, 32 | 2, 4, 8 (4) | 1, 2, 4 (1) | 1-4, 6 (4) | | FETCH 0, 1 (1 at one token, else 0) |
 | `fp8-prompt` | 32 or 64 routes, E4M3 MMA, staged by cp.async | 256, 1,024, 4,096 | 2, 4, 8 (8) | 1, 2, 4 (4) | 1-4 (1) | 128, 256, 512 (128) | |
 | `declared` | the integer block order | | | | | | |
 | `plan-combine` | grouping and the route-order sum | | | | | | |
 
-fp4-tile: WM (1, 2, 4; 4) warps along the block's matrix rows, WN (1, 2, 4; 2) along the item's routes, STAGES
-(2, 3, 4; 2) 128-k steps in its ring; its defaults (TILES 2, STAGES 2: 36 KiB a block) fit every GPU's shared memory
-without opting in, and the sweep tunes the rest per GPU and shape. WARPS: warps a block (fp4-decode, fp8-decode: WARPS / k_parts(K) row-tile groups, at least one, of k_parts(K) warps
+fp4-tile: PRODUCER (0, 1, 2; 0) its mainloop, 1 the block's cp.async ring, 2 warp-specialized (below), 0 2 for gate/up and 1
+for down; WM (1, 2, 4; 4) warps along the block's matrix rows, WN (1, 2, 4; 2) along the item's routes, STAGES
+(2, 3, 4; 3) 128-k steps in its ring; its defaults (TILES 0: 2 for gate/up and 4 for down, which took 0.81-1.02x the time of 2 from 128 to 8,192 tokens; STAGES 3: 54 KiB a block with 2 tiles, 90 with 4, opted in on the sm_120 family
+where the FP4 MMA runs; STAGES 2 took 1.00-1.05x its time over a layer's two passes from 128 to 8,192 tokens on an RTX
+5090), and the sweep tunes the rest per GPU and shape. WARPS: warps a block (fp4-decode, fp8-decode: WARPS / k_parts(K) row-tile groups, at least one, of k_parts(K) warps
 each, one a K part, so a pass of 2,048 k at WARPS 2 runs 4 warps a block); TILES: MMA row tiles a warp owns (gate/up 8 inter rows each, down 16 output rows), sharing each
 B fragment (fp4 gate/up at least 2: a warp holds the intermediate's 16-row blocks); DEPTH: 64-k blocks of weights in
 flight a warp (0 is the format's own depth, 2 to 6; fp4: 128-k steps, fp8: 64-k steps); CHUNK: k values of the
@@ -197,6 +199,51 @@ FP8 decode stays at 0.77-0.97x of the BF16 path's W8A16: it reads twice FP4's we
 on 2048 x 768 (the BF16 path 1,115 and 3,980) and 7,653 at 8,192 tokens on 4096 x 1536 (15,493): 1.8-2.0x the BF16
 path, 12-16% slower than before K was split (539, 1,760, 6,590). Both arithmetics stay opt-in (the plugin's
 `arithmetic`).
+
+**FP4 prompt layers** (RTX 5090, 2026-11-24, CUDA graph replay after a 256 MB L2 flush, median; a layer is
+`route_outputs`: the plan, the quantizers and both passes; nvfp4 W4A4 experts in device memory, every route's bits
+checked against the previous build first). fp4-tile now stages three steps (STAGES 3), reads its staged fragments by
+ldmatrix and gives the down pass 4 row tiles a warp (TILES 0), and the grouped-experts plugin runs FP4 prompt calls
+on it where no sweep report says otherwise (before: fp4-prompt's 32-route items). A layer, us, before (fp4-prompt) ->
+after (fp4-tile), and FlashInfer 0.7.3's NVFP4 fused MoE (`cutlass_fused_moe`, W4A4 on its CUTLASS grouped GEMMs,
+the activations quantized inside its call; another order, so not these bits) on random experts of the shape:
+
+| Experts, tokens | Before | After | Speedup | FlashInfer fused MoE |
+| --- | --- | --- | --- | --- |
+| 512 x top 10, 2560 x 640, 512 | 1,363.6 | 1,349.7 | 1.01x | 1,098.4 |
+| same, 2,048 | 1,911.3 | 1,487.1 | 1.29x | 1,329.8 |
+| same, 8,192 | 4,991.7 | 3,210.9 | 1.55x | 2,715.2 |
+| 128 x top 8, 2048 x 768, 512 | 455.3 | 391.4 | 1.16x | 299.7 |
+| same, 2,048 | 1,083.0 | 778.3 | 1.39x | 440.5 |
+| same, 8,192 | 3,384.0 | 2,242.3 | 1.51x | 1,425.7 |
+
+**fp4-tile's warp-specialized mainloop** (PRODUCER, 2026-11-25, the same RTX 5090 and method): one more warp issues a
+block's copies up to STAGES steps ahead, the weights' codes as TMA boxes of a 3-D tensor map over the store
+([slots][rows][K / 2], 64-byte rows swizzled; gate/up the block's gate rows, then its up rows), the weights' scales
+and the routes' codes and scales by cp.async, every copy completing the slot's mbarrier; the consumer warps release a
+slot on an mbarrier of its own, so no barrier of the whole block a step. The consumers' fragments, MMAs and part sums
+are the block ring's: every route's bits (each configuration checked against the build before). PRODUCER 0 runs it
+for gate/up, where it pays, and keeps the ring for down (K of the inter, a few steps a block: the warp-specialized form
+took 0.83-1.16x the ring's time there at its best TILES 2, and the slots of TILES 4 do not fit four stages). A pass or
+layer, us, before -> after, and FlashInfer 0.7.3's fused MoE:
+
+| Experts, tokens | gate/up | layer | FlashInfer fused MoE (layer) |
+| --- | --- | --- | --- |
+| 512 x top 10, 2560 x 640, 512 | 844.4 -> 621.2 (1.36x) | 1,350.1 -> 1,121.0 (1.20x) | 1,098.4 |
+| same, 2,048 | 883.3 -> 697.1 (1.27x) | 1,483.5 -> 1,317.4 (1.13x) | 1,329.8 |
+| same, 8,192 | 1,874.7 -> 1,804.9 (1.04x) | 3,272.3 -> 3,161.7 (1.03x) | 2,715.2 |
+| 128 x top 8, 2048 x 768, 512 | 242.3 -> 197.3 (1.23x) | 389.5 -> 346.5 (1.12x) | 299.7 |
+| same, 2,048 | 412.3 -> 398.0 (1.04x) | 767.3 -> 741.1 (1.04x) | 440.5 |
+| same, 8,192 | 1,358.4 -> 1,325.5 (1.02x) | 2,260.4 -> 2,217.6 (1.02x) | 1,425.7 |
+
+The 512-expert layer now runs within 2% of FlashInfer at 512 tokens and 1% faster at 2,048. What did not pay: the
+producer issuing the weights' codes by cp.async too (30 to 50 copies a lane a step; 1.0-1.7x slower than the ring),
+STAGES 4 (0.94-1.01x of 3), WN 4 (0.97-1.03x), TILES 4 for gate/up (0.79-0.92x). Large prompts stay bound by the
+consumers (8 warps of 160 registers, one block an SM).
+
+FlashInfer's fused MoE stays 1.1-1.8x faster at these prompts (its tiles fill the FP4 tensor cores: fp4-tile's 8 warps
+an SM keep them 9-14% busy, ncu), while crit's decode layers are 1.03-1.52x faster than it from 1 to 64 tokens (the
+512-expert layer at 1 token 43.7 us against 66.2).
 
 ## Against the library
 

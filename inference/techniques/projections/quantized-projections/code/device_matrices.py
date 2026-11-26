@@ -67,6 +67,7 @@ FORMATS = ("bf16", "fp8:channel", "fp8:tensor", "mxfp8", "nvfp4", "fp8:block", "
 # fp8:block matrices' activations: E4M3 per this many inputs at amax / 448 (fp8-block-rows' declared quantizer), the
 # FP8 block checkpoints' own activation granularity (their 128-wide weight blocks)
 FP8_BLOCK_GROUP = 128
+FP8_BLOCK_LAYOUTS = ("plain", "visit")   # an fp8:block matrix's codes as stored, or in the visit order (_fp8_block)
 # INT4 with a zero point a group, as AWQ and GPTQ checkpoints store it (loaded into crit's rows, format int4_zp):
 #     awq   qweight int32 [in][out / 8] (AWQ's nibble order 0, 2, 4, 6, 1, 3, 5, 7), qzeros int32 [in / group][out / 8]
 #           (the same order), scales FP16 [in / group][out]
@@ -173,7 +174,8 @@ BUFFER_BYTES = WORKSPACE_BYTES + SCRATCH_BYTES + PARTIAL_BYTES + 4 * COUNTERS + 
 
 
 def load(tensors, format, device=None, activations="nvfp4", prompt="bf16", gemm="provider", gemv="auto",
-         decode="prompt", decode_rows=GEMV_ROWS, tile_rows="auto", fp8_activations="fp8", mx_activations="bf16"):
+         decode="prompt", decode_rows=GEMV_ROWS, tile_rows="auto", fp8_activations="fp8", mx_activations="bf16",
+         fp8_block_layout="plain"):
     """A Matrix on `device` (the weight's own unless given) from a checkpoint's tensors by role. Its decode rows (calls
     of up to its decode_rows: `decode_rows`, 8 to GEMV_ROWS, or fewer where its GEMV takes fewer) take `decode` (DECODES: prompt, the prompt rows' activations; bf16, 16-bit ones) through `gemv`
     (GEMVS: auto, by the matrix's arithmetic: FP8 16-bit decode rows on decode-gemv's dot GEMV, W4A4 ones on
@@ -270,7 +272,7 @@ def load(tensors, format, device=None, activations="nvfp4", prompt="bf16", gemm=
         matrix.path = "gemv" if matrix.native is not None else "torch"
         return _finish(matrix, decode_rows, device, tile, tile_rows, modules)
     if format == "fp8:block":
-        return _fp8_block(tensors, device, gemm, decode_rows, modules)
+        return _fp8_block(tensors, device, gemm, decode_rows, modules, fp8_block_layout)
     if format == "mxfp8":
         w = weight.to(device).view(torch.float8_e4m3fn).contiguous()
         exponents = tensors["scale"].to(device).view(torch.uint8).contiguous()
@@ -346,13 +348,17 @@ def load(tensors, format, device=None, activations="nvfp4", prompt="bf16", gemm=
     return _finish(matrix, decode_rows, device, tile, tile_rows, modules)
 
 
-def _fp8_block(tensors, device, gemm, decode_rows, modules):
+def _fp8_block(tensors, device, gemm, decode_rows, modules, layout="plain"):
     """An fp8:block matrix (FP8 in b0 x b1 blocks of FP32 scales) stored as is, on crit's fp8-block-rows: W8A8
     against activations quantized per FP8_BLOCK_GROUP inputs by its declared quantizer (amax / 448). Decode rows (up
     to decode_rows, 8 a job) on its declared rows; prompt rows on its declared staged GEMM (gemm-staged: every output
     the bits of its row decoded, whatever rows share the call: prompt_exact), or, with prompt_gemm native (and auto),
     its tensor-core GEMM (gemm-native-blocks: faster, not the declared order nor row invariant). The job tables are
-    made here, so a captured call copies nothing from the host."""
+    made here, so a captured call copies nothing from the host. layout (FP8_BLOCK_LAYOUTS): plain, the codes as
+    stored; visit, each row's blocks of 32 stored once at load in the kernel core's visit order, which the rows and
+    the staged GEMM read with the same bits (a visit's two blocks of a row one 64-byte piece: on an RTX 5090 the
+    staged GEMM 1.08-1.53x faster at 32 to 128 tokens and 0.97-1.01x past 512, the decode rows 0.66-0.90x), for the
+    staged prompt GEMM only (the native GEMM reads the plain codes: a native matrix stays plain)."""
     import torch
     from . import device_nvfp4
     w = tensors["weight"].to(device).view(torch.uint8).contiguous()
@@ -368,8 +374,14 @@ def _fp8_block(tensors, device, gemm, decode_rows, modules):
     if module is None:
         raise ValueError("an fp8:block matrix multiplies on crit's fp8-block-rows, which is not here (a CUDA device "
                          "where the kernel builds)")
-    table = module.matrix_table([(w, scale, b0, b1, 1.0)])
+    if layout not in FP8_BLOCK_LAYOUTS:
+        raise ValueError(f"an fp8:block matrix's layout is {', '.join(FP8_BLOCK_LAYOUTS)}, not {layout!r}")
+    visit = layout == "visit" and gemm not in ("native", "pinned")
+    if visit:
+        w = module.to_visit_weights(w)
+    table = module.matrix_table([(w, scale, b0, b1, 1.0, module.VISIT if visit else module.PLAIN)])
     m = Matrix("fp8:block", rows, columns, {"weight": w, "scale": scale, "table": table, "block": (b0, b1)}, "fp8")
+    m.layout = "visit" if visit else "plain"
     m.fb, m.decode, m.decode_rows = module, "prompt", min(decode_rows, GEMV_ROWS)
     m.row_jobs = {n: module.row_jobs([(0, list(range(a, min(a + 8, n))), list(range(a, min(a + 8, n))))
                                       for a in range(0, n, 8)], device) for n in range(1, m.decode_rows + 1)}
@@ -389,12 +401,16 @@ def _fp8_block(tensors, device, gemm, decode_rows, modules):
 
 
 def _fp8_block_matmul(x, m, out_dtype):
-    """y = x W^T of an fp8:block matrix: the rows quantized per FP8_BLOCK_GROUP, then its decode rows or prompt GEMM."""
+    """y = x W^T of an fp8:block matrix: the rows quantized per FP8_BLOCK_GROUP, then its decode rows or prompt GEMM
+    (the staged GEMM's activations in its visit order: the same codes and scales, each token's blocks of a visit one
+    contiguous piece; on an RTX 5090 at 2,048 tokens 1.20x and 1.41x the plain order's speed on 5120 x 2560 and
+    12288 x 5120, the GEMM's default tiles)."""
     import torch
     fb, table = m.fb, m.tensors["table"]
     n = x.shape[0]
+    staged = n > m.decode_rows and m.gemm == "staged"
     codes, scales = fb.quantize(x if x.dtype in (torch.float32, torch.bfloat16) else x.float(), FP8_BLOCK_GROUP,
-                                fb.AMAX)
+                                fb.AMAX, order=fb.VISIT if staged else fb.PLAIN)
     if n <= m.decode_rows:
         out = torch.empty(n, m.rows, dtype=torch.float32, device=x.device)
         fb.rows(table, m.row_jobs[n], m.rows, codes, scales, FP8_BLOCK_GROUP, out)
@@ -406,7 +422,7 @@ def _fp8_block_matmul(x, m, out_dtype):
             fb.gemm_native(table, m.gemm_job, m.rows, n, codes, scales, FP8_BLOCK_GROUP, out, mx=False)
         else:
             out = torch.empty(n, m.rows, dtype=torch.float32, device=x.device)
-            fb.gemm_staged(table, m.gemm_job, m.rows, n, codes, scales, FP8_BLOCK_GROUP, out)
+            fb.gemm_staged(table, m.gemm_job, m.rows, n, codes, scales, FP8_BLOCK_GROUP, out, order=fb.VISIT)
     return out.to(out_dtype or torch.bfloat16)
 
 
@@ -977,8 +993,9 @@ def _int4_matmul(x, m, out_dtype):
         out = torch.empty(x.shape[0], m.rows, dtype=dtype, device=x.device)
         x16 = device_nvfp4._aligned(x if x.dtype == torch.bfloat16 else x.to(torch.bfloat16))
         t = m.tensors
-        module.mm_prompt(x16, t["codes"], out, "int4_zp", t["scales"], None, "bf16", 1.0, False, splits,
-                         call_buffers(x.device, "scratch")[0], t["zeros"], m.group)
+        scratch, partial = call_buffers(x.device, "scratch", "partial")
+        module.mm_prompt(x16, t["codes"], out, "int4_zp", t["scales"], None, "bf16", 1.0, False, splits, scratch,
+                         t["zeros"], m.group, **_prompt_parts(x.device, module, "bf16", partial))
         return _out(out, out_dtype)
     flags = torch.backends.cuda.matmul
     before, flags.allow_tf32 = flags.allow_tf32, False   # FP32 products, not TF32
@@ -1248,10 +1265,14 @@ def _matmul(x, m, out_dtype=None, prompt=False):
 def _prompt_tile(x, m, out_dtype):
     """Prompt rows through mma-rows' prompt tile (gemm tile): the decode rows' activations and the matrix's plan, so
     every output has the bits the row has as a decode row; in out_dtype (BF16 unless FP32 or FP16 is asked for).
-    Quantized activations go through the shared scratch, as many rows a call as it holds (64 at least)."""
+    A tile's splits of K run in several CTAs where the shared partial sums hold them (_prompt_parts). Quantized
+    activations go through the shared scratch, or the shared workspace where it holds more rows than the scratch
+    (a call's buffer, which no other path of the call uses), as many rows a call as it holds (64 at least): each call
+    reads the whole matrix again, and a short call cannot fill the GPU (a 2,048-row prompt of a 320 x 10240 FP8
+    matrix in 192-row calls took 7.9 times one call's time)."""
     import torch
     from . import device_nvfp4
-    scratch = call_buffers(x.device, "scratch")[0]
+    scratch, partial = call_buffers(x.device, "scratch", "partial")   # taken together: apart, they would overlap
     _, _, splits = m.mma_plan
     acts = m.mma_acts["decode"]
     dtype = out_dtype if out_dtype in (torch.float32, torch.float16) else torch.bfloat16
@@ -1259,14 +1280,34 @@ def _prompt_tile(x, m, out_dtype):
     x16 = device_nvfp4._aligned(x if x.dtype == torch.bfloat16 else x.to(torch.bfloat16))
     w, scales, row_scale, blocked, g = _tile_operands(m)
     if acts == "nvfp4_mma":   # the FP4 prompt tile's scratch: codes, then block scales of rows padded to 128
-        step = max(TILE_ROWS, SCRATCH_BYTES // (m.columns // 2 + (m.columns // 16 + 3) // 4 * 4) // 128 * 128 - 128)
-    else:
-        step = x.shape[0] if acts == "bf16" else max(TILE_ROWS, SCRATCH_BYTES // (m.columns * 2 + 4) // 16 * 16)
+        row = m.columns // 2 + (m.columns // 16 + 3) // 4 * 4
+        if x.shape[0] * row > SCRATCH_BYTES and WORKSPACE_BYTES > SCRATCH_BYTES:
+            scratch = buffers(x.device)["workspace"].view(torch.uint8)
+        step = max(TILE_ROWS, scratch.numel() // row // 128 * 128 - 128)
+    elif acts == "bf16":
+        step = x.shape[0]
+    else:   # the quantized values (2 bytes a value) and the FP8 row scales
+        row = m.columns * 2 + 4
+        if x.shape[0] * row > SCRATCH_BYTES and WORKSPACE_BYTES > SCRATCH_BYTES:
+            scratch = buffers(x.device)["workspace"].view(torch.uint8)
+        step = max(TILE_ROWS, scratch.numel() // row // 16 * 16)
+    parts = _prompt_parts(x.device, m.mma, acts, partial)
     for r0 in range(0, x.shape[0], step):
         r1 = min(x.shape[0], r0 + step)
         m.mma.mm_prompt(x16[r0:r1], w, out[r0:r1], m.mma_weights, scales, row_scale, acts, g, blocked, splits,
-                        scratch)
+                        scratch, **parts)
     return out if out_dtype is None or out.dtype == out_dtype else out.to(out_dtype)
+
+
+def _prompt_parts(device, module, acts, partial):
+    """mm_prompt's partial sums and counters (the call's partial buffer, taken with its scratch, and the decode
+    tile's counters, used by one call at a time in stream order: they are left zero), with which a tile's splits of K
+    run in several CTAs, every output's bits unchanged: a short prompt or a narrow matrix fills the GPU (the FP4
+    prompt tile's too). Nothing for a build whose mm_prompt does not take them."""
+    code = getattr(getattr(module, "mm_prompt", None), "__code__", None)
+    if code is None or "partial" not in code.co_varnames:
+        return {}
+    return {"partial": partial, "counters": buffers(device)["counters"]}
 
 
 def _tile_operands(m):

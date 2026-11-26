@@ -5,6 +5,7 @@
   "title": "RMSNorm with a residual, head norms with rotary positions, gated norms, activation products and residual-stream mixes, one Triton launch a call",
   "package": "fused_norms",
   "language": "triton",
+  "launches": ["act_mul_kernel", "long_rows_kernel", "pair_kernel", "rows_kernel", "rows_quant_kernel", "softplus_decay_kernel", "stream_add_kernel", "stream_sum_kernel"],
   "operations": [
     "rms-norm",
     "rotary-positions",

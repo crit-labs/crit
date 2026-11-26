@@ -38,7 +38,7 @@ WARPS = 4          # warps a CTA, each its own 16 x groups matrix rows
 PROMPT_TOKENS = 64   # activation rows a CTA of mm_prompt takes, untuned (structure prompt-tile's PT)
 
 __all__ = ["ACTS", "FP4_STEP", "MAX_ROWS", "PROMPT_TOKENS", "STEP", "VALUES", "WEIGHTS", "eligible", "fp4_mma",
-           "interleave_glu", "mm_prompt", "mm_rows", "partial_elements", "plan", "quantize_fp8_rows", "quantize_nvfp4", "row_tiles",
+           "interleave_glu", "mm_prompt", "mm_rows", "partial_elements", "plan", "prompt_ctas", "quantize_fp8_rows", "quantize_nvfp4", "row_tiles",
            "scratch_bytes"]
 
 
@@ -131,17 +131,27 @@ def mm_rows(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, weights: str, s
 
 def mm_prompt(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, weights: str, scales=None, row_scale=None,
               acts: str = "bf16", input_scale: float = 1.0, blocked: bool = False, splits: int = 1, scratch=None,
-              zeros=None, group: int = 0, glu: bool = False):
+              zeros=None, group: int = 0, glu: bool = False, partial=None, counters=None):
     """out [M][N] = x [M][K] times the matrix w for any number of rows M >= 1 (the prompt tile), every element with
     the bits mm_rows gives it for the same matrix, acts and splits (plan()'s, the matrix's): a prompt row equals the
     same row decoded alone or batched, so a prompt's tokens score as they are served. Each decoded weight serves
     PROMPT_TOKENS rows a CTA (a GEMM's reuse); quantized activations take scratch_bytes(M, K, acts) of scratch. acts
     nvfp4_mma (NVFP4 weights with blocked scales, K a multiple of FP4_STEP, where fp4_mma()): the FP4 prompt tile, every
     element with the bits mm_rows gives it on the FP4 MMA with plan(..., acts="nvfp4_mma")'s splits. glu: as
-    mm_rows'."""
+    mm_rows'. partial (FP32) and counters (int32 zeros, left zero), given together: with splits > 1, a tile's splits
+    run in several CTAs (prompt_ctas) where the partial sums fit, each split's chain stored and added in split order,
+    so the bits stay those of one CTA running them all; a short prompt or a narrow matrix then fills the GPU."""
     ops.mm_prompt(x, w, scales, row_scale, WEIGHTS[weights], ACTS[acts], float(input_scale), blocked, splits, scratch,
-                  out, zeros, int(group), int(bool(glu)))
+                  out, zeros, int(group), int(bool(glu)), partial, counters)
     return out
+
+
+def prompt_ctas(tokens: int, rows: int, columns: int, weights: str, acts: str = "bf16", splits: int = 1,
+                partial_elements: int = 0, counters: int = 0) -> int:
+    """The CTAs mm_prompt launches for `tokens` rows of a rows x columns matrix with this build's tuning, given a
+    partial buffer of partial_elements FP32 elements and `counters` counters (its quantizing pre-pass not counted)."""
+    return int(ops.prompt_ctas(tokens, rows, columns, WEIGHTS[weights], ACTS[acts], splits, partial_elements,
+                               counters))
 
 
 def interleave_glu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:

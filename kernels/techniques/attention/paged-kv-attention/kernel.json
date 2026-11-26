@@ -5,6 +5,7 @@
   "title": "Attention over paged KV caches in Triton: page writes (BF16, FP16, FP8, INT8), split-KV decode and verify windows merged by their log-sum-exps, causal prompt chunks, and flash structures (grouped heads packed into tensor-core tiles, contiguous KV splits) for windows and prompt chunks, and a CUDA flash tile (queries in shared memory, 16 rows a warp) for both",
   "package": "paged_kv_attention",
   "language": "triton",
+  "launches": ["_flash_kernel", "_flash_merge_kernel", "_merge_kernel", "_prefill_kernel", "_sparse_kernel", "_window_kernel", "_write_kernel", "cw_merge", "cw_merge2", "cw_window"],
   "capabilities": [
     "8.0",
     "8.6",
@@ -901,7 +902,7 @@
             100000
           ],
           "default": 0,
-          "what": "the launch's tiles, as a percent of the programs the device holds at once, from which each tile is one program walking its splits in turn (0: 50; 1: every launch; 100000: none, every launch a program a split): speed only, the same states folded in the same order"
+          "what": "the launch's tiles, as a percent of the programs the device holds at once, from which each tile is one program walking its splits in turn (0: 125; 1: every launch; 100000: none, every launch a program a split): speed only, the same states folded in the same order"
         }
       },
       "yardstick": {

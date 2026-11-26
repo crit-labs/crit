@@ -381,14 +381,14 @@ def _precheck(served, run, root, data, port, log):
     from crit_eval import load_json
     from crit_eval.quality.prepare import PREPARED
     from crit_eval.run.precheck import run_precheck
-    from .records import quality_terms
+    from .records import user_quality_budget
     from .store import amendments
     data = Path(data).absolute()
     if not (data / PREPARED).is_file():
         raise ValueError(f"{data} holds no {PREPARED}: prepare it from the run's model first (crit eval prepare)")
     headroom = run["spec"]["hardware_constraints"]["vram_headroom_bytes"]   # every run records it (records.request_spec)
     latest = max(p.stem for p in (root / "segments").glob("segment-*.json"))
-    budget = quality_terms(run["spec"]["correctness"], amendments(root, latest))[0]
+    budget = user_quality_budget(run["spec"]["correctness"], amendments(root, latest)) or None   # as crit run eval
     try:   # its verdicts are hints (crit_eval.run.precheck), never a gate: reported, the status left alone
         return [{**item, "hint": True} for item in run_precheck(
             Reopening(served, load_json(data / PREPARED), port), run["spec"]["model_path"], data, served.kv_tokens,

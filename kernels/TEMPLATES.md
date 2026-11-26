@@ -17,6 +17,8 @@ kernels/techniques/<family>/<id>/
     torch_binding.cpp, torch_binding.h   the ops (TORCH_LIBRARY_EXPAND / REGISTER_EXTENSION, registration.h)
     <package>/       the Python package plugins import: __init__.py and any Triton modules
   tests/             pytest against the operation's reference, loading the kernel with crit_kernels.build.load
+  tunings/           optional: <capability>.json, sweeps' tables for one compute capability (crit kernels ship;
+                     README.md#shipped-tunings), outside the kernel's source digest
 ```
 
 Families: `projections`, `attention`, `recurrence`, `experts`, `norms`, `starters`.
@@ -40,6 +42,7 @@ technique's algorithm does stays in that technique. A change to the core rebuild
   "title": "one line",
   "package": "decode_gemv",
   "language": "cuda",
+  "launches": ["crit::kernels::decode_gemv::", "_decode_kernel"],
   "operations": ["nvfp4-projection"],
   "sources": ["decode_gemv_cuda/decode_gemv.cu", "decode_gemv_cuda/binding.cu", "torch-ext/torch_binding.cpp"],
   "capabilities": ["8.0", "8.6", "8.9", "9.0", "10.0a", "12.0a"],
@@ -68,6 +71,11 @@ technique's algorithm does stays in that technique. A change to the core rebuild
   and as code in `crit_kernels/contracts.py`). A structure that computes only some of them names those in its own
   `operations` (a page write beside attention readers, a convolution beside scans); CI's `contracts.problems()`
   refuses a kernel that names none or one no technique defines.
+- `launches`: the kernels it launches as a kernel trace names them (`crit eval kernels`, `crit run ... profile`), so
+  `crit kernels rank --trace TRACE` gives each kernel its share of an engine's GPU time and names the kernels that
+  launched nothing: a crit namespace with `::` (every kernel under it), or a name as written (a Triton kernel's
+  function, a CUDA kernel outside crit's namespaces), read without template arguments and anonymous namespaces.
+  `crit_kernels/tests/test_launches.py` holds it to the sources.
 - `language`: `cuda` (compiled with torch's extension builder for the current GPU) or `triton` (no compile step;
   CUDA sources beside the Triton modules: `cuda` below).
   CUDA is the backend built today; another backend adds its language and capability names.
@@ -240,6 +248,7 @@ every read from it (`tcgen05.ld`) has completed.
 ```sh
 crit kernels list
 crit kernels build ID [--tuning FILE] [--arch 80 ...]
+crit kernels rank --trace TRACE                                # which kernels an engine's time went to: sweep those first
 crit kernels sweep ID --model CHECKPOINT --out TUNING_DIR      # or --shapes FILE {structure: [shape, ...]}
 crit kernels gates ID --model CHECKPOINT [--tuning FILE]       # the gates beyond the reference check; --controls
 ```

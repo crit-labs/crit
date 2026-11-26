@@ -45,7 +45,10 @@ crit and put the model's **instance** in its engine package.
 **Kernels are templates.** A technique holds its host reference and its mechanisms; its arithmetic comes from a
 library where one covers it, and otherwise from one of crit's kernel templates (`kernels/techniques/<family>/<id>/`): source
 built for the engine's device, with every constant that only changes speed (warps, tiles, splits, stages) a knob that
-`crit kernels sweep` tunes for the model and GPU. A contribution to a kernel adds a structure or a knob value, never a
+`crit kernels sweep` tunes for the model and GPU. A sweep's picks may ship with the kernel as the table for the
+compute capability it ran on (`crit kernels ship`: `tunings/<capability>.json`, used only on that capability, after an
+engine's own tuning), a measurement and never a default: a table is written from sweeps, not by hand, and names no
+model. A contribution to a kernel adds a structure or a knob value, never a
 constant chosen on one GPU, and never removes a structure because a new one beat it on one GPU: the sweep picks
 between them on each device ([guarding against one GPU](../kernels/README.md#one-gpu)). [Kernels and plugins](PLUGINS.md#kernels-and-plugins) gives the rule: what stays in a
 technique as mechanism, how a plugin declares and loads a kernel with its fallback, and what a technique keeps

@@ -20,10 +20,12 @@ engine's device and shapes. A new GPU generation or backend is a core addition, 
 
 Each technique's speed-only constants (warps, rows a warp owns, tiles, K splits,
 pipeline stages, loads in flight) are knobs. They are source in this folder, one `kernels/techniques/<family>/<id>/` each,
-built and tuned for the engine's device and model; nothing is downloaded or shipped prebuilt. A
+built and tuned for the engine's device and model; nothing is downloaded and no binary is shipped. A
 kernel is only ever fast for one GPU and one model's shapes, so crit ships the structure and lets the sweep find the
 constants: the know-how that is the same on every GPU lives in the template, what differs per GPU and model is
-measured there. Each template is checked against its operation's reference and measured against the best vendor
+measured there. What earlier sweeps measured may travel with a kernel as a [shipped tuning](#shipped-tunings): a
+table per compute capability, used only on GPUs of that capability, so an engine there need not sweep the shapes it
+covers again. Each template is checked against its operation's reference and measured against the best vendor
 or open library at the same arithmetic (its README names the library; in a run, `crit eval status --kernels`). An
 external engine takes a template into its own code: `crit kernels build ID --tuning FILE` builds it and prints the
 package, which it loads with `crit_kernels.build.load`, and `crit kernels sweep` tunes it without any plugin. The
@@ -60,6 +62,7 @@ level 1 for every engine.
 crit kernels list                                        # every kernel: operations, structures, their exactness
 crit kernels build ID                                    # build for this GPU with the default knobs (cached)
 crit kernels sweep ID --model CHECKPOINT --out TUNING    # tune the knobs for a model on this GPU
+crit kernels ship ID --tuning TUNING/ID.json             # merge a finished sweep into the kernel's shipped tuning
 crit kernels gates ID --model CHECKPOINT                 # NaN, repeats, tile edges, FP32 sums, every arch's limits
 crit kernels report --model A --model B --markdown R.md  # every kernel: gates and speed against its library
 "kernel_tuning": "tuning" in configuration.json            # the package's plugins build with its tuning folder
@@ -80,6 +83,24 @@ and given back while the sweep waits on the next build. A library plugin loads a
 kernel as it was hand-tuned, and falls back to its torch path when the kernel cannot be built here (no CUDA toolkit,
 an architecture it does not cover). Builds need torch with CUDA, the CUDA toolkit (nvcc) and ninja; they are cached
 in `CRIT_KERNEL_CACHE` (default `kernels` under `CRIT_CACHE_HOME`, itself `~/.cache/crit` by default).
+
+<a id="shipped-tunings"></a>
+
+**Shipped tunings.** A kernel folder may carry `tunings/<capability>.json` (`tunings/12.0.json`: swept on GPUs of
+compute capability 12.0), the tables earlier sweeps wrote, keyed by each structure's shape key (`weights`, `N`, `K`),
+never by a model, each entry naming the sweep it came from: the kernel source digest, the GPU, its capability and the
+day ([crit_kernels/shipped.py](crit_kernels/shipped.py)). On a GPU of that capability every build takes, per
+structure and shape, the engine's own tuning first (given, or its tuning folder), then the table, then the default
+knobs: an engine whose tuning lacks a shape gets the table's entry for it, and a plugin's record says `tuned` with the
+table under `shipped`. On any other GPU, or without a table, nothing changes. `crit kernels sweep` leaves out the
+shapes the table covers (it says how many, and writes their entries and report rows into its tuning and report, so
+the engine's tuning file stays complete; `--no-shipped` sweeps them too), and builds nothing where it covers every
+shape. Tables come from sweeps only: `crit kernels ship ID --tuning TUNING/ID.json` merges a finished sweep (and the
+report beside it) into the table for its capability, an entry swept on the current kernel source winning over one
+from an earlier source, else the later sweep. A table outlives edits to its kernel as an engine's tuning does: a
+retired structure's entries move (`retire`), a knob added since takes its default, and a knob or value removed since
+fails the kernel tests' check of every table against its kernel.json (a build ignores such a table with a warning,
+and `crit kernels ship` drops those entries).
 
 **Contributing.** A kernel template is welcome where an operation lacks one, and so is a new structure in an
 existing kernel (a faster tile shape, another split, a fused path) or a knob value the sweep should try, when it meets
@@ -155,7 +176,7 @@ GPU decide the rest:
 
 | What was found on one GPU | Where it goes | Never |
 | --- | --- | --- |
-| A faster warp count, tile, split or stage count | A knob value; the sweep picks it per GPU and shape | A constant, or a default other GPUs inherit as their tuning |
+| A faster warp count, tile, split or stage count | A knob value; the sweep picks it per GPU and shape, and a sweep's picks may ship as the table for its compute capability (`crit kernels ship`) | A constant, or a default other GPUs inherit as their tuning |
 | A device limit (shared memory a block, registers, SMs) | Read from the device (`crit_kernels.gates.shared_memory_optin()`, the device's properties) | One GPU's figure written into a kernel or a bench's `valid()` |
 | An instruction one GPU generation has (block-scaled FP4/FP8 MMA, TMA, hardware E2M1 conversion) | Behind a feature check (`crit_kcore/arch.cuh`'s `CRIT_KCORE_HAS_*`, or a probe), with the path for the other GPUs beside it | The only path; a dispatch on one GPU's name |
 | A new way of computing an operation that wins | A new structure beside the ones it beat; the sweep chooses between them on every GPU | Rewriting or removing the structure it beat |
@@ -168,6 +189,10 @@ What enforces it:
   another compute capability is not applied: the kernel builds with its default knobs, its record in the engine's
   facts says `built` with the reason, and stderr says so once. Given explicitly (`crit kernels build --tuning`,
   `gates --tuning`), it is used with a warning.
+- **A shipped tuning is a measurement on one compute capability.** A kernel's `tunings/<capability>.json`
+  ([shipped tunings](#shipped-tunings)) applies only on GPUs of the capability its file names, after the engine's own
+  tuning; every other GPU builds with the default knobs and sweeps as before. It is written by `crit kernels ship`
+  from sweeps, never by hand, and never becomes a knob's default in kernel.json or a constant in a kernel.
 - **The fallback path is tested on the reference GPU.** A structure with an architecture-specific path proves the
   path the other GPUs run on the reference GPU too, against the same reference: a build for the plain target
   (decode-gemv's plain sm_120 variant without the hardware E2M1 conversion), a software decode beside the hardware one,

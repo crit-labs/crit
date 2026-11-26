@@ -212,6 +212,27 @@ def causal(ctx):
     return "passed", f"{len(lengths)} prefixes ({lengths[0]} to {lengths[-1]} tokens) match the whole prompt"
 
 
+# The levels at which a plugin's prompt row has the bits of the same row decoded (crit_plugins.exactness): a plugin
+# whose prompt rows sit below them computes prompt and decode rows in two arithmetics.
+DECODE_BITS = ("exact", "declared")
+
+
+def rounding_suspects(facts):
+    """For a decode gap that is rounding: the plugins whose prompt rows run another arithmetic than their decode rows
+    (the engine's facts' exactness.plugins, prompt below exact), the only places decode can round otherwise than
+    prefill. Each is served in turn with its prompt rows on its decode arithmetic, or its decode on its prompt's, to
+    find the one ("" when the facts name none)."""
+    plugins = ((facts.get("exactness") or {}).get("plugins") or {})
+    found = sorted(plugin for plugin, levels in plugins.items()
+                   if isinstance(levels, dict) and levels.get("prompt") not in DECODE_BITS)
+    if not found:
+        return ""
+    return ("; the plugins whose prompt rows run another arithmetic than their decode rows (prompt below exact): "
+            + ", ".join(found) + ". Serve each in turn with the options that put its prompt and decode rows on one "
+            "arithmetic (crit run ... ablate --smoke-test decode_matches_prefill --set PLUGIN.OPTION=VALUE) to find "
+            "the one the gap grows in")
+
+
 def rounding_or_fault(ctx, prompt, continuation, expected):
     """Why a decode comparison failed, for its item: on an engine whose facts say decode_via_prompt, the same tokens
     decoded again with the decode rows through the model's prompt arithmetic (each a one-token prompt chunk, the same
@@ -227,7 +248,8 @@ def rounding_or_fault(ctx, prompt, continuation, expected):
     ok, summary = compare(rows, expected, ctx.prompt_tolerance)
     if ok:
         return (f"; rounding: decoded through the prompt path the rows match prefill ({summary}), so the gap is the "
-                "decode arithmetic's (GEMV against GEMM, another reader), not the KV cache, positions or masking")
+                "decode arithmetic's (GEMV against GEMM, another reader), not the KV cache, positions or masking"
+                + rounding_suspects(ctx.client.facts()))
     return (f"; fault: decoded through the prompt path the rows still move ({summary}): KV cache writes or reads, "
             "positions or masking, which decode shares with it")
 

@@ -35,6 +35,11 @@ def run(module, rows, tokens, codes, scales, act_codes, act_scales):
     staged = torch.zeros_like(prompt)
     module.gemm_staged(table, module.gemm_jobs([(0, 0, tokens)], dev), rows, tokens, act_codes, act_scales, 32, staged)
     assert torch.equal(staged.view(torch.int32), prompt.view(torch.int32))   # the staged GEMM: the same bits
+    visit_codes, visit_scales = module.to_visit_order(act_codes, act_scales)
+    staged.zero_()
+    module.gemm_staged(table, module.gemm_jobs([(0, 0, tokens)], dev), rows, tokens, visit_codes, visit_scales, 32,
+                       staged, order=module.VISIT)
+    assert torch.equal(staged.view(torch.int32), prompt.view(torch.int32))   # and on its visit-order activations
     return decode, prompt, again
 
 
@@ -51,9 +56,11 @@ def test_every_knob_setting_gives_the_default_bits():
             {"WARPS": 4, "TILES": 2, "UNROLL": 4}]
     staged = [{"BM": 32, "BN": 16, "WM": 2, "WN": 1, "GROUP": 1, "RUN": 1},
               {"BM": 64, "BN": 64, "WM": 2, "WN": 2, "GROUP": 2, "RUN": 2},
-              {"BM": 128, "BN": 32, "WM": 4, "WN": 2, "GROUP": 1, "RUN": 2}]
+              {"BM": 128, "BN": 32, "WM": 4, "WN": 2, "GROUP": 1, "RUN": 2},
+              {"BM": 128, "BN": 64, "WM": 4, "WN": 2, "GROUP": 2, "RUN": 1},
+              {"BM": 64, "BN": 128, "WM": 2, "WN": 4, "GROUP": 2, "RUN": 2, "STAGES": 3}]
     other = load("fp8-block-rows", configs={"rows": rows, "gemm": gemm, "gemm-staged": staged})   # defaults: index 0
-    for index in range(1, max(len(rows), len(gemm)) + 1):
+    for index in range(1, max(len(rows), len(gemm), len(staged)) + 1):
         select(other, "rows", min(index, len(rows)))
         select(other, "gemm", min(index, len(gemm)))
         select(other, "gemm-staged", min(index, len(staged)))
@@ -61,9 +68,8 @@ def test_every_knob_setting_gives_the_default_bits():
         assert torch.equal(d.view(torch.int32), decode.view(torch.int32)), index
         assert torch.equal(p.view(torch.int32), prompt.view(torch.int32)), index
     # rows forward to decode-gemv's rows-fp8-block, and select() follows: a configuration it does not hold is refused
-    select(other, "rows", len(rows) + 1)
-    with pytest.raises(RuntimeError):
-        run(other, *data)
+    with pytest.raises(IndexError):
+        select(other, "rows", len(rows) + 1)
     select(other, "rows", -1)
 
 
@@ -204,3 +210,83 @@ def test_the_quantized_values_are_the_codes_times_their_scales():
             want = (codes.view(torch.float8_e4m3fn).float().view(19, -1, group) * scales[..., None]).view(19, 704)
             found = fb.quantized_values(x, group, kind)
             assert found.dtype == torch.bfloat16 and torch.equal(found, want.to(torch.bfloat16)), (dtype, kind, group)
+
+
+@pytest.mark.parametrize("cols,group,kind", [(704, 32, 0), (768, 128, 1), (2560, 128, 1)])
+def test_the_visit_order_quantizer_writes_the_plain_codes_in_the_visit_order(cols, group, kind):
+    """quantize(order=VISIT): the plain quantizer's codes with each row's blocks of 32 moved to their visit positions
+    (a permutation of the blocks, whatever the lanes' block counts), and its scales transposed."""
+    g = torch.Generator().manual_seed(cols)
+    x = torch.randn(37, cols, generator=g).to(dev, torch.bfloat16)
+    codes, scales = fb.quantize(x, group, kind)
+    visit_codes, visit_scales = fb.quantize(x, group, kind, order=fb.VISIT)
+    want_codes, want_scales = fb.to_visit_order(codes, scales)
+    assert sorted(fb.visit_positions(cols)) == list(range(cols // 32))
+    assert torch.equal(visit_codes, want_codes) and torch.equal(visit_scales.view(torch.int32), want_scales.view(torch.int32))
+
+
+@pytest.mark.parametrize("scale_rows", [128, 48, 1])
+def test_the_staged_gemm_on_block_scales_gives_gemms_bits(scale_rows):
+    """An FP8 block checkpoint's layout (FP32 scales per scale_rows x 128, activations per 128 by the amax quantizer):
+    the staged GEMM, its CTAs' rows on one scale row (128: their scale products shared) or on several, gives the
+    register GEMM's bits on the plain and on the visit-order activations, at a K whose lanes have unequal blocks."""
+    g = torch.Generator().manual_seed(scale_rows)
+    rows, cols, tokens = 200, 2432, 150
+    codes = torch.randint(0, 0x7E, (rows, cols), dtype=torch.uint8, generator=g)
+    codes = (codes | (torch.randint(0, 2, (rows, cols), generator=g) * 0x80).to(torch.uint8)).to(dev)
+    scales = (torch.rand(-(-rows // scale_rows), cols // 128, generator=g) * 2e-3 + 1e-4).to(dev)
+    table = fb.matrix_table([(codes, scales, scale_rows, 128, 1.0)])
+    x = (torch.randn(tokens, cols, generator=g) * 3).to(dev, torch.bfloat16)
+    act_codes, act_scales = fb.quantize(x, 128, fb.AMAX)
+    jobs = fb.gemm_jobs([(0, 0, tokens)], dev)
+    prompt = torch.zeros(tokens, rows, device=dev)
+    fb.gemm(table, jobs, rows, tokens, act_codes, act_scales, 128, prompt)
+    staged = torch.zeros_like(prompt)
+    fb.gemm_staged(table, jobs, rows, tokens, act_codes, act_scales, 128, staged)
+    assert torch.equal(staged.view(torch.int32), prompt.view(torch.int32))
+    visit_codes, visit_scales = fb.quantize(x, 128, fb.AMAX, order=fb.VISIT)
+    staged.zero_()
+    fb.gemm_staged(table, jobs, rows, tokens, visit_codes, visit_scales, 128, staged, order=fb.VISIT)
+    assert torch.equal(staged.view(torch.int32), prompt.view(torch.int32))
+
+
+@pytest.mark.parametrize("cols,scale_rows,scale_k", [(704, 1, 32), (2432, 128, 128), (2560, 48, 128)])
+def test_weights_in_the_visit_order_give_the_plain_layouts_bits(cols, scale_rows, scale_k):
+    """A matrix stored once in the visit order (to_visit_weights, matrix_table order VISIT): the decode rows, the
+    register GEMM and the staged GEMM (plain and visit-order activations) give the plain layout's bits, at a K whose
+    lanes have unequal blocks (704: 22 blocks) and with E8M0 or FP32 block scales; the native GEMMs refuse it."""
+    g = torch.Generator().manual_seed(cols)
+    rows, tokens = 136, 37
+    codes = torch.randint(0, 0x7E, (rows, cols), dtype=torch.uint8, generator=g)
+    codes = (codes | (torch.randint(0, 2, (rows, cols), generator=g) * 0x80).to(torch.uint8)).to(dev)
+    if scale_k == 32:
+        scales = torch.randint(120, 134, (rows, cols // 32), dtype=torch.uint8, generator=g).to(dev)
+        group, kind = 32, fb.MX
+    else:
+        scales = (torch.rand(-(-rows // scale_rows), cols // scale_k, generator=g) * 2e-3 + 1e-4).to(dev)
+        group, kind = 128, fb.AMAX
+    visit_codes = fb.to_visit_weights(codes)
+    pos = fb.visit_positions(cols)
+    assert torch.equal(visit_codes.view(rows, -1, 32)[:, pos], codes.view(rows, -1, 32))
+    plain = fb.matrix_table([(codes, scales, scale_rows, scale_k, 1.0)])
+    visit = fb.matrix_table([(visit_codes, scales, scale_rows, scale_k, 1.0, fb.VISIT)])
+    x = (torch.randn(tokens, cols, generator=g) * 3).to(dev, torch.bfloat16)
+    act_codes, act_scales = fb.quantize(x, group, kind)
+    vac, vas = fb.quantize(x, group, kind, order=fb.VISIT)
+    jobs = fb.gemm_jobs([(0, 0, tokens)], dev)
+    want = torch.zeros(tokens, rows, device=dev)
+    fb.gemm(plain, jobs, rows, tokens, act_codes, act_scales, group, want)
+    got = torch.zeros_like(want)
+    fb.gemm(visit, jobs, rows, tokens, act_codes, act_scales, group, got)
+    assert torch.equal(got.view(torch.int32), want.view(torch.int32))
+    for codes_, scales_, order in ((act_codes, act_scales, fb.PLAIN), (vac, vas, fb.VISIT)):
+        got.zero_()
+        fb.gemm_staged(visit, jobs, rows, tokens, codes_, scales_, group, got, order=order)
+        assert torch.equal(got.view(torch.int32), want.view(torch.int32)), order
+    row_jobs = fb.row_jobs([(0, list(range(t, min(t + 8, tokens))), list(range(t, min(t + 8, tokens))))
+                            for t in range(0, tokens, 8)], dev)
+    decode = torch.zeros_like(want)
+    fb.rows(visit, row_jobs, rows, act_codes, act_scales, group, decode)
+    assert torch.equal(decode.view(torch.int32), want.view(torch.int32))
+    with pytest.raises(ValueError):
+        fb.gemm_native(visit, jobs, rows, tokens, act_codes, act_scales, group, torch.zeros_like(want), mx=False)

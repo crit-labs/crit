@@ -63,6 +63,10 @@ Use github.com/crit-labs/crit to optimize my own inference engine in <engine_ref
 > apply what works to your model and hardware quickly. Each strategy is a plugin with its own tests,
 > and an ablation switches each one off to measure what it adds to your engine.
 
+**Its own kernels, tuned for your GPU and model ⚡** 
+> A kernel is only ever fastest for one GPU and one model. To solve this, `crit` ships its kernels
+> as templates built from a shared core and tunes them on your machine.
+
 **Physics-based evaluation suite 🔬** 
 > A benchmark score alone doesn't tell
 > you what's still left on the table. `crit` measures your hardware's limits and shows
@@ -76,8 +80,9 @@ Use github.com/crit-labs/crit to optimize my own inference engine in <engine_ref
 > The engines of these case studies are plugin packages built with `crit`'s plugin architecture, on `crit`'s main after
 > 0.18.0, and are on [`crit-hub`](https://github.com/crit-labs/crit-hub) as
 > [`crit-labs/mtp5-nvfp4-drafts`](https://github.com/crit-labs/crit-hub/tree/main/engines/crit-labs/mtp5-nvfp4-drafts),
-> [`crit-labs/mtp3-exact-prompt-rows`](https://github.com/crit-labs/crit-hub/tree/main/engines/crit-labs/mtp3-exact-prompt-rows) and
-> [`crit-labs/block-drafter-fp4-experts`](https://github.com/crit-labs/crit-hub/tree/main/engines/crit-labs/block-drafter-fp4-experts).
+> [`crit-labs/mtp3-exact-prompt-rows`](https://github.com/crit-labs/crit-hub/tree/main/engines/crit-labs/mtp3-exact-prompt-rows),
+> [`crit-labs/block-drafter-fp4-experts`](https://github.com/crit-labs/crit-hub/tree/main/engines/crit-labs/block-drafter-fp4-experts) and
+> [`crit-labs/ranked-expert-cache-mtp3`](https://github.com/crit-labs/crit-hub/tree/main/engines/crit-labs/ranked-expert-cache-mtp3).
 
 We gave `Claude Opus 5.5` a target LLM along with the `crit` repository and let it cook autonomously.
 
@@ -89,7 +94,8 @@ We gave `Claude Opus 5.5` a target LLM along with the `crit` repository and let 
 | **New architectures** | crit had no model plugin for Qwen3.8's hybrid gated-delta layout; each agent wrote its own and ran it on crit's library plugins. Inkling-2-Mini's looped mixture-of-experts decoder went further: its model plugin, model techniques and kernels were built into crit's library first, for any model that has them |
 | **Every step is evidence** | Each candidate is sealed with its exact source and its Eval result, so the tables below are a record, not a recollection |
 | **Honest about what is left** | Decode runs at 65% of the ceiling Eval measures for it, prefill at 43%; Eval reports each gap next to the score |
-| **Next** | Gemma 4 31B (dense), and Qwen3.8-Flash-Next and Nemotron 3.5 Super 120B, mixture-of-experts models larger than VRAM |
+| **Larger than VRAM** | Qwen3.8-Flash-Next's 117 GB checkpoint on the 32 GB GPU: 108.3 tok/s sampled decode at 200,000 tokens, its 65 GB of routed experts in host memory behind a device cache, from crit's library as released |
+| **Next** | Gemma 4 31B (dense) and Nemotron 3.5 Super 120B, a mixture-of-experts model larger than VRAM |
 
 > [!CAUTION]
 > These engines were built with a limited candidate budget and a limited time budget. They show what crit reaches on
@@ -406,6 +412,109 @@ output.
   greedy decoding token for token.
 - **Concurrency:** 180 tok/s with one client, 252 tok/s with two together, 230 tok/s with four
 - **What is left:** a model pass takes 11.5 ms against its 3.1 ms bandwidth floor (the looped span runs 12 layers three times; 2.0x on decode); the CUDA prompt chunk with the distance bias, off while a prefix's rows follow the prompt's length in the plugin path, about 15% on prefill
+
+</details>
+
+---
+
+<details>
+<summary><strong>📋 [Qwen architecture] MoE larger than VRAM</strong></summary>
+
+<br />
+
+**Goal:** Serve a mixture-of-experts checkpoint almost four times larger than the GPU's memory, fast, with crit as released.
+**Limit:** A fixed candidate budget of five, crit's own defaults for every term but the quality mode.
+
+<div align="center">
+<table>
+  <tr>
+    <td align="center" width="16%">
+      <strong>
+
+13h 7m</strong>
+
+Development time
+    </td>
+    <td align="center" width="16%">
+      <strong>
+
+108.3 tok/s</strong>
+
+Sampled decode
+    </td>
+    <td align="center" width="16%">
+      <strong>
+
+1,487 tok/s</strong>
+
+Prefill
+    </td>
+    <td align="center" width="16%">
+      <strong>
+
+1.56 s</strong>
+
+TTFT
+    </td>
+    <td align="center" width="16%">
+      <strong>
+
++9.5%</strong>
+
+Perplexity vs reference
+    </td>
+    <td align="center" width="16%">
+      <strong>
+
+0.18</strong>
+
+Mean KL divergence
+    </td>
+  </tr>
+</table>
+</div>
+
+<br />
+
+`ranked-expert-cache-mtp3`
+runs Qwen3.8-Flash-Next on one 32 GB RTX 5090 with 200,000 tokens of context, in the `speed` quality mode, from
+NVIDIA's FP4-Local checkpoint: 117 GB on disk, with 512 routed experts of which 10 a token in NVFP4, MXFP8 attention
+and gated-delta projections, a 30 GB NVFP4 n-gram table and an MTP layer. Its 48 layers mix gated-delta and sparse
+attention, over gated residual streams.
+
+The agent started from crit 0.23.0 and added no model support: the model plugin `qwen4-exp-model` and every other
+plugin come from crit's library. The 65 GB of routed experts live in host memory behind an elastic device cache of
+about 8,200 slots (`expert-offload`, ranked policy), started from a residency profile it recorded on a corpus it
+wrote for the run, with misses copied over the PCIe link by a fill kernel on 128 blocks. The n-gram and embedding
+tables are read as file rows off the device. The checkpoint's MTP layer drafts three tokens a round inside Core's
+captured rounds, with rejection sampling on the device, and prompts run in 2,048-token chunks layer by layer.
+
+Two findings shaped it. On the whole checkpoint, the library's default prompt rows drifted 0.60 nats from decode over
+48 layers, which crit smoke caught; an ablation traced it to the projections' prompt GEMMs summing in another order
+than their decode kernels, and the engine runs those prompt rows on the decode tile. Keeping fewer of each token's
+routes was the largest decode lever, and it spends the quality budget: 6 of 10 routes use 62% of it.
+
+| Candidate | What changed | Sampled decode | Prefill | TTFT | Eval |
+| --- | --- | ---: | ---: | ---: | --- |
+| 1 | Experts in host memory behind the device cache, tables as file rows, MTP drafts | | | | serve check |
+| 2 | The plugin round: fused norms, file-backed tables, elastic recurrent states | 64.7 | 819 | 2,684 | small |
+| 3 | The ranked policy with a 128-block fill kernel, 2,048-token prompt chunks, kernel tuning | 80.4 | 1,481 | 1,846 | medium |
+| 4 | 7 of 10 routes; only the projections' prompt rows on the decode tile | 96.8 | 1,636 | 1,545 | medium |
+| 5 | 6 of 10 routes, the cache started from a residency profile | 108.3 | 1,487 | 1,556 | certified, all gates pass |
+
+The run took 13h 7m from its first command to the selected engine, eleven sealed candidates for the five rungs
+(rebuilds after fixes), $52 at API list prices. On the way it fixed three bugs in crit, each with a test: two in
+library plugins, which the engine's own copies carry, so it runs on crit 0.23.0 as released, and one in a kernel's
+sweep bench. Its result qualifies for the closed track: the mode's protocol budget, one engine load and the
+checkpoint's own draft layer as the only drafter.
+
+Measured with `crit-eval` (`crit-eval-v0.8.1`) at 200,000 tokens of context. Decode is sampled at the model's own
+settings (temperature 1.0, top_p 0.95, top_k 20), the geometric mean over Eval's speed cases; Eval decodes each engine's own output.
+
+- **Long context:** 91 tok/s decode at 32K and 70 tok/s at 200,000 tokens; a full 200,000-token prompt reaches its first token in 78 s; held-out prompts in other languages and code decode at 73 tok/s
+- **Quality:** the worst path (a 32,768-token text's prompt rows) uses 62% of the drift budget; drafted greedy replies match plain greedy decoding token for token
+- **Concurrency:** 62 tok/s with one client, 77 tok/s with two, 83 tok/s with four: every client's rows add expert misses over the same link
+- **What is left:** a model pass takes 25.7 ms against a 5.1 ms floor priced from host memory at a 91% cache hit rate; a freshly opened engine needs its first requests to settle (decode rises 18% to 103%); Eval projects +48% decode from a drafter whose later drafts hold their acceptance
 
 </details>
 

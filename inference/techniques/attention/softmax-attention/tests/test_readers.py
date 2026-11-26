@@ -180,6 +180,36 @@ class ReaderAgreementTests(PluginTestCase):
                 decoded = self.step(attention, pool, [("a", 600 + at, 1)])
                 self.assertLess(float((decoded.float() - prompt[at:at + 1].float()).abs().max()), 1.6e-2, dtype)
 
+    def test_a_short_prompt_chunk_has_the_bits_of_the_same_rows_in_a_longer_chunk(self):
+        # prompt_reader "prefill" keeps its prompt rows row-exact: a prompt chunk of up to the pool's window (16
+        # tokens) that the model marks a prompt chunk reads through the prompt reader too, not as a window row (the
+        # decode reduction), so a short prompt's rows are those of the same rows in a longer one, as at a chunk's end.
+        torch = self.torch
+        kv, attention = self.engine(prompt_reader="prefill")
+        if attention.device_form.kernels is None:
+            self.skipTest("crit's split-KV reader does not load here")
+        self.assertEqual(attention.device_form.exactness()["prompt"], "row-exact")
+
+        def chunk(pool, sequence, prefix, count):
+            batch = StepBatch.build([(sequence, prefix, count)], "cuda")
+            batch.prompts = frozenset({0})
+            positions = list(range(prefix, prefix + count))
+            pool.write(0, pool.reserve(batch), *self.kv(positions))
+            return attention.forward(0, self.q(positions), pool, batch)
+        for dtype in ("bf16", "fp8:row"):
+            for prefix in (0, 600):
+                pool = self.pool(kv, dtype)
+                for sequence in ("long", "short"):
+                    pool.open(sequence)
+                    if prefix:
+                        self.step(attention, pool, [(sequence, 0, prefix)])
+                        pool.keep(sequence, prefix)
+                whole = chunk(pool, "long", prefix, CHUNK)
+                for count in (2, 5, 9, 16):
+                    part = chunk(pool, "short", prefix, count)
+                    self.assertTrue(torch.equal(part, whole[:count]),
+                                    (dtype, prefix, count, float((part.float() - whole[:count].float()).abs().max())))
+
     def test_the_facts_state_the_honesty_class(self):
         facts = self.engine()[1].facts()
         self.assertEqual(facts["served_vs_scored"], "exact")

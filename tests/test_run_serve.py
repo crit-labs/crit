@@ -129,6 +129,11 @@ class CoreItemsTests(unittest.TestCase):
         self.assertIn("1 segments that left less free than the VRAM headroom", broken["detail"])
         self.assertIn("least free 100 MiB", broken["detail"])
         self.assertIn("refused", self.items(steps(refused=1))["step_memory"]["detail"])
+        # A step past the arena names the most each kind of step took, largest first, over every load.
+        kinds = self.items(steps(overflows=1, most={"decode": 100 << 20, "prompt": 900 << 20}),
+                           steps(most={"prompt": 1200 << 20, "score": 300 << 20}))["step_memory"]["detail"]
+        self.assertIn("the most a step took, by kind: prompt 1,200 MiB, score 300 MiB, decode 100 MiB", kinds)
+        self.assertNotIn("by kind", clean["detail"])
 
     def test_step_memory_sets_aside_memory_other_programs_took(self):
         # Another program took 200 MiB of the card while the engine served: the device read 237 MiB left after a

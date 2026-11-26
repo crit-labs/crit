@@ -324,7 +324,9 @@ def device_missing(slot, plugin):
 class StepBatch:
     """One step's tokens for the device plugins: `sequences` (one per row), `starts` (the first token of each row,
     rows + 1 entries, the last the token count) and `positions` (each token's position in its sequence), on the host
-    as lists and on the device as tensors (`starts_t` int32, `positions_t` int64, `rows_t` int64: each token's row)."""
+    as lists and on the device as tensors (`starts_t` int32, `positions_t` int64, `rows_t` int64: each token's row).
+    `prompts`: the rows that are prompt chunks, where the model says which (its row groups; prompt_row()), None
+    where it does not."""
     sequences: list
     starts: list
     positions: list
@@ -332,6 +334,7 @@ class StepBatch:
     starts_t: object = field(default=None, repr=False)
     positions_t: object = field(default=None, repr=False)
     rows_t: object = field(default=None, repr=False)
+    prompts: object = field(default=None, repr=False)
 
     @classmethod
     def build(cls, rows, device):
@@ -363,6 +366,14 @@ class StepBatch:
         """(sequence, first token, token count, first position) of row r."""
         first = self.starts[r]
         return self.sequences[r], first, self.starts[r + 1] - first, self.positions[first]
+
+    def prompt_row(self, r, window):
+        """Whether row r is a prompt chunk: one the model marked (prompts), else, where it marked none, one of more
+        than `window` tokens. A plugin that reads short rows as decode rows (a kv_cache's window rows) asks this, so
+        a short prompt chunk keeps the prompt rows' arithmetic, the bits of the same rows in a longer chunk."""
+        if self.prompts is not None:
+            return r in self.prompts
+        return self.starts[r + 1] - self.starts[r] > window
 
     # A StepBatch is built on the host for one step; a RoundBatch (below) lives on the device for captured rounds and
     # a PromptBatch for captured prompt chunks.
