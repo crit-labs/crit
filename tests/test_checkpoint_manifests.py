@@ -52,7 +52,7 @@ class LayerCutTests(unittest.TestCase):
         import json
         import os
         import struct
-        from support import layer_cut
+        from crit.preflight import cut as layer_cut
 
         def shard(path, tensors):
             entries, data = {}, b""

@@ -40,7 +40,10 @@ class CatalogTests(unittest.TestCase):
                 used = ({spec["block"] for spec in layout["mixers"].values()}
                         | {spec["block"] for spec in layout.get("before", [])}
                         | {layout.get("residual", {}).get("block", "pre-norm"), layout.get("ffn", {}).get("block", "auto")})
-                self.assertEqual(used - provided, set())   # a shipped plugin composes library techniques only
+                own = {name for piece in plugin["pieces"] for names in piece["provides"].values() for name in names}
+                # a shipped plugin composes library techniques and its family's own
+                self.assertEqual(used - provided - own, set())
+                self.assertFalse(own & provided)
         served = [t for plugin in shipped for t in plugin["model_types"]]
         self.assertEqual(len(served), len(set(served)))   # one finished plugin a model type
         self.assertIn("pre-norm", provided)
@@ -186,6 +189,24 @@ class ConfigTests(unittest.TestCase):
 
 
 @unittest.skipIf(torch is None, "torch and transformers")
+class FamilyReadsTests(unittest.TestCase):
+    def test_inspect_counts_a_familys_own_techniques_and_never_a_companion_drafters_reads(self):
+        # a finished model plugin's own techniques count as the library's do; a technique whose reads are a companion
+        # drafter folder's (reads_of companion: Gemma 4's assistant drafter) is not matched against the target
+        import tempfile
+        from support.tiny_checkpoints import checkpoint
+        with tempfile.TemporaryDirectory() as temp:
+            gemma = checkpoint("windows", Path(temp) / "gemma")
+            if gemma is None:
+                self.skipTest("transformers lacks the Gemma 4 architecture")
+            found = models.inspect(gemma)
+        families = {entry["id"]: entry for entry in models.family_techniques(ROOT / "models/cache/gemma4-model")}
+        self.assertEqual(families["assistant-drafter"]["reads_of"], "companion")
+        self.assertNotIn("assistant-drafter", found["techniques"])
+        listed = [entry["id"] for entry in models.family_techniques(ROOT / "models/cache/gemma4-model")]
+        self.assertIn("shared-kv-attention", listed)
+
+
 class TinyTests(unittest.TestCase):
     def test_a_tiny_checkpoint_inspects_and_its_composed_engine_scores_as_its_reference(self):
         if os.environ.get("CRIT_CORE_STEP_LIBRARY") is None and not (ROOT / "build").is_dir():
@@ -207,6 +228,45 @@ class TinyTests(unittest.TestCase):
             self.addCleanup(building.doCleanups)
             compared = models.diff(tiny, plugin=building.built("qwen3", mixer=OWN_MIXER))
             self.assertIsNone(compared["first_divergent"], compared)
+
+
+@unittest.skipIf(transformers is None or not hasattr(transformers, "Gemma4AssistantForCausalLM"),
+                 "transformers with Gemma4AssistantForCausalLM")
+class TinyCompanionTests(unittest.TestCase):
+    def test_tiny_shrinks_the_companion_beside_it_and_diff_plans_it_as_the_draft_head(self):
+        if os.environ.get("CRIT_CORE_STEP_LIBRARY") is None and not (ROOT / "build").is_dir():
+            from crit_plugins.testing import unchecked
+            raise unchecked("Core's runtime (crit core build), which the composed engine runs on")
+        text = dict(vocab_size=512, vocab_size_per_layer_input=512, hidden_size=256, intermediate_size=512,
+                    num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2, head_dim=32,
+                    global_head_dim=64, num_global_key_value_heads=1, attention_k_eq_v=True, sliding_window=24,
+                    layer_types=["sliding_attention", "full_attention"] * 2, enable_moe_block=False,
+                    hidden_size_per_layer_input=0, max_position_embeddings=2048, tie_word_embeddings=True,
+                    pad_token_id=0, eos_token_id=1, bos_token_id=2,
+                    rope_parameters={"full_attention": {"partial_rotary_factor": 0.25, "rope_theta": 1000000.0,
+                                                        "rope_type": "proportional"},
+                                     "sliding_attention": {"rope_theta": 10000.0, "rope_type": "default"}})
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "downloads" / "model"
+            transformers.Gemma4TextConfig(**text).save_pretrained(source)
+            drafter = dict(text, hidden_size=128, num_hidden_layers=2, layer_types=["sliding_attention",
+                                                                                    "full_attention"],
+                           num_kv_shared_layers=2, vocab_size_per_layer_input=0)
+            transformers.Gemma4AssistantConfig(text_config=transformers.Gemma4TextConfig(**drafter),
+                                               backbone_hidden_size=256).save_pretrained(source.parent / "assistant")
+            self.assertEqual(models.companions_near(source), [source.parent / "assistant"])
+            tiny = models.tiny(source, Path(folder) / "tiny" / "model")
+            shrunk = json.loads((tiny.parent / "model-companion" / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(shrunk["backbone_hidden_size"], models.TINY["hidden_size"])
+            self.assertEqual(shrunk["model_type"], "gemma4_assistant")
+            compared = models.diff(tiny)
+            self.assertIsNone(compared["first_divergent"], compared)
+            self.assertEqual(Path(compared["companion"]["folder"]).resolve(), (tiny.parent / "model-companion")
+                             .resolve())
+            self.assertGreater(compared["companion"]["bytes_per_step"], 0)
+            # --no-companion: none written
+            plain = models.tiny(source, Path(folder) / "plain" / "model", companion=False)
+            self.assertFalse((plain.parent / "model-companion").exists())
 
 
 if __name__ == "__main__":

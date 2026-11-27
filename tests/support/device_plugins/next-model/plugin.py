@@ -20,7 +20,7 @@ import json
 from crit_core.batch import DECODE, PREFILL, StepLayout, step_item
 from crit_core.native import Scores, StepResult
 from crit_plugins import StepBatch
-from crit_plugins.device import DECODE_ROWS, free_device_bytes
+from crit_plugins.device import DECODE_ROWS, free_device_bytes, row_groups
 from crit_plugins.prompt_cache import PromptCache
 
 CORE_SAMPLING = ("temperature", "top_p", "top_k", "min_p", "seed")
@@ -140,28 +140,17 @@ class NextModel:
 
     @staticmethod
     def _groups(batch):
-        """The token ranges the batch's matrices multiply apart: each prompt chunk alone, one-token rows (decode rows,
-        a round's columns) DECODE_ROWS at a time, so every row's bits are those it has alone whatever shares the step."""
-        if batch.round:
-            return [(first, min(first + DECODE_ROWS, batch.tokens)) for first in range(0, batch.tokens, DECODE_ROWS)]
-        groups, run = [], None
-        for r in range(batch.rows):
-            first, end = batch.starts[r], batch.starts[r + 1]
-            if end - first > 1:
-                groups.append((first, end))
-                run = None
-            elif run is not None and run[1] == first and run[1] - run[0] < DECODE_ROWS:
-                run = groups[-1] = (run[0], end)
-            else:
-                run = (first, end)
-                groups.append(run)
-        return groups
+        """The token ranges the batch's matrices multiply apart, by each row's phase (crit_plugins.device.row_groups):
+        each prompt chunk alone however short, decode tokens (decode rows, verify windows, a round's columns)
+        DECODE_ROWS at a time, so every row's bits are those it has alone whatever shares the step."""
+        return row_groups(batch, DECODE_ROWS)   # (first, end, prompt): each call its rows' phase
 
     def _mm(self, x, matrix):
         groups = self.groups
         if len(groups) == 1:
-            return self.proj.matmul(x, matrix)
-        return self.torch.cat([self.proj.matmul(x[first:end], matrix) for first, end in groups])
+            return self.proj.matmul(x, matrix, prompt=groups[0][2])
+        return self.torch.cat([self.proj.matmul(x[first:end], matrix, prompt=prompt)
+                               for first, end, prompt in groups])
 
     def _linear(self, i, h, batch):
         torch, t, b = self.torch, h.shape[0], self.blocks[i]
@@ -224,7 +213,8 @@ class NextModel:
             return torch.zeros(0, self.vocabulary, dtype=torch.float32, device=self.device)
         rows = torch.tensor(logit_rows, dtype=torch.int64, device=self.device)
         # Each logits row alone: a prompt's last row, a decode row and a round's column multiply the head the same way.
-        return torch.cat([self.proj.matmul(h[rows[j:j + 1]], self.head) for j in range(len(logit_rows))]).float()
+        return torch.cat([self.proj.matmul(h[rows[j:j + 1]], self.head, prompt=False)   # a logits row a call
+                          for j in range(len(logit_rows))]).float()
 
     def verify(self, view, batch):
         """The round's target pass (crit_plugins.rounds): logits of every column of the RoundBatch, [rows][width + 1]
@@ -260,7 +250,7 @@ class NextModel:
             s = rows[placement.item].session
             inputs = [s.pending] if placement.phase == DECODE else s.prompt[s.done:s.done + placement.rows]
             s.phase, s.rows, s.produced = placement.phase, len(inputs), []
-            packed.append((s.handle, s.done, len(inputs)))
+            packed.append((s.handle, s.done, len(inputs), placement.phase))
             ids += inputs
             if placement.logits:
                 logit_rows.append(len(ids) - 1)
@@ -325,7 +315,7 @@ class NextModel:
         try:
             for start in range(0, wanted.stop, chunk):   # the last token predicts nothing scored
                 end = min(start + chunk, wanted.stop)
-                batch = StepBatch.build([(sequence, start, end - start)], self.device)
+                batch = StepBatch.build([(sequence, start, end - start, PREFILL)], self.device)
                 rows = [row - start for row in wanted if start <= row < end]
                 logits = self._forward(torch.tensor(ids[start:end], device=self.device), batch, rows)
                 found.append(torch.log_softmax(logits, -1))

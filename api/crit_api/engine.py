@@ -372,12 +372,13 @@ class ServedEngine:
 
     The server owns the machine's crit runtime while it runs, also while its engine is unloaded: no other crit process
     can load an engine. With `idle_unload` (crit serve --idle-unload) the engine unloads after that many seconds
-    without a request, and the next request loads it again.
+    without a request, and the next request loads it again. With `one_process` (crit serve --one-process) each engine
+    runs in a host process of its own, which ends when the engine is unloaded or replaced (ResidentRuntime).
     """
     def __init__(self, workspace, run_id=None, candidate_id=None, project=ROOT, runtime_directory=None,
                  host_limit=None, device_limit=None, timeout=600, load_timeout=None, verify_model=False, attempt=None,
                  kv_tokens=None, max_queue=None, queue_timeout=None, idle_unload=None, max_concurrency=None,
-                 configuration=None):
+                 configuration=None, one_process=False):
         # No workspace: a subclass that serves engines from elsewhere (crit_api.installed) verifies its own.
         self.store = RunStore(workspace, project) if workspace is not None else None
         self.run_id = run_id or single_run(self.store)
@@ -397,7 +398,7 @@ class ServedEngine:
         self.max_concurrency = (None if max_concurrency is None
                                 else number(max_concurrency, "max concurrency", 1, 1024, integer=True))
         self.ownership = RuntimeOwnership(runtime_directory)
-        self.runtime = ResidentRuntime(self.ownership, host_limit, device_limit)
+        self.runtime = ResidentRuntime(self.ownership, host_limit, device_limit, one_process=one_process)
         self.lock = Admission(
             None if max_queue is None else number(max_queue, "queue size", 0, 1_000_000, integer=True),
             None if queue_timeout is None else number(queue_timeout, "queue timeout", 0, 86400))
@@ -539,6 +540,10 @@ class ServedEngine:
                 raise ValueError("Engine is closed")
             self.context_tokens, self.configuration = kv_tokens, configuration
             self.specs.clear()
+            # The engine closes first, also where the new spec is the one loaded (a reopen at the same context and
+            # configuration, which the host would otherwise keep as it is): Core judges that close, last_close reads it
+            if self.runtime.status().get("engine"):
+                self._close_loaded(stop)
             self._load_default(self.spec(), stop)
 
     def _load_default(self, spec, stop):
@@ -601,6 +606,8 @@ class ServedEngine:
                 self.ownership.failed_tree = None
             self.runtime.announce("closed")
             self.runtime.close()
+            if self.runtime.one_process:
+                self.runtime.forget_kept_files()
         except BaseException as exc:
             self.ownership.block("Engine cleanup failed: " + str(exc))
             raise
@@ -649,6 +656,16 @@ class ServedEngine:
         default candidate) is the one loaded, else None."""
         status = self.runtime.status()
         return status.get("engine_facts") if self.loaded(candidate_id, status) else None
+
+    def last_close(self):
+        """How the resident host's last engine close went (crit_api.host's close_outcome: "returned" True, False or
+        None where it was not judged, and the report's "message"), or None before any close in this host. A reload
+        or a model switch closes the engine first, and Core refuses the next load beside a close that did not
+        return its memory, so a check reads it right after a reopen."""
+        found = self.runtime.status().get("last_close")
+        if not isinstance(found, dict):   # one engine, one process: a closed engine's host ended with it
+            found = getattr(self.runtime, "last_exit", None)
+        return dict(found) if isinstance(found, dict) else None
 
     def loaded(self, candidate_id=None, status=None):
         """Whether the host's engine is `candidate_id`'s (default: the default candidate's) package: the same run,
@@ -924,6 +941,33 @@ class ServedEngine:
                     self.unload(idle=self.idle_unload)
                 except EngineError:
                     pass  # the next request reports the runtime's state
+
+    def close_engine(self):
+        """Close the loaded engine as a reload closes it first (the resident host's close: the model's pool, its
+        mapped files and device weights, stays for the next load), and return how the close went (last_close), or
+        None where no engine was loaded. The next request or reopen loads the engine again."""
+        with self.lock:
+            if self.closed:
+                raise EngineError("Engine is stopping", 503)
+            self._check_running()
+            if not self.runtime.status().get("engine"):
+                return None
+            self._close_loaded()
+            self.lock.invalidate()
+        return self.last_close()
+
+    def _close_loaded(self, stop=None):
+        """The resident host's close of the loaded engine (its model's pool stays); a host that fails it retires."""
+        try:
+            result = self.runtime.call("close", {}, _CommandStop(stop or threading.Event(), self._stopping),
+                                       self.timeout)
+        except BaseException as exc:
+            self._retire(exc)
+            if not isinstance(exc, (ValueError, OSError)):
+                raise
+        else:
+            if result["status"] != "completed":
+                self._retire(result["error"])
 
     def unloads_at(self):
         """With idle_unload, the time (seconds since the epoch) the loaded engine unloads unless a request uses it;

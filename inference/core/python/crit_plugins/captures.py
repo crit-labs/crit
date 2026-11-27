@@ -77,7 +77,7 @@ def capture_graph(device, stream, pool, run, observer=None):
     observed = observer.snapshot() if observer is not None else None
     try:
         capture_workspaces(stream)
-        with memory.capturing(pool), torch.cuda.graph(graph, pool=pool, stream=stream):
+        with memory.capturing(pool, graph), torch.cuda.graph(graph, pool=pool, stream=stream):
             output = run()
     finally:
         if collecting:

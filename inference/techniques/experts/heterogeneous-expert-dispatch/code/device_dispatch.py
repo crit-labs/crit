@@ -286,7 +286,10 @@ class DeviceDispatch:
                      b["routes"], b["count"], self.counters)
         self.posted.add(layer)
 
-    def forward(self, layer, x, ids, weights, store, slots):
+    def forward(self, layer, x, ids, weights, store, slots, prompt=None):
+        """The routed rows of a call. prompt: the caller's phase of its rows; a decode call (False) keeps the declared
+        order at any count, so a decode row's bits never follow how many rows share its step; None (a caller that
+        states none) takes a call past max_tokens for a prompt chunk's."""
         if not self.in_stream:
             if capturing():
                 raise RuntimeError("the CPU routes join inside a capture only through the in-stream handoff, which is "
@@ -305,16 +308,17 @@ class DeviceDispatch:
             self.kernels.scatter(s, y, b["routes"], b["count"], b["status"], ids.numel())
             self.posted.discard(layer)
             return self.part.combine(y, ids, weights)
-        return self._long(layer, x, ids, weights, store, slots)
+        return self._long(layer, x, ids, weights, store, slots, prompt is not False)
 
-    def _long(self, layer, x, ids, weights, store, slots):
-        """A call past max_tokens (prompt chunks; host-driven, never captured): the handoff only when it has -2 routes,
-        then in pieces of max_tokens tokens."""
+    def _long(self, layer, x, ids, weights, store, slots, prompt=True):
+        """A call past max_tokens (prompt chunks, or an eager step's decode rows; host-driven, never captured): the
+        handoff only when it has -2 routes, then in pieces of max_tokens tokens; the tensor arithmetic for a prompt
+        chunk's only."""
         if capturing():
             raise RuntimeError(f"a captured call has at most {self.max_tokens} tokens (max_tokens)")
         flat = ids.reshape(-1).long()
         cpu = bool(((flat >= 0) & (slots.long()[flat.clamp(min=0)] == -2)).any())   # one synchronization
-        if not cpu and self.prompt_arithmetic == "tensor":   # no CPU route to match: the kernel's tensor arithmetic
+        if prompt and not cpu and self.prompt_arithmetic == "tensor":   # no CPU route: the kernel's tensor arithmetic
             self.tensor_calls += 1
             return self.part.combine(self.part.route_outputs(layer, x, ids, store, slots, "tensor"), ids, weights)
         y = self.part.route_outputs(layer, x, ids, store, slots)

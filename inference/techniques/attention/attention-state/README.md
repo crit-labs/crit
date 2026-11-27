@@ -183,8 +183,10 @@ page type, eager prompt rows one row a launch), then
 torch: rows gathered and multiplied by SDPA, or a masked FP32 softmax over the
 page tables that captures in a CUDA graph (in a capture it reads every position
 the tables hold, so its cost follows the pool's capacity; in an eager step only
-the positions its rows reach). The pool's `window` option (16 tokens) is the one
-knob of what is a window row: a longer row is a prompt row. No library kernel
+the positions its rows reach). A row's phase is the batch's (`StepBatch.prompt_row`),
+never its length: decode rows (decode tokens, verify windows) are window rows, a prompt
+chunk of any length a prompt row; the pool's `window` option (16 tokens) bounds the
+decode rows its step buffers hold. No library kernel
 reads the pages by default: the plugins' option `flashinfer` (default `off`)
 set to `auto` puts FlashInfer's paged prefill on eager prompt rows of 16-bit and
 FP8 pages (and with softmax-attention's `decode: flashinfer` its decode on a

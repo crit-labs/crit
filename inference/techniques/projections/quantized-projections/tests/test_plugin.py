@@ -74,6 +74,52 @@ class QuantizedProjectionsTests(PluginTestCase):
         with self.assertRaisesRegex(ValueError, "quality mode 'fast' is not one of preserve, speed"):
             kernels.use_quality_mode("fast")
 
+    def test_resolve_prices_the_checkpoints_16_bit_matrices_as_load_holds_them(self):
+        # crit_plugins.assemble.PRICES: the stored and held bytes of every 16-bit target matrix (not a routed expert,
+        # an embedding table or an expert tower), the head by its role, read from the headers alone
+        import sys
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from crit_plugins import kernels
+        torch = __import__("torch")
+        from safetensors.torch import save_file
+        self.addCleanup(kernels.use_quality_mode, None)
+        module = sys.modules[type(self.assemble()["projections"]).__module__]
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(folder, ignore_errors=True))
+        bf16 = lambda r, c: torch.zeros(r, c, dtype=torch.bfloat16)   # noqa: E731
+        save_file({"model.layers.0.self_attn.q_proj.weight": bf16(32, 96),
+                   "model.layers.0.mlp.experts.0.down_proj.weight": bf16(32, 96),   # the experts slot's
+                   "model.embed_tokens.weight": bf16(40, 96),                        # a lookup table
+                   "model.norm.weight": torch.zeros(96, dtype=torch.bfloat16),       # not a matrix
+                   "lm_head.weight": bf16(40, 96)}, str(folder / "model.safetensors"))
+        (folder / "config.json").write_text('{"model_type": "llama", "hidden_size": 96}', encoding="utf-8")
+        context = SimpleNamespace(model=folder)
+        options = {"head": "auto", "trunk": "auto", "trunk_keep": "router"}
+        kernels.use_quality_mode("speed")
+        found = module.resolve(context, options, None)
+        pricer = self.assemble()["projections"]
+        self.assertEqual(found["stored_matrix_bytes"], 2 * (32 * 96 + 40 * 96))
+        self.assertEqual(found["held_matrix_bytes"], pricer.held_bytes("bf16", 32, 96, 32 * 96 * 2)
+                         + pricer.held_bytes("bf16", 40, 96, 40 * 96 * 2, "head"))
+        self.assertLess(found["held_matrix_bytes"], found["stored_matrix_bytes"])   # FP8 in speed
+        kernels.use_quality_mode("preserve")   # stored in preserve: held as stored
+        found = module.resolve(context, options, None)
+        self.assertEqual(found["held_matrix_bytes"], found["stored_matrix_bytes"])
+        # No head tensor: the head is tied to the embeddings, which the model plugin loads through the slot as a
+        # matrix beside the table: held as the head is, stored nowhere else (the table stays a lookup table)
+        tied = folder / "tied"
+        tied.mkdir()
+        save_file({"model.layers.0.self_attn.q_proj.weight": bf16(32, 96),
+                   "model.embed_tokens.weight": bf16(40, 96)}, str(tied / "model.safetensors"))
+        (tied / "config.json").write_text('{"model_type": "llama", "hidden_size": 96}', encoding="utf-8")
+        kernels.use_quality_mode("speed")
+        found = module.resolve(SimpleNamespace(model=tied), options, None)
+        self.assertEqual(found["stored_matrix_bytes"], 2 * 32 * 96)
+        self.assertEqual(found["held_matrix_bytes"], pricer.held_bytes("bf16", 32, 96, 32 * 96 * 2)
+                         + pricer.held_bytes("bf16", 40, 96, 40 * 96 * 2, "head"))
+
     def test_a_plan_prices_each_matrix_at_the_bytes_load_holds_it_in(self):
         # quality mode speed: trunk and head auto are fp8, trunk_keep's default leaves the router as stored
         from crit_plugins import kernels

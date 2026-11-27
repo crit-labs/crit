@@ -26,6 +26,7 @@ from crit_api.server import Api, Server  # noqa: E402
 from crit_eval import EVAL_DIR, load_json  # noqa: E402
 from crit_eval.run.chat import ChatEngine, Server as ChatServer, load_text  # noqa: E402
 from crit_eval.run.concurrency import run_concurrency  # noqa: E402
+from crit_eval.run.requests import case_request, request_sha256  # noqa: E402
 
 # The package: the toy engine's plugins (the plugin engine example), whose model's next token is a hash of every token
 # its row has seen, so a row decodes the same tokens in a batch as alone, and whose every step takes 4 ms however many
@@ -69,6 +70,7 @@ class ConcurrencyEndToEnd(MeasureFixture, unittest.TestCase):
         manifest = self.store.package(self.run_id, candidate, package,
                                       {"build": {"toolchain": {"fixture": "host-python"}, "dependencies": [],
                                                  "command": ["fixture"]}})
+        self.eval_completed(candidate)   # a measurement starts on a completed Eval (crit.run.state)
         self.checks(record, manifest)   # recorded before measure, as check --from-eval records them
         return candidate
 
@@ -103,8 +105,12 @@ class ConcurrencyEndToEnd(MeasureFixture, unittest.TestCase):
         self.store.seal(self.run_id, candidate, "completed")
         protocol = load_json(EVAL_DIR / "protocol.json")
         text = load_text(str(self.model))
+        # Each case with its output tokens, as prepare freezes them, its one request (crit-eval protocol
+        # requests.cases): a level asks every prompt its case's own length.
+        output = {"speed": protocol["speed"]["output_tokens"], "heldout": protocol["heldout"]["output_tokens"]}
         cases = lambda kind, seeds, lengths: [  # noqa: E731
-            {"id": f"{kind}-{seed}", "messages": messages, "prompt_ids": text.encode_chat(messages)}
+            {"id": f"{kind}-{seed}", "messages": messages, "prompt_ids": text.encode_chat(messages),
+             "output_tokens": output[kind]}
             for seed, count in zip(seeds, lengths)
             for messages in [[{"role": "user", "content": words(seed, count)}]]]
         # A sampling, so each level's sampled run, which every speed figure is taken from (crit-eval-v0.8.0), runs.
@@ -112,10 +118,11 @@ class ConcurrencyEndToEnd(MeasureFixture, unittest.TestCase):
                     "heldout": cases("heldout", (5, 6), (12, 40)), "sampling": {"temperature": 1.0, "top_p": 0.95}}
         chat = ChatEngine(ChatServer(self.serve(candidate), prepared),
                           {"context_tokens": 8192, "model": str(self.model)})
-        output = protocol["concurrency"]["output_tokens"]
-        # The speed part's serial greedy replies, which the batched ones are compared with.
+        # The speed part's serial greedy replies to the cases' own requests, which the batched ones are compared with.
         serial = {case["id"]: {"status": "measured",
-                               "tokens": chat.generate(case["prompt_ids"], output, lambda _: None)["tokens"]}
+                               "tokens": chat.generate(case["prompt_ids"], case["output_tokens"],
+                                                       lambda _: None)["tokens"],
+                               "request_sha256": request_sha256(case_request(case, "speed", protocol))}
                   for case in prepared["speed"]}
         logged = []
         found = run_concurrency(chat, chat.info(), prepared, protocol, {"speed": {"cases": serial}}, 8192,
@@ -126,7 +133,10 @@ class ConcurrencyEndToEnd(MeasureFixture, unittest.TestCase):
         for clients in (1, 2, 4):
             level = levels[str(clients)]
             self.assertTrue(level["qualified"], level["errors"])
-            self.assertEqual((level["requests"], level["completion_tokens"]), (4 * clients, 4 * clients * output))
+            # Client c's r-th request is pool prompt (c + r) mod its size, each at its case's own output tokens.
+            pool = found["pool"]
+            asked = sum(found["output_tokens"][pool[(c + r) % len(pool)]] for c in range(clients) for r in range(4))
+            self.assertEqual((level["requests"], level["completion_tokens"]), (4 * clients, asked))
             self.assertEqual(level["peak_concurrency"], clients)
             self.assertGreater(level["consistency"]["compared"], 0)
             self.assertEqual(level["consistency"]["fraction"], 1.0, level["consistency"]["differences"])

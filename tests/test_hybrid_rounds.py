@@ -122,10 +122,12 @@ class HybridRoundTests(unittest.TestCase):
         for sequence in sequences:
             self.m._close(sequence)
 
-    def step(self, sequence, frontier, tokens):
-        """The step path's row of `tokens` at `frontier`, accepted: the greedy token after it."""
-        from crit_plugins import StepBatch
-        batch = StepBatch.build([(sequence, frontier, len(tokens))], self.m.device)
+    def step(self, sequence, frontier, tokens, phase=None):
+        """The step path's row of `tokens` at `frontier` (a prompt chunk at frontier 0, else a decode row unless
+        `phase` says), accepted: the greedy token after it."""
+        from crit_plugins.device import DECODE, PREFILL, StepBatch
+        phase = phase or (PREFILL if frontier == 0 else DECODE)
+        batch = StepBatch.build([(sequence, frontier, len(tokens), phase)], self.m.device)
         logits = self.m._forward(torch.tensor(tokens, dtype=torch.int64, device=self.m.device), batch,
                                  [len(tokens) - 1])
         self.m.states.accept(sequence, len(tokens))

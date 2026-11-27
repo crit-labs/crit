@@ -76,6 +76,43 @@ class BundleStoreTests(PluginTestCase):
         self.assertFalse(layout.complete)   # another layout too
         layout.close()
 
+    def test_a_kept_store_outlasts_its_process_as_the_file_its_context_names(self):
+        # crit serve --one-process ends each engine's host with it: the context names a file for the kept store
+        # (crit_core.engine.LoadContext.kept_file), and the next host's keeper, a new one, reopens it complete.
+        from crit_core.kept import Kept
+        torch = __import__("torch")
+        device = self.device()
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        identity = {"shards": [["model-00001.safetensors", 4096, "9f2c"]]}
+
+        class Context:
+            def __init__(self):
+                self.keeper = Kept()
+
+            def keep(self, name, key, build, close=None, nbytes=None):
+                return self.keeper.keep(name, key, build, close, nbytes)
+
+            def kept_file(self, name, key):
+                from crit_core.kept import key_digest
+                return __import__("pathlib").Path(folder.name) / "kept" / f"{key_digest(key)[:16]}.store"
+        bundles = self.bundles(1, 4, 1024, seed=4)
+        first = self.assemble(context=Context())["expert_source"]
+        store = first.open_store({"bundle_bytes": 1024}, 1, 4, device, identity=identity, kept=["checkpoint"])
+        written = store.path
+        self.assertIsNotNone(written)
+        for (l, e), b in bundles.items():
+            store.put(l, e, b)
+        store.region()   # the seal writes the file
+        store.close()
+        second = self.assemble(context=Context())["expert_source"]   # the next host: a keeper of its own
+        again = second.open_store({"bundle_bytes": 1024}, 1, 4, device, identity=identity, kept=["checkpoint"])
+        self.assertIsNot(again, store)
+        self.assertEqual(again.path, written)
+        self.assertTrue(again.complete)
+        self.assertTrue(torch.equal(again.bundle(0, 1), bundles[(0, 1)]))
+        again.close()
+
     def test_a_kept_store_comes_back_sealed_to_the_next_engine(self):
         # The host's keeper (crit serve's model pool, crit eval's process: crit_core.kept) holds the store between
         # two engines of one model: the second one's source gets it sealed, as the first one left it.

@@ -111,14 +111,26 @@ def device_key(device):
     return str(device)
 
 
+def process_kept(device, name, tensor):
+    """`tensor`, kept by the process on `device` for every engine's matrices (a table, the shared buffers): named on
+    the device's memory (crit_plugins.memory's process), so a closed engine's close is measured without it
+    (crit_plugins.lifetime). `tensor` may be a callable that makes it. Returns the one the process keeps (another
+    copy of this code, an earlier engine's package's, may have kept it already: crit_plugins.memory's process)."""
+    from crit_plugins.memory import of
+    return of(device).process("quantized-projections", name, tensor)
+
+
 def constants(device):
-    """The quantizer's tables on `device`, made once (at load): E2M1 bounds, the ties that round up, the decode table."""
+    """The quantizer's tables on `device`, made once (at load): E2M1 bounds, the ties that round up, the decode table.
+    The process keeps them for every engine (process_kept)."""
     import torch
     key = device_key(device)
     if key not in _CONSTANTS:
         _CONSTANTS[key] = {"bounds": torch.tensor(BOUNDS, dtype=torch.float32, device=device),
                            "ties": torch.tensor(TIES_UP, dtype=torch.float32, device=device),
                            "table": torch.tensor([*E2M1, *(-v for v in E2M1)], dtype=torch.float32, device=device)}
+        _CONSTANTS[key] = {name: process_kept(device, f"constants.{name}", table)
+                           for name, table in _CONSTANTS[key].items()}
     return _CONSTANTS[key]
 
 
@@ -696,7 +708,13 @@ def _pin(m, device):
     def get(fmt, n, weight=None):
         key = (device_key(device), fmt, n, m.columns)
         if key not in _PINNED:
-            _PINNED[key] = module.pin(fmt, n, m.columns, device, workspace=GEMM_BYTES, buffer=space, weight=weight)
+            found = module.pin(fmt, n, m.columns, device, workspace=GEMM_BYTES, buffer=space, weight=weight)
+            # the pin is the process's, for every engine on the device: its alpha and beta too (process_kept)
+            for name in ("_one", "_zero"):
+                if hasattr(getattr(found, name, None), "untyped_storage"):
+                    setattr(found, name, process_kept(device, f"pinned.{fmt}.{n}x{m.columns}.{name[1:]}",
+                                                      getattr(found, name)))
+            _PINNED[key] = found
         return _PINNED[key]
 
     if m.format == "bf16":
@@ -1109,7 +1127,8 @@ _BUFFERS = {}
 
 
 class _Buffers(dict):
-    """A device's shared buffers by name, each made the first time it is asked for."""
+    """A device's shared buffers by name, each made the first time it is asked for: the process's, for every engine
+    on the device (process_kept)."""
 
     def __init__(self, device):
         super().__init__()
@@ -1117,13 +1136,13 @@ class _Buffers(dict):
 
     def __missing__(self, name):
         import torch
-        made = {"workspace": lambda: torch.empty(WORKSPACE_BYTES // 2, dtype=torch.bfloat16, device=self.device),
+        make = {"workspace": lambda: torch.empty(WORKSPACE_BYTES // 2, dtype=torch.bfloat16, device=self.device),
                 "scratch": lambda: torch.empty(SCRATCH_BYTES, dtype=torch.uint8, device=self.device),
                 "partial": lambda: torch.empty(PARTIAL_BYTES // 4, dtype=torch.float32, device=self.device),
                 "counters": lambda: torch.zeros(COUNTERS, dtype=torch.int32, device=self.device),
-                "gemm": lambda: torch.empty(GEMM_BYTES, dtype=torch.uint8, device=self.device)}[name]()
-        self[name] = made
-        return made
+                "gemm": lambda: torch.empty(GEMM_BYTES, dtype=torch.uint8, device=self.device)}[name]
+        self[name] = process_kept(self.device, f"buffers.{name}", make)
+        return self[name]
 
 
 def buffers(device):

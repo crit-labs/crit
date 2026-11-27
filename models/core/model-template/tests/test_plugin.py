@@ -4,6 +4,7 @@ timed cost model within the budget and the room, and row groups multiply each pr
 in calls of at most invariant_rows."""
 import importlib
 import json
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -22,13 +23,13 @@ def template(name):
 
 class LayoutTests(PluginTestCase):
     def test_the_layout_of_every_model_plugin_that_extends_this_core_checks(self):
-        compose = template("compose")
         checked = 0
         for manifest in self.registry():
             if (manifest.get("extends") or {}).get("id") != "model-template":
                 continue
-            path = Path(manifest["folder"]) / compose.LAYOUT
-            self.assertEqual(compose.check(json.loads(path.read_text(encoding="utf-8")), manifest["id"]), [])
+            # checked in the plugin's own package: the core's techniques and the plugin's own (a family's pieces)
+            from crit_models.plugin import layout
+            self.assertIn("mixers", layout(manifest["folder"]))   # a problem raises with its name
             checked += 1
         self.assertTrue(checked or not (HERE.parents[1] / "cache").is_dir())   # crit's library holds some
 
@@ -58,6 +59,8 @@ class LayoutTests(PluginTestCase):
         problems = compose.check(layout)
         self.assertTrue(any("unknown keys colour" in p for p in problems), problems)
         self.assertTrue(any("mixers.full_attention names a block" in p for p in problems), problems)
+        otherwise = {"schema": compose.SCHEMA, "mixers": {"full_attention": {"block": "attention", "otherwise": "lstm"}}}
+        self.assertTrue(any("mixers.full_attention.otherwise" in p for p in compose.check(otherwise)))
         self.assertTrue(any("residual names how blocks join" in p for p in problems), problems)
         del layout["colour"]   # the plugin's own techniques, which compose() takes beside the library's
         self.assertEqual(compose.check(layout, blocks={"lstm": object}, residuals={"braid": object}), [])
@@ -68,6 +71,115 @@ class LayoutTests(PluginTestCase):
             compose.layout_of(None)
         with self.assertRaisesRegex(ValueError, "the core a model plugin extends"):
             compose.layout_of(compose.LAYOUT)   # a layout lies in a model plugin's folder
+
+
+class OwnTechniqueTests(PluginTestCase):
+    """A model plugin's own techniques (code in its own folder that its manifest mounts as sources, a family's pieces
+    in its finished model plugin) mount beside the core's: the core's library() gives their blocks and drafters, a
+    layout may name them, and a name a library technique gives already is refused."""
+
+    def plugin(self, root, technique):
+        import tempfile
+        folder = Path(tempfile.mkdtemp(dir=root)) / "family-model"
+        (folder / "techniques" / "mine" / "code").mkdir(parents=True)
+        (folder / "techniques" / "mine" / "code" / "mine.py").write_text(technique, encoding="utf-8")
+        manifest = {"schema": "crit-plugin-v1", "id": "family-model", "title": "a family's model plugin",
+                    "fills": ["model"], "needs": [["model_type:family"]], "devices": ["cpu"],
+                    "sources": {"core": Path(os.path.relpath(HERE, folder)).as_posix(), "mine": "techniques/mine/code"}, "extends": "core",
+                    "entry": "plugin.py:create"}
+        (folder / "plugin.json").write_text(json.dumps(manifest), encoding="utf-8")
+        (folder / "plugin.py").write_text("def create(context, options, parts):\n    return None\n", encoding="utf-8")
+        from crit_plugins.assemble import plugin_package
+        from crit_plugins.manifest import load_manifest
+        package = plugin_package(load_manifest(folder)).__name__
+        return importlib.import_module(f"{package}.core.template.blocks"), \
+            importlib.import_module(f"{package}.core.template.compose")
+
+    def test_its_blocks_and_drafters_mount_beside_the_cores(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            blocks, compose = self.plugin(root, "class Own:\n    pass\n\n\nclass Drafts:\n    pass\n\n\n"
+                                                "BLOCKS = {'own-block': Own}\nDRAFTERS = {'own-drafter': Drafts}\n")
+            found, joins, drafts = blocks.library()
+            self.assertIn("own-block", found)
+            self.assertIn("attention", found)   # the core's own techniques beside it
+            self.assertIn("own-drafter", drafts)
+            self.assertEqual(set(blocks.own_sources()[1]), {"mine"})
+            layout = {"schema": compose.SCHEMA, "mixers": {"full_attention": {"block": "own-block"}},
+                      "draft": {"block": "own-drafter", "prefix": "mtp."}}
+            self.assertEqual(compose.check(layout), [])
+
+    def test_a_name_a_library_technique_gives_is_refused(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            blocks, _ = self.plugin(root, "class Mine:\n    pass\n\n\nBLOCKS = {'attention': Mine}\n")
+            with self.assertRaisesRegex(ValueError, "two techniques give the block attention"):
+                blocks.library()
+
+    def test_the_core_alone_mounts_no_plugins_own_techniques(self):
+        self.assertEqual(template("blocks").own_sources()[1], {})
+
+
+class CompanionTests(PluginTestCase):
+    """A companion drafter (companion.py): the folder the option names, else the one beside the checkpoint that holds
+    the layout's companion model_type and fits the model, nearest first; two that fit at one level are refused."""
+
+    class Drafter:
+        @staticmethod
+        def fits(config, shape):
+            return None if config.get("backbone_hidden_size") == shape.hidden else "reads another width"
+
+    class Shape:
+        hidden = 64
+
+    SPEC = {"block": "own-drafter", "companion": "own_assistant"}
+
+    def folder(self, path, model_type="own_assistant", width=64):
+        path.mkdir(parents=True)
+        (path / "config.json").write_text(json.dumps({"model_type": model_type, "backbone_hidden_size": width}),
+                                          encoding="utf-8")
+        return path
+
+    def find(self, checkpoint, given=""):
+        return template("companion").find(self.SPEC, checkpoint, given, self.Drafter, self.Shape)
+
+    def test_the_folder_beside_the_checkpoint_that_fits(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            model = self.folder(root / "model", "own")
+            self.folder(root / "wide-assistant", width=128)        # another model's drafter
+            self.folder(root / "other", "something_else")
+            self.folder(model / "inside")                          # never the checkpoint's own folder
+            self.assertIsNone(self.find(model))
+            fits = self.folder(root / "assistant")
+            self.assertEqual(self.find(model).folder.resolve(), fits.resolve())
+            self.folder(root / "second")
+            with self.assertRaisesRegex(ValueError, "2 own_assistant drafters fit"):
+                self.find(model)
+
+    def test_a_snapshot_folder_one_level_up_and_the_option_first(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            model = self.folder(root / "repo-model" / "rev1", "own")
+            fits = self.folder(root / "repo-assistant" / "rev2")
+            self.assertEqual(self.find(model).folder.resolve(), fits.resolve())
+            given = self.folder(root / "elsewhere" / "named")
+            self.assertEqual(self.find(model, str(given)).folder, given)
+            with self.assertRaisesRegex(ValueError, "holds no own_assistant checkpoint"):
+                self.find(model, str(model))
+            with self.assertRaisesRegex(ValueError, "reads another width"):
+                self.find(model, str(self.folder(root / "wide", width=128)))
+            self.assertIsNone(self.find(None))                     # a load without a folder: the option only
+
+    def test_a_layout_names_a_companion_or_a_stored_draft_block(self):
+        compose = template("compose")
+        base = {"schema": compose.SCHEMA, "mixers": {"full_attention": {"block": "attention"}}}
+        self.assertTrue(compose.check({**base, "draft": {"block": "mtp", "companion": "own_assistant"}}))
+        self.assertTrue(compose.check({**base, "draft": {"block": "mtp"}}))
+        self.assertEqual(compose.check({**base, "draft": {"block": "block-drafter", "prefix": "mtp."}}), [])
+        self.assertEqual(compose.check({**base, "draft": {"block": "block-drafter", "companion": "own_assistant"}}), [])
 
 
 class SpanTests(PluginTestCase):
@@ -296,12 +408,17 @@ class CheckpointTests(PluginTestCase):
 
 
 class _Batch:
-    def __init__(self, lengths):
-        self.round, self.rows = False, len(lengths)
+    """A step's rows: `lengths`, each a decode row unless its index is in `prompts`."""
+
+    def __init__(self, lengths, prompts=()):
+        self.round, self.rows, self._prompts = False, len(lengths), set(prompts)
         self.starts = [0]
         for n in lengths:
             self.starts.append(self.starts[-1] + n)
         self.tokens = self.starts[-1]
+
+    def prompt_row(self, r):
+        return r in self._prompts
 
 
 class _Projections:
@@ -315,22 +432,31 @@ class RowGroupTests(PluginTestCase):
         groups = rows.RowGroups(_Projections())
         self.assertEqual(groups.decode_rows, 8)
         # ten decode rows, a prompt chunk of 5, two decode rows (StepLayout puts decode rows first; this mixes them)
-        found = groups.of(_Batch([1] * 10 + [5] + [1] * 2))
+        found = groups.of(_Batch([1] * 10 + [5] + [1] * 2, prompts={10}))
         self.assertEqual(found, [(0, 8, False), (8, 10, False), (10, 15, True), (15, 17, False)])
         self.assertEqual(groups.rows(17), [(0, 8, False), (8, 16, False), (16, 17, False)])
 
-    def test_a_steps_prompt_chunks_are_marked_on_its_batch_however_short(self):
-        # attention-state reads a row of up to its window as a window row unless the batch marks it a prompt chunk:
-        # the marks are the groups' prompt rows (a 3-token chunk, a one-token row decode_via_prompt names), so a short
-        # chunk's attention keeps the bits of the same rows in a longer chunk.
-        from crit_plugins import StepBatch
+    def test_a_one_token_prompt_chunk_is_a_prompt_row_and_a_verify_window_decode_rows(self):
+        # A prompt-cache hit leaves a one-token remainder: a prefill row, multiplied alone with the prompt rows'
+        # arithmetic (it was a decode row by its length, and a repeated request diverged after ~30 tokens). A verify
+        # window outside a captured round is decode tokens, cut into calls of decode_rows as the round cuts its
+        # columns, not a prompt chunk.
         groups = template("rows").RowGroups(_Projections())
-        batch = StepBatch.build([("a", 9, 1), ("b", 0, 3), ("c", 4, 1), ("d", 0, 40)], "cpu")
-        self.assertIsNone(batch.prompts)
-        self.assertEqual([batch.prompt_row(r, 16) for r in range(4)], [False, False, False, True])
-        groups.of(batch, via_prompt={2})
+        self.assertEqual(groups.of(_Batch([1, 1, 1], prompts={1})), [(0, 1, False), (1, 2, True), (2, 3, False)])
+        self.assertEqual(groups.of(_Batch([1, 12, 3, 40], prompts={3})),
+                         [(0, 8, False), (8, 16, False), (16, 56, True)])
+
+    def test_a_steps_prompt_chunks_are_its_prefill_rows_however_short(self):
+        # The plugins read a row's phase from the batch: a 3-token chunk and a one-token row decode_via_prompt names
+        # (the model builds it a prefill row) are prompt rows, so a short chunk keeps the bits of the same rows in a
+        # longer one.
+        from crit_plugins import StepBatch
+        from crit_plugins.device import DECODE, PREFILL
+        groups = template("rows").RowGroups(_Projections())
+        batch = StepBatch.build([("a", 9, 1, DECODE), ("b", 0, 3, PREFILL), ("c", 4, 1, PREFILL), ("d", 0, 40, PREFILL)],
+                                "cpu")
         self.assertEqual(batch.prompts, {1, 2, 3})
-        self.assertEqual([batch.prompt_row(r, 16) for r in range(4)], [False, True, True, True])
+        self.assertEqual(groups.of(batch), [(0, 1, False), (1, 4, True), (4, 5, True), (5, 45, True)])
 
 
 

@@ -16,6 +16,8 @@ state all follow from it.
 import array
 from dataclasses import dataclass, field
 
+from crit_core.batch import DECODE, PREFILL
+
 # The row count up to which every projections plugin's matmul keeps each row's bits whatever rows share the call (a
 # step's decode rows, a verify window): DEVICE_INTERFACES["projections"]["matmul"]. A plugin may promise more in its
 # facts (row_invariance rows); invariant_rows() reads it.
@@ -53,6 +55,15 @@ def invariant_rows(projections):
     facts = projections.facts() if callable(getattr(projections, "facts", None)) else {}
     rows = (facts.get("row_invariance") or {}).get("rows")
     return max(DECODE_ROWS, int(rows)) if rows else DECODE_ROWS
+
+def decode_call(rows, limit, plugin):
+    """Refuse a decode call (prompt False) of more than `limit` rows: the projections slot multiplies decode rows in
+    calls of at most invariant_rows (crit_plugins.device.row_groups cuts them so) and a prompt chunk, of any length,
+    with prompt True; a longer call without its phase is a caller's error, never taken as a prompt chunk."""
+    if rows > limit:
+        raise ValueError(f"{plugin}: a decode call of {rows} rows, past the {limit} a decode call holds: a prompt "
+                         "chunk is multiplied with prompt=True (crit_plugins.device.row_groups)")
+
 
 # slot -> {method: what it takes and returns}: the device form a plugin running on a device adds to its host form.
 DEVICE_INTERFACES = {
@@ -323,10 +334,11 @@ def device_missing(slot, plugin):
 @dataclass
 class StepBatch:
     """One step's tokens for the device plugins: `sequences` (one per row), `starts` (the first token of each row,
-    rows + 1 entries, the last the token count) and `positions` (each token's position in its sequence), on the host
-    as lists and on the device as tensors (`starts_t` int32, `positions_t` int64, `rows_t` int64: each token's row).
-    `prompts`: the rows that are prompt chunks, where the model says which (its row groups; prompt_row()), None
-    where it does not."""
+    rows + 1 entries, the last the token count), `positions` (each token's position in its sequence) and `phases`
+    (each row's phase: PREFILL, a prompt chunk however short, or DECODE, a decode token or a verify window), on the
+    host as lists and on the device as tensors (`starts_t` int32, `positions_t` int64, `rows_t` int64: each token's
+    row). A plugin reads a row's phase from here (prompt_row(), prompts), never from its length: a one-token prompt
+    chunk is a prompt row, a verify window of any width a decode row (docs/PLUGINS.md, a row's phase)."""
     sequences: list
     starts: list
     positions: list
@@ -334,21 +346,29 @@ class StepBatch:
     starts_t: object = field(default=None, repr=False)
     positions_t: object = field(default=None, repr=False)
     rows_t: object = field(default=None, repr=False)
-    prompts: object = field(default=None, repr=False)
+    phases: tuple = field(default=(), repr=False)
 
     @classmethod
     def build(cls, rows, device):
-        """A batch from rows of (sequence, first position, token count), in the order the model packed them."""
+        """A batch from rows of (sequence, first position, token count, phase), in the order the model packed them;
+        phase is PREFILL or DECODE (crit_core.batch), the row's placement's: required, as no plugin may infer it."""
         import torch
-        sequences, starts, positions, row_of = [], [0], [], []
-        for r, (sequence, first, count) in enumerate(rows):
+        sequences, starts, positions, row_of, phases = [], [0], [], [], []
+        for r, row in enumerate(rows):
+            if len(row) != 4:
+                raise ValueError("a row is (sequence, first position, token count, phase): its phase, PREFILL or "
+                                 "DECODE, is the model's to give, never inferred from its length")
+            sequence, first, count, phase = row
             if count < 1 or first < 0:
                 raise ValueError("a row is one or more tokens at non-negative positions")
+            if phase not in (PREFILL, DECODE):
+                raise ValueError(f"a row's phase is {PREFILL!r} or {DECODE!r}, not {phase!r}")
             sequences.append(sequence)
             starts.append(starts[-1] + count)
             positions += range(first, first + count)
             row_of += [r] * count
-        batch = cls(sequences, starts, positions, device)
+            phases.append(phase)
+        batch = cls(sequences, starts, positions, device, phases=tuple(phases))
         batch.starts_t = torch.tensor(starts, dtype=torch.int32, device=device)
         batch.positions_t = torch.tensor(positions, dtype=torch.int64, device=device)
         batch.rows_t = torch.tensor(row_of, dtype=torch.int64, device=device)
@@ -367,13 +387,16 @@ class StepBatch:
         first = self.starts[r]
         return self.sequences[r], first, self.starts[r + 1] - first, self.positions[first]
 
-    def prompt_row(self, r, window):
-        """Whether row r is a prompt chunk: one the model marked (prompts), else, where it marked none, one of more
-        than `window` tokens. A plugin that reads short rows as decode rows (a kv_cache's window rows) asks this, so
-        a short prompt chunk keeps the prompt rows' arithmetic, the bits of the same rows in a longer chunk."""
-        if self.prompts is not None:
-            return r in self.prompts
-        return self.starts[r + 1] - self.starts[r] > window
+    def prompt_row(self, r):
+        """Whether row r is a prompt chunk (its phase PREFILL), whatever its length: a short prompt chunk keeps the
+        prompt rows' arithmetic, the bits of the same rows in a longer chunk, and a verify window of any width the
+        decode rows'."""
+        return self.phases[r] == PREFILL
+
+    @property
+    def prompts(self):
+        """The rows that are prompt chunks (frozenset of row indices)."""
+        return frozenset(r for r in range(self.rows) if self.prompt_row(r))
 
     # A StepBatch is built on the host for one step; a RoundBatch (below) lives on the device for captured rounds and
     # a PromptBatch for captured prompt chunks.
@@ -439,6 +462,10 @@ class RoundBatch(StepBatch):
 
     def row(self, r):
         raise ValueError("a round batch has no host rows: read its device tensors, and a sequence through its round slot")
+
+    def prompt_row(self, r):
+        """A round's rows are decode rows (a pending token and its drafts)."""
+        return False
 
 
 class PromptBatch(StepBatch):
@@ -526,6 +553,36 @@ class PromptBatch(StepBatch):
         if r != 0:
             raise IndexError("a prompt batch has one row")
         return self.sequence, 0, self.bucket, self.frontier
+
+    def prompt_row(self, r):
+        """A prompt batch's one row is a prompt chunk, at every count."""
+        return True
+
+
+def row_groups(batch, decode_rows):
+    """[(first, end, prompt)]: the calls a step's matrices multiply a StepBatch, RoundBatch or PromptBatch in, by each
+    row's phase (StepBatch.prompt_row), never its length: a prompt chunk alone with prompt=True (a one-token chunk
+    too), decode tokens (decode rows, verify windows of any width, a round's columns) in runs of up to `decode_rows`
+    (invariant_rows(projections)) with prompt=False, cut as a captured round cuts its columns, so each row has the bits
+    it has alone, in a step as in a round (docs/PLUGINS.md, a row's phase)."""
+    if getattr(batch, "prompt", False):   # a captured prompt chunk: one chunk, its bucket's rows
+        return [(0, batch.tokens_t.shape[0], True)]
+    if batch.round:
+        return [(first, min(first + decode_rows, batch.tokens), False) for first in range(0, batch.tokens, decode_rows)]
+    groups, run = [], None
+    for r in range(batch.rows):
+        first, end = batch.starts[r], batch.starts[r + 1]
+        if batch.prompt_row(r):
+            groups.append((first, end, True))
+            run = None
+            continue
+        for token in range(first, end):
+            if run is not None and run[1] == token and run[1] - run[0] < decode_rows:
+                run = groups[-1] = (run[0], token + 1, False)
+            else:
+                run = (token, token + 1, False)
+                groups.append(run)
+    return groups
 
 
 class Allowed:

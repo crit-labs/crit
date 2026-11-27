@@ -157,7 +157,6 @@ The technique's host pieces:
 | [catch_up.py](code/catch_up.py) | `catch_up_plan` and a `PositionalDrafter` toy for stateful drafters |
 | [round_budget.py](code/round_budget.py) | `RoundBudget`: tokens per round, round/step ratio, speedup `tokens_per_round / ratio`, pass/fail at 1.3 |
 | [python_round.py](code/python_round.py) | The technique's pieces for rounds on Core's round driver (`crit_plugins.rounds`, [Python engines](#python-engines)): `rejection_predictions` and `draw` for sampled rounds, `override_drafts` and `CopyDrafts` for copied drafts |
-| [width_policy.py](code/width_policy.py) | `WidthPolicy`: the draft width per round from each row's per-depth acceptance (decayed) over the measured round cost, for the rows that decode together |
 
 ## What the engine supplies
 
@@ -332,9 +331,9 @@ step ahead. Before the step that reads the rows, `wait` on that round's tickets 
 and a rejected draft's rows stay in the hot-row cache. Put the wait time in the round account: `RowPrefetch.stats()`
 says how much of it the table still costs.
 
-[width_policy.py](code/width_policy.py) chooses the width per round: each row's per-depth acceptance
-a_d with decay, E(K) = 1 + a_1 + a_1 a_2 + ..., over the round's cost base + K x step fitted from measured
-rounds per row count, maximizing the rows' tokens per millisecond together among the captured widths.
+Core's round driver chooses the width per round (`crit_plugins.rounds`, width policy `rate`, on the device inside
+the captured rounds): per-depth acceptance c_d with decay, 1 + c_1 + c_1 c_2 + ... tokens a row, over each captured
+round's measured time per row count, the most tokens per unit of time among the captured widths.
 
 The hook boundary (draft, verify, commit) is checked with two different drafters over one toy target: a
 stateful one that catches up from the previous round's column features, as an MTP head from the target's

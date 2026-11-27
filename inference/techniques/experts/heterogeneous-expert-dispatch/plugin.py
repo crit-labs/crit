@@ -269,10 +269,10 @@ class SplitExperts:
         engine = self._engine(x.device)
         engine.post(layer, x, ids, self.stores[layer][1] if slots is None else slots)
 
-    def forward(self, layer, x, ids, weights):
+    def forward(self, layer, x, ids, weights, prompt=None):
         engine = self._engine(x.device)
         store, slots = self.stores[layer]
-        return engine.forward(layer, x, ids, weights, store, slots)
+        return engine.forward(layer, x, ids, weights, store, slots, prompt=prompt)
 
     def forward_bundles(self, layer, x, ids, weights, store, slots, format=None):
         return self._engine(x.device).forward(layer, x, ids, weights, store, slots)
@@ -312,8 +312,8 @@ class SplitExperts:
             join = "host, after a synchronization (" + (b["ext_reason"] or "no native CPU tier") + ")"
         return {"cpu_expert_rows": rows, "cpu_join": join, "cpu_routes_capture": b["ext"] is not None and b["native"],
                 "device_expert_rows": self._device_rows(),
-                "prompt_expert_rows": ("the kernel's tensor arithmetic where no CPU route takes part (calls past "
-                                       "max_tokens), the declared order otherwise" if self._prompt_arithmetic()
+                "prompt_expert_rows": ("the kernel's tensor arithmetic where no CPU route takes part (prompt calls "
+                                       "past max_tokens), the declared order otherwise (decode rows at any count)" if self._prompt_arithmetic()
                                        == "tensor" else "the declared order"),
                 "cpu_quota": "provisional: measured with copy-engine copies, not the expert cache's fills"}
 

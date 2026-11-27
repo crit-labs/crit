@@ -324,3 +324,10 @@ def test_a_prompt_chunk_over_an_e4m3_cache_matches_float64_over_its_stored_value
     seen = torch.arange(590, device=dev)[None, :] <= 500 + torch.arange(90, device=dev)[:, None]
     want, _ = ref.latent_attention(q[:, :, :512], q[:, :, 512:], latent, rope_k, seen, 192 ** -0.5)
     torch.testing.assert_close(out.double(), want, atol=8e-3, rtol=2e-2)
+
+
+def test_the_partitions_rule_counts_the_orders_multiprocessors_never_the_devices(monkeypatch):
+    found = [la.partitions(torch.device("cuda"), heads, 512, 64, 64) for heads in (16, 64, 128)]
+    monkeypatch.setattr(la, "_multiprocessors", lambda device: 46)   # a smaller GPU
+    assert [la.partitions(torch.device("cuda"), heads, 512, 64, 64) for heads in (16, 64, 128)] == found
+    assert la.ORDER_MULTIPROCESSORS == 170

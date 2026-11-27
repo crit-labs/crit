@@ -4,6 +4,7 @@ with option flashinfer auto (when FlashInfer is installed: a yardstick),
 the torch fallbacks otherwise; a row's result does not depend on the rows beside it; a decode step over step buffers
 replays from a CUDA graph."""
 from crit_plugins import StepBatch
+from crit_plugins.device import DECODE, PREFILL
 from crit_plugins.testing import PluginTestCase
 
 USE = {"kv_cache": "attention-state"}
@@ -60,10 +61,10 @@ class PagedKernelTests(PluginTestCase):
                          (self.expected_kind(fast, dtype, step_rows, decode, flashinfer), "torch"))
         for s in "abc":
             pool.open(s)
-        self.write(pool, [("a", 0, 300), ("b", 0, 70)], 1)
-        steps = [[("a", 300, 1), ("b", 70, 1), ("c", 0, 1)],                     # decode rows
-                 [("a", 301, 1), ("b", 71, 40), ("c", 1, 130)],                  # decode + prompt chunks
-                 [("a", 302, 6), ("b", 111, 1), ("c", 131, 3)]]                  # verify windows
+        self.write(pool, [("a", 0, 300, PREFILL), ("b", 0, 70, PREFILL)], 1)
+        steps = [[("a", 300, 1, DECODE), ("b", 70, 1, DECODE), ("c", 0, 1, DECODE)],                     # decode rows
+                 [("a", 301, 1, DECODE), ("b", 71, 40, PREFILL), ("c", 1, 130, PREFILL)],                  # decode + prompt chunks
+                 [("a", 302, 6, DECODE), ("b", 111, 1, DECODE), ("c", 131, 3, DECODE)]]                  # verify windows
         for seed, rows in enumerate(steps, 2):
             batch = self.write(pool, rows, seed)
             keys, values = self.written
@@ -74,7 +75,7 @@ class PagedKernelTests(PluginTestCase):
             self.assertLess(error, bound, (dtype, page, rows))
             for r in range(batch.rows):
                 sequence, first, count, position = batch.row(r)
-                alone = StepBatch.build([(sequence, position, count)], "cuda")
+                alone = StepBatch.build([(sequence, position, count, batch.phases[r])], "cuda")
                 # A step of this row alone: its keys and values written again (the same codes; a prompt row's kept
                 # fresh for its attention as in the step).
                 pool.write(0, pool.reserve(alone), keys[first:first + count], values[first:first + count])
@@ -108,19 +109,21 @@ class PagedKernelTests(PluginTestCase):
             self.skipTest("FlashInfer is not installed")
         torch = self.torch
         state = {"page": 16}
-        kv = self.assemble(USE, use_options={"attention-state": state})["kv_cache"]
-        attention = self.assemble(USE, options={"decode": "split", "flashinfer": "auto"},
-                                  use_options={"attention-state": state})["attention"]
+        # one assembly: two would hold the second's close to the first's pool, which outlives it
+        parts = self.assemble(USE, options={"decode": "split", "flashinfer": "auto"},
+                              use_options={"attention-state": state})
+        kv, attention = parts["kv_cache"], parts["attention"]
         plans = []
         for kind, wrapper in attention.device_form._wrappers.items():
             def counted(*args, _plan=wrapper.plan, _kind=kind, **kwargs):
                 plans.append(_kind)
                 return _plan(*args, **kwargs)
             wrapper.plan = counted
+            self.addCleanup(vars(wrapper).pop, "plan")   # no cycle through the wrapper outlives the test
         pool = kv.pool([0, 1, 2], HKV, D, 4096, "cuda", "bf16")
         for s in "ab":
             pool.open(s)
-        batch = StepBatch.build([("a", 0, 40), ("b", 0, 1)], "cuda")    # a prompt row and a window row
+        batch = StepBatch.build([("a", 0, 40, PREFILL), ("b", 0, 1, DECODE)], "cuda")    # a prompt row and a window row
         slots = pool.reserve(batch)
         g = torch.Generator().manual_seed(4)
         q = torch.randn(batch.tokens, HQ, D, generator=g).cuda().to(torch.bfloat16)
@@ -140,8 +143,8 @@ class PagedKernelTests(PluginTestCase):
         pool, fast, plain = self.engine("bf16", 16)        # no step buffers: a step's rows are planned on the host
         for s in "ab":
             pool.open(s)
-        self.write(pool, [("a", 0, 100), ("b", 0, 30)], 1)
-        batch = self.write(pool, [("a", 100, 1), ("b", 30, 1)], 2)
+        self.write(pool, [("a", 0, 100, PREFILL), ("b", 0, 30, PREFILL)], 1)
+        batch = self.write(pool, [("a", 100, 1, DECODE), ("b", 30, 1, DECODE)], 2)
         q = torch.randn(2, HQ, D, generator=torch.Generator().manual_seed(3)).cuda().to(torch.bfloat16)
         graph = torch.cuda.CUDAGraph()
         with self.assertRaisesRegex(RuntimeError, "host"):
@@ -158,15 +161,15 @@ class PagedKernelTests(PluginTestCase):
             pool, fast, plain = self.engine(dtype, 64, step_rows=4)
             for s in "ab":
                 pool.open(s)
-            self.write(pool, [("a", 0, 200), ("b", 0, 90)], 1)
-            batch = self.write(pool, [("a", 200, 1), ("b", 90, 1)], 2)
+            self.write(pool, [("a", 0, 200, PREFILL), ("b", 0, 90, PREFILL)], 1)
+            batch = self.write(pool, [("a", 200, 1, DECODE), ("b", 90, 1, DECODE)], 2)
             q = torch.randn(2, HQ, D, generator=torch.Generator().manual_seed(3)).cuda().to(torch.bfloat16)
             fast.forward(0, q, pool, batch)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 out = fast.forward(0, q, pool, batch)
             for step in range(3):   # the next steps: reserve() and the KV writes outside the graph, then a replay
-                batch = self.write(pool, [("a", 201 + step, 1), ("b", 91 + step, 1)], 10 + step)
+                batch = self.write(pool, [("a", 201 + step, 1, DECODE), ("b", 91 + step, 1, DECODE)], 10 + step)
                 graph.replay()
                 self.assertTrue(torch.equal(out, fast.forward(0, q, pool, batch)), (dtype, step))
                 error = float((out.float() - plain.forward(0, q, pool, batch).float()).abs().max())

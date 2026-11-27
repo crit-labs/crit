@@ -1,5 +1,5 @@
 """Core's round driver over an engine's own hooks (crit_plugins.rounds.SpeculativeRounds) with device-speculative-round's
-pieces (python_round.py: rejection sampling, copied drafts) and adaptive width rule (width_policy.py): batched rounds
+pieces (python_round.py: rejection sampling, copied drafts): batched rounds
 over a toy target with two different drafters decode exactly what plain greedy decoding does, at any widths, through
 stops, output limits, truncations and row changes; replay and forced rounds follow a fixed text; sampled rounds keep
 the target's distribution; and captured CUDA graphs give the eager rounds' tokens."""
@@ -105,10 +105,9 @@ def plain(prompt, count, stops=()):
 class PythonRoundTests(unittest.TestCase):
     def setUp(self):
         self.m = load("device-speculative-round", "python_round.py")
-        self.policy = load("device-speculative-round", "width_policy.py")
 
     def decode(self, toy, rounds, prompts, counts, widths, mode="greedy", stops=(), continuations=None, truncate=None):
-        """Decode every prompt in rows of one driver; widths: a list cycled per round, or a WidthPolicy."""
+        """Decode every prompt in rows of one driver; widths: a list cycled per round."""
         outputs = []
         for slot, prompt in enumerate(prompts):
             first = toy.prefill(slot, prompt) if continuations is None else continuations[slot][0]
@@ -118,10 +117,7 @@ class PythonRoundTests(unittest.TestCase):
         cycle = 0
         while any(len(o) < c and (not o or o[-1] not in stops) for o, c in zip(outputs, counts)):
             rows = len(prompts)
-            if isinstance(widths, list):
-                width = widths[cycle % len(widths)]
-            else:
-                width = widths.choose(range(rows))
+            width = widths[cycle % len(widths)]
             rounds.launch(rows, width, mode)
             found = rounds.read()
             if truncate and cycle in truncate:
@@ -130,8 +126,6 @@ class PythonRoundTests(unittest.TestCase):
                 found = [{**r, "tokens": r["tokens"][:k]} for r, k in zip(found, keep)]
             for row, result in enumerate(found):
                 outputs[row] += result["tokens"]
-                if not isinstance(widths, list) and result["tokens"]:
-                    widths.observe(row, width, result["matched"])
             cycle += 1
             self.assertLess(cycle, 500)
         return outputs, cycle
@@ -147,14 +141,13 @@ class PythonRoundTests(unittest.TestCase):
                     outputs, _ = self.decode(toy, rounds, prompts, counts, widths)
                     self.assertEqual(outputs, [plain(p, c) for p, c in zip(prompts, counts)])
 
-    def test_a_good_drafter_emits_several_tokens_per_round_and_the_policy_widens(self):
+    def test_a_good_drafter_emits_several_tokens_per_round(self):
+        # (the width per round is Core's round driver's: width policy rate, tests/test_core_rounds.py)
         toy = Toy(1, 8, "cpu")
         rounds = SpeculativeRounds(toy, 1, 8, "cpu")
-        policy = self.policy.WidthPolicy([1, 2, 4, 8], base_ms=10.0, step_ms=0.5)
-        outputs, cycles = self.decode(toy, rounds, [[3, 1, 4]], [200], policy)
+        outputs, cycles = self.decode(toy, rounds, [[3, 1, 4]], [200], [8])
         self.assertEqual(outputs, [plain([3, 1, 4], 200)])
         self.assertLess(cycles, 200 / 2.5)   # the drafter is right six positions in seven
-        self.assertGreater(policy.choose([0]), 1)
 
     def test_stops_output_limits_and_inactive_rows(self):
         prompts = [[1, 2], [3, 4], [5]]
@@ -438,41 +431,6 @@ class PythonRoundTests(unittest.TestCase):
         self.assertEqual(results[True], results[False])
         self.assertEqual(results[False][0][:33], truth[0][:33])
         self.assertEqual(len(results[False][0]), 33)   # every copy accepted: 1 + 8 rounds x 5 tokens, capped at 33
-
-
-class WidthPolicyTests(unittest.TestCase):
-    def setUp(self):
-        self.m = load("device-speculative-round", "width_policy.py")
-
-    def test_expected_tokens_follow_per_depth_acceptance_with_decay(self):
-        policy = self.m.WidthPolicy([0, 1, 2, 4], decay=0.5, prior=0.5, prior_weight=0.0)
-        policy.observe("a", 4, 4)
-        self.assertEqual(policy.expected("a", 4), 5.0)
-        policy.observe("a", 4, 1)   # the second draft was rejected, the third and fourth not tried
-        # depth 1: (1 * .5 + 1) / (1 * .5 + 1) = 1; depth 2: (1 * .5 + 0) / (1 * .5 + 1) = 1/3; depths 3, 4 decayed only.
-        self.assertAlmostEqual(policy.acceptance("a", 1), 1.0)
-        self.assertAlmostEqual(policy.acceptance("a", 2), 1 / 3)
-        self.assertAlmostEqual(policy.acceptance("a", 3), 1.0)
-        self.assertAlmostEqual(policy.expected("a", 2), 1 + 1 + 1 / 3)
-        with self.assertRaises(ValueError):
-            policy.observe("a", 2, 3)
-
-    def test_the_width_maximizes_tokens_per_ms_for_the_rows_together(self):
-        policy = self.m.WidthPolicy([0, 2, 4, 8], prior=0.5, prior_weight=1.0, base_ms=13.8, step_ms=1.09)
-        for _ in range(30):
-            policy.observe("good", 8, 8)
-            policy.observe("bad", 8, 0)
-        self.assertEqual(policy.choose(["good"]), 8)
-        self.assertEqual(policy.choose(["bad"]), 0)
-        self.assertIn(policy.choose(["good", "bad"]), (2, 4, 8))
-        # A costly draft step narrows the choice; measured rounds replace the configured costs.
-        for width, ms in ((0, 10.0), (8, 90.0), (4, 50.0)):
-            policy.observe_cost(width, 1, ms)
-        self.assertAlmostEqual(policy.cost(2, 1), 30.0)
-        self.assertEqual(policy.cost(2, 3), 13.8 + 2 * 1.09, "another batch size has no rounds measured yet")
-        self.assertLess(policy.choose(["good"]), 8)
-        policy.forget("good")
-        self.assertAlmostEqual(policy.acceptance("good", 1), 0.5)
 
 
 if __name__ == "__main__":

@@ -1,9 +1,11 @@
 """Two serving contracts of a model plugin, kept here once so that no model plugin writes them again.
 
 Exact rows (RowGroups). A batched engine's reply must not depend on the requests beside it, and a prompt row's bits
-must follow from the prompt alone: every prompt chunk is multiplied alone with `prompt=True` (the prompt rows'
-arithmetic at every length), and one-token rows (decode rows, a round's columns, draft steps) in calls of at most
-`invariant_rows(projections)` rows, so each row has the bits it has alone (docs/PLUGINS.md, row invariance).
+must follow from the prompt alone: every prompt chunk (a prefill row of the batch, however short) is multiplied alone
+with `prompt=True` (the prompt rows' arithmetic at every length), and decode tokens (decode rows and verify windows
+of any width, a round's columns, draft steps) in calls of at most `invariant_rows(projections)` rows, so each row has
+the bits it has alone, in a step as in a captured round (docs/PLUGINS.md, row invariance). The phase is the batch's
+(StepBatch.prompt_row), never a row's length.
 
 Prompt spans' first guess (fit). Core cancels a request between steps, and crit serve retires the engine when a
 cancel does not settle within its grace (one second): every prompt step must finish well inside it, at every context
@@ -31,31 +33,14 @@ class RowGroups:
         self.proj = projections
         self.decode_rows = invariant_rows(projections)
 
-    def of(self, batch, via_prompt=()):
-        """[(first, end, prompt)] of a StepBatch, RoundBatch or PromptBatch: each prompt chunk alone, one-token rows
-        decode_rows at a time; the one-token rows `via_prompt` names (the batch's row indices: decode rows of a
-        request that asks decode_via_prompt) each alone as a one-token prompt chunk, the prompt rows' arithmetic. A
-        StepBatch's prompt chunks are marked on it (StepBatch.prompts), so the plugins that read short rows as decode
-        rows (attention's window rows) give them the prompt rows' arithmetic too."""
-        step = self.decode_rows
-        if getattr(batch, "prompt", False):   # a captured prompt chunk: one chunk, its bucket's rows
-            return [(0, batch.tokens_t.shape[0], True)]
-        if batch.round:
-            return [(first, min(first + step, batch.tokens), False) for first in range(0, batch.tokens, step)]
-        groups, run, prompts = [], None, set()
-        for r in range(batch.rows):
-            first, end = batch.starts[r], batch.starts[r + 1]
-            if end - first > 1 or r in via_prompt:
-                groups.append((first, end, True))
-                prompts.add(r)
-                run = None
-            elif run is not None and run[1] == first and run[1] - run[0] < step:
-                run = groups[-1] = (run[0], end, False)
-            else:
-                run = (first, end, False)
-                groups.append(run)
-        batch.prompts = frozenset(prompts)
-        return groups
+    def of(self, batch):
+        """[(first, end, prompt)] of a StepBatch, RoundBatch or PromptBatch, by each row's phase: a prompt chunk
+        alone (a prefill row of any length: a one-token chunk, a prompt-cache hit's remainder, and a decode row of a
+        request that asks decode_via_prompt, which the model builds a prefill row), decode tokens decode_rows at a
+        time (decode rows and verify windows of any width, cut as a captured round cuts its columns: a window's tokens
+        the bits they have in the round): Core's crit_plugins.device.row_groups."""
+        from crit_plugins.device import row_groups
+        return row_groups(batch, self.decode_rows)
 
     def rows(self, count):
         """Groups of `count` one-token rows (logits rows, draft steps)."""

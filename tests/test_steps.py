@@ -4,7 +4,8 @@ from pathlib import Path
 import sys
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "inference" / "core" / "python"))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "inference" / "core" / "python"))
 
 from crit_plugins.steps import GRACE, QUANTUM, SECONDS, StepBudget, Steps  # noqa: E402
 
@@ -135,6 +136,40 @@ class StepPlanTests(unittest.TestCase):
         self.assertEqual(row["choice"]["m"], 1024.0)             # the most bytes a row took
         self.assertEqual((budget.seconds, again.seconds), (0.5, SECONDS))
         self.assertIn(budget, steps.budgets)
+
+
+class StepContractTests(unittest.TestCase):
+    """Step contract 3: the model plugin declares what it can take (its manifest's steps), its options leave the
+    settings to Core (CORE), and Core chooses within both."""
+
+    def test_core_chooses_within_what_the_model_declares(self):
+        from crit_plugins.steps import CORE, LANES, PENDING, ACTIVATIONS
+        plan = Steps().capable({"lanes": 3, "pending": 1})
+        self.assertEqual((plan.lanes(CORE), plan.pending(CORE, 3)), (3, 1))   # Core's 4 and 2, within the model's
+        self.assertEqual(plan.lanes(8), 3)                                     # a bound past what the model takes
+        self.assertEqual(Steps().lanes(CORE), LANES)
+        self.assertEqual(Steps().pending(CORE), PENDING)
+        self.assertEqual(Steps().activations(CORE << 20), ACTIVATIONS)
+        self.assertEqual(Steps().seconds(float(CORE)), SECONDS)
+        self.assertEqual(Steps(max_concurrent_requests=2).capable({"lanes": 64}).lanes(CORE), 2)
+
+    def test_model_template_leaves_the_settings_to_core_and_its_plugins_inherit_what_it_takes(self):
+        # no second copy of Core's values: the core's options for Core's settings default to CORE, and a model
+        # plugin extending it takes its steps
+        import json
+        from crit_plugins.manifest import load_manifest
+        from crit_plugins.steps import CORE
+        template = ROOT / "models" / "core" / "model-template"
+        options = json.loads((template / "plugin.json").read_text(encoding="utf-8"))["options"]
+        for name in ("concurrency", "pending", "activations_mib", "span_seconds"):
+            self.assertEqual(options[name]["default"], CORE, name)
+        core = load_manifest(template)["steps"]
+        self.assertEqual(load_manifest(ROOT / "models" / "cache" / "llama-qwen3-model")["steps"], core)
+        from crit_plugins.manifest import PluginError, _steps
+        with self.assertRaisesRegex(PluginError, "most requests"):
+            _steps({"lanes": 1}, {"fills": ["model"]}, "x")
+        with self.assertRaisesRegex(PluginError, "model plugin"):
+            _steps({"lanes": 4}, {"fills": ["attention"]}, "x")
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ eager path's (the padding writes only the dump page); its output equals the unpa
 prompt_reader decode (every row in the decode's reduction), else within the prompt readers' rounding;
 and the selection's prompt facts hold, so the graphs are captured."""
 from crit_plugins import StepBatch
+from crit_plugins.device import PREFILL
 from crit_plugins.testing import PluginTestCase
 
 USE = {"kv_cache": "attention-state"}
@@ -45,7 +46,7 @@ class Model:
 
     def eager(self, sequence, frontier, count):
         """The model's own eager prompt path: an unpadded StepBatch of the chunk."""
-        out = self.forward(StepBatch.build([(sequence, frontier, count)], "cuda"))
+        out = self.forward(StepBatch.build([(sequence, frontier, count, PREFILL)], "cuda"))
         self.pool.keep(sequence, frontier + count)
         return out
 

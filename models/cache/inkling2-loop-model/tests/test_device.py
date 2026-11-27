@@ -68,6 +68,54 @@ class LoopedTests(t.Layout):
         self.assertEqual(model.expert_ids[2], model.expert_ids[4])
 
 
+    def test_a_decode_row_beside_prompt_chunks_keeps_the_bits_it_has_alone(self):
+        # block-attention: a looped layer's decode rows take row-ops' fused gates in a step beside prompt rows too
+        # (they took the GEMM gates whenever the step held a prompt row): a request decoding one token a step while
+        # another prompt prefills in chunks beside it scores every token with the bits it has decoding alone.
+        if self.device != "cuda":
+            self.skipTest("row-ops' fused gates run on a GPU")
+        import threading
+        engine = self.load(prefill_chunk=16)
+        residual = engine.model.residual
+        if residual.ops is None:
+            self.skipTest("row-ops did not build here")
+        (prompt,), (long,) = self.prompts(1, 9), self.prompts(1, 300)
+
+        def scored(beside=None):
+            rows, started = [], threading.Event()
+
+            def on_tokens(found, values):
+                rows.extend(values)
+                if len(rows) >= 2:
+                    started.set()
+            worker = None
+            if beside is not None:   # the long prompt joins once the request decodes
+                worker = threading.Thread(target=lambda: (started.wait(10), engine.generate(
+                    beside, 2, stop_tokens=[], sampling=GREEDY)))
+                worker.start()
+            tokens, _ = engine.generate(prompt, 24, stop_tokens=[], sampling=GREEDY, logprobs=2, plain=True,
+                                        on_tokens=on_tokens)
+            if worker is not None:
+                worker.join()
+            return tokens, rows
+
+        mixed, fused_rows = [], residual._fused_rows
+
+        def spied(messages, gates, ctx):
+            found = fused_rows(messages, gates, ctx)
+            if messages is not None and ctx.prompt and found:
+                mixed.append(found)   # decode rows fused in a step beside prompt rows
+            return found
+        alone = scored()
+        residual._fused_rows = spied
+        try:
+            beside = scored(long)
+        finally:
+            residual._fused_rows = fused_rows
+        self.assertTrue(mixed, "no step held the request's decode row beside the prompt's chunks")
+        self.assertEqual(beside, alone)
+
+
 # transformers saves the looped checkpoint under the release's own names (its conversion mapping, reversed): the
 # layout's names rules map those to the names the techniques read. The same rules, applied to the saved names, store
 # it under transformers' own module names (a wrapper's prefix, model.language_model.), which the rules leave as they are.

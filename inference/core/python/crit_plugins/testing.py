@@ -14,9 +14,9 @@ import time
 import unittest
 
 from .assemble import Registry, assemble, plugins_root
-from .device import StepBatch, pool_missing
+from .device import DECODE, PREFILL, StepBatch, pool_missing
 from .manifest import HOST, MANIFEST
-from .memory import POISON
+from .memory import POISON, of as device_memory
 from .slots import compare, model_problems
 
 
@@ -34,6 +34,17 @@ def compiles():
         yield found
     finally:
         found.extend(watch.stop())
+
+
+def _device_of(context):
+    """The device a test's assembly goes on, whose memory its close is measured on: the context's, else CUDA where
+    torch has it (a device form's tests run there), else the CPU (whose memory cannot be read: the ranges, givers
+    and graphs are judged)."""
+    found = context.get("device") if isinstance(context, dict) else getattr(context, "device", None)
+    if found is not None:
+        return str(found)
+    torch = sys.modules.get("torch")
+    return "cuda" if torch is not None and torch.cuda.is_available() else "cpu"
 
 
 @functools.lru_cache(maxsize=None)
@@ -78,6 +89,38 @@ def core_runtime():
 _DISCOVERED = {}
 
 
+def routing_grid(window=16, widest=64):
+    """The phase x length grid a routing-conformance test drives a device plugin over (assertRoutesByPhase): [(name,
+    rows)], rows (sequence, first position, token count, phase) of one step each. Prompt chunks of one token, of the
+    window, past it and past `widest` (a reader's most columns), decode rows, verify windows of several widths up to the
+    window, and mixed steps, so every threshold a plugin might route by falls inside some row on either side. A row at
+    position `first` reads positions before it: a route writes them first."""
+    P, D = PREFILL, DECODE
+    return [("a one-token prompt chunk", [("a", 40, 1, P)]),
+            ("a prompt chunk of the window", [("a", 40, window, P)]),
+            ("a prompt chunk past the window", [("a", 40, window + 1, P)]),
+            ("a prompt chunk past the widest", [("a", 0, widest + 9, P)]),
+            ("decode rows", [("a", 40, 1, D), ("b", 7, 1, D), ("c", 3, 1, D)]),
+            ("verify windows", [("a", 40, 2, D), ("b", 7, 5, D), ("c", 3, window, D)]),
+            ("a mixed step", [("a", 40, 1, D), ("b", 7, 4, D), ("c", 3, 1, P), ("d", 0, window, P),
+                              ("e", 9, widest + 1, P)]),
+            ("short prompt chunks beside decode rows", [("a", 40, 1, D), ("b", 7, 2, P), ("c", 3, 3, P)])]
+
+
+def long_call(x, projections):
+    """The phase of a projections test's call of x's rows written against the slot's old size rule: a prompt chunk
+    past invariant_rows(projections) rows, decode rows within them. The slot takes the phase as data (matmul's
+    required `prompt`); a test that means a phase of its own passes it."""
+    from .device import invariant_rows
+    return x.shape[0] > invariant_rows(projections)
+
+
+def long_route_call(ids, experts):
+    """The phase of an experts test's call of ids's tokens written against an experts plugin's old size rule: a prompt
+    chunk past its max_tokens tokens, decode rows within them (forward's required `prompt`)."""
+    return ids.shape[0] > int(experts.options["max_tokens"])
+
+
 class PluginTestCase(unittest.TestCase):
     """A test of the plugin whose folder holds the test file. assemble() creates it (with the plugins and engine facts
     it needs, which a test supplies); reference() creates its reference plugins in the same slots, and
@@ -105,9 +148,49 @@ class PluginTestCase(unittest.TestCase):
         own = {slot: self.plugin_id() for slot in registry[self.plugin_id()]["fills"]}
         selection = {"use": {**(use or {}), **own},
                      "options": {**(use_options or {}), self.plugin_id(): options or {}}}
-        assembly = assemble(selection, registry, context, facts, budget)
-        self.addCleanup(assembly.close)
+        return self._assembled(selection, registry, context, facts, budget)
+
+    def _assembled(self, selection, registry, context, facts, budget=None):
+        """assemble(), held to Core's close: the device's level is taken before the plugins are made, and the test's
+        cleanup closes the assembly and asserts the close returned its memory (crit_plugins.lifetime: every elastic
+        range, giver and captured graph the plugins made gone, torch's bytes back), as Core's engine close does, so
+        every plugin's own tests hold its close to it. The plugin objects are followed by weak references: one
+        still alive at a close that kept memory is named with what holds it."""
+        from . import lifetime
+        memory = device_memory(_device_of(context))
+        memory.leaking = None   # each test answers for its own close: an earlier test's leak was reported there
+        opened = lifetime.Opened(memory)
+        memory.opened.append(opened)
+        try:
+            assembly = assemble(selection, registry, context, facts, budget)
+        except BaseException:
+            memory.opened.remove(opened)
+            raise
+        opened.watch(dict(assembly.instances))
+        held = [assembly]
+        self.addCleanup(self._close_assembly, held, opened, set(vars(self)))
         return assembly
+
+    def _close_assembly(self, held, opened, before=None):
+        """Close the assembly a test made, drop the harness's own reference to it and the test's attributes set
+        since it was made (its plugins, their pools and tensors: `self.kv = parts["kv_cache"]` in a setUp, which the
+        test object keeps past its run), and fail the test where the close did not return its memory (the report names
+        what holds it). As Core's engine close does, the device's step pool retires after the plugins close (a test
+        that ran steps through the device's step frames leaves its last one)."""
+        for name in set(vars(self)) - set(before or vars(self)):
+            delattr(self, name)
+        try:
+            held.pop().close()
+        finally:
+            try:
+                opened.memory.retire_pool()
+            except AttributeError:   # a device memory without step pools (a test's stand-in)
+                pass
+            report = opened.close(quiet=True)
+            opened.memory.leaking = None
+        if report["returned"] is False:
+            self.fail(f"{self.plugin_id()}: closing what the test assembled did not return its memory: "
+                      f"{report['message']}")
 
     def reference(self, use=None, options=None, context=None, facts=(), use_options=None):
         """The plugin's reference (its manifest's `reference`) in its slots: for a fused plugin the separate plugins it
@@ -116,9 +199,7 @@ class PluginTestCase(unittest.TestCase):
         registry = self.registry()
         selection = {"use": {**(use or {}), **registry.reference_use(self.plugin_id())},
                      "options": {**(use_options or {}), **(options or {})}}
-        assembly = assemble(selection, registry, context, facts)
-        self.addCleanup(assembly.close)
-        return assembly
+        return self._assembled(selection, registry, context, facts)
 
     def core_runtime(self):
         """The crit_core_steps library a test that runs the engine on Core's runtime loads (crit_core.native's
@@ -205,6 +286,63 @@ class PluginTestCase(unittest.TestCase):
             return (plugin.pool([0], 1, 8, 64, device),)
         return (plugin.pool([0], 1, 4, 4, device),)
 
+    def assertRoutesByPhase(self, route, window=16, widest=64, vary=(), device="cpu"):
+        """Routing conformance: a row's path through the plugin follows its phase (StepBatch.prompt_row), never its
+        length or the rows beside it. route(batch) runs one step of a StepBatch through the plugin (its pools made and
+        each row's earlier positions written afresh) with recording kernels in place of its own, and returns one label
+        a token: the path that computed it (a kernel, a reader, a call). Over routing_grid(window, widest), every
+        token of a phase has one label, and each row has the labels it has in a step alone; a phase in `vary` (a size
+        choice within that phase the plugin's facts declare: row_invariance) may take other labels at other lengths,
+        but still those of the row alone."""
+        found = {}
+        for name, rows in routing_grid(window, widest):
+            batch = StepBatch.build(rows, device)
+            labels = list(route(batch))
+            if len(labels) != batch.tokens:
+                self.fail(f"{self.plugin_id()}: route gave {len(labels)} labels for {batch.tokens} tokens ({name})")
+            for r, row in enumerate(rows):
+                first, count = batch.starts[r], rows[r][2]
+                mine = labels[first:first + count]
+                if len(rows) > 1:
+                    alone = list(route(StepBatch.build([row], device)))
+                    if mine != alone:
+                        self.fail(f"{self.plugin_id()}: row {row} took {sorted(set(mine))} in a step of {len(rows)} "
+                                  f"rows ({name}) but {sorted(set(alone))} alone: its path follows the rows beside it")
+                found.setdefault(row[3], {}).setdefault(tuple(sorted(set(mine), key=repr)), []).append((name, row))
+        for phase, paths in found.items():
+            if phase not in vary and len(paths) > 1:
+                described = "; ".join(f"{list(path)} for {rows_[0][1]} ({rows_[0][0]})" for path, rows_ in paths.items())
+                self.fail(f"{self.plugin_id()}: its {phase} rows take other paths at other lengths: {described}")
+        return found
+
+    def assertProjectionsRouteByPhase(self, plugin, matrix, width, record, device="cpu"):
+        """Routing conformance of a projections plugin (assertRoutesByPhase): each step of the grid multiplied as a
+        model multiplies it (crit_plugins.device.row_groups: a prompt chunk alone with prompt=True, decode tokens in
+        calls of invariant_rows(plugin) with prompt=False). record() is a context manager over the plugin's kernels
+        that yields a list it appends (label, rows) to, a kernel call each, in the order the calls compute the call's
+        rows (a call whose kernel calls take one label is that label's, padded rows and all). A decode row's kernel never follows its length or the rows beside it; a prompt row's may follow its
+        chunk's length only where the facts do not say row_invariance prompt_rows."""
+        import torch
+        from .device import invariant_rows, row_groups
+        rows = invariant_rows(plugin)
+        facts = plugin.facts() if callable(getattr(plugin, "facts", None)) else {}
+
+        def route(batch):
+            x = torch.zeros(batch.tokens, width, dtype=torch.bfloat16, device=device)
+            labels = []
+            for first, end, prompt in row_groups(batch, rows):
+                with record() as calls:
+                    plugin.matmul(x[first:end], matrix, prompt=prompt)
+                made = [label for label, n in calls for _ in range(n)]
+                if len({label for label, _ in calls}) == 1:   # one kernel (a padded call's rows past the call's too)
+                    made = [calls[0][0]] * (end - first)
+                if len(made) != end - first:
+                    self.fail(f"{self.plugin_id()}: its recorded calls cover {len(made)} of a call's {end - first} rows")
+                labels += made
+            return labels
+        vary = () if (facts.get("row_invariance") or {}).get("prompt_rows") else (PREFILL,)
+        return self.assertRoutesByPhase(route, vary=vary, device=device)
+
     def assertKeepsRows(self, plugin):
         """The projections plugin's matmul keeps each row's bits whatever rows share a call of up to
         crit_plugins.device.invariant_rows(plugin) rows (DECODE_ROWS, or the facts' row_invariance rows, up to 32 here),
@@ -220,23 +358,24 @@ class PluginTestCase(unittest.TestCase):
         facts = plugin.facts() if callable(getattr(plugin, "facts", None)) else {}
         most = min(32, invariant_rows(plugin))
         for out_dtype in (None, torch.float32):
-            alone = [plugin.matmul(x[r:r + 1].clone(), matrix, out_dtype)[0] for r in range(most)]
+            alone = [plugin.matmul(x[r:r + 1].clone(), matrix, out_dtype, prompt=False)[0] for r in range(most)]
             for rows in range(2, most + 1):
-                batch = plugin.matmul(x[:rows], matrix, out_dtype)
+                batch = plugin.matmul(x[:rows], matrix, out_dtype, prompt=False)
                 for r in range(rows):
                     if not torch.equal(batch[r], alone[r]):
                         self.fail(f"{self.plugin_id()}: row {r} of a {rows}-row matmul differs from the row alone "
                                   f"({out_dtype or 'default'} out): batched decoding would not match serial")
         if (facts.get("row_invariance") or {}).get("prompt_rows"):
-            whole = plugin.matmul(x, matrix)
+            whole = plugin.matmul(x, matrix, prompt=True)
             for first, rows in ((0, most + 1), (7, 40), (100, 200)):
-                if not torch.equal(plugin.matmul(x[first:first + rows].clone(), matrix), whole[first:first + rows]):
+                if not torch.equal(plugin.matmul(x[first:first + rows].clone(), matrix, prompt=True),
+                                   whole[first:first + rows]):
                     self.fail(f"{self.plugin_id()} says its prompt rows keep their bits, but rows {first}.. of "
                               f"{rows} differ from the same rows in a call of {len(x)}")
         if (facts.get("row_invariance") or {}).get("prompt_exact"):
-            whole = plugin.matmul(x, matrix)
+            whole = plugin.matmul(x, matrix, prompt=True)
             for r in (0, 1, most, 150, len(x) - 1):
-                if not torch.equal(whole[r], plugin.matmul(x[r:r + 1].clone(), matrix)[0]):
+                if not torch.equal(whole[r], plugin.matmul(x[r:r + 1].clone(), matrix, prompt=False)[0]):
                     self.fail(f"{self.plugin_id()} says its prompt rows have the decode rows' bits, but row {r} of a "
                               f"call of {len(x)} differs from the row alone")
 
@@ -253,10 +392,10 @@ class PluginTestCase(unittest.TestCase):
         keys = torch.randn(5, 2, 8, generator=generator).to(device)
         values = torch.randn(5, 2, pool.value_dim, generator=generator).to(device)
         pool.open("a")
-        pool.write(0, pool.reserve(StepBatch.build([("a", 0, 5)], device)), keys, values)
+        pool.write(0, pool.reserve(StepBatch.build([("a", 0, 5, PREFILL)], device)), keys, values)
         pool.keep("a", 5)
         pool.fork("a", "b")
-        pool.write(0, pool.reserve(StepBatch.build([("b", 3, 1)], device)), keys[:1] * 2, values[:1] * 2)
+        pool.write(0, pool.reserve(StepBatch.build([("b", 3, 1, DECODE)], device)), keys[:1] * 2, values[:1] * 2)
         pool.keep("b", 4)
         found = {name: pool.gather(0, name, pool.length(name)) for name in ("a", "b")}
         expected = {"a": (keys, values), "b": (torch.cat([keys[:3], keys[:1] * 2]), torch.cat([values[:3], values[:1] * 2]))}

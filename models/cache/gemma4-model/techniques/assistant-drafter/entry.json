@@ -1,0 +1,55 @@
+{
+  "schema": "crit-model-technique-v1",
+  "id": "assistant-drafter",
+  "category": "drafters",
+  "summary": "Gemma 4's companion MTP drafter (a gemma4_assistant checkpoint in a folder of its own) as the device draft head: query-only decoder layers over the target's last sliding and full layer KV, fed the target's final-normed row",
+  "provides": {
+    "drafters": [
+      "gemma4-assistant"
+    ]
+  },
+  "source": "assistant_drafter",
+  "needs_sources": [
+    "template"
+  ],
+  "path": "models/cache/gemma4-model/techniques/assistant-drafter/README.md",
+  "code_path": "models/cache/gemma4-model/techniques/assistant-drafter/code",
+  "code_files": [
+    {
+      "path": "models/cache/gemma4-model/techniques/assistant-drafter/code/assistant_drafter.py",
+      "purpose": "The drafter technique (DRAFTERS), its draft head and the arithmetic both the head and the tests' host reference run (step)"
+    }
+  ],
+  "reads": {
+    "tensors": [
+      "model.embed_tokens.weight",
+      "model.layers.N.input_layernorm.weight",
+      "model.layers.N.layer_scalar",
+      "model.layers.N.mlp.down_proj.weight",
+      "model.layers.N.mlp.gate_proj.weight",
+      "model.layers.N.mlp.up_proj.weight",
+      "model.layers.N.post_attention_layernorm.weight",
+      "model.layers.N.post_feedforward_layernorm.weight",
+      "model.layers.N.pre_feedforward_layernorm.weight",
+      "model.layers.N.self_attn.o_proj.weight",
+      "model.layers.N.self_attn.q_norm.weight",
+      "model.layers.N.self_attn.q_proj.weight",
+      "model.norm.weight",
+      "post_projection.weight",
+      "pre_projection.weight"
+    ],
+    "config": [
+      "hidden_size",
+      "layer_types",
+      "num_attention_heads",
+      "rms_norm_eps",
+      "text_config",
+      "text_config.hidden_size",
+      "text_config.layer_types",
+      "text_config.num_attention_heads",
+      "text_config.rms_norm_eps"
+    ],
+    "layout": []
+  },
+  "reads_of": "companion"
+}

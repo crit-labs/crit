@@ -48,7 +48,7 @@ import itertools
 import math
 import time
 
-from crit_plugins.device import StepBatch, capturing
+from crit_plugins.device import PREFILL, StepBatch, capturing
 
 STASH, CHECKPOINTS, RECOMPUTE, FINAL, FLUSH = 0, 1, 2, 3, 4   # recurrent-scans' row kinds
 REPLAY, FLUSH_PENDING = 2, 3                                  # and its replay modes
@@ -460,15 +460,20 @@ class StatePool:
 
     def _plan(self, batch):
         """A StepBatch's rows, the same for every layer of a step: {"rows": (sequence, index, first, tokens) each,
-        "prompts": the rows of more than widest + 1 tokens, "conv": the convolution's row table, "index": each row's
-        sequence index on the device}, and the state's row tables by how prompt rows run (delta_rows)."""
+        "prompts": the rows the batch marks as prompt chunks (its phase, PREFILL, whatever their length: a short prompt
+        chunk keeps its final state as a long one does), "conv": the convolution's row table, "index": each row's
+        sequence index on the device}, and the state's row tables by how prompt rows run (delta_rows). A decode row (a
+        verify window) is committed by prefix (STASH) and holds at most widest + 1 tokens."""
         if self._plans is not None and self._plans[0] is batch:
             return self._plans[1]
         rows, conv, prompts = [], [], []
         for r in range(batch.rows):
             sequence, first, count, _ = batch.row(r)
             i = self._index(sequence)
-            prompt = count > self.capacity
+            prompt = batch.prompt_row(r)
+            if not prompt and count > self.capacity:
+                raise ValueError(f"a decode row of {count} tokens in a pool of verify rows up to {self.capacity} "
+                                 "(widest + 1): a longer row is a prompt chunk, which the batch marks so")
             rows.append((sequence, i, first, count))
             conv.append([first, count, i, FLUSH if prompt else STASH, -1])
             if prompt:
@@ -488,8 +493,9 @@ class StatePool:
         free unit for every FINAL row (or no memory to back them), they are slots of a scratch the step makes."""
         key = (exact_rows, chunked)
         if key not in plan["delta"]:
-            kinds = [STASH if count <= self.capacity else FINAL if count <= exact_rows or chunked is None else FLUSH
-                     for _, _, _, count in plan["rows"]]
+            prompts = set(plan["prompts"])
+            kinds = [STASH if r not in prompts else FINAL if count <= exact_rows or chunked is None else FLUSH
+                     for r, (_, _, _, count) in enumerate(plan["rows"])]
             finals = [sequence for (sequence, _, _, _), kind in zip(plan["rows"], kinds) if kind == FINAL]
             units = sorted(self.free)[:len(finals)]
             pooled = bool(finals) and len(units) == len(finals) and (
@@ -674,7 +680,7 @@ def scan_rows(pool, prompt, chunk_fp32=True):
         v = torch.randn(tokens, pool.heads, pool.values, generator=g).to(pool.device, torch.bfloat16)
         log_decay = (-torch.rand(tokens, pool.heads, generator=g) * 0.5).to(pool.device)
         beta = torch.rand(tokens, pool.heads, generator=g).to(pool.device)
-        batch = StepBatch.build([(0, 0, tokens)], pool.device)
+        batch = StepBatch.build([(0, 0, tokens, PREFILL)], pool.device)
 
         def run(exact):
             forward(0, q, k, v, log_decay, beta, probe, batch, geometry, exact, chunk_fp32, prompt)
@@ -836,7 +842,8 @@ def _chunk_forward(pool, li, q, k, v, g, b, batch, geometry, out):
         return out
     plan = pool._plan(batch)
     rows = plan["rows"]
-    window = [(r, i, first, count) for r, (_, i, first, count) in enumerate(rows) if count <= pool.capacity]
+    prompts = set(plan["prompts"])
+    window = [(r, i, first, count) for r, (_, i, first, count) in enumerate(rows) if r not in prompts]
     if window:
         idx = torch.cat([torch.arange(first, first + count, device=q.device) for _, _, first, count in window])
         counts = [count for _, _, _, count in window]
@@ -1007,8 +1014,9 @@ def convolve(layer, x, weight, bias, pool, batch, activation="silu", out=None):
             pool.kernels.conv_segments(out[span], pool.windows[li, i], final, x[span], weight, bias, silu=silu)
             pool.final_windows.setdefault(sequence, {})[li] = final
         return out
+    marked = set(prompts)
     for r, (sequence, i, first, count) in enumerate(rows):
-        prompt = count > pool.capacity
+        prompt = r in marked   # the batch's phase (PoolStates._plan), never the row's length
         final = _torch_window(pool, li, index[r:r + 1], FINAL if prompt else STASH, first, count, x, weight, bias, silu,
                               out)
         if prompt:

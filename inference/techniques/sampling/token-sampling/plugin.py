@@ -51,6 +51,11 @@ class CoreSampler:
             self._rounds.scratch = getattr(self, "scratch", None)
         return self._rounds
 
+    def close(self):
+        """The rounds' buffers go, and a scratch they made for themselves where the engine gave none."""
+        if self._rounds is not None:
+            self._rounds.close()
+
     def reserve(self, rows, widest, vocab, device, logprobs=0):
         """The round buffers for up to `rows` rows at up to `widest` drafts over `vocab` logits, once, before
         capturing rounds (device_rounds.RoundSampling.reserve)."""

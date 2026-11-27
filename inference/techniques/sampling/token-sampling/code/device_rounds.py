@@ -57,12 +57,14 @@ WORD = 0xFFFFFFFF
 ONE = 0x3F800000                                 # the bits of FP32 1.0
 KERNELS = ("native", "torch")                    # sampling.cu built at load, or the torch law
 
-_NATIVE = {}
+_NATIVE = {}   # device -> the extension module built for it (None where it did not build), once a process
 KERNEL = "token-sampling"   # crit's kernel of the sampling law (plugin.json "kernels")
 
 
 class Native:
-    """sampling.cu's launches for torch tensors (the extension module built at load), None for an absent buffer."""
+    """sampling.cu's launches for torch tensors (the extension module built at load), None for an absent buffer.
+    One an engine (native()): the empty tensors it passes for absent buffers live on its device, so they go with the
+    engine that holds it, never with the process (a closed engine's device memory is all returned)."""
 
     def __init__(self, module):
         self.module = module
@@ -114,9 +116,9 @@ class Native:
 
 def native(device):
     """crit's kernel token-sampling (the sampling law, built for `device` by crit's kernel build with the engine's
-    tuning or its default knobs, crit_plugins.kernels.load_kernel; recorded in the engine's facts) as Native, once a
-    process; None on a CPU device or where it does not build here (no CUDA compiler, no crit_kernels: recorded as
-    the kernel's fallback with its reason), and the torch law serves."""
+    tuning or its default knobs, crit_plugins.kernels.load_kernel; recorded in the engine's facts; built once a
+    process) as a Native of the caller's own; None on a CPU device or where it does not build here (no CUDA
+    compiler, no crit_kernels: recorded as the kernel's fallback with its reason), and the torch law serves."""
     device = torch.device(device)
     if device.type != "cuda":
         return None
@@ -128,8 +130,8 @@ def native(device):
         if module is None:
             warnings.warn("token-sampling: crit's kernel token-sampling did not build here; rounds sample with the "
                           "torch law instead")
-        _NATIVE[key] = Native(module) if module is not None else None
-    return _NATIVE[key]
+        _NATIVE[key] = module
+    return Native(_NATIVE[key]) if _NATIVE[key] is not None else None
 
 
 # --- Core's Philox draw in torch (int64 arithmetic, exact): the torch law's uniforms -------------------------------
@@ -275,9 +277,9 @@ class RoundState:
             layout = self.native.layout()
             self.request_bytes, self.position_word = layout["request"], layout["position"] // 8
             self.requests = torch.zeros(rows * self.request_bytes, dtype=torch.uint8, **dev)
-            if scratch is None:
+            if scratch is None:   # no engine's (a test, a bench): one of its own, closed with it (close())
                 from crit_plugins.memory import of as memory_of
-                scratch = memory_of(self.device).scratch("token-sampling")
+                scratch = self._own = memory_of(self.device).scratch("token-sampling")
             self._scratch = scratch
             # A launch's scratch for the state's most logit rows: FP32 words, and FP64 words for the log-probabilities.
             self.scratch_bytes = (self.native.scratch_bytes(vocab, rows * cols) // 4 + 2) * 4
@@ -288,6 +290,14 @@ class RoundState:
                 self._request(slot, {})
         else:
             self.laws = DraftLaws(rows, widest, vocab, self.device)
+
+    _own = None   # the scratch the state made for itself where no engine gave one
+
+    def close(self):
+        """Give back the scratch the state made for itself (an engine's own scratch closes with the engine)."""
+        own, self._own = self._own, None
+        if own is not None:
+            own.close()
 
     def _request(self, slot, rule):
         packed = self.native.pack_request(rule.get("temperature", 0.0), rule.get("top_p", 1.0), rule.get("min_p", 0.0),
@@ -371,11 +381,19 @@ class RoundSampling:
         found = self._round
         if found is None or (found.rows, found.widest, found.vocab, found.device, found.top, found.kernel) != (
                 rows, widest, vocab, torch.device(device), int(logprobs), self.kernel):
+            if found is not None:
+                found.close()
             self._round = RoundState(rows, widest, vocab, device, logprobs, self.kernel, self.scratch)
             for slot, params in sorted(self._staged.items()):   # the rules staged before, in the new buffers
                 if slot < rows:
                     self._round.stage(slot, params)
         return self._round
+
+    def close(self):
+        """The round buffers go, and the scratch the round state made for itself with them."""
+        found, self._round = self._round, None
+        if found is not None:
+            found.close()
 
     def _state(self, view, vocab, drafting=False):
         if self._round is None:

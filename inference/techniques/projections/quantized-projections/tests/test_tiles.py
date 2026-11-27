@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from crit_plugins.testing import PluginTestCase
+from crit_plugins.testing import long_call
 
 SHAPES = ((10240, 5120), (5120, 17408))   # a wide projection and a down projection of a model of hidden size 5120
 CASES = [("bf16", {}), ("fp8:channel", {}), ("fp8:channel", {"decode_activations": "bf16"}), ("mxfp8", {}),
@@ -71,10 +72,12 @@ class TileTests(PluginTestCase):
                     most = plugin.facts()["row_invariance"]["rows"]
                     self.assertEqual(most, 16 if options.get("decode_activations") == "bf16" else 128)
                     x = torch.randn(most, k, generator=self.g).cuda().to(torch.bfloat16)
-                    alone = torch.cat([plugin.matmul(x[r:r + 1].clone(), m, torch.float32) for r in range(most)])
+                    alone = torch.cat([plugin.matmul(x[r:r + 1].clone(), m, torch.float32,
+                                                     prompt=long_call(x[r:r + 1].clone(), plugin)) for r in range(most)])
                     for rows in (2, 3, 8, 15, 16, 17, 31, 64, 65, 100, most):
                         if rows <= most:
-                            self.assertTrue(torch.equal(plugin.matmul(x[:rows], m, torch.float32), alone[:rows]),
+                            self.assertTrue(torch.equal(plugin.matmul(x[:rows], m, torch.float32,
+                                                                      prompt=long_call(x[:rows], plugin)), alone[:rows]),
                                             (format, options, rows))
         self.assertIn("prompts:projections", self.registry()["quantized-projections"]["provides"])
 
@@ -97,10 +100,12 @@ class TileTests(PluginTestCase):
             x[:, torch.randperm(5120, generator=self.g)[:8]] *= 60.0
             x = (x * (torch.rand(24, 1, generator=self.g) * 3 + 0.2)).cuda().to(torch.bfloat16)
             for out in (torch.float32, None):
-                alone = torch.cat([plugin.matmul(x[r:r + 1].clone(), m, out) for r in range(24)])
+                alone = torch.cat([plugin.matmul(x[r:r + 1].clone(), m, out,
+                                                 prompt=long_call(x[r:r + 1].clone(), plugin)) for r in range(24)])
                 for k in range(1, 17):
                     for first in range(0, 24 - k + 1):
-                        if not torch.equal(plugin.matmul(x[first:first + k].clone(), m, out), alone[first:first + k]):
+                        if not torch.equal(plugin.matmul(x[first:first + k].clone(), m, out,
+                                                         prompt=long_call(x[first:first + k].clone(), plugin)), alone[first:first + k]):
                             self.fail(f"{format}: rows {first}..{first + k - 1} of a {k}-row call differ from the "
                                       f"rows alone ({out or 'default'} out)")
             del m
@@ -135,10 +140,12 @@ class TileTests(PluginTestCase):
                 m = plugin.load(self.stored(format, n, k), format)
                 self.assertEqual(m.path, "mma")
                 x = torch.randn(200, k, generator=self.g).cuda().to(torch.bfloat16)
-                alone = torch.cat([plugin.matmul(x[r:r + 1].clone(), m, torch.float32) for r in range(128)])
+                alone = torch.cat([plugin.matmul(x[r:r + 1].clone(), m, torch.float32,
+                                                 prompt=long_call(x[r:r + 1].clone(), plugin)) for r in range(128)])
                 for rows in (4, 16, 23, 128):
-                    self.assertTrue(torch.equal(plugin.matmul(x[:rows], m, torch.float32), alone[:rows]), rows)
-                prompt = plugin.matmul(x, m, torch.float32)
+                    self.assertTrue(torch.equal(plugin.matmul(x[:rows], m, torch.float32,
+                                                              prompt=long_call(x[:rows], plugin)), alone[:rows]), rows)
+                prompt = plugin.matmul(x, m, torch.float32, prompt=long_call(x, plugin))
                 self.assertLess(float((prompt[:128] - alone).abs().max() / prompt.abs().max()), 2e-5)
 
     def test_tile_rows_agree_with_the_prompt_path_in_order_only_and_beyond_them_the_prompt_path_serves(self):
@@ -149,8 +156,10 @@ class TileTests(PluginTestCase):
             n, k = SHAPES[0]
             m = plugin.load(self.stored(format, n, k), format)
             x = torch.randn(200, k, generator=self.g).cuda().to(torch.bfloat16)
-            prompt = plugin.matmul(x, m, torch.float32)          # 200 rows: past the tile, the prompt path
-            tiles = torch.cat([plugin.matmul(x[r:r + 100], m, torch.float32) for r in (0, 100)])
+            prompt = plugin.matmul(x, m, torch.float32,
+                                   prompt=long_call(x, plugin))          # 200 rows: past the tile, the prompt path
+            tiles = torch.cat([plugin.matmul(x[r:r + 100], m, torch.float32,
+                                             prompt=long_call(x[r:r + 100], plugin)) for r in (0, 100)])
             gap = float((prompt - tiles).abs().max() / prompt.abs().max())
             self.assertLess(gap, 2e-5, (format, options))
 
@@ -167,14 +176,15 @@ class TileTests(PluginTestCase):
             table = torch.randn(97, k, generator=self.g).cuda().to(torch.bfloat16)
 
             def forward(batch):
-                return plugin.matmul(table.index_select(0, batch.tokens_t), m, torch.float32)
+                return plugin.matmul(table.index_select(0, batch.tokens_t), m, torch.float32,
+                                     prompt=long_call(table.index_select(0, batch.tokens_t), plugin))
             prompts = PromptGraphs(forward, device="cuda", buckets=(16, 64, 128))
             self.assertEqual(prompts.prepare(), [16, 64, 128])
             for count in (1, 5, 16, 23, 64, 100, 128):
                 tokens = torch.randint(0, 97, (count,), generator=self.g).tolist()
                 out = prompts.run(0, 0, tokens)
                 self.assertIsNotNone(out, count)
-                eager = plugin.matmul(table[tokens], m, torch.float32)
+                eager = plugin.matmul(table[tokens], m, torch.float32, prompt=long_call(table[tokens], plugin))
                 self.assertTrue(torch.equal(out[:count], eager), (format, options, count))
 
     def test_fp8_prompt_rows_with_16_bit_activations_multiply_the_exact_weights(self):
@@ -190,7 +200,7 @@ class TileTests(PluginTestCase):
             plugin = self.assemble(options={**options, "tile_rows": "128"}, context=OnCuda())["projections"]
             m = plugin.load(stored, "fp8:channel")
             for rows in (1, 16, 100, 300):
-                found = plugin.matmul(x[:rows], m, torch.float32).double()
+                found = plugin.matmul(x[:rows], m, torch.float32, prompt=long_call(x[:rows], plugin)).double()
                 self.assertLess(float((found - exact[:rows]).abs().max() / exact[:rows].abs().max()), 1e-5, rows)
             facts = plugin.facts()
             self.assertEqual(facts["prompt_activations"], {"fp8": "bf16"})
@@ -198,8 +208,9 @@ class TileTests(PluginTestCase):
             self.assertEqual(facts["prompt_arithmetic"], {"fp8": {"weights": "exact", "activations": "bf16",
                                                                    "sums": "fp32"}})
             if options.get("prompt_gemm") == "fixed_tiles" and self.nvfp4.tiles_kernel() is not None:
-                whole = plugin.matmul(x, m)
-                self.assertTrue(torch.equal(plugin.matmul(x[50:250].clone(), m), whole[50:250]))
+                whole = plugin.matmul(x, m, prompt=long_call(x, plugin))
+                self.assertTrue(torch.equal(plugin.matmul(x[50:250].clone(), m,
+                                                          prompt=long_call(x[50:250].clone(), plugin)), whole[50:250]))
         w8a8 = self.assemble(context=OnCuda())["projections"]
         w8a8.load(stored, "fp8:channel")
         self.assertEqual(w8a8.facts()["prompt_arithmetic"]["fp8"]["activations"], "fp8")
@@ -216,12 +227,13 @@ class TileTests(PluginTestCase):
             stored["global_scale"] = torch.cat([torch.full((split,), 500.0), torch.full((10240 - split,), 300.0)])
             m = plugin.load(stored, "nvfp4")
             self.assertEqual([(a, b) for a, b, _ in m.runs], [(0, split), (split, 10240)])
-            full, half = plugin.matmul(x, m, torch.float32), plugin.matmul(x, m)
+            full, half = plugin.matmul(x, m, torch.float32, prompt=long_call(x, plugin)), plugin.matmul(x, m, prompt=long_call(x, plugin))
             self.assertEqual(half.dtype, torch.bfloat16)
             self.assertTrue(bool(((half.float() - full).abs() <= full.abs() / 128 + 1e-3 * full.abs().max()).all()),
                             split)
         m = plugin.load(self.stored("fp8:channel", 2048, 1024), "fp8:channel")
-        full, half = plugin.matmul(x, m, torch.float32), plugin.matmul(x, m)
+        full, half = plugin.matmul(x, m, torch.float32, prompt=long_call(x, plugin)), plugin.matmul(x, m,
+                                                                                                    prompt=long_call(x, plugin))
         self.assertTrue(bool(((half.float() - full).abs() <= full.abs() / 128 + 1e-3 * full.abs().max()).all()))
 
     def test_a_weight_only_matrix_s_prompt_decoder_is_compiled_at_load(self):
@@ -263,7 +275,7 @@ class TileTests(PluginTestCase):
                 for rows in (1, 3, 8, 16, 23, 64, 100, 213, 300, 1500, 3000, 3001):
                     x = torch.randn(rows, 1024, generator=self.g).cuda().to(torch.bfloat16)
                     for out in (None, torch.float32):
-                        plugin.matmul(x, m, out)
+                        plugin.matmul(x, m, out, prompt=long_call(x, plugin))
                 torch.cuda.synchronize()
                 triton.knobs.runtime.jit_cache_hook = before
                 self.assertEqual(compiled, [], (format, options))
@@ -283,7 +295,8 @@ class TileTests(PluginTestCase):
             original = self.nvfp4.kernel
             with patch.object(self.nvfp4, "kernel", lambda name: asked.append(name) or original(name)):
                 for rows in (1, 7, 16, 40, 300):
-                    plugin.matmul(torch.randn(rows, 1024, generator=self.g).cuda().to(torch.bfloat16), m)
+                    x = torch.randn(rows, 1024, generator=self.g).cuda().to(torch.bfloat16)
+                    plugin.matmul(x, m, prompt=long_call(x, plugin))
             self.assertEqual(asked, [], (format, options))
 
     def test_the_decode_workspace_is_the_declared_buffers_and_prompt_gemms_decode_a_chunk_at_a_time(self):
@@ -309,7 +322,7 @@ class TileTests(PluginTestCase):
         # Prompt rows past the tile decode a chunk of rows at a time: the stored values in FP32 sums.
         x = torch.randn(300, k, generator=self.g).cuda().to(torch.bfloat16)
         exact = x.double() @ self.matrices.dense(m).double().t()
-        found = plugin.matmul(x, m, torch.float32).double()
+        found = plugin.matmul(x, m, torch.float32, prompt=long_call(x, plugin)).double()
         self.assertLess(float((found - exact).abs().max() / exact.abs().max()), 1e-5)
         # Fixed tiles: chunking the matrix's rows changes no bits (the fallback, a torch GEMM a row, picks its kernel by
         # the chunk's rows too).
@@ -318,10 +331,10 @@ class TileTests(PluginTestCase):
         fixed = self.assemble(options={"activations": "bf16", "prompt_gemm": "fixed_tiles"}, context=OnCuda())
         f = fixed["projections"].load(self.stored("nvfp4", 4096, 1024), "nvfp4")
         x = torch.randn(300, 1024, generator=self.g).cuda().to(torch.bfloat16)
-        whole = fixed["projections"].matmul(x, f, torch.float32)
+        whole = fixed["projections"].matmul(x, f, torch.float32, prompt=True)
         with patch.object(self.matrices, "WORKSPACE_BYTES", 1 << 20):   # 512 rows a chunk
             self.assertEqual(len(self.matrices.row_chunks(f)), 8)
-            self.assertTrue(torch.equal(fixed["projections"].matmul(x, f, torch.float32), whole))
+            self.assertTrue(torch.equal(fixed["projections"].matmul(x, f, torch.float32, prompt=True), whole))
 
 
 if __name__ == "__main__":

@@ -26,11 +26,14 @@ class KVStateCache:
         return pages.position_bytes(layers, kv_heads, head_dim, dtype, value_dim)
 
     def close(self):
-        """The engine closes: every pool made gives its device memory back (pages.KVPool.discard)."""
+        """The engine closes: every pool made gives its device memory back (pages.KVPool.discard), and so does what
+        the kernels' module kept of this cache's launches (their dummies: device_attention.OwnedKernels)."""
         for made in self.pools:
             made.discard()
         self.pools = []
         self.states = {}
+        if isinstance(self.kernels, device_attention.OwnedKernels):
+            self.kernels.release()
 
     def _state(self, sequence):
         try:
@@ -95,8 +98,8 @@ class KVStateCache:
         """The engine facts of the pools made so far: kv_bytes_per_token, the device bytes one more token of context
         takes across them, its slot in each page tensor ([layers][pages][page][...]: every layer's keys and values at
         its pool's precision, an int8 pool's scales too), which crit-eval sizes the KV cache at a context by; and over
-        FP8 or INT8 pools which keys and values a prompt row reads (a StepBatch row of more than `window` tokens, a
-        PromptBatch's chunk of more than `window` real tokens): with the fresh buffer its own chunk's as the
+        FP8 or INT8 pools which keys and values a prompt row reads (a StepBatch's prompt chunk, a PromptBatch's chunk,
+        however short): with the fresh buffer its own chunk's as the
         projections gave them (16-bit: steps of up to fresh_tokens tokens) and the earlier positions from the pages,
         else everything from the pages. Sliding pools (kv:sliding) count as kv_sliding_bytes_per_sequence, the bytes
         a sequence's rings hold at any length, not per token. None before a pool is made."""
@@ -118,10 +121,10 @@ class KVStateCache:
             found["prompt_kv"] = ("a prompt row reads its own chunk's keys and values from the FP8 or INT8 pages, as "
                                   "decode rows read them (no fresh buffer: option fresh_mib 0)")
             return found
-        found["prompt_kv"] = (f"a prompt row (a step's row, or a prompt batch's chunk, of more than {self.window} "
-                              "tokens) reads its own chunk's keys and values as the projections gave them (16-bit), "
-                              "the earlier positions from the FP8 or INT8 pages; window rows (decode tokens, verify "
-                              "windows, pieces of up to the window), rounds, block lists and draft trees read the "
+        found["prompt_kv"] = ("a prompt row (a step's prompt chunk or a prompt batch's chunk, however short) reads "
+                              "its own chunk's keys and values as the projections gave them (16-bit), the earlier "
+                              "positions from the FP8 or INT8 pages; window rows (decode tokens, verify windows), "
+                              "rounds, block lists and draft trees read the "
                               "pages: a scored continuation reads its own tokens otherwise than the decode that served "
                               "them (outside a 0.001-nat honesty tolerance; fresh_mib 0 for served == scored)")
         found["prompt_kv_fresh_tokens"] = tokens
@@ -160,6 +163,8 @@ def create(context, options, parts):
     if options["kernels"] == "auto":
         from crit_plugins.kernels import load_kernel
         kernels = load_kernel(KERNELS, folder=Path(__file__).parent)
+        if hasattr(kernels, "owner"):   # the pools' writes run as this cache's own (released at its close)
+            kernels = device_attention.OwnedKernels(kernels)
     fresh = None
     device = device_attention.engine_device(context)
     if device.startswith("cuda") and options["fresh_mib"]:

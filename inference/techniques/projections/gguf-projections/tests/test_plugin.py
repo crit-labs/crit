@@ -98,9 +98,9 @@ class DeviceTests(PluginTestCase):
             matrix = plugin.load({"weight": raw}, f"gguf:{name}")
             self.assertEqual((matrix.rows, matrix.columns), (n, k))
             x = self.activations(5, k)
-            y = plugin.matmul(x, matrix)
+            y = plugin.matmul(x, matrix, prompt=False)
             # Each row's bits its own, alone and among others.
-            self.assertTrue(torch.equal(y[:1], plugin.matmul(x[:1], matrix)), name)
+            self.assertTrue(torch.equal(y[:1], plugin.matmul(x[:1], matrix, prompt=False)), name)
             values = torch.from_numpy(stored_values(raw, type_id, k)).to("cuda", torch.bfloat16)
             if plugin.kernel is not None:
                 self.assertTrue(torch.equal(y, plugin.kernel.gemv(x, matrix.kernel)), name)
@@ -108,7 +108,7 @@ class DeviceTests(PluginTestCase):
             # Prompt rows by dequantize: the stored values in BF16 through cuBLAS.
             p = self.activations(40, k)
             want = torch.mm(p, values.t(), out_dtype=torch.float32).to(torch.bfloat16)
-            self.assertTrue(torch.equal(plugin.matmul(p, matrix), want), name)
+            self.assertTrue(torch.equal(plugin.matmul(p, matrix, prompt=True), want), name)
             # cuBLAS's bits follow its row count: a 3-row prompt call against cuBLAS on the same 3 rows.
             want3 = torch.mm(p[:3], values.t(), out_dtype=torch.float32).to(torch.bfloat16)
             self.assertTrue(torch.equal(plugin.matmul(p[:3], matrix, prompt=True), want3), name)
@@ -128,8 +128,8 @@ class DeviceTests(PluginTestCase):
         for type_id, name in ((12, "Q4_K"), (35, "TQ2_0")):
             raw = blocks(type_id, 32, 1024, seed=3)
             matrix = plugin.load({"weight": raw}, f"gguf:{name}")
-            prompt = plugin.matmul(x, matrix)
-            self.assertTrue(torch.equal(prompt[:8], plugin.matmul(x[:8], matrix)), name)
+            prompt = plugin.matmul(x, matrix, prompt=True)
+            self.assertTrue(torch.equal(prompt[:8], plugin.matmul(x[:8], matrix, prompt=False)), name)
         self.assertEqual(plugin.facts()["row_invariance"], {"rows": 8, "prompt_rows": True, "prompt_exact": True})
         self.assertEqual(plugin.exactness(), {"decode": "declared", "prompt": "declared"})
 
@@ -143,7 +143,7 @@ class DeviceTests(PluginTestCase):
         y = plugin.matmul_experts(x, stack, ids)
         for t, e in enumerate(ids.tolist()):
             one = plugin.load({"weight": raw[e]}, "gguf:IQ4_XS")
-            self.assertTrue(torch.equal(y[t:t + 1], plugin.matmul(x[t:t + 1], one)), t)
+            self.assertTrue(torch.equal(y[t:t + 1], plugin.matmul(x[t:t + 1], one, prompt=False)), t)
 
     def test_without_the_kernel_the_host_decoded_values_run_through_torch(self):
         torch = self.torch
@@ -155,8 +155,8 @@ class DeviceTests(PluginTestCase):
         values = torch.from_numpy(stored_values(raw, 21, 256)).to("cuda", torch.bfloat16)
         self.assertTrue(torch.equal(matrix.dense, values))
         x = self.activations(3, 256)
-        y = plugin.matmul(x, matrix)
-        self.assertTrue(torch.equal(y[1:2], plugin.matmul(x[1:2], matrix)))
+        y = plugin.matmul(x, matrix, prompt=False)
+        self.assertTrue(torch.equal(y[1:2], plugin.matmul(x[1:2], matrix, prompt=False)))
         self.assertEqual(plugin.facts()["prompt"], "fallback")
         self.assertEqual(plugin.exactness(), {"decode": "row-exact", "prompt": "repeatable"})
 
@@ -166,7 +166,7 @@ class DeviceTests(PluginTestCase):
         w = torch.randn(8, 64)
         matrix = plugin.load({"weight": w}, "bf16")
         x = self.activations(2, 64)
-        self.assertTrue(torch.equal(plugin.matmul(x[:1], matrix),
+        self.assertTrue(torch.equal(plugin.matmul(x[:1], matrix, prompt=False),
                                     torch.mm(x[:1], w.to("cuda", torch.bfloat16).t(), out_dtype=torch.float32)
                                     .to(torch.bfloat16)))
         with self.assertRaisesRegex(ValueError, "gguf:<TYPE>"):
@@ -252,6 +252,42 @@ class DenseRowTests(PluginTestCase):
                 found[name] = plugin.load({"weight": torch.from_numpy(raw)}, "gguf:" + info.dtype)
         return found
 
+    def test_a_dense_rows_kernel_follows_its_phase(self):
+        # Routing conformance: decode tokens one row a call (or mma-rows' decode tile) at every step of the grid,
+        # verify windows past the decode rows too; a prompt chunk's kernel the prompt rows' however short.
+        import sys
+        from contextlib import contextmanager
+        from unittest import mock
+        torch = self.torch
+        plugin = self.assemble()["projections"]
+        matrix = plugin.load({"weight": torch.zeros(16, 256, dtype=torch.bfloat16)}, "bf16")
+        module = sys.modules[type(plugin).__module__]
+        mm = module._mm
+
+        @contextmanager
+        def record():
+            calls = []
+
+            def recorded(x16, w):
+                calls.append(("one row" if x16.shape[0] == 1 else "a GEMM of rows", x16.shape[0]))
+                return mm(x16, w)
+            patches = [mock.patch.object(module, "_mm", recorded)]
+            tile = getattr(plugin, "tile", None)
+            for name in ("mm_rows", "mm_prompt"):
+                if tile is not None and callable(getattr(tile, name, None)):
+                    real = getattr(tile, name)
+                    patches.append(mock.patch.object(tile, name, lambda x, *a, _n=name, _r=real, **k: (
+                        calls.append((_n, x.shape[0])), _r(x, *a, **k))[1]))
+            for patch in patches:
+                patch.start()
+            try:
+                yield calls
+            finally:
+                for patch in patches:
+                    patch.stop()
+        found = self.assertProjectionsRouteByPhase(plugin, matrix, 256, record, device=self.at)
+        self.assertEqual(len(found["decode"]), 1)
+
     def test_dense_rows_keep_their_bits_in_every_composition_where_exact_rows_are_asked(self):
         torch = self.torch
         self.ask("preserve")
@@ -262,15 +298,16 @@ class DenseRowTests(PluginTestCase):
                 continue   # a quantized matrix on gguf-rows: its own tests hold its bits
             k = matrix.columns
             x = torch.randn(40, k, generator=torch.Generator().manual_seed(k)).to(self.at, torch.bfloat16)
-            prompt = plugin.matmul(x, matrix)                  # one prompt chunk of 40 rows
-            alone = torch.cat([plugin.matmul(x[r:r + 1], matrix) for r in range(40)])   # each row decoded alone
+            prompt = plugin.matmul(x, matrix, prompt=True)     # one prompt chunk of 40 rows
+            alone = torch.cat([plugin.matmul(x[r:r + 1], matrix, prompt=False) for r in range(40)])   # each row decoded alone
             self.assertTrue(torch.equal(prompt, alone), name)
-            batched = torch.cat([plugin.matmul(x[r:r + 3], matrix) for r in range(0, 40, 3)])   # decode calls of 3
+            batched = torch.cat([plugin.matmul(x[r:r + 3], matrix, prompt=False) for r in range(0, 40, 3)])   # decode calls of 3
             self.assertTrue(torch.equal(prompt, batched), name)
-            chunks = torch.cat([plugin.matmul(x[:17], matrix), plugin.matmul(x[17:], matrix)])   # other chunks
+            chunks = torch.cat([plugin.matmul(x[:17], matrix, prompt=True),
+                                plugin.matmul(x[17:], matrix, prompt=True)])   # other chunks
             self.assertTrue(torch.equal(prompt, chunks), name)
             self.assertTrue(torch.equal(plugin.matmul(x[5:10], matrix, prompt=True), prompt[5:10]), name)
-            fp32 = plugin.matmul(x, matrix, out_dtype=torch.float32)
+            fp32 = plugin.matmul(x, matrix, out_dtype=torch.float32, prompt=True)
             self.assertTrue(torch.equal(fp32.to(torch.bfloat16), prompt), name)
             # and they are the stored values' products, FP32 sums
             want = torch.mm(x.float(), matrix.dense.float().t())
@@ -349,13 +386,14 @@ class DenseRowTests(PluginTestCase):
         wide = plugin.load({"weight": torch.zeros(80000, 32)}, "bf16")
         self.assertEqual(wide.tile, (2, 4, 6))
         x = torch.randn(20, 64).to(self.at, torch.bfloat16)
-        self.assertTrue(torch.equal(plugin.matmul(x, tiled), torch.cat([plugin.matmul(x[r:r + 1], tiled)
-                                                                         for r in range(20)])))
+        self.assertTrue(torch.equal(plugin.matmul(x, tiled, prompt=True),
+                                    torch.cat([plugin.matmul(x[r:r + 1], tiled, prompt=False)
+                                               for r in range(20)])))
         self.assertEqual(calls[0], ("mm_prompt", "bf16", 7, 20))
         self.assertEqual(calls[1], ("mm_rows", "bf16", 2, 4, 7, 1))
         plugin.matmul(x[:4], tiled, prompt=True)
         self.assertEqual(calls[-1], ("mm_prompt", "bf16", 7, 4))
-        plugin.matmul(torch.randn(3, 48).to(self.at, torch.bfloat16), odd)
+        plugin.matmul(torch.randn(3, 48).to(self.at, torch.bfloat16), odd, prompt=False)
         self.assertEqual(len(calls), 22)   # the 48-column matrix took no tile call
         self.assertEqual(plugin.facts()["dense_paths"], ["rows", "tile"])
 

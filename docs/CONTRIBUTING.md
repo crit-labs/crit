@@ -97,7 +97,7 @@ decoder experts). Two checks cover them:
   cannot read or that no part of the model reads. Add a target's manifest with
   `python tests/support/manifests.py MODEL_FOLDER`, which reads only the headers.
 - **The stress test** (a GPU and the checkpoints, on a machine that has them): `python tests/stress.py` serves
-  layer-cut copies of real checkpoints ([tests/support/layer_cut.py](../tests/support/layer_cut.py): a few decoder
+  layer-cut copies of real checkpoints ([crit.preflight.cut](../cli/crit/preflight/cut.py): a few decoder
   layers, every tensor byte for byte, and a twelve-layer cut where an error that grows with depth shows) as
   `crit run serve --check` serves a candidate of the library's plugins at their defaults, in both quality modes and at four device memory pressures made by a VRAM ballast
   (`CRIT_VRAM_BALLAST`, [crit_plugins.memory](../inference/core/python/crit_plugins/memory.py)), with short, 32k and
@@ -110,7 +110,9 @@ decoder experts). Two checks cover them:
   with the scenario (Core's build, the runs and their packages, crit-eval's data, expert-offload's store, the
   plugin tests) is built once per commit and cached; it writes `stress.json` and `stress.md`, a scenario a row.
 
-Builds and releases start only from a commit where both pass ([Building engines](BUILDING_ENGINES.md)).
+Releases start only from a commit where both pass. A build starts from the run's own preflight instead
+(`crit run ... preflight`: the same code, `crit.preflight`, on a cut of the run's checkpoint with every size taken
+from the run; [Building engines](BUILDING_ENGINES.md#preflight)).
 
 ## Source snapshots
 
@@ -122,7 +124,7 @@ and installs the wheel from a clean snapshot:
 mkdir -p build/package-source
 git archive HEAD | tar -x -C build/package-source
 python -B -c "import os; from setuptools.build_meta import build_sdist, build_wheel; os.chdir('build/package-source'); build_sdist('../dist'); build_wheel('../dist')"
-python -m pip install build/dist/crit-0.24.0-py3-none-any.whl
+python -m pip install build/dist/crit-0.25.0-py3-none-any.whl
 ```
 
 The `crit` wheel holds `crit`, `crit_api`, `crit_kernels`, `crit_mcp` and `crit_smoke`, and

@@ -97,6 +97,11 @@ class ConstrainedSampler:
             self._rounds = RoundMasks(inner)
         return self._rounds
 
+    def close(self):
+        """The rounds' buffers go, and a scratch they made for themselves where the engine gave none."""
+        if self._rounds is not None:
+            self._rounds.inner.close()
+
     def reserve(self, rows, widest, vocab, device, logprobs=0):
         """The round buffers for up to `rows` rows at up to `widest` drafts over `vocab` logits, the slots' masks
         among them, once, before capturing rounds."""

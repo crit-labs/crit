@@ -226,11 +226,16 @@ def rounding_suspects(facts):
     found = sorted(plugin for plugin, levels in plugins.items()
                    if isinstance(levels, dict) and levels.get("prompt") not in DECODE_BITS)
     if not found:
-        return ""
+        return "; " + LOCALISER
     return ("; the plugins whose prompt rows run another arithmetic than their decode rows (prompt below exact): "
             + ", ".join(found) + ". Serve each in turn with the options that put its prompt and decode rows on one "
             "arithmetic (crit run ... ablate --smoke-test decode_matches_prefill --set PLUGIN.OPTION=VALUE) to find "
-            "the one the gap grows in")
+            "the one the gap grows in; " + LOCALISER)
+
+
+# Where a gap starts in the model, layer by layer against the reference beside the 16-bit baseline (crit diff).
+LOCALISER = ("crit diff --package PACKAGE --model MODEL names the first layer whose rows leave the reference beyond "
+             "rounding, its blocks and the plugins they call")
 
 
 def rounding_or_fault(ctx, prompt, continuation, expected):

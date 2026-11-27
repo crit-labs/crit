@@ -1,0 +1,36 @@
+{
+  "schema": "crit-model-technique-v1",
+  "id": "shared-kv-attention",
+  "category": "mixers",
+  "summary": "Full-attention layers whose values are their keys' own rows (attention_k_eq_v), held once a position: one row a KV head [values | rotated key dimensions], read through the attention slot's latent attention",
+  "provides": {
+    "blocks": [
+      "shared-kv-attention"
+    ]
+  },
+  "source": "shared_kv_attention",
+  "needs_sources": [
+    "template",
+    "attention",
+    "rope"
+  ],
+  "path": "models/cache/gemma4-model/techniques/shared-kv-attention/README.md",
+  "code_path": "models/cache/gemma4-model/techniques/shared-kv-attention/code",
+  "code_files": [
+    {
+      "path": "models/cache/gemma4-model/techniques/shared-kv-attention/code/shared_kv_attention.py",
+      "purpose": "The block class and its registry (BLOCKS)"
+    }
+  ],
+  "reads": {
+    "tensors": [],
+    "config": [
+      "attention_k_eq_v"
+    ],
+    "layout": [
+      "head_dim",
+      "kv_heads",
+      "pool"
+    ]
+  }
+}

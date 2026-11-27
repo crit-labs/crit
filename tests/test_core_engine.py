@@ -3,6 +3,7 @@ engine is Core running what the selection assembles. The loader refuses a packag
 model plugin that cannot batch or serve the contract, runs the toy package (inference/starters/plugin-engine/plugins) on Core's concurrent
 runtime, and Core's eval-v1 and chat-resident-v1 adapters serve it with its plugins in their facts."""
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import shutil
@@ -542,6 +543,9 @@ class LoadTests(PackageFixture, unittest.TestCase):
                          ("toy step model", 2048, USE, False))
         self.assertEqual(info["configuration"]["label"], "x")
         self.assertNotIn("package", info["configuration"])
+        # Eval's result carries the engine's spec, each value with its source (crit_core.spec)
+        self.assertEqual((info["spec"]["context_tokens"], info["spec"]["cancel_grace_seconds"]["source"]),
+                         ({"value": 2048, "source": "user"}, "core"))
         out = evaluated.generate([5, 6], 4, lambda tokens: None)
         self.assertEqual(out["tokens"], oracle([5, 6], 4, stops=()))
         # Core's facts of the request's rounds: one a decode row, nothing drafted.
@@ -578,6 +582,13 @@ class LoadTests(PackageFixture, unittest.TestCase):
             prompt, chosen = clients[row["client"]][row["index"]], sampling[row["client"]][row["index"]]
             alone = evaluated.generate_sampled(prompt, 4, lambda tokens: None, chosen)
             self.assertEqual(row["tokens"], alone["tokens"])
+        # Each request at its own length (crit-eval's case requests, max_new_tokens[c][r]).
+        lengths = [[3, 5], [2, 4], [6]]
+        sized = evaluated.cohort(clients, lengths)
+        for row in sized["requests"]:
+            prompt, length = clients[row["client"]][row["index"]], lengths[row["client"]][row["index"]]
+            self.assertEqual(row["tokens"], oracle(prompt, length, stops=()))
+            self.assertEqual(row["completion_tokens"], length)
 
     def test_a_drafting_engine_decodes_plainly_on_request_and_eval_s_plain_engine_drafts_nothing(self):
         drafting = write_package(self.root / "drafting", drafting=True)
@@ -1006,6 +1017,62 @@ class PackageExactnessTests(PackageFixture, unittest.TestCase):
             self.assertEqual(engine.telemetry()["load"]["resolved"], right["facts"])
         finally:
             engine.close()
+
+    @unittest.skipUnless(STEP_LIBRARY, "Core's runtime crit_core_steps is not built: `crit core build` builds it")
+    def test_the_engine_spec_gives_every_value_its_source_and_the_load_records_it(self):
+        # One description of the engine before any weight (crit_core.spec): a value crit run wrote from the user's
+        # request says user (the configuration's provenance), one the package names says package, a default says
+        # default, Core's bounds say core; the load records the spec it was held to.
+        from crit_core.spec import differences, engine_spec, plain
+        from crit_plugins.memory import HEADROOM, HOST_HEADROOM
+        from crit_plugins.steps import GRACE
+        configuration = {**self.configuration(), "vram_headroom_bytes": 1 << 30, "quality_mode": "speed",
+                         "provenance": {"vram_headroom_bytes": "user"}}
+        spec = engine_spec(self.package, self.model, configuration, context_tokens=512, device="cpu")
+        sources = {name: item["source"] for name, item in spec["values"].items()}
+        self.assertEqual((sources["vram_headroom_bytes"], sources["quality_mode"], sources["ram_headroom_bytes"],
+                          sources["cancel_grace_seconds"], sources["context_tokens"], sources["exactness"]),
+                         ("user", "package", "default", "core", "user", "mode"))
+        values = plain(spec)
+        self.assertEqual((values["vram_headroom_bytes"], values["ram_headroom_bytes"], values["cancel_grace_seconds"],
+                          values["context_tokens"]), (1 << 30, HOST_HEADROOM, GRACE, 512))
+        self.assertEqual(plain(engine_spec(self.package, self.model, device="cpu"))["vram_headroom_bytes"], HEADROOM)
+        self.assertEqual({item["source"] for options in spec["options"].values() for item in options.values()} -
+                         {"default", "mode", "package"}, set())
+        with self.assertRaisesRegex(ValueError, "has the source 'guessed'"):
+            engine_spec(self.package, self.model, {**configuration, "provenance": {"x": "guessed"}}, device="cpu")
+        engine = load(self.package, self.model, configuration, context_tokens=512, device="cpu")
+        try:
+            self.assertEqual(engine.telemetry()["load"]["spec"]["values"], spec["values"])
+        finally:
+            engine.close()
+        resolved = {**spec, "values": {**spec["values"], "kv_bytes_per_token": {"value": 64, "source": "resolved",
+                                                                                 "by": "toy-model"}}}
+        self.assertEqual(differences(resolved, {"kv_bytes_per_token": 64}), [])
+        self.assertIn("kv_bytes_per_token", differences(resolved, {"kv_bytes_per_token": 80})[0])
+        # a price sizes the engine before it exists and holds no load; the engine serves the spec's context at least
+        priced = {**resolved, "values": {**resolved["values"], "held_matrix_bytes": {"value": 10, "source": "resolved",
+                                                                                    "by": "projections"}}}
+        self.assertEqual(differences(priced, {"kv_bytes_per_token": 64}), [])
+        self.assertEqual(differences(resolved, {"kv_bytes_per_token": 64, "context": 512}), [])
+        self.assertIn("the engine serves 256 tokens of context, its spec asks 512",
+                      differences(resolved, {"kv_bytes_per_token": 64, "context": 256})[0])
+        from unittest import mock
+        with mock.patch("crit_core.spec.differences", lambda spec, facts: ["context_tokens: fixture"]):
+            with self.assertRaisesRegex(Exception, "the engine is not its spec .*context_tokens: fixture"):
+                load(self.package, self.model, configuration, context_tokens=512, device="cpu")
+
+    def test_a_kept_file_is_named_only_where_the_server_names_its_folder(self):
+        # crit serve --one-process names the folder (CRIT_KEPT_FILES); elsewhere a kept store stays in the process
+        from unittest import mock
+        context = core_engine.LoadContext.__new__(core_engine.LoadContext)
+        with mock.patch.dict(os.environ, {core_engine.KEPT_FILES: ""}):
+            self.assertIsNone(context.kept_file("expert-tensors:store", {"a": 1}))
+        with mock.patch.dict(os.environ, {core_engine.KEPT_FILES: "/srv/kept"}):
+            found = context.kept_file("expert-tensors:store", {"a": 1})
+            self.assertEqual((found.parent.as_posix(), found.suffix), ("/srv/kept", ".store"))
+            self.assertTrue(found.name.startswith("expert-tensors-store-"))
+            self.assertNotEqual(found, context.kept_file("expert-tensors:store", {"a": 2}))
 
     def test_crit_plugins_resolve_prints_what_the_plugins_answer_before_a_load(self):
         import contextlib

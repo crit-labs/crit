@@ -105,7 +105,7 @@ REOPEN_STEP = 16
 # decode gap's rounding from a fault by it).
 ENGINE_FACTS = ("speculative", "plain", "draft_width", "bytes_per_pass", "host_bytes_per_pass", "draft_bytes_per_step",
                 "draft_ms", "kv_bytes_per_token", "prompt_activations", "prompt_cache", "plugins", "kernels", "matrices",
-                "exactness", "approximations", "decode_via_prompt")
+                "exactness", "approximations", "decode_via_prompt", "spec_prices")
 # What a generation's timing may report beside its phases, for crit serve's telemetry and an Eval adapter's results:
 # the drafting facts (drafts accepted and made per round, device time in verify passes and draft steps), which plain
 # decoding has none of, and the device expert cache's routed reads and hits, which every decode has.
@@ -268,6 +268,13 @@ def engine_facts(engine):
                     isinstance(m, dict) and isinstance(m.get("N"), int) and isinstance(m.get("K"), int)
                     and isinstance(m.get("format"), str) for m in value):
                 out[key] = [{"N": m["N"], "K": m["K"], "format": m["format"]} for m in value]
+        elif key == "spec_prices":
+            # The EngineSpec's prices the engine was loaded under (crit_plugins.assemble.PRICES: KV elements a token,
+            # the held and stored bytes of its 16-bit target matrices), which crit Eval sizes the engine by
+            if isinstance(value, dict) and value and all(
+                    isinstance(k, str) and isinstance(v, int) and not isinstance(v, bool) and v >= 0
+                    for k, v in value.items()):
+                out[key] = dict(value)
         elif key == "host_bytes_per_pass":
             # The part of bytes_per_pass read from host memory: {"link": copied over the host link, "cpu": computed
             # by the CPU}, which crit-eval prices at the probe's host rates.

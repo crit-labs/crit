@@ -1,6 +1,6 @@
 {
   "kind": "crit.native-core.contract-documentation",
-  "version": "0.24.0",
+  "version": "0.25.0",
   "interface": "inference/core/include/crit/core.h",
   "component_interfaces": [
     "inference/core/include/crit/sampling.h",

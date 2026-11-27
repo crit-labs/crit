@@ -1,4 +1,5 @@
-"""Each model technique's entry.json declares what its code reads (`reads`), and nothing its code does not read.
+"""Each model technique's entry.json declares what its code reads (`reads`), and nothing its code does not read: the
+library's (models/techniques) and a family's own (models/cache/<family>/techniques).
 
 A technique reads its tensors, its config keys and its layout fields under its own names (models/techniques/README.md,
 docs/CONTRIBUTION_CRITERIA.md#model-neutral-code); its entry.json lists them, and `crit models inspect` matches
@@ -807,7 +808,9 @@ def code_reads(folder, helpers=None):
 
 
 def entries():
-    return sorted(TECHNIQUES.glob("*/*/entry.json"))
+    """Every model technique's entry: the library's (models/techniques) and each family's own in its finished model
+    plugin (models/cache/<family>/techniques), held to the same rule."""
+    return sorted(TECHNIQUES.glob("*/*/entry.json")) + sorted((ROOT / "models/cache").glob("*/techniques/*/entry.json"))
 
 
 def problems():

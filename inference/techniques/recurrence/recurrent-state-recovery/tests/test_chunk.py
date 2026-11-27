@@ -4,6 +4,7 @@ accepted prefix with those bits (step accepts, captured rounds committed at any 
 captured prompt chunks continue a sequence as an eager prompt row does (padding alone changes nothing), the outputs
 follow the float64 recurrence, and the convolution window is the scan form's."""
 from crit_plugins import StepBatch
+from crit_plugins.device import DECODE, PREFILL
 from crit_plugins.device import PromptBatch, RoundBatch
 from crit_plugins.testing import PluginTestCase
 
@@ -50,7 +51,9 @@ class ChunkTests(PluginTestCase):
         return out.clone(), x.clone()
 
     def step(self, pool, first, count, accept=None, plugin=None):
-        return self.rows(pool, StepBatch.build([("a", first, count)], self.dev), first, count, accept, plugin)
+        """A step of one row: a decode token (one token), a verify window (an accept given), else a prompt chunk."""
+        phase = DECODE if count == 1 or accept is not None else PREFILL
+        return self.rows(pool, StepBatch.build([("a", first, count, phase)], self.dev), first, count, accept, plugin)
 
     def decoded(self, n):
         """Outputs, windows' outputs and the state of decoding tokens 0 .. n - 1 one by one."""
@@ -184,6 +187,6 @@ class ChunkTests(PluginTestCase):
         self.assertTrue(torch.equal(pool.state(0, "b"), pool.state(0, "a")))
         self.assertTrue(torch.equal(pool.window(0, "b"), pool.window(0, "a")))
         a = self.step(pool, 70, 1)[0]
-        batch = StepBatch.build([("b", 70, 1)], self.dev)
+        batch = StepBatch.build([("b", 70, 1, DECODE)], self.dev)
         b = self.plugin.forward(0, *(self.inputs[n][70:71] for n in "qkvgb"), pool, batch, self.geometry)
         self.assertTrue(torch.equal(a, b))

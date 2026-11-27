@@ -72,6 +72,11 @@ def parser():
     result.add_argument("--idle-unload", type=float, metavar="SECONDS",
                         help="Unload the engine's weights after this many seconds without a request; the next request "
                              "loads it again (default: stay loaded)")
+    result.add_argument("--one-process", action="store_true",
+                        help="One engine, one process: each engine runs in a host process of its own, which ends when "
+                             "the engine is unloaded or another one loads, so everything it held returns to the system "
+                             "(default: one host across reloads, which keeps the model's mapped files and host-side "
+                             "stores for the next engine)")
     result.add_argument("--resident-ram-gib", type=float, help="Optional cap on retained model bytes in host memory")
     result.add_argument("--resident-vram-gib", type=float, help="Optional cap on retained model bytes in device memory")
     result.add_argument("--project", type=Path, default=default_project(),
@@ -200,7 +205,7 @@ def _serve(args, keys, tls):
                        device_limit=gib(args.resident_vram_gib), timeout=args.timeout,
                        load_timeout=args.load_timeout, verify_model=args.verify_model, max_queue=args.max_queue,
                        queue_timeout=args.queue_timeout, idle_unload=args.idle_unload,
-                       max_concurrency=args.max_concurrency)
+                       max_concurrency=args.max_concurrency, one_process=args.one_process)
         if args.engine:
             from .installed import InstalledEngine
             engine = InstalledEngine(args.store or args.project / "engines", args.engine, **options)

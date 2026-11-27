@@ -119,19 +119,22 @@ def tile(M, N, K, device):
 
 SPLITS_MAX = 4            # mm-split's most splits of K (SPLIT 0, the untuned rule)
 SPLIT_K_MIN = 1024        # and the fewest K values a split takes
+ORDER_MULTIPROCESSORS = 170   # the multiprocessors the untuned split rule counts: a definition (an RTX 5090's), never
+# the device's, so every GPU sums a row in the same order
 
 
 def split_tile(M, N, K, device):
     """mm-split's launch parameters for an [M][K] x [N][K] call: the tuning's knobs for (N, K) at M rows, and the
     splits: SPLIT, or with SPLIT 0 as many (up to SPLITS_MAX, each at least SPLIT_K_MIN values of K) as bring the
-    tiles to the device's multiprocessors."""
+    tiles to ORDER_MULTIPROCESSORS, the order's multiprocessors whatever the device (the splits are the sums'
+    order)."""
     k = _knobs("mm-split", {"N": N, "K": K}, M)
     t = {"BLOCK_M": k["BLOCK_M"], "BLOCK_N": k["BLOCK_N"], "BLOCK_K": k["BLOCK_K"], "GROUP_M": MM_TILE["GROUP_M"],
          "num_warps": k["WARPS"], "num_stages": k["STAGES"]}
     splits = k["SPLIT"]
     if not splits:
         tiles = triton.cdiv(M, t["BLOCK_M"]) * triton.cdiv(N, t["BLOCK_N"])
-        splits = max(1, min(SPLITS_MAX, round(_sms(device) / tiles), K // SPLIT_K_MIN))
+        splits = max(1, min(SPLITS_MAX, round(ORDER_MULTIPROCESSORS / tiles), K // SPLIT_K_MIN))
     t["SPLIT"] = splits
     return t
 

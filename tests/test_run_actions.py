@@ -154,7 +154,7 @@ class FromEvalTests(RunFixture, unittest.TestCase):
     def evaluated(self, gate_list, free=2 * 2**30, requirements=None):
         candidate = self.candidate()
         self.package(candidate)
-        candidate = candidate["candidate_id"]
+        candidate = self.serve_checked(candidate["candidate_id"])   # an Eval after a passed serve --check
         reservation = self.store.reserve(self.run_id, candidate, "eval")
         path = self.directory / "candidates" / candidate / "eval" / (reservation["attempt_id"] + ".json")
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -238,6 +238,7 @@ class RunCacheTests(unittest.TestCase):
 
 
 class ServeCheckTests(run_measure.MeasureFixture, unittest.TestCase):
+    evaluated = False   # the tests run serve --check themselves
     def test_serve_check_runs_the_serving_checks_and_records_a_functional_check(self):
         candidate = self.served()
         result = served.serve(self.store, self.run_id, candidate, port=0, check=True)
@@ -260,9 +261,11 @@ class ServeCheckTests(run_measure.MeasureFixture, unittest.TestCase):
                           # The candidate's plan declared its prompt activations, and this engine has none to differ.
                           "plan_activations": "passed",
                           # A scripted adapter's steps are not Core's, so nothing probes them, no compile watch runs
-                          # and no request drafts.
+                          # and no request drafts; its close is its host's exit (one engine, one process: crit run's
+                          # default), which returns everything the engine held.
                           "full_context_prompt_step": "unverified", "full_context_device_memory": "unverified",
-                          "compiles_after_load": "unverified", "drafts_accepted": "passed", "step_memory": "unverified"})
+                          "compiles_after_load": "unverified", "drafts_accepted": "passed", "step_memory": "unverified",
+                          "close_returns_memory": "passed"})
         self.assertEqual(check["evidence"][1]["path"], f"candidates/{candidate}/logs/serve-attempt-0001.log")
         self.assertEqual(check["package_sha256"],
                          digest(read_json(self.directory / "candidates" / candidate / "package/manifest.json")))

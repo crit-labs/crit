@@ -77,7 +77,7 @@ class ToyModel:
         x = batch.tokens_t.float()[:, None].expand(-1, self.graph_weight.shape[1]).contiguous()
         if self.options["prompt_graphs"] == "skip":
             return x @ self.graph_weight.T
-        return self.proj.matmul(x, self.graph_weight)
+        return self.proj.matmul(x, self.graph_weight, prompt=True)   # a captured prompt chunk
 
     def info(self):
         return {"implementation": "toy step model", "vocabulary": self.vocabulary, "context": self.context,
@@ -102,8 +102,9 @@ class ToyModel:
 
     # -- the pool holds each token as its key ----------------------------------------------------------------------------
     def _write(self, rows):
-        """Rows of (session, first position, tokens) into the pool; returns the StepBatch they form."""
-        batch = StepBatch.build([(s.handle, first, len(tokens)) for s, first, tokens in rows], self.device)
+        """Rows of (session, first position, tokens) into the pool, each row in its session's phase (a verified
+        draft's row a decode row); returns the StepBatch they form."""
+        batch = StepBatch.build([(s.handle, first, len(tokens), s.phase) for s, first, tokens in rows], self.device)
         ids = self.torch.tensor([t for _, _, tokens in rows for t in tokens], dtype=self.torch.float32,
                                 device=self.device).view(-1, 1, 1)
         self.pool.write(0, self.pool.reserve(batch), ids, ids)
@@ -142,9 +143,9 @@ class ToyModel:
         if self.prompts is not None:
             for s, first, inputs in placed:
                 if self.prompts.run(s.handle, first, inputs) is None:
-                    self.proj.matmul(self.torch.ones(1, 1, device=self.device), self.weight)
+                    self.proj.matmul(self.torch.ones(1, 1, device=self.device), self.weight, prompt=False)
         elif self.skip != "projections":
-            self.proj.matmul(self.torch.ones(1, 1, device=self.device), self.weight)
+            self.proj.matmul(self.torch.ones(1, 1, device=self.device), self.weight, prompt=False)
         if self.skip != "attention":
             self.attention.forward(0, self.torch.ones(batch.tokens, 1, 1, device=self.device), self.pool, batch)
         results = [None] * len(rows)

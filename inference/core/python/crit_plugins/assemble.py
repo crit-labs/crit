@@ -314,6 +314,13 @@ class Dry:
 # Engine facts that add up over the plugins that hold their part (each plugin's pools a token of context): a plugin's
 # resolve() states its own share, and the resolution is their sum.
 ADDITIVE_FACTS = ("kv_bytes_per_token",)
+# Prices a resolve() states for sizing an engine before it exists (crit_core.spec; crit Eval's context and placement
+# read them through the spec): the KV elements a token of context takes over the pools a sequence grows (Eval prices
+# them at its protocol's precision), the device bytes of the KV pools that do not grow with the context (a sliding
+# window's rings, one a sequence the engine runs at once), and the bytes the projections slot holds the checkpoint's
+# target matrices in against their stored bytes. A loaded engine is not held to a price (resolution_problems skips
+# them): the plan that sizes the load is (crit_core.engine.plan_problems, against the bytes the load measured).
+PRICES = ("kv_elements_per_token", "kv_ring_bytes", "held_matrix_bytes", "stored_matrix_bytes")
 
 
 def resolve(registry, use, order, options, context):
@@ -336,9 +343,10 @@ def resolve(registry, use, order, options, context):
         if not isinstance(found, dict) or not all(isinstance(key, str) for key in found):
             raise PluginError(f"{plugin_id}: resolve() returns a dict of engine facts")
         for key, value in found.items():
-            if key in ADDITIVE_FACTS:
+            if key in ADDITIVE_FACTS or key in PRICES:
                 if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                    raise PluginError(f"{plugin_id}: resolve() states {key} as bytes (an int of 0 or more)")
+                    raise PluginError(f"{plugin_id}: resolve() states {key} as "
+                                      f"{'bytes' if key in ADDITIVE_FACTS else 'a count'} (an int of 0 or more)")
                 facts[key] = facts.get(key, 0) + value
                 by[key] = f"{by[key]} + {plugin_id}" if key in by else plugin_id
                 continue
@@ -355,6 +363,8 @@ def resolution_problems(resolved, stated):
     engine's own (its info() and its plugins' facts, `stated`). Numbers agree to the byte, everything else as equal."""
     problems = []
     for key, value in sorted((resolved or {}).get("facts", {}).items()):
+        if key in PRICES:   # a price for sizing, which the plan that sized the load is held to instead
+            continue
         found = stated.get(key)
         if found != value:
             problems.append(f"{resolved['by'][key]}'s resolve() states {key} {value!r}, and the loaded engine "

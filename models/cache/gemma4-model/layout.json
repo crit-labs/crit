@@ -15,9 +15,10 @@
   "defaults": {"norm_topk_prob": true, "scoring_func": "softmax"},
   "residual": {"block": "sandwich"},
   "mixers": {
-    "full_attention": {"block": "attention", "prefix": "self_attn.", "scale": 1.0, "value_norm": true,
-                       "head_dim": "global_head_dim", "kv_heads": "num_global_key_value_heads"},
+    "full_attention": {"block": "shared-kv-attention", "otherwise": "attention", "prefix": "self_attn.", "scale": 1.0,
+                       "value_norm": true, "head_dim": "global_head_dim", "kv_heads": "num_global_key_value_heads"},
     "sliding_attention": {"block": "attention", "prefix": "self_attn.", "scale": 1.0, "value_norm": true}
   },
-  "ffn": {"block": "auto", "prefix": "mlp.", "routed": "parallel-moe"}
+  "ffn": {"block": "auto", "prefix": "mlp.", "routed": "parallel-moe"},
+  "draft": {"block": "gemma4-assistant", "companion": "gemma4_assistant"}
 }

@@ -87,6 +87,7 @@ class ExternalCandidateTests(ExternalFixture, unittest.TestCase):
             f"candidates/{candidate}/logs/engine-attempt-0001.log")]).read_text(encoding="utf-8"))
         self.assertEqual(self.started()["context"], ["8192"] * len(self.started()["server"]))
 
+        self.eval_completed(candidate)   # a measurement starts on a completed Eval (crit.run.state)
         (record,) = measure.measure(self.store, self.run_id, candidate)
         self.assertEqual(record["extensions"]["served_by"], external.SERVED_BY)
         self.assertEqual(len(record["metrics"]["decode_tps"]["samples"]), 3)
@@ -107,6 +108,7 @@ class ExternalCandidateTests(ExternalFixture, unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         candidate = self.external(render="text", checks=False)
+        self.serve_checked(candidate)   # Eval starts after a passed serve --check (crit.run.state)
         data = self.root / "eval-data"
         data.mkdir()
         write_data(data)

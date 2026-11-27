@@ -1,13 +1,12 @@
-"""A prompt row over FP8 and INT8 pages (a step's row, or a prompt batch's chunk, of more than the pool's window)
-attends its own chunk's keys and values as the projections gave them (attention-state's fresh buffer) and the earlier
-positions from the pages; a decode row beside it and a decode step after it read the chunk from the pages, as do
-pieces of up to the window, in a step and in a prompt batch alike, captured or not, with either prompt reader;
-over BF16 pages nothing is kept.
+"""A prompt row over FP8 and INT8 pages (a step's prompt chunk, or a prompt batch's chunk, however short) attends its
+own chunk's keys and values as the projections gave them (attention-state's fresh buffer) and the earlier positions
+from the pages; a decode row beside it, a decode step after it and a verify window read the chunk from the pages, in
+a step and in a prompt batch alike, captured or not, with either prompt reader; over BF16 pages nothing is kept.
 To show which keys and values a row reads, most tests put other values in the fresh buffer than the pages hold (as the
 kernel's own test does): its rows then equal float64 attention over [the pages' prefix, those values] or over the
 pages, and are far from the other. The pages' values are read dequantized in FP32 (rows_at), as the readers use them."""
 from crit_plugins import StepBatch
-from crit_plugins.device import PromptBatch
+from crit_plugins.device import DECODE, PREFILL, PromptBatch
 from crit_plugins.testing import PluginTestCase
 
 USE = {"kv_cache": "attention-state"}
@@ -55,7 +54,7 @@ class FreshChunkTests(PluginTestCase):
         return pool.rows_at(0, table[n // pool.page] * pool.page + n % pool.page)
 
     def prefix(self, pool, sequence, count):
-        batch = StepBatch.build([(sequence, 0, count)], "cuda")
+        batch = StepBatch.build([(sequence, 0, count, PREFILL)], "cuda")
         pool.write(0, pool.reserve(batch), self.rows(count, HKV), self.rows(count, HKV))
         pool.keep(sequence, count)
 
@@ -99,7 +98,7 @@ class FreshChunkTests(PluginTestCase):
                 self.prefix(pool, "b", 4)
                 q = self.rows(121, HQ).to(torch.bfloat16)
                 # b decodes one token (a window row) beside a's prompt row of 120 tokens.
-                batch = StepBatch.build([("b", 4, 1), ("a", 300, 120)], "cuda")
+                batch = StepBatch.build([("b", 4, 1, DECODE), ("a", 300, 120, PREFILL)], "cuda")
                 pool.write(0, pool.reserve(batch), self.rows(121, HKV), self.rows(121, HKV))
                 keys, values = self.substitute(pool, 121)
                 out = attention.forward(0, q, pool, batch)
@@ -107,7 +106,7 @@ class FreshChunkTests(PluginTestCase):
                 self.assertReads(out[:1], *self.against(pool, "b", q[:1], 4, (keys[:1], values[:1])), False, case)
                 pool.keep("a", 420)
                 # A decode step after the prompt reads the pool: the chunk at its pages' precision.
-                step = StepBatch.build([("a", 420, 1)], "cuda")
+                step = StepBatch.build([("a", 420, 1, DECODE)], "cuda")
                 pool.write(0, pool.reserve(step), self.rows(1, HKV), self.rows(1, HKV))
                 self.assertIsNone(pool.fresh_rows(0, 1), "a decode step keeps nothing fresh")
                 q1 = self.rows(1, HQ).to(torch.bfloat16)
@@ -123,7 +122,7 @@ class FreshChunkTests(PluginTestCase):
             self.prefix(pool, "a", 300)
             keys, values = self.rows(120, HKV), self.rows(120, HKV)
             q = self.rows(120, HQ).to(torch.bfloat16)
-            batch = StepBatch.build([("a", 300, 120)], "cuda")
+            batch = StepBatch.build([("a", 300, 120, PREFILL)], "cuda")
             pool.write(0, pool.reserve(batch), keys, values)
             out = attention.forward(0, q, pool, batch)
             own = (keys.to(torch.bfloat16), values.to(torch.bfloat16))
@@ -132,14 +131,14 @@ class FreshChunkTests(PluginTestCase):
             if dtype != "int8":
                 self.assertLess(error, other, (dtype, reader))
 
-    def test_a_prompt_batch_reads_its_chunk_fresh_past_the_window_and_its_pages_up_to_it(self):
+    def test_a_prompt_batch_reads_its_chunk_fresh_however_short(self):
         torch = self.torch
         for kernels, reader in (("auto", "prefill"), ("torch", "prefill"), ("auto", "decode"), ("torch", "decode")):
             for dtype in ("fp8:row", "int8"):
                 pool, attention = self.engine(dtype, kernels, reader)
                 self.prefix(pool, "a", 200)
                 frontier = 200
-                for count, own in ((40, True), (WINDOW, False), (9, False), (WINDOW + 1, True)):
+                for count, own in ((40, True), (WINDOW, True), (9, True), (WINDOW + 1, True), (1, True)):
                     case = (kernels, reader, dtype, count)
                     batch = PromptBatch(64, "cuda").fill(64, "a", frontier, list(range(count)))
                     pool.stage_prompt(batch)
@@ -152,7 +151,7 @@ class FreshChunkTests(PluginTestCase):
                                                                 (keys[:count], values[:count])), own, case)
                     frontier += count
 
-    def test_one_captured_prompt_chunk_reads_fresh_or_its_pages_by_its_count(self):
+    def test_one_captured_prompt_chunk_reads_fresh_at_every_count(self):
         torch = self.torch
         for dtype, reader in (("fp8:row", "prefill"), ("int8", "prefill"), ("fp8:row", "decode"), ("int8", "decode")):
             pool, attention = self.engine(dtype, reader=reader)
@@ -171,7 +170,7 @@ class FreshChunkTests(PluginTestCase):
             with torch.cuda.graph(graph):
                 out = attention.forward(0, q, pool, batch)
             frontier = 200
-            for count, own in ((40, True), (9, False), (WINDOW, False), (50, True)):
+            for count, own in ((40, True), (9, True), (WINDOW, True), (1, True), (50, True)):
                 keys, values = stage(count, frontier)
                 graph.replay()
                 pool.commit_prompt(batch)
@@ -180,23 +179,31 @@ class FreshChunkTests(PluginTestCase):
                                  (dtype, reader, count))
                 frontier += count
 
-    def test_a_step_piece_up_to_the_window_reads_its_pages(self):
+    def test_a_verify_window_reads_its_pages_and_a_prompt_chunk_as_short_itself_fresh(self):
         torch = self.torch
         pool, attention = self.engine("fp8:row")
         self.prefix(pool, "a", 200)
         q = self.rows(WINDOW, HQ).to(torch.bfloat16)
-        batch = StepBatch.build([("a", 200, WINDOW)], "cuda")
+        batch = StepBatch.build([("a", 200, WINDOW, DECODE)], "cuda")
         pool.write(0, pool.reserve(batch), self.rows(WINDOW, HKV), self.rows(WINDOW, HKV))
         self.assertIsNone(pool.fresh_rows(0, WINDOW), "a step of window rows keeps nothing fresh")
         want = self.reference(q, *self.stored(pool, "a", 200 + WINDOW), 200)
         self.assertLess(float((attention.forward(0, q, pool, batch).double() - want).abs().max()), NEAR)
+        pool.keep("a", 200)
+        for count in (WINDOW, 1):   # the same positions as a prompt chunk: its own keys and values fresh
+            chunk = StepBatch.build([("a", 200, count, PREFILL)], "cuda")
+            pool.write(0, pool.reserve(chunk), self.rows(count, HKV), self.rows(count, HKV))
+            keys, values = self.substitute(pool, count)
+            out = attention.forward(0, q[:count], pool, chunk)
+            self.assertReads(out, *self.against(pool, "a", q[:count], 200, (keys, values)), True, count)
+            pool.keep("a", 200)
 
     def test_16_bit_pages_keep_nothing_fresh(self):
         torch = self.torch
         pool, attention = self.engine("bf16")
         self.assertEqual(pool.fresh_tokens, 0)
         self.prefix(pool, "a", 100)
-        batch = StepBatch.build([("a", 100, 50)], "cuda")
+        batch = StepBatch.build([("a", 100, 50, PREFILL)], "cuda")
         pool.write(0, pool.reserve(batch), self.rows(50, HKV), self.rows(50, HKV))
         self.assertIsNone(pool.fresh_rows(0, 50))
         attention.forward(0, self.rows(50, HQ).to(torch.bfloat16), pool, batch)

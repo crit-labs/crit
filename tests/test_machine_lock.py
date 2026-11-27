@@ -146,6 +146,17 @@ class EngineLockTest(unittest.TestCase):
             pass
 
 
+class CoreFullSpeedTests(unittest.TestCase):
+    def test_cores_load_asks_the_opt_out_once_for_every_caller(self):
+        from unittest import mock
+        from crit_core import engine
+        engine._FULL_SPEED.clear()
+        with mock.patch("crit_core.machine.keep_full_speed", return_value=True) as asked:
+            self.assertTrue(engine.full_speed())
+            self.assertTrue(engine.full_speed())
+        self.assertEqual(asked.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
 

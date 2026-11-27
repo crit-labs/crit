@@ -105,6 +105,7 @@ class RunEvalTests(RunFixture, unittest.TestCase):
         scripted_serving(self, lambda: self.capabilities)
         package = scripted_package(self.root / "served-package", ADAPTER)
         self.store.package(self.run_id, self.candidate_id, package, RECIPE)
+        self.serve_checked(self.candidate_id)   # Eval starts after a passed serve --check (crit.run.state)
         self.folder = self.directory / "candidates" / self.candidate_id
         self.eval_data = self.root / "eval-data"
         self.eval_data.mkdir()
@@ -162,13 +163,16 @@ class RunEvalTests(RunFixture, unittest.TestCase):
         log = attempt["logs"][0]
         self.assertEqual(log["path"], f"candidates/{self.candidate_id}/logs/eval-attempt-0001.log")
         logged = (self.directory / log["path"]).read_text()
-        # A certified Eval opens the lower context after the run's, in the same resident host, and the required
-        # context again after it, which crit-eval measures the lower context against.
+        # A certified Eval opens the lower context after the run's, each in a fresh host (one engine, one process:
+        # crit run's default), and the required context again after it, which crit-eval measures the lower context
+        # against.
         self.assertEqual([line for line in logged.splitlines() if line.startswith(("crit serve: loading",
                                                                                    "crit serve: reloading"))],
                          [f"crit serve: loading {self.candidate_id} at 8,192 tokens of context",
-                          f"crit serve: reloading {self.candidate_id} at 2,048 tokens of context in the same host",
-                          f"crit serve: reloading {self.candidate_id} at 8,192 tokens of context in the same host"])
+                          f"crit serve: reloading {self.candidate_id} at 2,048 tokens of context in a fresh host "
+                          "(one engine, one process)",
+                          f"crit serve: reloading {self.candidate_id} at 8,192 tokens of context in a fresh host "
+                          "(one engine, one process)"])
         self.assertEqual(result["context"]["engine_max_context"], 8192)
         self.assertEqual(logged.count("crit serve: stopped"), 1)
         self.assertFalse((self.root / "runtime/owner.json").exists())

@@ -59,6 +59,9 @@ def _constant(name, values, dtype, device):
     key = (name, str(dtype), str(torch.device(device) if device is not None else "cpu"))
     if key not in _CONSTANTS:
         _CONSTANTS[key] = torch.tensor(values, dtype=dtype, device=device)
+        if device is not None:   # the process's, for every engine on the device (crit_plugins.lifetime)
+            from crit_plugins.memory import of
+            _CONSTANTS[key] = of(device).process("host-expert-arithmetic", f"{name}.{key[1]}", _CONSTANTS[key])
     return _CONSTANTS[key]
 
 

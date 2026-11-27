@@ -22,10 +22,20 @@ from crit_api.models import ModelContext, ModelPool
 from crit_api.stream import StreamWriter
 from crit_api.options import MAX_CHAT_RECORD
 from crit_core import engine as core_engine
-from crit_core.machine import keep_full_speed
+from crit_core.engine import full_speed
 from crit_core.serving import (CONCURRENT_CAPABILITY, CONFIG_CAPABILITY, LOGPROBS_CAPABILITY, SCORE_CAPABILITY, STREAM_CAPABILITY,
                                STRICT_TOOLS_CAPABILITY, TOKENIZE_CAPABILITY, TOOL_CHOICE_CAPABILITY,
                                TOOL_STREAM_CAPABILITY, TOOLS_CAPABILITY, RequestRejected, engine_facts)
+
+
+def close_outcome(report, number=None):
+    """An engine close's report in brief for crit serve's status ("last_close"): {"returned": True, False or None
+    (not judged), "judged", "message", "close": the host's close count at it}; None for an engine that reports none
+    (one not built by Core's loader)."""
+    if not isinstance(report, dict):
+        return None
+    return {"returned": report.get("returned"), "judged": bool(report.get("judged")),
+            "message": str(report.get("message") or "")[:4000], "close": number}
 
 
 def effective_configuration_problem(engine, configuration):
@@ -101,7 +111,11 @@ class Host:
         self.state_lock = threading.RLock()
         self.texts = 0  # tokenize requests running on the engine (chat-tokenize-v1)
         self.settled = threading.Condition(self.state_lock)
-
+        # The last engine close's outcome (crit_plugins.lifetime's report, in brief: returned, judged, message): crit
+        # serve's status carries it, so a reload, a model switch or a check reads whether the closed engine gave its
+        # memory back. Core refuses the next load in this process beside a close that did not.
+        self.last_close = None
+        self.closes = 0   # engine closes so far: last_close's "close", by which a reader tells a new one
     def telemetry(self, request):
         """A telemetry request (crit serve's /health), on its own thread beside any generation: the loaded engine's work
         so far (its telemetry(): Core's StepEngine.telemetry, the plugins' and Core's counters) as JSON values, None
@@ -138,6 +152,7 @@ class Host:
                 "host_bytes": sum(p.host_bytes for p in self.pools.values()),
                 "device_bytes": sum(p.device_bytes for p in self.pools.values()),
                 "engine_loads": self.loads, "active_requests": self.active,
+                **({"last_close": self.last_close} if self.last_close is not None else {}),
                 "max_concurrent_requests": self.capacity, "engine_facts": self.facts,
                 **({"device_free_bytes": free} if free is not None else {}), **extra}})
 
@@ -148,10 +163,14 @@ class Host:
                 self.identity = None  # no tokenize starts on the engine being closed; running ones finish first
                 while self.texts:
                     self.settled.wait()
+            self.closes += 1
             try:
-                self.engine.close()
+                self.last_close = close_outcome(self.engine.close(), self.closes)
                 self.context.close()
-            except BaseException:
+            except BaseException as exc:
+                report = getattr(exc, "report", None)   # a close that did not return its memory, raised
+                if isinstance(report, dict):
+                    self.last_close = close_outcome(report, self.closes)
                 self.blocked = True
                 raise
             self.engine = self.context = self.identity = self.facts = self.limits = self.configuration = None
@@ -321,6 +340,9 @@ class Host:
             self.pools.clear()
             self.status("unloaded")
             return None
+        if action == "close":   # the engine alone, as a reload closes it first: the model's pool stays
+            self.detach()
+            return None
         self.attach(payload["spec"])
         if action == "load":
             return None
@@ -392,10 +414,9 @@ class Host:
 def main():
     # No core file from a crash: importing crit_core limits it for every process that uses crit.
     # The engine runs in this process: it keeps its speed while crit serve's or crit run eval's window is behind
-    # another one.
-    if not keep_full_speed():
-        print("crit serve: Windows refused full-speed scheduling; the engine slows while its window is in the "
-              "background", file=sys.stderr, flush=True)
+    # another one (Core's load opts every loading process out; here before the first load, so the host's own work
+    # before it runs at full speed too).
+    full_speed()
     config = read_json(Path(sys.argv[1]))
     link = channel.connect(config["port"], config["token"])
     host = Host(Path(config["root"]), config["host_limit"], config["device_limit"], link.send)

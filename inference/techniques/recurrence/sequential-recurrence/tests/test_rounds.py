@@ -4,6 +4,7 @@ through rounds of verify windows whose drafts are wrong at every third position,
 and a truncation, by every commit strategy, and emits exactly the tokens, states and convolution windows of decoding the
 same sequences one token at a time through step() rows."""
 from crit_plugins import StepBatch
+from crit_plugins.device import DECODE, PREFILL
 from crit_plugins.testing import PluginTestCase
 
 VOCAB, KEY_HEADS, HEADS, KEYS, VALUES, KERNEL = 48, 1, 2, 32, 32, 4
@@ -86,7 +87,7 @@ class RoundTests(PluginTestCase):
     def prefill(self, toy, pool, sequence):
         tokens = self.prompts[sequence]
         pool.open(sequence)
-        batch = StepBatch.build([(sequence, 0, len(tokens))], "cuda")
+        batch = StepBatch.build([(sequence, 0, len(tokens), PREFILL)], "cuda")
         logits = toy.run(self.torch.tensor(tokens, device="cuda"), batch)
         pool.accept(sequence, len(tokens))
         return int(logits[-1].argmax())
@@ -101,7 +102,7 @@ class RoundTests(PluginTestCase):
             tokens = [self.prefill(toy, pool, s)]
             while len(tokens) < outputs:
                 position = len(self.prompts[s]) + len(tokens) - 1
-                batch = StepBatch.build([(s, position, 1)], "cuda")
+                batch = StepBatch.build([(s, position, 1, DECODE)], "cuda")
                 tokens.append(int(toy.run(self.torch.tensor([tokens[-1]], device="cuda"), batch)[0].argmax()))
                 pool.accept(s, 1)
             found[s] = tokens

@@ -654,3 +654,21 @@ def test_the_split_knobs_reach_every_launch_over_a_cache():
     want = pk.attend(*args, partitions=16, piece=64, **kw)
     assert torch.equal(split.attend(*args, **kw), want)
     assert torch.equal(split.attend(*args, fused=True, **kw), want)
+
+
+def test_the_order_rules_count_the_orders_multiprocessors_never_the_devices(monkeypatch):
+    # partitions, the CUDA tile's chunk and a prompt chunk's splits fix a column's sums: they count
+    # ORDER_MULTIPROCESSORS whatever the device reports, so every GPU sums a row in the same order
+    found = [pk.partitions("cuda", heads, kind, 128) for heads in (2, 8) for kind in ("bf16", "fp8")]
+    chunks = [pk._cuda_chunk_rule(heads) for heads in (2, 8)]
+
+    class Small:
+        multi_processor_count = 46
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda *args, **kwargs: Small())
+    pk._capability.cache_clear()
+    try:
+        assert [pk.partitions("cuda", heads, kind, 128) for heads in (2, 8) for kind in ("bf16", "fp8")] == found
+        assert [pk._cuda_chunk_rule(heads) for heads in (2, 8)] == chunks
+    finally:
+        pk._capability.cache_clear()
+    assert pk.ORDER_MULTIPROCESSORS == 170

@@ -21,11 +21,33 @@ crit plugins add ENGINE/plugins qwen4-exp-model    # the plugin, the models core
 | --- | --- |
 | `plugin.json` | The plugin's manifest ([Plugins](../../docs/PLUGINS.md)): it fills `model`, serves the config model_types its `needs` names, calls the slots in `requires` and `requires_when` (a mixture of experts' `router` and `experts`, a linear-attention layer's `recurrence`), provides the draft head where its layout has a draft layer, and extends the models core ([model-template](../core/model-template/README.md)), whose options it takes |
 | `layout.json` | The architecture (`crit-model-layout-v1`, [compose.py](../core/model-template/code/compose.py)): the model technique each layer kind and FFN runs, the residual, the draft layer, the config values the family's reference assumes where config.json is silent, and the rules that rename a checkpoint's tensors to the names the techniques read |
-| `plugin.py` | The plugin's three functions (`resolve`, `memory`, `create`), the core's over this layout; and, where the layout runs a block or residual no library technique computes, that technique's class |
+| `plugin.py` | The plugin's three functions (`resolve`, `memory`, `create`), the core's over this layout |
+| `techniques/`, `tools.py` | Where the family has them, [its own pieces](#a-familys-own-pieces): model techniques only its layout composes, its tool-call and reasoning syntax |
 | `tests/` | A small random checkpoint of the architecture served by an engine of the plugin, against the reference's log-probabilities and greedy choices ([crit_models.testing](../core/python/crit_models/testing/__init__.py)), in at least two checkpoint layouts that `tests/checkpoints.json` lists with their test classes: transformers' safetensors, the same model as GGUF (`GgufEngines`), or under a release's own tensor names that the layout's `names` map back (`Respelled`) |
 | `README.md` | What the architecture is and which techniques compose it |
 
 A model_type is the only place a family's name appears: it is what the checkpoint's config says, used to match it.
+
+## A family's own pieces
+
+A finished model plugin may also hold code only its family uses, so that the next engine of the family starts from
+it rather than writing it again ([the rule](../../docs/CONTRIBUTION_CRITERIA.md#a-familys-own-pieces)):
+
+| Piece | Where | How the core finds it |
+| --- | --- | --- |
+| A model technique (a block, a residual, a drafter) | `techniques/ID/`: `entry.json` (schema `crit-model-technique-v1`, its `reads`), `README.md`, `code/KEY.py`, `tests/` | The manifest mounts `techniques/ID/code` as its source `KEY`; the core's `blocks.library()` finds its `BLOCKS`, `RESIDUALS` or `DRAFTERS` beside the library's ([model-template](../core/model-template/README.md#a-new-model-plugin)), and the layout names them |
+| A tool-call or reasoning syntax | `tools.py`: a `crit_core.text.ToolFormat`, a `ReasoningFormat` | The manifest's `tool_format` and `reasoning_format` (`tools.py:NAME`) |
+
+Each piece meets the library's standard: built from crit's interfaces, reading its tensors and config keys through
+the layout (`tests/test_technique_reads.py` holds its `reads`), its kernels from crit's templates with their torch
+fallback, no constant measured on one GPU, and engine-tested on tiny random checkpoints in the package's two
+checkpoint layouts against the official implementation. Its code may name its family; shared code still names none and
+imports no family package, and no other family's layout composes a family's technique (`tests/test_model_neutral.py`).
+When a second family needs a piece, the change that brings it moves the piece to [models/techniques](../techniques/README.md)
+(or `inference/techniques`) under its general name. An engine build that wrote such a piece and got it working proposes
+it back to the family's package as toolkit feedback (AGENTS.md).
+
+`crit run ... recon` lists the pieces of the model plugin that serves the run's model.
 
 ## Keeping a plugin a run built
 

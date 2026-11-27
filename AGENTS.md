@@ -48,6 +48,11 @@ release's tag: records go in the folder `--project` names (default the current o
   the run's origin ([origin engine](docs/RUN_RECORDS.md#origin-engine)). Its source at the pinned commit is
   candidate 1 (`"lineage": "origin-engine"`), unchanged; its small Eval is the run's baseline. When `resolve` says
   the model is another checkpoint, candidate 1 absorbs what `recon --compare` says differs.
+- **Run the preflight first.** `crit run ... preflight`, which `next` names on a new run, serves a cut of the
+  run's checkpoint with the library's plugins at their defaults in minutes, sized from the run, and keeps its report
+  in the run folder ([preflight](docs/RUN_RECORDS.md#preflight)). Its failed scenarios are where the library at its
+  defaults breaks on this checkpoint: plan the first candidate around them and report them as toolkit feedback. It
+  is not a gate.
 - **Study the model before the first candidate.** `recon` reads `generation_config.json`, the tokenizer and chat
   templates and `config.json`, writes the facts to `work/recon.json` and scaffolds `work/recon.md`. Finish
   `recon.md` from the model card and the transformers reference implementation (norm and attention quirks, rope
@@ -98,7 +103,8 @@ its launch command in `configuration.engine`, and `crit run` records, checks, me
   batching) without writing them again. Check a new model plugin on a tiny random checkpoint first (`crit models
   tiny`, then `crit models diff --model TINY --plugin ENGINE/plugins/ID`), and keep it once it passes (`crit models
   cache add ENGINE/plugins/ID`: `crit plugins add ID` then puts it into any engine) so the architecture is built
-  once.
+  once. The finished model plugin may hold pieces of its family's own (its techniques, its tool-call syntax, a
+  companion drafter it reads: `crit run ... recon` lists them); take them before writing your own.
   Take the slots' plugins from crit's library and crit-hub (`crit plugins list --model MODEL --device cuda` lists
   what fits and the slots nothing fits; `crit plugins add`; `crit plugins status ENGINE/plugins` says which copies the
   library has changed since and which the engine changed, and `crit plugins update` brings the unchanged ones up
@@ -192,7 +198,11 @@ request at the full context (its slowest prompt step against crit serve's one-se
 device memory against the run's headroom), [crit smoke](smoke/README.md) at the run's context and at a quarter of it, and Eval's pre-check of the gates rounds
 most often fail on, the quality texts' drift by the run's budget among them. Fix what it fails before spending a round. `crit smoke --url` runs the smoke suite against any
 served engine while you build. Once the data holds the reference's scores, `recon --data EVAL_DATA` records smoke's
-reference, so `fluent` judges the engine against its checkpoint rather than an absolute perplexity.
+reference, so `fluent` judges the engine against its checkpoint rather than an absolute perplexity. Where a quality
+check or gate fails and you do not know where, `crit diff --package PACKAGE --model MODEL` (on the checkpoint, or a
+`crit models tiny` of it) names the first layer whose rows leave the official forward beyond the 16-bit baseline (and
+the checkpoint's declared activation formats, where it declares them), its blocks and the plugins they call, before
+you spend ablations on it.
 
 Each round:
 
@@ -359,7 +369,11 @@ distance. Effort, time and candidate count are not causes.
 Write `summary.md` at the run root and tell the user: target and workload; baseline versus recommended candidate;
 gains and tradeoffs; checks and limitations; techniques and kernels; Eval results and missing coverage; remaining
 work; source and package paths. Say when none qualified, and, with the rung unreachable, that no candidate is
-certified and why (`crit run ... next` says it). Put toolkit feedback here, not into Core or Inference.
+certified and why (`crit run ... next` says it). Put toolkit feedback here, not into Core or Inference. A piece
+you wrote that only this model's family uses and that works (a tool format, a drafter, a technique only its layout
+composes) is toolkit feedback too: propose it back to the family's finished model plugin
+([a family's own pieces](models/cache/README.md#a-familys-own-pieces)), naming where it lies in the engine and what
+tested it, so the next build of the family starts from it; shared code still takes only what any model can use.
 Record the cost with `crit run ... cost --transcript <your session transcript> --agent "<agent and model>"`, and name
 with `--idle FROM..UNTIL` each stretch your session was offline with nothing running (a restart, a lost
 connection), so the record gives the active hours beside the wall hours.

@@ -5,6 +5,7 @@ narrower one), its padding takes no step and leaves the window, padding alone (t
 sequence, and decoding after a captured chunk continues as after the step path. A chunk the step path would hand to the
 chunked kernel agrees with it within the stated prompt tolerance."""
 from crit_plugins import StepBatch
+from crit_plugins.device import DECODE, PREFILL
 from crit_plugins.testing import PluginTestCase
 
 VOCAB = 97
@@ -57,7 +58,7 @@ class Layers:
 
     def eager(self, sequence, frontier, tokens):
         """The step path: an unpadded StepBatch of the chunk, then its accept."""
-        batch = StepBatch.build([(sequence, frontier, len(tokens))], self.device)
+        batch = StepBatch.build([(sequence, frontier, len(tokens), PREFILL)], self.device)
         batch.tokens_t = self.torch.tensor(tokens, dtype=self.torch.int64, device=self.device)
         out = self.forward(batch)
         self.pool.accept(sequence, len(tokens))
@@ -121,12 +122,12 @@ class PromptGraphTests(PluginTestCase):
                     self.assertEqual(graph.calls, calls, "every chunk replayed a graph")
                     self.assertSame(step, graph, range(len(CHUNKS) + 1))
                     # Decoding continues alike after a captured chunk and after the step path.
-                    rows = [(s, sum(len(c) for c in CHUNKS[s]), 1) for s in range(len(CHUNKS))]
+                    rows = [(s, sum(len(c) for c in CHUNKS[s]), 1, DECODE) for s in range(len(CHUNKS))]
                     for model in (step, graph):
                         batch = StepBatch.build(rows, self.device())
                         batch.tokens_t = torch.tensor([7] * len(rows), dtype=torch.int64, device=self.device())
                         model.decoded = model.forward(batch)
-                        for s, _, _ in rows:
+                        for s, _, _, _ in rows:
                             model.pool.accept(s, 1)
                     self.assertTrue(torch.equal(step.decoded, graph.decoded))
                     self.assertSame(step, graph, range(len(CHUNKS) + 1))
@@ -149,7 +150,7 @@ class PromptGraphTests(PluginTestCase):
                 self.assertSame(step, graph, [early])
                 chunk = [(7 * i) % VOCAB for i in range(count)]
                 for model in (step, graph):   # a pending decode row first: the chunk applies it before its kernel
-                    batch = StepBatch.build([(0, 0, 2)], self.device())
+                    batch = StepBatch.build([(0, 0, 2, DECODE)], self.device())
                     batch.tokens_t = torch.tensor([3, 5], dtype=torch.int64, device=self.device())
                     model.forward(batch)
                     model.pool.accept(0, 2)

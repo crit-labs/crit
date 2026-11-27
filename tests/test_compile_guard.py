@@ -50,13 +50,37 @@ class CompileGuardTests(unittest.TestCase):
         finally:
             extension._jit_compile = original
 
+    def test_recording_runs_while_any_recorder_runs_and_each_stops_once(self):
+        from crit_plugins import compiles as module
+        before = len(module._recorders)   # engines an earlier module left open
+        first, second = module.record(), module.record()
+        self.assertTrue(module.recording())
+        first.stop()
+        first.stop()   # a second stop is no second recorder's end
+        self.assertTrue(module.recording(), "the other engine still records")
+        self.assertEqual(len(module._recorders), before + 1)
+        second.stop()
+        self.assertEqual((len(module._recorders), module.recording()), (before, before > 0))
+
     def test_watches_nest_and_end_in_any_order(self):
         # Core's loader keeps a watch for an engine's life while a test opens its own: both see what compiles while
         # they run, and the hook goes back only when the last ends.
         if torch is None:
             self.skipTest("torch is not installed")
         import torch.utils.cpp_extension as extension
+        from crit_plugins import compiles as module
         from crit_plugins.compiles import Watch
+        # Watches alone: an engine an earlier test module left open keeps recording (its recorder ends with its close
+        # or its collection), which would keep the hooks in; set aside here, put back after
+        held = list(module._recorders)
+        module._recorders.clear()
+        module._sync()
+
+        def restore():
+            module._recorders.extend(held)
+            with module._lock:
+                module._sync()
+        self.addCleanup(restore)
         original = extension._jit_compile
         stand_in = extension._jit_compile = lambda name, *args, **kwargs: f"built {name}"
         try:

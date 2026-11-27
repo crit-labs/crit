@@ -4,6 +4,7 @@ by the prefill option, the scan otherwise) agree with the float64 recurrence wit
 commit strategies keep a verify window's accepted prefix with the same bits, which continue as the base plugin's
 serial decode."""
 from crit_plugins import StepBatch
+from crit_plugins.device import DECODE, PREFILL
 from crit_plugins.device import RoundBatch
 from crit_plugins.testing import PluginTestCase
 
@@ -45,7 +46,9 @@ class DeviceTests(PluginTestCase):
         return out, x
 
     def step(self, plugin, pool, first, count):
-        return self.rows(plugin, pool, StepBatch.build([("a", first, count)], self.dev), first, count)
+        """A step of one row: a decode token (one token), else a prompt chunk."""
+        phase = DECODE if count == 1 else PREFILL
+        return self.rows(plugin, pool, StepBatch.build([("a", first, count, phase)], self.dev), first, count)
 
     def test_it_has_the_device_form_and_the_rounds_methods(self):
         self.assertImplements()
@@ -79,7 +82,7 @@ class DeviceTests(PluginTestCase):
         plugin = self.assemble(options={"exact_rows": 16})["recurrence"]
         together = self.pool(plugin)
         together.open("b")
-        batch = StepBatch.build([("a", 0, 40), ("b", 0, 70)], self.dev)
+        batch = StepBatch.build([("a", 0, 40, PREFILL), ("b", 0, 70, PREFILL)], self.dev)
         q, k, v, g, b, x = (torch.cat([self.inputs[n][:40], self.inputs[n][40:110]]) for n in "qkvgbx")
         xo = plugin.convolve(0, x, self.weight, None, together, batch)
         out = plugin.forward(0, q, k, v, g, b, together, batch, self.geometry)
@@ -88,7 +91,7 @@ class DeviceTests(PluginTestCase):
         for name, first, count in (("a", 0, 40), ("b", 40, 70)):
             alone = plugin.pool([0], self.h, self.dk, self.dv, self.dev, 4, 0, (24, 4), self.kh, 1)
             alone.open(name)
-            one = StepBatch.build([(name, 0, count)], self.dev)
+            one = StepBatch.build([(name, 0, count, PREFILL)], self.dev)
             span = slice(first, first + count)
             xa = plugin.convolve(0, x[span], self.weight, None, alone, one)
             oa = plugin.forward(0, q[span], k[span], v[span], g[span], b[span], alone, one, self.geometry)

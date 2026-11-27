@@ -24,23 +24,79 @@ on any rung is sealed built, and the hand-off says that no candidate is certifie
 A sealed candidate is a draft when it is not on the candidate ladder (crit.run.ladder.counted); its plan builds the
 fix.
 
+Which operations may start in each state is one table (OPERATIONS) that next_step(), RunStore.reserve and seal read:
+the docs' table of the run's states and this module's agree with it, and tests/test_run_state.py walks every state.
+
 A step named here is one its command takes: where a command judges a candidate by a rule of its own (measure's
 qualification, seal's measured cases), the step reads that rule (measure.unqualified), so no state is left without
 a legal action. A build's c2 was told to measure, which refused (its checks keep its benchmarks exploratory), and
 seal completed refused without a measurement.
 """
 from . import ladder, plans, recon
+from .replay import MARKER as REPLAY_MARKER
 from .records import load_run, read_json, safe_path, segment, timestamp
 from ..records import utc_now
 
 CANDIDATE_STATES = ("created", "build_failed", "packaged", "check_failed", "serve_checked", "eval_stopped",
                     "evaluated", "running", "sealed")
-RUN_STEPS = ("resume", "recon", "finish_recon", "capture", "resolve", "plan", "candidate", "build", "serve_check",
+RUN_STEPS = ("resume", "preflight", "recon", "finish_recon", "capture", "resolve", "plan", "candidate", "build", "serve_check",
              "seal", "eval", "eval_resume", "record_checks", "measure", "wait", "stop", "hand_off", "done")
 FROM_EVAL = "crit run check --from-eval"
+
+# The one transition table of a candidate: the operations a command takes on it (an attempt it reserves, or a seal)
+# and the states each may start in. Every command that reserves an attempt asks it (RunStore.reserve: refusal()), and
+# next_step() names only commands it allows, so no state is left without a legal action and no command starts where
+# the table refuses it. An operation's other states refuse it with WHY.
+PACKAGED = ("packaged", "check_failed", "serve_checked", "eval_stopped", "evaluated")
+OPERATIONS = {
+    "build": ("created", "build_failed"),
+    "check": PACKAGED,       # serve (--check), ablate, profile, record-routes, switch-check
+    # Eval only after a passed serve --check (and its resume, or another Eval of an evaluated candidate); measure only
+    # on a completed Eval (measure's own qualification judges the rest: measure.unqualified). The phase order is
+    # the table's, so RunStore.reserve refuses an Eval or a measurement out of it for every caller.
+    "eval": ("serve_checked", "eval_stopped", "evaluated"),
+    "benchmark": ("evaluated",),
+    "seal": ("created", "build_failed") + PACKAGED,
+}
+WHY = {
+    "created": "it is not built: crit run ... build --candidate {cid} first",
+    "build_failed": "its newest build failed: seal it build_failed and build the fix as a new candidate",
+    "packaged": "its serve --check has not passed: crit run ... serve --candidate {cid} --check first",
+    "check_failed": "its newest serve --check failed: seal it check_failed and build the fix as a new candidate",
+    "serve_checked": "it has no completed Eval: crit run ... eval --candidate {cid} first",
+    "eval_stopped": "its Eval stopped before the end: crit run ... eval --candidate {cid} --resume",
+    "evaluated": "its Eval is complete: record its checks (check --from-eval), measure it or seal it",
+    "running": "an attempt of it is running ({detail}): wait for it, or settle it with its real outcome when its "
+               "process is gone (crit run ... settle)",
+    "sealed": "it is sealed ({detail}): a sealed candidate is immutable; allocate a new candidate",
+}
+# The operation each of next_step()'s steps takes, where it takes one (the others are records or the agent's work).
+STEP_OPERATION = {"build": "build", "serve_check": "check", "eval": "eval", "eval_resume": "eval",
+                  "measure": "benchmark", "seal": "seal"}
+
+
+# The states no operation starts in, whoever asks (refusal(strict=False): seal's own check, which judges a seal's
+# lifecycle by rules of its own); RunStore.reserve asks the whole table.
+NEVER = ("running", "sealed")
+
+
+def refusal(operation, row, strict=True):
+    """None where the table allows `operation` in the candidate's state (`row`: candidate_state's), else why not.
+    strict False: only the states no operation starts in (NEVER)."""
+    if operation not in OPERATIONS or row["state"] in OPERATIONS[operation]:
+        return None
+    if not strict and row["state"] not in NEVER:
+        return None
+    return (f"{row['candidate']} is {row['state']}, where crit run's {operation} does not start: "
+            + WHY[row["state"]].format(cid=row["candidate"], detail=row.get("detail")))
 # A sealed candidate takes no attempt, so what the next plan wants measured on this engine is measured before its seal.
 SWEEP_FIRST = ("A sealed candidate takes no attempt: sweep the options the next plan needs measured on this engine "
                "(ablate --candidate {cid} --set ...) before its seal")
+
+
+def replay_of(root):
+    """Whether the run folder is a replay (crit.run.replay), which records nothing, a preflight neither."""
+    return (root / REPLAY_MARKER).is_file()
 
 
 def _attempts(folder):
@@ -64,7 +120,13 @@ def _checks(folder, recorded_by):
 
 
 def candidate_state(root, run, candidate_id):
-    """Where one candidate stands: {candidate, state, scope, on_ladder, plan_id, detail}."""
+    """Where one candidate stands: {candidate, state, scope, on_ladder, plan_id, detail, allowed}: allowed, the
+    operations the transition table lets start in its state (OPERATIONS), which next and show print."""
+    found = _candidate_state(root, run, candidate_id)
+    return {**found, "allowed": [op for op, states in OPERATIONS.items() if found["state"] in states]}
+
+
+def _candidate_state(root, run, candidate_id):
     folder = safe_path(root, f"candidates/{candidate_id}")
     sealed = ladder.sealed_lifecycle(root, candidate_id)
     scope = ladder.scope_of(root, candidate_id)
@@ -115,9 +177,12 @@ def next_step(store, run_id):
     candidates = sorted(p.name for p in safe_path(root, "candidates").glob("candidate-*"))
     rows = [candidate_state(root, run, c) for c in candidates]
 
+    from ..preflight.records import brief
+    preflight = brief(root, run["spec"]["model_path"]) if not replay_of(root) else None
+
     def step(name, command, why, candidate=None):
         return {"step": name, "command": command and f"{base} {command}", "why": why, "candidate": candidate,
-                "state": {"segment": bounds["segment_id"], "candidates": rows}}
+                "state": {"segment": bounds["segment_id"], "candidates": rows, "preflight": preflight}}
 
     uncertified = ladder.uncertified(root)
     if state["stopping_reason"] is not None:
@@ -135,6 +200,13 @@ def next_step(store, run_id):
     if utc_now() >= timestamp(bounds["deadline_at"], "deadline"):
         return step("resume", "resume --candidates N --external-agent-stopped",
                     "The segment's safety window has passed: only the user authorizes a new segment")
+    if preflight is not None and not preflight["current"] and not rows:
+        # Before the first candidate: the library at its defaults on the run's own checkpoint, so the toolkit's bugs
+        # this checkpoint's geometry exposes show up in minutes, not in the build's candidates.
+        return step("preflight", "preflight", "Run the preflight first: the library's plugins at their defaults on a "
+                    "cut of the run's checkpoint, sized from the run, in minutes (no report for this crit and "
+                    "checkpoint yet" + (f"; the newest is {preflight['key']}" if preflight["report"] else "") + "). "
+                    "A failed scenario is toolkit feedback, not a gate: the build may go on")
     from .store import described
     if not (root / recon.RECON_JSON).is_file() and described(run["spec"]["model_path"]):
         return step("recon", "recon", "Study the model before the first candidate: recon writes work/recon.json and "
@@ -250,5 +322,11 @@ def render(found):
     lines = [f"next: {found['step']}" + (f" ({found['candidate']})" if found["candidate"] else ""), found["why"]]
     if found["command"]:
         lines.append(found["command"])
+    preflight = (found.get("state") or {}).get("preflight")
+    if preflight and preflight.get("report"):
+        lines.append(f"preflight {preflight['key']}" + ("" if preflight["current"] else " (another crit or checkpoint)")
+                     + f": {preflight['passed']} passed, {preflight['failed']} failed, {preflight['skipped']} skipped"
+                     + (" (at the library's defaults: " + ", ".join(preflight["failed_scenarios"][:8]) + ")"
+                        if preflight["failed"] else "") + f"; {preflight['report']}")
     return "\n".join(lines)
 

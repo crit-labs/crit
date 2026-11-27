@@ -52,567 +52,486 @@
     {
      "GROUPS": 1,
      "WARPS": 4,
-     "SPLITS": 0,
      "SW": 0,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 4,
-     "SPLITS": 1,
      "SW": 0,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 4,
-     "SPLITS": 1,
      "SW": 4,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 1,
      "SW": 4,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 1,
      "SW": 8,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 1,
      "SW": 8,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 2,
-     "SPLITS": 1,
      "SW": 4,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 2,
-     "SPLITS": 1,
      "SW": 4,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 2,
-     "SPLITS": 1,
      "SW": 8,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 2,
-     "SPLITS": 1,
      "SW": 0,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 0,
      "SW": 4,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 0,
      "SW": 4,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 4,
-     "SPLITS": 6,
      "SW": 8,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 4,
-     "SPLITS": 6,
      "SW": 4,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 4,
-     "SPLITS": 6,
      "SW": 4,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 4,
-     "SPLITS": 1,
      "SW": 4,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 16,
      "SW": 0,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 24,
      "SW": 0,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 24,
      "SW": 4,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 3,
      "SW": 8,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 3,
      "SW": 4,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 3,
      "SW": 8,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 4,
-     "SPLITS": 32,
      "SW": 4,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 4,
-     "SPLITS": 32,
      "SW": 8,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 32,
      "SW": 8,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 32,
      "SW": 0,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 32,
      "SW": 8,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 32,
      "SW": 4,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 2,
-     "SPLITS": 0,
      "SW": 4,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 2,
-     "SPLITS": 0,
      "SW": 8,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 2,
-     "SPLITS": 0,
      "SW": 0,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 2,
-     "SPLITS": 0,
      "SW": 4,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 2,
-     "SPLITS": 0,
      "SW": 8,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 4,
-     "SPLITS": 3,
      "SW": 0,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 4,
-     "SPLITS": 3,
      "SW": 4,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 1,
      "SW": 4,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 32,
      "SW": 4,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 4,
-     "SPLITS": 24,
      "SW": 4,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 4,
-     "SPLITS": 24,
      "SW": 8,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 4,
-     "SPLITS": 24,
      "SW": 8,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 4,
-     "SPLITS": 0,
      "SW": 8,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 0,
      "SW": 8,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 2,
      "SW": 8,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 2,
      "SW": 4,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 2,
      "SW": 0,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 0,
      "SW": 8,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 2,
-     "SPLITS": 4,
      "SW": 4,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 2,
-     "SPLITS": 4,
      "SW": 4,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 2,
-     "SPLITS": 6,
      "SW": 4,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 24,
      "SW": 8,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 24,
      "SW": 4,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 2,
-     "SPLITS": 3,
      "SW": 8,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 2,
-     "SPLITS": 3,
      "SW": 0,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 2,
-     "SPLITS": 3,
      "SW": 4,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 2,
-     "SPLITS": 24,
      "SW": 0,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 2,
-     "SPLITS": 24,
      "SW": 4,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 2,
-     "SPLITS": 8,
      "SW": 4,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 2,
-     "SPLITS": 8,
      "SW": 0,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 2,
-     "SPLITS": 2,
      "SW": 0,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 2,
-     "SPLITS": 2,
      "SW": 8,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 2,
-     "SPLITS": 2,
      "SW": 8,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 1,
      "SW": 0,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 4,
-     "SPLITS": 1,
      "SW": 8,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 4,
-     "SPLITS": 1,
      "SW": 8,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 4,
      "SW": 4,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 8,
      "SW": 4,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 8,
      "SW": 4,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 3,
      "SW": 4,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 2,
-     "SPLITS": 4,
      "SW": 8,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 2,
-     "SPLITS": 4,
      "SW": 8,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 4,
-     "SPLITS": 24,
      "SW": 4,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 2,
-     "SPLITS": 24,
      "SW": 4,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 4,
-     "SPLITS": 4,
      "SW": 0,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 4,
-     "SPLITS": 4,
      "SW": 8,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 4,
-     "SPLITS": 4,
      "SW": 8,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 4,
-     "SPLITS": 24,
      "SW": 0,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 4,
      "SW": 8,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 4,
      "SW": 8,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 1,
-     "SPLITS": 2,
      "SW": 4,
      "SPF": 0
     },
     {
      "GROUPS": 1,
      "WARPS": 4,
-     "SPLITS": 8,
      "SW": 8,
      "SPF": 1
     },
     {
      "GROUPS": 1,
      "WARPS": 4,
-     "SPLITS": 8,
      "SW": 4,
      "SPF": 0
     }
@@ -3608,7 +3527,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 0,
       "WARPS": 4
      },
@@ -3632,7 +3550,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 0,
       "WARPS": 4
      },
@@ -3656,7 +3573,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 0,
       "WARPS": 4
      },
@@ -3680,7 +3596,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 0,
       "WARPS": 4
      },
@@ -3704,7 +3619,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 4
      },
@@ -3728,7 +3642,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 1
      },
@@ -3752,7 +3665,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 1
      },
@@ -3776,7 +3688,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 8,
       "WARPS": 1
      },
@@ -3800,7 +3711,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 8,
       "WARPS": 1
      },
@@ -3824,7 +3734,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 1
      },
@@ -3848,7 +3757,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 2
      },
@@ -3872,7 +3780,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 2
      },
@@ -3896,7 +3803,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 2
      },
@@ -3920,7 +3826,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 8,
       "WARPS": 2
      },
@@ -3944,7 +3849,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 2
      },
@@ -3968,7 +3872,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 2
      },
@@ -3992,7 +3895,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 2
      },
@@ -4016,7 +3918,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 0,
       "WARPS": 2
      },
@@ -4040,7 +3941,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 2
      },
@@ -4064,7 +3964,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 0,
       "WARPS": 2
      },
@@ -4088,7 +3987,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 2
      },
@@ -4112,7 +4010,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 2
      },
@@ -4136,7 +4033,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 2
      },
@@ -4160,7 +4056,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 2
      },
@@ -4184,7 +4079,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 2
      },
@@ -4208,7 +4102,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 0,
       "WARPS": 2
      },
@@ -4232,7 +4125,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 0,
       "WARPS": 2
      },
@@ -4256,7 +4148,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 2
      },
@@ -4280,7 +4171,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 2
      },
@@ -4304,7 +4194,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 2
      },
@@ -4328,7 +4217,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 4,
       "WARPS": 1
      },
@@ -4352,7 +4240,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 4,
       "WARPS": 1
      },
@@ -4376,7 +4263,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 4,
       "WARPS": 1
      },
@@ -4400,7 +4286,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 0,
       "SW": 4,
       "WARPS": 1
      },
@@ -4424,7 +4309,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 0,
       "SW": 4,
       "WARPS": 1
      },
@@ -4448,7 +4332,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 6,
       "SW": 8,
       "WARPS": 4
      },
@@ -4472,7 +4355,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 6,
       "SW": 4,
       "WARPS": 4
      },
@@ -4496,7 +4378,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 6,
       "SW": 4,
       "WARPS": 4
      },
@@ -4520,7 +4401,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 6,
       "SW": 4,
       "WARPS": 4
      },
@@ -4544,7 +4424,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 6,
       "SW": 4,
       "WARPS": 4
      },
@@ -4568,7 +4447,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 4
      },
@@ -4592,7 +4470,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 4
      },
@@ -4616,7 +4493,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 4
      },
@@ -4640,7 +4516,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 4
      },
@@ -4664,7 +4539,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 4
      },
@@ -4688,7 +4562,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 1
      },
@@ -4712,7 +4585,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 1
      },
@@ -4736,7 +4608,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 1
      },
@@ -4760,7 +4631,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 1
      },
@@ -4784,7 +4654,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 1
      },
@@ -4808,7 +4677,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 16,
       "SW": 0,
       "WARPS": 1
      },
@@ -4832,7 +4700,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 16,
       "SW": 0,
       "WARPS": 1
      },
@@ -4856,7 +4723,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 16,
       "SW": 0,
       "WARPS": 1
      },
@@ -4880,7 +4746,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 16,
       "SW": 0,
       "WARPS": 1
      },
@@ -4904,7 +4769,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 16,
       "SW": 0,
       "WARPS": 1
      },
@@ -4928,7 +4792,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 24,
       "SW": 0,
       "WARPS": 1
      },
@@ -4952,7 +4815,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 24,
       "SW": 0,
       "WARPS": 1
      },
@@ -4976,7 +4838,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 1
      },
@@ -5000,7 +4861,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 1
      },
@@ -5024,7 +4884,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 1
      },
@@ -5048,7 +4907,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 3,
       "SW": 8,
       "WARPS": 1
      },
@@ -5072,7 +4930,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 3,
       "SW": 8,
       "WARPS": 1
      },
@@ -5096,7 +4953,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 3,
       "SW": 8,
       "WARPS": 1
      },
@@ -5120,7 +4976,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 3,
       "SW": 4,
       "WARPS": 1
      },
@@ -5144,7 +4999,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 3,
       "SW": 8,
       "WARPS": 1
      },
@@ -5168,7 +5022,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 32,
       "SW": 4,
       "WARPS": 4
      },
@@ -5192,7 +5045,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 32,
       "SW": 4,
       "WARPS": 4
      },
@@ -5216,7 +5068,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 32,
       "SW": 4,
       "WARPS": 4
      },
@@ -5240,7 +5091,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 32,
       "SW": 8,
       "WARPS": 4
      },
@@ -5264,7 +5114,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 32,
       "SW": 8,
       "WARPS": 4
      },
@@ -5288,7 +5137,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 32,
       "SW": 8,
       "WARPS": 1
      },
@@ -5312,7 +5160,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 32,
       "SW": 0,
       "WARPS": 1
      },
@@ -5336,7 +5183,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 32,
       "SW": 0,
       "WARPS": 1
      },
@@ -5360,7 +5206,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 32,
       "SW": 0,
       "WARPS": 1
      },
@@ -5384,7 +5229,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 32,
       "SW": 8,
       "WARPS": 1
      },
@@ -5408,7 +5252,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 32,
       "SW": 4,
       "WARPS": 1
      },
@@ -5432,7 +5275,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 32,
       "SW": 4,
       "WARPS": 1
      },
@@ -5456,7 +5298,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 32,
       "SW": 4,
       "WARPS": 1
      },
@@ -5480,7 +5321,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 32,
       "SW": 4,
       "WARPS": 1
      },
@@ -5504,7 +5344,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 32,
       "SW": 4,
       "WARPS": 1
      },
@@ -5528,7 +5367,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 3,
       "SW": 0,
       "WARPS": 4
      },
@@ -5552,7 +5390,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 3,
       "SW": 0,
       "WARPS": 4
      },
@@ -5576,7 +5413,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 3,
       "SW": 0,
       "WARPS": 4
      },
@@ -5600,7 +5436,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 3,
       "SW": 4,
       "WARPS": 4
      },
@@ -5624,7 +5459,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 3,
       "SW": 4,
       "WARPS": 4
      },
@@ -5648,7 +5482,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 8,
       "WARPS": 1
      },
@@ -5672,7 +5505,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 8,
       "WARPS": 1
      },
@@ -5696,7 +5528,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 8,
       "WARPS": 1
      },
@@ -5720,7 +5551,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 1
      },
@@ -5744,7 +5574,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 8,
       "WARPS": 1
      },
@@ -5768,7 +5597,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 1
      },
@@ -5792,7 +5620,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 1
      },
@@ -5816,7 +5643,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 1
      },
@@ -5840,7 +5666,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 1
      },
@@ -5864,7 +5689,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 1
      },
@@ -5888,7 +5712,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 32,
       "SW": 0,
       "WARPS": 1
      },
@@ -5912,7 +5735,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 32,
       "SW": 0,
       "WARPS": 1
      },
@@ -5936,7 +5758,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 32,
       "SW": 4,
       "WARPS": 1
      },
@@ -5960,7 +5781,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 32,
       "SW": 8,
       "WARPS": 1
      },
@@ -5984,7 +5804,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 32,
       "SW": 4,
       "WARPS": 1
      },
@@ -6008,7 +5827,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 4
      },
@@ -6032,7 +5850,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 4
      },
@@ -6056,7 +5873,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 24,
       "SW": 8,
       "WARPS": 4
      },
@@ -6080,7 +5896,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 4
      },
@@ -6104,7 +5919,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 24,
       "SW": 8,
       "WARPS": 4
      },
@@ -6128,7 +5942,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 8,
       "WARPS": 4
      },
@@ -6152,7 +5965,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 0,
       "SW": 0,
       "WARPS": 4
      },
@@ -6176,7 +5988,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 0,
       "SW": 0,
       "WARPS": 4
      },
@@ -6200,7 +6011,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 0,
       "SW": 0,
       "WARPS": 4
      },
@@ -6224,7 +6034,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 8,
       "WARPS": 4
      },
@@ -6248,7 +6057,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 4,
       "WARPS": 1
      },
@@ -6272,7 +6080,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 0,
       "SW": 4,
       "WARPS": 1
      },
@@ -6296,7 +6103,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 4,
       "WARPS": 1
      },
@@ -6320,7 +6126,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 4,
       "WARPS": 1
      },
@@ -6344,7 +6149,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 8,
       "WARPS": 1
      },
@@ -6368,7 +6172,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 0,
       "SW": 0,
       "WARPS": 4
      },
@@ -6392,7 +6195,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 0,
       "SW": 0,
       "WARPS": 4
      },
@@ -6416,7 +6218,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 0,
       "SW": 0,
       "WARPS": 4
      },
@@ -6440,7 +6241,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 0,
       "SW": 0,
       "WARPS": 4
      },
@@ -6464,7 +6264,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 8,
       "WARPS": 4
      },
@@ -6488,7 +6287,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 4,
       "WARPS": 1
      },
@@ -6512,7 +6310,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 4,
       "WARPS": 1
      },
@@ -6536,7 +6333,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 8,
       "WARPS": 1
      },
@@ -6560,7 +6356,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 4,
       "WARPS": 1
      },
@@ -6584,7 +6379,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 8,
       "WARPS": 1
      },
@@ -6608,7 +6402,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 8,
       "WARPS": 1
      },
@@ -6632,7 +6425,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 8,
       "WARPS": 1
      },
@@ -6656,7 +6448,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 8,
       "WARPS": 1
      },
@@ -6680,7 +6471,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 8,
       "WARPS": 1
      },
@@ -6704,7 +6494,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 8,
       "WARPS": 1
      },
@@ -6728,7 +6517,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 2,
       "SW": 8,
       "WARPS": 1
      },
@@ -6752,7 +6540,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 2,
       "SW": 4,
       "WARPS": 1
      },
@@ -6776,7 +6563,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 2,
       "SW": 8,
       "WARPS": 1
      },
@@ -6800,7 +6586,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 2,
       "SW": 4,
       "WARPS": 1
      },
@@ -6824,7 +6609,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 2,
       "SW": 0,
       "WARPS": 1
      },
@@ -6848,7 +6632,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 8,
       "WARPS": 1
      },
@@ -6872,7 +6655,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 8,
       "WARPS": 1
      },
@@ -6896,7 +6678,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 8,
       "WARPS": 1
      },
@@ -6920,7 +6701,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 8,
       "WARPS": 1
      },
@@ -6944,7 +6724,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 0,
       "SW": 8,
       "WARPS": 1
      },
@@ -6968,7 +6747,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 8,
       "WARPS": 2
      },
@@ -6992,7 +6770,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 8,
       "WARPS": 2
      },
@@ -7016,7 +6793,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 8,
       "WARPS": 2
      },
@@ -7040,7 +6816,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 0,
       "SW": 0,
       "WARPS": 2
      },
@@ -7064,7 +6839,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 0,
       "SW": 0,
       "WARPS": 2
      },
@@ -7088,7 +6862,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 8,
       "WARPS": 1
      },
@@ -7112,7 +6885,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 8,
       "WARPS": 1
      },
@@ -7136,7 +6908,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 8,
       "WARPS": 1
      },
@@ -7160,7 +6931,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 8,
       "WARPS": 1
      },
@@ -7184,7 +6954,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 1
      },
@@ -7208,7 +6977,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 6,
       "SW": 4,
       "WARPS": 2
      },
@@ -7232,7 +7000,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 6,
       "SW": 4,
       "WARPS": 2
      },
@@ -7256,7 +7023,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 6,
       "SW": 4,
       "WARPS": 2
      },
@@ -7280,7 +7046,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 6,
       "SW": 4,
       "WARPS": 2
      },
@@ -7304,7 +7069,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 6,
       "SW": 4,
       "WARPS": 2
      },
@@ -7328,7 +7092,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 1
      },
@@ -7352,7 +7115,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 24,
       "SW": 0,
       "WARPS": 1
      },
@@ -7376,7 +7138,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 24,
       "SW": 0,
       "WARPS": 1
      },
@@ -7400,7 +7161,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 1
      },
@@ -7424,7 +7184,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 24,
       "SW": 0,
       "WARPS": 1
      },
@@ -7448,7 +7207,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 3,
       "SW": 8,
       "WARPS": 2
      },
@@ -7472,7 +7230,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 3,
       "SW": 0,
       "WARPS": 2
      },
@@ -7496,7 +7253,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 3,
       "SW": 4,
       "WARPS": 2
      },
@@ -7520,7 +7276,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 3,
       "SW": 0,
       "WARPS": 2
      },
@@ -7544,7 +7299,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 3,
       "SW": 0,
       "WARPS": 2
      },
@@ -7568,7 +7322,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 3,
       "SW": 4,
       "WARPS": 2
      },
@@ -7592,7 +7345,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 3,
       "SW": 0,
       "WARPS": 2
      },
@@ -7616,7 +7368,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 3,
       "SW": 4,
       "WARPS": 2
      },
@@ -7640,7 +7391,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 3,
       "SW": 0,
       "WARPS": 2
      },
@@ -7664,7 +7414,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 3,
       "SW": 8,
       "WARPS": 2
      },
@@ -7688,7 +7437,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 24,
       "SW": 0,
       "WARPS": 1
      },
@@ -7712,7 +7460,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 24,
       "SW": 0,
       "WARPS": 1
      },
@@ -7736,7 +7483,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 24,
       "SW": 0,
       "WARPS": 1
      },
@@ -7760,7 +7506,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 24,
       "SW": 0,
       "WARPS": 1
      },
@@ -7784,7 +7529,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 24,
       "SW": 0,
       "WARPS": 1
      },
@@ -7808,7 +7552,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 8,
       "WARPS": 1
      },
@@ -7832,7 +7575,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 8,
       "WARPS": 1
      },
@@ -7856,7 +7598,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 8,
       "WARPS": 1
      },
@@ -7880,7 +7621,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 8,
       "WARPS": 1
      },
@@ -7904,7 +7644,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 4,
       "WARPS": 1
      },
@@ -7928,7 +7667,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 8,
       "SW": 4,
       "WARPS": 2
      },
@@ -7952,7 +7690,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 8,
       "SW": 4,
       "WARPS": 2
      },
@@ -7974,7 +7711,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 8,
       "SW": 0,
       "WARPS": 2
      },
@@ -7996,7 +7732,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 8,
       "SW": 4,
       "WARPS": 2
      },
@@ -8018,7 +7753,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 8,
       "SW": 4,
       "WARPS": 2
      },
@@ -8040,7 +7774,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 3,
       "SW": 8,
       "WARPS": 1
      },
@@ -8064,7 +7797,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 3,
       "SW": 8,
       "WARPS": 1
      },
@@ -8088,7 +7820,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 3,
       "SW": 8,
       "WARPS": 1
      },
@@ -8112,7 +7843,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 3,
       "SW": 8,
       "WARPS": 1
      },
@@ -8136,7 +7866,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 3,
       "SW": 8,
       "WARPS": 1
      },
@@ -8160,7 +7889,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 2,
       "SW": 0,
       "WARPS": 2
      },
@@ -8184,7 +7912,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 2,
       "SW": 0,
       "WARPS": 2
      },
@@ -8208,7 +7935,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 2,
       "SW": 0,
       "WARPS": 2
      },
@@ -8232,7 +7958,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 2,
       "SW": 8,
       "WARPS": 2
      },
@@ -8256,7 +7981,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 2,
       "SW": 8,
       "WARPS": 2
      },
@@ -8280,7 +8004,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 8,
       "WARPS": 1
      },
@@ -8304,7 +8027,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 8,
       "WARPS": 1
      },
@@ -8328,7 +8050,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 8,
       "WARPS": 1
      },
@@ -8352,7 +8073,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 8,
       "WARPS": 1
      },
@@ -8376,7 +8096,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 0,
       "SW": 8,
       "WARPS": 1
      },
@@ -8400,7 +8119,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 1
      },
@@ -8422,7 +8140,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 1
      },
@@ -8444,7 +8161,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 0,
       "WARPS": 1
      },
@@ -8466,7 +8182,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 0,
       "WARPS": 1
      },
@@ -8488,7 +8203,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 8,
       "WARPS": 1
      },
@@ -8510,7 +8224,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 2,
       "SW": 0,
       "WARPS": 2
      },
@@ -8534,7 +8247,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 2,
       "SW": 0,
       "WARPS": 2
      },
@@ -8558,7 +8270,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 2,
       "SW": 0,
       "WARPS": 2
      },
@@ -8582,7 +8293,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 2,
       "SW": 0,
       "WARPS": 2
      },
@@ -8606,7 +8316,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 2,
       "SW": 8,
       "WARPS": 2
      },
@@ -8630,7 +8339,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 0,
       "WARPS": 1
      },
@@ -8654,7 +8362,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 0,
       "WARPS": 1
      },
@@ -8678,7 +8385,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 0,
       "WARPS": 1
      },
@@ -8702,7 +8408,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 8,
       "WARPS": 1
      },
@@ -8726,7 +8431,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 8,
       "WARPS": 1
      },
@@ -8750,7 +8454,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 8,
       "WARPS": 1
      },
@@ -8774,7 +8477,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 8,
       "WARPS": 1
      },
@@ -8798,7 +8500,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 8,
       "WARPS": 1
      },
@@ -8822,7 +8523,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 1
      },
@@ -8846,7 +8546,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 0,
       "WARPS": 1
      },
@@ -8870,7 +8569,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 8,
       "WARPS": 4
      },
@@ -8894,7 +8592,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 4
      },
@@ -8918,7 +8615,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 8,
       "WARPS": 4
      },
@@ -8942,7 +8638,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 8,
       "WARPS": 4
      },
@@ -8966,7 +8661,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 4
      },
@@ -8990,7 +8684,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 1
      },
@@ -9014,7 +8707,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 1
      },
@@ -9038,7 +8730,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 1
      },
@@ -9062,7 +8753,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 1
      },
@@ -9086,7 +8776,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 4,
       "WARPS": 1
      },
@@ -9110,7 +8799,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 0,
       "WARPS": 1
      },
@@ -9134,7 +8822,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 0,
       "WARPS": 1
      },
@@ -9158,7 +8845,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 0,
       "WARPS": 1
      },
@@ -9182,7 +8868,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 0,
       "WARPS": 1
      },
@@ -9206,7 +8891,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 8,
       "WARPS": 1
      },
@@ -9230,7 +8914,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 8,
       "WARPS": 1
      },
@@ -9254,7 +8937,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 8,
       "WARPS": 1
      },
@@ -9278,7 +8960,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 8,
       "WARPS": 1
      },
@@ -9302,7 +8983,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 1,
       "SW": 8,
       "WARPS": 1
      },
@@ -9326,7 +9006,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 1,
       "SW": 8,
       "WARPS": 1
      },
@@ -9350,7 +9029,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 4,
       "SW": 4,
       "WARPS": 1
      },
@@ -9374,7 +9052,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 4,
       "SW": 4,
       "WARPS": 1
      },
@@ -9398,7 +9075,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 4,
       "SW": 4,
       "WARPS": 1
      },
@@ -9422,7 +9098,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 4,
       "SW": 4,
       "WARPS": 1
      },
@@ -9446,7 +9121,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 4,
       "SW": 4,
       "WARPS": 1
      },
@@ -9470,7 +9144,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 8,
       "SW": 4,
       "WARPS": 1
      },
@@ -9494,7 +9167,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 8,
       "SW": 4,
       "WARPS": 1
      },
@@ -9518,7 +9190,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 8,
       "SW": 4,
       "WARPS": 1
      },
@@ -9542,7 +9213,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 8,
       "SW": 4,
       "WARPS": 1
      },
@@ -9566,7 +9236,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 8,
       "SW": 4,
       "WARPS": 1
      },
@@ -9590,7 +9259,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 3,
       "SW": 0,
       "WARPS": 2
      },
@@ -9612,7 +9280,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 3,
       "SW": 0,
       "WARPS": 2
      },
@@ -9634,7 +9301,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 3,
       "SW": 0,
       "WARPS": 2
      },
@@ -9656,7 +9322,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 3,
       "SW": 4,
       "WARPS": 2
      },
@@ -9678,7 +9343,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 3,
       "SW": 8,
       "WARPS": 2
      },
@@ -9700,7 +9364,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 0,
       "SW": 4,
       "WARPS": 1
      },
@@ -9724,7 +9387,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 0,
       "SW": 4,
       "WARPS": 1
      },
@@ -9748,7 +9410,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 4,
       "WARPS": 1
      },
@@ -9772,7 +9433,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 0,
       "SW": 4,
       "WARPS": 1
      },
@@ -9796,7 +9456,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 0,
       "SW": 4,
       "WARPS": 1
      },
@@ -9820,7 +9479,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 6,
       "SW": 4,
       "WARPS": 4
      },
@@ -9844,7 +9502,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 6,
       "SW": 4,
       "WARPS": 4
      },
@@ -9868,7 +9525,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 6,
       "SW": 4,
       "WARPS": 4
      },
@@ -9892,7 +9548,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 6,
       "SW": 4,
       "WARPS": 4
      },
@@ -9916,7 +9571,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 6,
       "SW": 4,
       "WARPS": 4
      },
@@ -9940,7 +9594,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 24,
       "SW": 0,
       "WARPS": 1
      },
@@ -9964,7 +9617,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 1
      },
@@ -9988,7 +9640,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 1
      },
@@ -10012,7 +9663,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 1
      },
@@ -10036,7 +9686,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 1
      },
@@ -10060,7 +9709,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 24,
       "SW": 8,
       "WARPS": 4
      },
@@ -10084,7 +9732,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 4
      },
@@ -10108,7 +9755,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 4
      },
@@ -10132,7 +9778,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 4
      },
@@ -10156,7 +9801,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 4
      },
@@ -10180,7 +9824,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 24,
       "SW": 0,
       "WARPS": 2
      },
@@ -10204,7 +9847,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 24,
       "SW": 0,
       "WARPS": 2
      },
@@ -10228,7 +9870,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 24,
       "SW": 0,
       "WARPS": 2
      },
@@ -10252,7 +9893,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 24,
       "SW": 0,
       "WARPS": 2
      },
@@ -10276,7 +9916,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 24,
       "SW": 0,
       "WARPS": 2
      },
@@ -10300,7 +9939,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 24,
       "SW": 0,
       "WARPS": 1
      },
@@ -10324,7 +9962,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 1
      },
@@ -10348,7 +9985,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 1
      },
@@ -10372,7 +10008,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 1
      },
@@ -10396,7 +10031,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 1
      },
@@ -10420,7 +10054,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 24,
       "SW": 0,
       "WARPS": 2
      },
@@ -10444,7 +10077,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 24,
       "SW": 0,
       "WARPS": 2
      },
@@ -10468,7 +10100,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 24,
       "SW": 0,
       "WARPS": 2
      },
@@ -10492,7 +10123,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 2
      },
@@ -10516,7 +10146,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 2
      },
@@ -10540,7 +10169,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 4
      },
@@ -10564,7 +10192,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 4
      },
@@ -10588,7 +10215,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 4
      },
@@ -10612,7 +10238,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 4
      },
@@ -10636,7 +10261,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 4
      },
@@ -10660,7 +10284,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 3,
       "SW": 8,
       "WARPS": 1
      },
@@ -10684,7 +10307,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 3,
       "SW": 8,
       "WARPS": 1
      },
@@ -10708,7 +10330,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 3,
       "SW": 8,
       "WARPS": 1
      },
@@ -10732,7 +10353,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 3,
       "SW": 8,
       "WARPS": 1
      },
@@ -10756,7 +10376,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 3,
       "SW": 8,
       "WARPS": 1
      },
@@ -10780,7 +10399,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 24,
       "SW": 0,
       "WARPS": 4
      },
@@ -10804,7 +10422,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 24,
       "SW": 0,
       "WARPS": 4
      },
@@ -10828,7 +10445,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 4
      },
@@ -10852,7 +10468,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 24,
       "SW": 4,
       "WARPS": 4
      },
@@ -10876,7 +10491,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 24,
       "SW": 8,
       "WARPS": 4
      },
@@ -10900,7 +10514,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 0,
       "SW": 0,
       "WARPS": 2
      },
@@ -10924,7 +10537,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 0,
       "SW": 4,
       "WARPS": 2
      },
@@ -10948,7 +10560,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 0,
       "SW": 4,
       "WARPS": 2
      },
@@ -10972,7 +10583,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 0,
       "SW": 4,
       "WARPS": 2
      },
@@ -10996,7 +10606,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 0,
       "SW": 4,
       "WARPS": 2
      },
@@ -11020,7 +10629,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 4,
       "SW": 4,
       "WARPS": 1
      },
@@ -11044,7 +10652,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 4,
       "SW": 8,
       "WARPS": 1
      },
@@ -11068,7 +10675,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 4,
       "SW": 8,
       "WARPS": 1
      },
@@ -11092,7 +10698,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 4,
       "SW": 4,
       "WARPS": 1
      },
@@ -11116,7 +10721,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 4,
       "SW": 4,
       "WARPS": 1
      },
@@ -11140,7 +10744,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 8,
       "SW": 8,
       "WARPS": 4
      },
@@ -11164,7 +10767,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 8,
       "SW": 8,
       "WARPS": 4
      },
@@ -11188,7 +10790,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 8,
       "SW": 8,
       "WARPS": 4
      },
@@ -11212,7 +10813,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 8,
       "SW": 4,
       "WARPS": 4
      },
@@ -11236,7 +10836,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 1,
-      "SPLITS": 8,
       "SW": 8,
       "WARPS": 4
      },
@@ -11260,7 +10859,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 0,
       "SW": 4,
       "WARPS": 1
      },
@@ -11284,7 +10882,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 0,
       "SW": 4,
       "WARPS": 1
      },
@@ -11308,7 +10905,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 0,
       "SW": 4,
       "WARPS": 1
      },
@@ -11332,7 +10928,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 0,
       "SW": 4,
       "WARPS": 1
      },
@@ -11356,7 +10951,6 @@
      "config": {
       "GROUPS": 1,
       "SPF": 0,
-      "SPLITS": 0,
       "SW": 4,
       "WARPS": 1
      },
@@ -11375,72 +10969,58 @@
    "configs": [
     {
      "WARPS": 4,
-     "SPLITS": 0,
      "HOIST": 2
     },
     {
      "WARPS": 2,
-     "SPLITS": 0,
      "HOIST": 4
     },
     {
      "WARPS": 2,
-     "SPLITS": 0,
      "HOIST": 1
     },
     {
      "WARPS": 4,
-     "SPLITS": 4,
      "HOIST": 1
     },
     {
      "WARPS": 1,
-     "SPLITS": 2,
      "HOIST": 2
     },
     {
      "WARPS": 1,
-     "SPLITS": 2,
      "HOIST": 1
     },
     {
      "WARPS": 4,
-     "SPLITS": 1,
      "HOIST": 1
     },
     {
      "WARPS": 2,
-     "SPLITS": 0,
      "HOIST": 2
     },
     {
      "WARPS": 4,
-     "SPLITS": 3,
      "HOIST": 2
     },
     {
      "WARPS": 1,
-     "SPLITS": 1,
      "HOIST": 2
     },
     {
      "WARPS": 4,
-     "SPLITS": 0,
      "HOIST": 1
     },
     {
      "WARPS": 1,
-     "SPLITS": 32,
      "HOIST": 1
     },
     {
      "WARPS": 1,
-     "SPLITS": 32,
      "HOIST": 4
     },
     {
      "WARPS": 2,
-     "SPLITS": 8,
      "HOIST": 2
     }
    ],
@@ -11768,7 +11348,6 @@
      "tuned_us": 11.552,
      "config": {
       "HOIST": 4,
-      "SPLITS": 0,
       "WARPS": 2
      },
      "default_us": 11.648,
@@ -11789,7 +11368,6 @@
      "tuned_us": 11.616,
      "config": {
       "HOIST": 1,
-      "SPLITS": 0,
       "WARPS": 2
      },
      "default_us": 11.616,
@@ -11810,7 +11388,6 @@
      "tuned_us": 11.616,
      "config": {
       "HOIST": 1,
-      "SPLITS": 0,
       "WARPS": 2
      },
      "default_us": 11.648,
@@ -11831,7 +11408,6 @@
      "tuned_us": 13.632,
      "config": {
       "HOIST": 1,
-      "SPLITS": 0,
       "WARPS": 2
      },
      "default_us": 13.696,
@@ -11852,7 +11428,6 @@
      "tuned_us": 13.696,
      "config": {
       "HOIST": 4,
-      "SPLITS": 0,
       "WARPS": 2
      },
      "default_us": 15.712,
@@ -11873,7 +11448,6 @@
      "tuned_us": 11.552,
      "config": {
       "HOIST": 1,
-      "SPLITS": 4,
       "WARPS": 4
      },
      "default_us": 12.288,
@@ -11894,7 +11468,6 @@
      "tuned_us": 11.584,
      "config": {
       "HOIST": 1,
-      "SPLITS": 4,
       "WARPS": 4
      },
      "default_us": 12.288,
@@ -11915,7 +11488,6 @@
      "tuned_us": 12.256,
      "config": {
       "HOIST": 1,
-      "SPLITS": 4,
       "WARPS": 4
      },
      "default_us": 13.664,
@@ -11936,7 +11508,6 @@
      "tuned_us": 13.664,
      "config": {
       "HOIST": 1,
-      "SPLITS": 4,
       "WARPS": 4
      },
      "default_us": 14.336,
@@ -11957,7 +11528,6 @@
      "tuned_us": 15.712,
      "config": {
       "HOIST": 1,
-      "SPLITS": 4,
       "WARPS": 4
      },
      "default_us": 17.76,
@@ -11978,7 +11548,6 @@
      "tuned_us": 15.68,
      "config": {
       "HOIST": 2,
-      "SPLITS": 2,
       "WARPS": 1
      },
      "default_us": 15.68,
@@ -11999,7 +11568,6 @@
      "tuned_us": 15.712,
      "config": {
       "HOIST": 2,
-      "SPLITS": 2,
       "WARPS": 1
      },
      "default_us": 15.712,
@@ -12020,7 +11588,6 @@
      "tuned_us": 15.712,
      "config": {
       "HOIST": 1,
-      "SPLITS": 2,
       "WARPS": 1
      },
      "default_us": 15.744,
@@ -12041,7 +11608,6 @@
      "tuned_us": 15.744,
      "config": {
       "HOIST": 1,
-      "SPLITS": 2,
       "WARPS": 1
      },
      "default_us": 17.76,
@@ -12062,7 +11628,6 @@
      "tuned_us": 17.728,
      "config": {
       "HOIST": 1,
-      "SPLITS": 2,
       "WARPS": 1
      },
      "default_us": 19.808,
@@ -12083,7 +11648,6 @@
      "tuned_us": 101.728,
      "config": {
       "HOIST": 1,
-      "SPLITS": 1,
       "WARPS": 4
      },
      "default_us": 113.248,
@@ -12104,7 +11668,6 @@
      "tuned_us": 101.728,
      "config": {
       "HOIST": 1,
-      "SPLITS": 1,
       "WARPS": 4
      },
      "default_us": 113.984,
@@ -12125,7 +11688,6 @@
      "tuned_us": 101.728,
      "config": {
       "HOIST": 1,
-      "SPLITS": 1,
       "WARPS": 4
      },
      "default_us": 116.704,
@@ -12146,7 +11708,6 @@
      "tuned_us": 102.4,
      "config": {
       "HOIST": 1,
-      "SPLITS": 1,
       "WARPS": 4
      },
      "default_us": 124.256,
@@ -12167,7 +11728,6 @@
      "tuned_us": 106.496,
      "config": {
       "HOIST": 1,
-      "SPLITS": 1,
       "WARPS": 4
      },
      "default_us": 151.712,
@@ -12188,7 +11748,6 @@
      "tuned_us": 11.648,
      "config": {
       "HOIST": 2,
-      "SPLITS": 0,
       "WARPS": 2
      },
      "default_us": 11.648,
@@ -12209,7 +11768,6 @@
      "tuned_us": 11.648,
      "config": {
       "HOIST": 2,
-      "SPLITS": 0,
       "WARPS": 2
      },
      "default_us": 11.648,
@@ -12230,7 +11788,6 @@
      "tuned_us": 11.648,
      "config": {
       "HOIST": 1,
-      "SPLITS": 0,
       "WARPS": 2
      },
      "default_us": 11.648,
@@ -12251,7 +11808,6 @@
      "tuned_us": 13.664,
      "config": {
       "HOIST": 1,
-      "SPLITS": 0,
       "WARPS": 2
      },
      "default_us": 14.336,
@@ -12272,7 +11828,6 @@
      "tuned_us": 16.128,
      "config": {
       "HOIST": 4,
-      "SPLITS": 0,
       "WARPS": 2
      },
      "default_us": 18.432,
@@ -12293,7 +11848,6 @@
      "tuned_us": 46.4,
      "config": {
       "HOIST": 2,
-      "SPLITS": 3,
       "WARPS": 4
      },
      "default_us": 46.368,
@@ -12314,7 +11868,6 @@
      "tuned_us": 46.368,
      "config": {
       "HOIST": 2,
-      "SPLITS": 3,
       "WARPS": 4
      },
      "default_us": 46.304,
@@ -12335,7 +11888,6 @@
      "tuned_us": 46.4,
      "config": {
       "HOIST": 2,
-      "SPLITS": 3,
       "WARPS": 4
      },
      "default_us": 46.4,
@@ -12356,7 +11908,6 @@
      "tuned_us": 47.136,
      "config": {
       "HOIST": 2,
-      "SPLITS": 3,
       "WARPS": 4
      },
      "default_us": 48.384,
@@ -12377,7 +11928,6 @@
      "tuned_us": 53.248,
      "config": {
       "HOIST": 2,
-      "SPLITS": 3,
       "WARPS": 4
      },
      "default_us": 53.248,
@@ -12398,7 +11948,6 @@
      "tuned_us": 79.072,
      "config": {
       "HOIST": 2,
-      "SPLITS": 3,
       "WARPS": 4
      },
      "default_us": 85.312,
@@ -12419,7 +11968,6 @@
      "tuned_us": 79.168,
      "config": {
       "HOIST": 2,
-      "SPLITS": 3,
       "WARPS": 4
      },
      "default_us": 85.312,
@@ -12440,7 +11988,6 @@
      "tuned_us": 79.2,
      "config": {
       "HOIST": 2,
-      "SPLITS": 3,
       "WARPS": 4
      },
      "default_us": 87.232,
@@ -12461,7 +12008,6 @@
      "tuned_us": 81.12,
      "config": {
       "HOIST": 2,
-      "SPLITS": 3,
       "WARPS": 4
      },
      "default_us": 91.36,
@@ -12482,7 +12028,6 @@
      "tuned_us": 88.064,
      "config": {
       "HOIST": 2,
-      "SPLITS": 3,
       "WARPS": 4
      },
      "default_us": 103.648,
@@ -12503,7 +12048,6 @@
      "tuned_us": 93.568,
      "config": {
       "HOIST": 2,
-      "SPLITS": 1,
       "WARPS": 1
      },
      "default_us": 95.552,
@@ -12524,7 +12068,6 @@
      "tuned_us": 93.568,
      "config": {
       "HOIST": 2,
-      "SPLITS": 1,
       "WARPS": 1
      },
      "default_us": 95.616,
@@ -12545,7 +12088,6 @@
      "tuned_us": 93.568,
      "config": {
       "HOIST": 2,
-      "SPLITS": 1,
       "WARPS": 1
      },
      "default_us": 96.224,
@@ -12566,7 +12108,6 @@
      "tuned_us": 94.208,
      "config": {
       "HOIST": 2,
-      "SPLITS": 1,
       "WARPS": 1
      },
      "default_us": 98.304,
@@ -12587,7 +12128,6 @@
      "tuned_us": 95.2,
      "config": {
       "HOIST": 2,
-      "SPLITS": 1,
       "WARPS": 1
      },
      "default_us": 102.976,
@@ -12608,7 +12148,6 @@
      "tuned_us": 12.288,
      "config": {
       "HOIST": 1,
-      "SPLITS": 0,
       "WARPS": 4
      },
      "default_us": 13.696,
@@ -12629,7 +12168,6 @@
      "tuned_us": 12.256,
      "config": {
       "HOIST": 1,
-      "SPLITS": 0,
       "WARPS": 4
      },
      "default_us": 13.696,
@@ -12650,7 +12188,6 @@
      "tuned_us": 14.304,
      "config": {
       "HOIST": 2,
-      "SPLITS": 0,
       "WARPS": 4
      },
      "default_us": 14.304,
@@ -12671,7 +12208,6 @@
      "tuned_us": 16.384,
      "config": {
       "HOIST": 2,
-      "SPLITS": 0,
       "WARPS": 4
      },
      "default_us": 16.384,
@@ -12692,7 +12228,6 @@
      "tuned_us": 21.024,
      "config": {
       "HOIST": 1,
-      "SPLITS": 0,
       "WARPS": 4
      },
      "default_us": 23.552,
@@ -12713,7 +12248,6 @@
      "tuned_us": 11.648,
      "config": {
       "HOIST": 1,
-      "SPLITS": 0,
       "WARPS": 2
      },
      "default_us": 12.768,
@@ -12734,7 +12268,6 @@
      "tuned_us": 11.648,
      "config": {
       "HOIST": 1,
-      "SPLITS": 0,
       "WARPS": 2
      },
      "default_us": 13.664,
@@ -12755,7 +12288,6 @@
      "tuned_us": 14.336,
      "config": {
       "HOIST": 1,
-      "SPLITS": 0,
       "WARPS": 2
      },
      "default_us": 14.336,
@@ -12776,7 +12308,6 @@
      "tuned_us": 16.384,
      "config": {
       "HOIST": 2,
-      "SPLITS": 0,
       "WARPS": 2
      },
      "default_us": 16.896,
@@ -12797,7 +12328,6 @@
      "tuned_us": 20.48,
      "config": {
       "HOIST": 2,
-      "SPLITS": 0,
       "WARPS": 2
      },
      "default_us": 21.76,
@@ -12818,7 +12348,6 @@
      "tuned_us": 11.648,
      "config": {
       "HOIST": 1,
-      "SPLITS": 32,
       "WARPS": 1
      },
      "default_us": 12.288,
@@ -12837,7 +12366,6 @@
      "tuned_us": 11.648,
      "config": {
       "HOIST": 4,
-      "SPLITS": 32,
       "WARPS": 1
      },
      "default_us": 12.288,
@@ -12856,7 +12384,6 @@
      "tuned_us": 14.336,
      "config": {
       "HOIST": 1,
-      "SPLITS": 32,
       "WARPS": 1
      },
      "default_us": 14.336,
@@ -12875,7 +12402,6 @@
      "tuned_us": 16.384,
      "config": {
       "HOIST": 4,
-      "SPLITS": 32,
       "WARPS": 1
      },
      "default_us": 16.384,
@@ -12894,7 +12420,6 @@
      "tuned_us": 20.48,
      "config": {
       "HOIST": 4,
-      "SPLITS": 32,
       "WARPS": 1
      },
      "default_us": 21.376,
@@ -12913,7 +12438,6 @@
      "tuned_us": 14.336,
      "config": {
       "HOIST": 1,
-      "SPLITS": 0,
       "WARPS": 2
      },
      "default_us": 16.864,
@@ -12934,7 +12458,6 @@
      "tuned_us": 13.696,
      "config": {
       "HOIST": 1,
-      "SPLITS": 0,
       "WARPS": 2
      },
      "default_us": 15.744,
@@ -12955,7 +12478,6 @@
      "tuned_us": 16.384,
      "config": {
       "HOIST": 1,
-      "SPLITS": 0,
       "WARPS": 2
      },
      "default_us": 16.384,
@@ -12976,7 +12498,6 @@
      "tuned_us": 18.432,
      "config": {
       "HOIST": 1,
-      "SPLITS": 0,
       "WARPS": 2
      },
      "default_us": 19.808,
@@ -12997,7 +12518,6 @@
      "tuned_us": 21.728,
      "config": {
       "HOIST": 1,
-      "SPLITS": 0,
       "WARPS": 2
      },
      "default_us": 24.576,
@@ -13018,7 +12538,6 @@
      "tuned_us": 15.968,
      "config": {
       "HOIST": 1,
-      "SPLITS": 0,
       "WARPS": 4
      },
      "default_us": 19.072,
@@ -13039,7 +12558,6 @@
      "tuned_us": 16.928,
      "config": {
       "HOIST": 1,
-      "SPLITS": 0,
       "WARPS": 4
      },
      "default_us": 19.392,
@@ -13060,7 +12578,6 @@
      "tuned_us": 17.632,
      "config": {
       "HOIST": 1,
-      "SPLITS": 0,
       "WARPS": 4
      },
      "default_us": 19.488,
@@ -13081,7 +12598,6 @@
      "tuned_us": 20.48,
      "config": {
       "HOIST": 1,
-      "SPLITS": 0,
       "WARPS": 4
      },
      "default_us": 21.696,
@@ -13102,7 +12618,6 @@
      "tuned_us": 24.576,
      "config": {
       "HOIST": 1,
-      "SPLITS": 0,
       "WARPS": 4
      },
      "default_us": 26.624,
@@ -13123,7 +12638,6 @@
      "tuned_us": 48.416,
      "config": {
       "HOIST": 2,
-      "SPLITS": 8,
       "WARPS": 2
      },
      "default_us": 48.384,
@@ -13144,7 +12658,6 @@
      "tuned_us": 47.104,
      "config": {
       "HOIST": 2,
-      "SPLITS": 8,
       "WARPS": 2
      },
      "default_us": 48.096,
@@ -13165,7 +12678,6 @@
      "tuned_us": 48.448,
      "config": {
       "HOIST": 2,
-      "SPLITS": 8,
       "WARPS": 2
      },
      "default_us": 50.4,
@@ -13186,7 +12698,6 @@
      "tuned_us": 51.2,
      "config": {
       "HOIST": 2,
-      "SPLITS": 8,
       "WARPS": 2
      },
      "default_us": 52.448,
@@ -13207,7 +12718,6 @@
      "tuned_us": 60.736,
      "config": {
       "HOIST": 2,
-      "SPLITS": 8,
       "WARPS": 2
      },
      "default_us": 60.416,
@@ -13228,7 +12738,6 @@
      "tuned_us": 54.528,
      "config": {
       "HOIST": 2,
-      "SPLITS": 0,
       "WARPS": 4
      },
      "default_us": 54.528,
@@ -13249,7 +12758,6 @@
      "tuned_us": 53.28,
      "config": {
       "HOIST": 2,
-      "SPLITS": 0,
       "WARPS": 4
      },
      "default_us": 53.28,
@@ -13270,7 +12778,6 @@
      "tuned_us": 54.592,
      "config": {
       "HOIST": 2,
-      "SPLITS": 0,
       "WARPS": 4
      },
      "default_us": 54.592,
@@ -13291,7 +12798,6 @@
      "tuned_us": 56.544,
      "config": {
       "HOIST": 2,
-      "SPLITS": 0,
       "WARPS": 4
      },
      "default_us": 56.544,
@@ -13312,7 +12818,6 @@
      "tuned_us": 59.36,
      "config": {
       "HOIST": 2,
-      "SPLITS": 0,
       "WARPS": 4
      },
      "default_us": 59.36,

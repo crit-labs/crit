@@ -226,10 +226,12 @@ class BlockHead:
         self.ops = model.kernel("row-ops")   # crit's span attention on CUDA, None for torch's
 
     # -- arithmetic ----------------------------------------------------------------------------------------------------
-    def _mm(self, x, matrix):
-        """x [n][in] times a held matrix: FP32 [n][out]."""
+    def _mm(self, x, matrix, prompt=False):
+        """x [n][in] times a held matrix: FP32 [n][out]. prompt: a prompt chunk's rows, one prompt call however few
+        (a short chunk's rows the bits of the same rows in a longer one); else a round's draft rows, in decode calls
+        up to the decode rows and one call past them (the drafter's own rows: their bits change no verified token)."""
         rows, n = self.m.rows, x.shape[0]
-        groups = rows.rows(n) if n <= rows.decode_rows else [(0, n, True)]   # a prompt's rows: one prompt call
+        groups = [(0, n, True)] if prompt or n > rows.decode_rows else rows.rows(n)
         return rows.matmul(x.to(self.torch.bfloat16).contiguous(), matrix, groups).float()
 
     def _rms(self, x, weight=None):
@@ -256,13 +258,14 @@ class BlockHead:
         copy of the taps: a prompt chunk's taps are its widest tensor)."""
         return self.torch.matmul(self.layer_alpha, taps.reshape(taps.shape[0], -1, self.hidden))
 
-    def _context(self, taps, positions):
-        """The cache rows of taps [n][width] at positions [n]: per layer (k [n][kv][dim] roped and normed, v)."""
+    def _context(self, taps, positions, prompt=False):
+        """The cache rows of taps [n][width] at positions [n]: per layer (k [n][kv][dim] roped and normed, v); prompt:
+        a prompt chunk's (_mm)."""
         found = []
         mixed = self._mixes(taps)
         for i, w in enumerate(self.w):
             c = self._rms(mixed[:, i], w["tap_norm.weight"]).to(self.torch.bfloat16)
-            kv = self._mm(c, w["ctx"]).view(-1, 2, self.kv_heads, self.head_dim)
+            kv = self._mm(c, w["ctx"], prompt).view(-1, 2, self.kv_heads, self.head_dim)
             k = self._rope(self._rms(kv[:, 0], w["self_attn.context_k_norm.weight"]), positions)
             found.append((k.to(self.torch.bfloat16), kv[:, 1].to(self.torch.bfloat16)))
         return found
@@ -354,7 +357,7 @@ class BlockHead:
                 s.draft_rows = tuple([torch.zeros(shape, dtype=torch.bfloat16, device=self.m.device)
                                       for shape in shapes] for _ in range(2))
             positions = torch.arange(first, first + count, device=self.m.device)
-            for i, (k, v) in enumerate(self._context(hidden[at:at + count], positions)):
+            for i, (k, v) in enumerate(self._context(hidden[at:at + count], positions, prompt=True)):
                 r = self.rings[i]
                 if not r:
                     s.draft_rows[0][i][:, first:first + count] = k.transpose(0, 1)

@@ -21,7 +21,9 @@
     "cpu"
   ],
   "sources": {
-    "core": "../../core/model-template"
+    "core": "../../core/model-template",
+    "shared_kv_attention": "techniques/shared-kv-attention/code",
+    "assistant_drafter": "techniques/assistant-drafter/code"
   },
   "extends": "core",
   "test_with": [
@@ -30,6 +32,7 @@
     "expert-tensors",
     "experts-reference",
     "fused-norms",
+    "greedy-head-drafter",
     "memory-table-rows",
     "projections-dense",
     "softmax-attention",
@@ -37,5 +40,11 @@
     "topk-router",
     "torch-norms"
   ],
-  "entry": "plugin.py:create"
+  "entry": "plugin.py:create",
+  "tool_format": "tools.py:TOOL_FORMAT",
+  "reasoning_format": "tools.py:REASONING_FORMAT",
+  "provides": [
+    "draft:head",
+    "draft:head-device"
+  ]
 }

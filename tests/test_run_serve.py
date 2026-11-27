@@ -12,6 +12,7 @@ from crit.run.records import read_json
 
 
 class RunServeTests(MeasureFixture, unittest.TestCase):
+    evaluated = False   # serving takes a check attempt on a packaged candidate
     def serve_in_thread(self, candidate):
         ready, stop, out = threading.Event(), threading.Event(), {}
 
@@ -163,6 +164,113 @@ class CoreItemsTests(unittest.TestCase):
         cut = steps([(237 * mib, 500 * mib)])
         cut["steps"]["segment_memory_cut"] = True
         self.assertEqual(self.items(cut)["step_memory"]["state"], "failed")
+
+
+class CloseItemTests(unittest.TestCase):
+    """close_returns_memory: every engine close a check made in the resident host, as crit serve reports each one
+    (last_close), read into Served.closes once per close."""
+
+    def test_a_close_that_kept_memory_fails_the_check_and_one_judged_close_passes_it(self):
+        from crit.run.checks import close_item
+        passed = {"returned": True, "judged": True, "message": "returned", "close": 1}
+        kept = {"returned": False, "judged": True, "close": 2,
+                "message": "4 captured graph(s) alive (core/graphs), held by StepEngine.rounds"}
+        self.assertEqual(close_item([passed], lambda line: None)["state"], "passed")
+        item = close_item([passed, kept], lambda line: None)
+        self.assertEqual(item["state"], "failed")
+        self.assertIn("1 of 2 engine closes did not return their memory; the first: 4 captured graph(s)", item["detail"])
+        unjudged = {"returned": None, "judged": False, "message": "not judged: 1 other engine(s) are open", "close": 1}
+        self.assertEqual(close_item([unjudged], lambda line: None)["state"], "unverified")
+        self.assertEqual(close_item([], lambda line: None)["state"], "unverified")
+
+    def test_served_reads_each_close_once_and_logs_one_that_kept_memory(self):
+        logged = []
+        found = served.Served.__new__(served.Served)
+        found.closes, found.log = [], logged.append
+
+        class Engine:
+            close = None
+
+            def last_close(self):
+                return self.close
+        engine = Engine()
+        self.assertIsNone(found.closed(engine))   # no close yet
+        engine.close = {"returned": True, "judged": True, "message": "returned", "close": 1}
+        found.closed(engine, 8192)
+        found.closed(engine, 4096)   # a reload that failed before it closed the engine: the same close
+        engine.close = {"returned": False, "judged": True, "message": "elastic range a/b is open", "close": 2}
+        found.closed(engine)
+        self.assertEqual([(c["close"], c["reopened_at"]) for c in found.closes], [(1, 8192), (2, None)])
+        self.assertEqual(logged, ["crit serve: the closed engine did not return its memory: elastic range a/b is open"])
+
+
+class HostTests(unittest.TestCase):
+    def test_crit_run_reloads_each_engine_in_a_host_of_its_own_unless_asked_for_one_host(self):
+        # one engine, one process where crit run reloads engines; --same-host keeps one host for the command
+        from unittest import mock
+        from crit.run import cli
+        self.assertIs(served.Served.one_process, True)
+        self.addCleanup(setattr, served.Served, "one_process", True)
+        with mock.patch.object(cli, "act", lambda command, args: 0):
+            cli.main(["--same-host", "--id", "run-x", "show"])
+        self.assertIs(served.Served.one_process, False)
+
+
+class ReopenTests(unittest.TestCase):
+    def test_a_reopen_closes_the_engine_first_also_at_the_same_context(self):
+        # The host keeps an engine whose spec it already holds, so a reopen at the same context and configuration
+        # (the preflight's reopen_same_context) closes it first: Core judges that close, and the reload builds it again.
+        import threading
+        from crit_api.engine import ServedEngine
+        calls = []
+
+        class Runtime:
+            def status(self):
+                return {"engine": {"candidate_id": "c"}}
+
+            def call(self, action, payload, stop, timeout, **_):
+                calls.append(action)
+                return {"status": "completed", "error": None}
+        engine = ServedEngine.__new__(ServedEngine)
+        engine.lock, engine.closed, engine._stopping = threading.RLock(), False, threading.Event()
+        engine.attempt, engine.specs, engine.runtime, engine.timeout = "attempt-0001", {}, Runtime(), 5
+        engine.context_tokens = engine.configuration = None
+        engine.spec = lambda candidate_id=None: {"candidate_id": "c"}
+        engine._load_default = lambda spec, stop: calls.append("load")
+        engine.reopen(None)
+        self.assertEqual(calls, ["close", "load"])
+
+
+class EvalCloseTests(unittest.TestCase):
+    def test_evals_close_of_a_served_engine_closes_it_in_the_host_and_returns_cores_report(self):
+        # crit run eval: Eval's lower-context round reads the close of the engine it opened (context.lower.close),
+        # which crit serve's host makes and Core judges; an external candidate's close says nothing.
+        import threading
+        from crit.run.evaluation import EvalEngines, Opening
+        logged = []
+        found = EvalEngines.__new__(EvalEngines)
+        found.closes, found.log, found.lock = [], logged.append, threading.Lock()
+        kept = {"returned": False, "judged": True, "message": "4 captured graph(s) alive", "close": 1}
+
+        class Engine:
+            closed_in_host = 0
+
+            def close_engine(self):
+                self.closed_in_host += 1
+                return kept
+
+            def last_close(self):
+                return kept if self.closed_in_host else None
+        engine = Engine()
+        found.current = (engine, object())
+        report = found.close_report()
+        self.assertEqual(engine.closed_in_host, 1)
+        self.assertEqual((report["returned"], report["message"]), (False, "4 captured graph(s) alive"))
+        self.assertEqual(found.closes, [report])
+        self.assertIn("did not return its memory", logged[-1])
+        found.current = None
+        self.assertIsNone(found.close_report())   # nothing served: nothing closed
+        self.assertIsNone(Opening.close_report(found))
 
 
 class PlanKvTests(unittest.TestCase):

@@ -36,7 +36,7 @@ EXACTNESS_MODES = {"reported", "required"}  # must speculative output equal plai
 # close to the checkpoint's, every precision change measured against it. Every run record states its mode.
 from crit_plugins.exactness import QUALITY_MODES  # noqa: E402
 # The quality mode of a run whose request (and settings.toml) names none.
-DEFAULT_QUALITY_MODE = "speed"
+from crit_plugins.exactness import DEFAULT_QUALITY_MODE   # noqa: E402 - Core's, one definition
 # Every run follows the current rules: a plan for every candidate, the plan rules of crit.run.plans, lever fates in
 # every proposal and a candidate budget counted on the candidate ladder (crit.run.ladder). Runs created by earlier crit
 # releases recorded which version of those rules they followed in these spec keys; crit still reads such runs (to
@@ -282,10 +282,14 @@ def header(value, kind, run_id, required, optional=()):
     return value
 
 
-def eval_max_context(model, device, vram_headroom_bytes, reserve_bytes=None, requested=None, drafters=()):
+def eval_max_context(model, device, vram_headroom_bytes, reserve_bytes=None, requested=None, drafters=(),
+                     quality_mode=None):
     """Eval's max context (crit_eval/limits/context.py) for MODEL on DEVICE, a `crit eval probe` result, capped at the
-    requested context. reserve_bytes replaces the protocol's reserve (device memory kept out of the KV cache for
-    workspaces and speed techniques); drafters: companion drafter folders whose stored weights are kept out too."""
+    requested context, sized by the EngineSpec of the engine a build starts from (crit.spec.library_spec, the
+    library's defaults in the run's quality mode: its KV pools and held matrix bytes; Eval's reading of the config
+    where the checkpoint has no finished model plugin). reserve_bytes replaces the protocol's reserve (device memory
+    kept out of the KV cache for workspaces and speed techniques); drafters: companion drafter folders whose stored
+    weights are kept out too."""
     from crit_eval import EVAL_DIR
     from crit_eval.limits.context import max_context
     protocol = EVAL_DIR / "protocol.json"
@@ -294,7 +298,9 @@ def eval_max_context(model, device, vram_headroom_bytes, reserve_bytes=None, req
     settings = json.loads(protocol.read_text(encoding="utf-8"))["context"]
     if reserve_bytes is not None:
         settings = {**settings, "reserve_gib": reserve_bytes / GIB}
-    return max_context(model, device, vram_headroom_bytes, settings, requested, drafters=drafters)
+    from crit.spec import library_spec
+    return max_context(model, device, vram_headroom_bytes, settings, requested, drafters=drafters,
+                       spec=library_spec(model, quality_mode=quality_mode))
 
 
 def kv_need(workload):
@@ -310,7 +316,7 @@ def cases_need(data, workload):
         return 0
 
 
-def kv_capacity(data, model, vram_headroom_bytes, reserve_bytes=None, need=0):
+def kv_capacity(data, model, vram_headroom_bytes, reserve_bytes=None, need=0, quality_mode=None):
     """The run's KV capacity in tokens of prompt plus output, and what it rests on. An explicit kv_tokens
     is taken as given. Otherwise the request names its device (a `crit eval probe` result) and the run is
     built for Eval's max context: the context the user wants (context_tokens, from settings.toml; default crit Eval's
@@ -342,7 +348,8 @@ def kv_capacity(data, model, vram_headroom_bytes, reserve_bytes=None, need=0):
     for path in drafters:
         if not path.is_dir():
             raise ValueError(f"Drafter folder {path} does not exist on this computer")
-    value = eval_max_context(model, read_json(device), vram_headroom_bytes, reserve_bytes, requested, drafters)
+    value = eval_max_context(model, read_json(device), vram_headroom_bytes, reserve_bytes, requested, drafters,
+                             quality_mode)
     if not value["tokens"]:
         raise ValueError("Eval cannot derive the max context: " + (value["reason"] or "; ".join(value["missing"])))
     tokens, bound = min(value["tokens"], KV_TOKENS_MAX), value["bound"] if value["tokens"] <= KV_TOKENS_MAX else "crit"
@@ -353,7 +360,7 @@ def kv_capacity(data, model, vram_headroom_bytes, reserve_bytes=None, need=0):
                "model_limit_source": value["model_limit_source"], "device_limit": value["device_limit"],
                "kv_precision": value["kv_precision"], "kv_bytes_per_token": value["kv_bytes_per_token"],
                **{key: basis[key] for key in ("device", "memory_free_bytes", "memory_total_bytes", "reserve_bytes",
-                                              "resident_weight_bytes", "expert_bytes", "fixed_state_bytes",
+                                              "resident_weight_bytes", "expert_bytes", "fixed_state_bytes", "sized_by",
                                               "expert_bytes_in_device_memory_at_max", "companion_drafter_bytes",
                                               "companion_drafters") if key in basis},
                "device_file": str(device), "device_sha256": file_sha(device)}
@@ -384,7 +391,8 @@ def request_spec(data):
                 for kind, default in (("vram", vram_headroom_gib({})), ("ram", RAM_HEADROOM_GIB))}
     reserve = (round(number(data["context_reserve_gib"], "context reserve", 0, 65536) * GIB)
                if "context_reserve_gib" in data else None)
-    capacity, context = kv_capacity(data, path, headroom["vram_headroom_bytes"], reserve, cases_need(data, workload))
+    capacity, context = kv_capacity(data, path, headroom["vram_headroom_bytes"], reserve, cases_need(data, workload),
+                                    data.get("quality_mode", DEFAULT_QUALITY_MODE))
     if capacity < kv_need(workload):
         raise ValueError("KV capacity must cover prompt plus output" + (
             f" for each of the {workload['concurrency']} concurrent requests" if workload["concurrency"] > 1 else ""))
@@ -397,8 +405,15 @@ def request_spec(data):
     # mode speed may re-encode them (one way to spend its budget) unless the user says otherwise.
     policy = data.get("weights_policy", "transformable" if mode == "speed" else None)
     level = validate_level(data.get("verification_level", "artifact_verified"))
+    # Where each value came from (crit_core.spec's sources): the request's (its own or the machine's settings, which
+    # crit run create fills in) is the user's; a headroom it leaves out is Core's default; a KV capacity it does not
+    # give is Eval's max context.
+    sources = {"vram_headroom_bytes": "user" if "vram_headroom_gib" in data else "default",
+               "ram_headroom_bytes": "user" if "ram_headroom_gib" in data else "default",
+               "kv_tokens": "user" if "kv_tokens" in data else "protocol"}
     spec = {"model_path": str(path), "hardware_constraints": {"kv_tokens": capacity, **headroom,
-                                                              **({"context": context} if context else {})},
+                                                              **({"context": context} if context else {}),
+                                                              "sources": sources},
             "cases": data.get("cases", [{"case_id": "case-0001", "workload": workload}]),
             "benchmark_protocol": text(data.get("benchmark_protocol", "crit-matched-v1"), "Protocol", 200),
             "correctness": {"criteria": text(data["correctness_criteria"], "Correctness criteria", 8000),
@@ -480,7 +495,13 @@ def validate_spec(value):
     if not Path(text(value["model_path"], "model locator")).is_absolute():
         raise ValueError("Model locator requires an absolute local path")
     hardware = value["hardware_constraints"]
-    keys(hardware, {"kv_tokens", "vram_headroom_bytes", "ram_headroom_bytes"}, {"context"})
+    keys(hardware, {"kv_tokens", "vram_headroom_bytes", "ram_headroom_bytes"}, {"context", "sources"})
+    from crit_core.spec import SOURCES
+    if "sources" in hardware and (not isinstance(hardware["sources"], dict) or any(
+            key not in ("kv_tokens", "vram_headroom_bytes", "ram_headroom_bytes") or source not in SOURCES
+            for key, source in hardware["sources"].items())):
+        raise ValueError("hardware_constraints.sources maps kv_tokens and the headrooms to their sources "
+                         f"({', '.join(SOURCES)})")
     number(hardware["kv_tokens"], "KV capacity", 1, KV_TOKENS_MAX, integer=True)
     if "context" in hardware and (not isinstance(hardware["context"], dict) or hardware["context"].get("source") not in ("eval", "given")):
         raise ValueError("A KV capacity basis is Eval's max context or a given capacity's device file")

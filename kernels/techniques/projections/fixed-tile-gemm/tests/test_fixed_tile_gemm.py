@@ -129,3 +129,11 @@ def test_the_cuda_gemm_keeps_a_row_s_bits_whatever_rows_and_configuration():
         assert torch.equal(other.mm_cuda(x[:9].clone(), w), whole[:9]), knobs
     select(other, "cuda-mm", -1)
     assert ftg.cuda_ok(x, w) and not ftg.cuda_ok(x[:, 1:], w[:, 1:])
+
+
+def test_the_untuned_split_counts_the_orders_multiprocessors_never_the_devices(monkeypatch):
+    # the splits of K are the sums' order: the rule counts ORDER_MULTIPROCESSORS, so every GPU splits alike
+    found = [ftg.split_tile(m, n, k, "cuda")["SPLIT"] for m, n, k in ((64, 512, 8192), (256, 4096, 4096))]
+    monkeypatch.setattr(ftg, "_sms", lambda device: 46)
+    assert [ftg.split_tile(m, n, k, "cuda")["SPLIT"] for m, n, k in ((64, 512, 8192), (256, 4096, 4096))] == found
+    assert ftg.ORDER_MULTIPROCESSORS == 170

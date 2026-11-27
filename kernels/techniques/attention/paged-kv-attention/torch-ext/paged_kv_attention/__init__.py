@@ -160,10 +160,13 @@ def owner(key):
 
 
 def release(key):
-    """Drop an owner's module workspaces (its captured graphs must be gone: they replay into them)."""
-    for held in (_workspaces, _fused_workspaces, _states):
+    """Drop an owner's module workspaces, its dummy and its ragged prompt plans (its captured graphs must be gone:
+    they replay into them), so an engine's close leaves nothing of it on the device."""
+    for held in (_workspaces, _fused_workspaces, _states, _dummies):
         for at in [at for at in held if at[1] == key]:
             del held[at]
+    for at in [at for at in _ragged_plans if at[0] == key]:
+        del _ragged_plans[at]
     _retired[:] = [(k, found) for k, found in _retired if k != key]
 
 
@@ -225,6 +228,13 @@ def _check_kind(kind, key_scales):
     return KINDS[kind]
 
 
+# The multiprocessors the order rules count (partitions, the CUDA tile's chunk, a prompt chunk's splits, the merge's
+# depth): a definition, the RTX 5090 (170 SMs) the rules were measured on, never this device's count. A column's
+# bits follow the rules, so every GPU sums a row in the same order (ROOT-FIXES class A: one order per operation);
+# the speed on a GPU of another size is what that order gives it.
+ORDER_MULTIPROCESSORS = 170
+
+
 @functools.lru_cache(maxsize=None)
 def _capability(device):
     return torch.cuda.get_device_capability(device), torch.cuda.get_device_properties(device).multi_processor_count
@@ -241,14 +251,16 @@ def _codes(pages, kind, device):
     return pages
 
 
-_dummies = {}
+_dummies = {}   # (device, owner) -> its dummy: an owner's, released with its workspaces (release())
 
 
 def _dummy(device):
-    """A one-float tensor for the pointers a launch does not read (no scales, no tree, no lse)."""
-    found = _dummies.get(device)
+    """A one-float tensor for the pointers a launch does not read (no scales, no tree, no lse), the current owner's
+    (owner()): an engine's goes with its close, never kept by the process for the next."""
+    key = _held(device)
+    found = _dummies.get(key)
     if found is None:
-        found = _dummies[device] = torch.zeros(1, dtype=torch.float32, device=device)
+        found = _dummies[key] = torch.zeros(1, dtype=torch.float32, device=device)
     return found
 
 
@@ -263,13 +275,13 @@ def partitions(device, kv_heads, kind, head_dim=None, value_dim=None):
     "split", knob PARTS, by the cache's head widths when given), else the rule for one long row: about one and a half
     programs per SM over converted pages (FP8, INT8), three quarters of one over 16-bit pages, whose pieces carry four
     times the bytes (a power of two within 8..128; measured best at 200K positions with 2, 4 and 8 KV heads of 256 and
-    128 on an sm_120 GPU). A column's bits depend on it, so keep one count for every launch whose results must
-    agree."""
+    128 on an sm_120 GPU), the SMs ORDER_MULTIPROCESSORS's, whatever the device. A column's bits depend on it, so
+    every GPU takes the same count; `device` is kept for callers."""
     key = _split_key(head_dim, value_dim, kv_heads, kind)
     tuned = _knobs("split", key, 1)["PARTS"] if key else 0
     if tuned:
         return int(tuned)
-    sms = _capability(torch.device(device))[1]
+    sms = ORDER_MULTIPROCESSORS
     programs = (3 * sms) // (2 if KINDS[kind] else 4)
     return max(8, min(128, triton.next_power_of_2(max(1, programs // max(1, kv_heads)))))
 
@@ -738,7 +750,7 @@ def _prefill_flash(q, kp, vp, kind, k_kind, table, position, page, ks, vs, multi
         raise ValueError("flash launches take head dims that are powers of two of 16 to 256")
     tuned = _knobs("flash-prefill", {"D": d, "HQ": hq, "HKV": hkv, "PAGE": int(page), "KIND": k_kind,
                                      "INT8": int(bool(int8_qk))}, T)
-    capability, sms = _capability(device)
+    capability, sms = _capability(device)[0], ORDER_MULTIPROCESSORS
     bm = int(tuned["BLOCK_M"]) or 32
     block_n = int(tuned["BLOCK_N"]) or 32
     warps = int(tuned["WARPS"]) or 4
@@ -998,17 +1010,16 @@ def cuda_chunk(head_dim, value_dim, heads, kv_heads, page, kind="bf16"):
 
 @functools.lru_cache(maxsize=64)
 def _cuda_chunk_rule(kv_heads):
-    """The untuned split, from the GPU: a decode row of CUDA_REACH positions over six programs an SM, its KV heads
-    counted by their square root (a row's KV heads share its splits' pages and queries' tiles: four times the heads
-    want about twice the split, measured), to the nearest 128 positions, 128 to 2,048, with the untuned RAMP 1 (a
-    row's first 16 splits half as long). Short rows then take a few splits a KV head and long rows few enough that
-    their merge stays short; fixed per cache (the GPU and the cache's KV heads), never by the batch. On an RTX 5090
+    """The untuned split, from the order's multiprocessors (ORDER_MULTIPROCESSORS): a decode row of CUDA_REACH
+    positions over six programs an SM, its KV heads counted by their square root (a row's KV heads share its splits'
+    pages and queries' tiles: four times the heads want about twice the split, measured), to the nearest 128
+    positions, 128 to 2,048, with the untuned RAMP 1 (a row's first 16 splits half as long). Short rows then take a
+    few splits a KV head and long rows few enough that their merge stays short; fixed per cache (the order's SMs and
+    the cache's KV heads), never by the batch or the device. On an RTX 5090
     (170 SMs: 128 positions at 2 KV heads, 256 at 8) over 1 to 32 rows of 1K to 64K positions it decodes at 0.885x
     the split-KV reader's time (geometric mean of 92 cases over four cache geometries, the worst 1.18x), where two
     programs an SM without the ramp took 1.05-1.10x (the worst 3.3x, short rows)."""
-    if not torch.cuda.is_available():
-        return CUDA_CHUNK
-    sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    sms = ORDER_MULTIPROCESSORS   # the order's, never this device's (a column's bits follow the chunk)
     found = CUDA_REACH * math.sqrt(int(kv_heads)) / (6 * sms)
     return int(min(2048, max(128, round(found / 128) * 128)))
 
@@ -1224,7 +1235,7 @@ def _attend_cuda(q, key_pages, value_pages, kind, k_kind, tables, rows, starts, 
     _cuda_launch(lib, structure, entry, P, device, (tiles, 1 if serial else parts, R * hkv))
     if not fused:
         # The staged merge: deep batches where its programs fit the GPU at once, shallow ones where they do not.
-        P.merge = 1 if columns * hq * R <= _capability(device)[1] else 2
+        P.merge = 1 if columns * hq * R <= ORDER_MULTIPROCESSORS else 2
         _cuda_merge(lib, P, device, (columns, hq, R))
     return out
 
@@ -1245,7 +1256,7 @@ def _prefill_cuda(q, kp, vp, kind, k_kind, table, position, page, ks, vs, multip
     t_kind = _cuda_dtype(q, kind)
     _cuda_rows_ok(q, out)
     tuned = _knobs("cuda-prefill", {"D": d, "HQ": hq, "HKV": hkv, "PAGE": int(page), "KIND": k_kind, "INT8": 0}, T)
-    sms = _capability(device)[1]
+    sms = ORDER_MULTIPROCESSORS
     biased = int(bias is not None)
     lib = _cuda_lib(device, T=t_kind, KIND=k_kind, D=d, DV=d, W=0, S=0, VS=0, B=biased)
     entry, warps, _, block, _ = _cuda_plan(lib, _CUDA_PREFILL, hq, hkv, page, T, fresh=fresh is not None)
@@ -1426,14 +1437,15 @@ def prefill(q, key_pages, value_pages, kind, table, position, page, *, key_scale
     return out
 
 
-_ragged_plans = {}   # (device, BLOCK_M, rows' tokens, positions and first tokens) -> (block map, metadata)
+_ragged_plans = {}   # (owner, device, BLOCK_M, rows' tokens, positions and first tokens) -> (block map, metadata)
 
 
 def _ragged_plan(device, block_m, starts, counts, positions, firsts):
     """The block map ([blocks][2] int32: the row, its block) and metadata ([rows][4] int64: first token, tokens, first
     position, first fresh position) of a ragged prompt launch, made once a set of rows (every layer of a step takes
-    the same) and kept for the last 64 sets."""
-    key = (str(device), int(block_m), tuple(starts), tuple(counts), tuple(positions), tuple(firsts))
+    the same) and kept for the last 64 sets, the current owner's (release() drops them)."""
+    key = (getattr(_owner, "key", None), str(device), int(block_m), tuple(starts), tuple(counts), tuple(positions),
+           tuple(firsts))
     found = _ragged_plans.get(key)
     if found is None:
         blocks = [(r, b) for r, n in enumerate(counts) for b in range(-(-int(n) // block_m))]

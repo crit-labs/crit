@@ -79,8 +79,8 @@ class ToyModel:
 
     def eager(self, sequence, frontier, tokens):
         """The model's own eager prompt path: an unpadded StepBatch of the chunk."""
-        from crit_plugins.device import StepBatch
-        batch = StepBatch.build([(sequence, frontier, len(tokens))], self.device)
+        from crit_plugins.device import PREFILL, StepBatch
+        batch = StepBatch.build([(sequence, frontier, len(tokens), PREFILL)], self.device)
         batch.tokens_t = torch.tensor(tokens, dtype=torch.long, device=self.device)
         out = self.forward(batch)
         self.pool.lengths[sequence] += len(tokens)

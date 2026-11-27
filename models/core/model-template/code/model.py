@@ -198,9 +198,14 @@ class ComposedModel(Shape):
         Shape.__init__(self, config, options, layout, blocks, ck, residuals=residuals,
                        context_tokens=context.context_tokens,
                        steps=getattr(context, "steps", None),
-                       drafter=self.drafter is not None)
+                       drafter=self.drafter is not None, facts=parts.facts)
         prefix = self.prefix
         if self.drafter is not None and not (self.mtp or self.draft_block is not None):
+            if (layout.get("draft") or {}).get("companion"):
+                raise ValueError(f"model-template drafts from a companion drafter ({layout['draft']['companion']}, "
+                                 "the layout's draft): the selection has a drafter, so set option mtp and give its "
+                                 "folder (option draft_folder, or a folder beside the checkpoint), or leave the "
+                                 "drafter slot empty")
             raise ValueError("model-template drafts from the checkpoint's MTP layer: the selection has a drafter, so "
                              "set option mtp and give a checkpoint with its draft layer's tensors (the layout's draft "
                              "prefix), or leave the drafter slot empty")
@@ -280,7 +285,9 @@ class ComposedModel(Shape):
 
         # -- the plan ----------------------------------------------------------------------------------------------------
         linear = [i for i, k in enumerate(self.kinds) if k == "linear_attention"]
-        # The KV pools' bytes as the kv_cache plugin prices a position (its position_bytes), whole pages.
+        # The KV pools' bytes as the kv_cache plugin prices a position (its position_bytes), whole pages of the
+        # plugin's page (its `page` option: one definition, the pools made below take it too).
+        self.page = int(getattr(parts["kv_cache"], "page", None) or PAGE)
         kv_bytes = self.kv_device_bytes(getattr(parts["kv_cache"], "position_bytes", None))
         state_bytes = 0
         if linear:
@@ -422,7 +429,7 @@ class ComposedModel(Shape):
             if spec["value_dim"] is not None:
                 extra["value_dim"] = spec["value_dim"]
             made = self.pools[spec["key"]] = kv.pool(spec["layers"], spec["kv_heads"], spec["head_dim"],
-                                                     spec["tokens"], self.device, spec["dtype"], page=PAGE, **extra)
+                                                     spec["tokens"], self.device, spec["dtype"], page=self.page, **extra)
             if spec["kind"] == "kv" and self.kv_scales:
                 for i in spec["layers"]:
                     made.set_scales(i, *self.decoder[i].mixer.kv_scales)
@@ -457,8 +464,8 @@ class ComposedModel(Shape):
         self.state_pools = [self.pools[k] for k in self.state_keys]
         self.draft_pools = [self.pools[k] for k in self.draft_keys]
         self.states = self.state_pools[0] if self.state_pools else None
-        pages = -(-self.kv_tokens // PAGE)
-        self.reservations = PageReservations(pages, PAGE, self.context, verify_rows=self.width + 1)
+        pages = -(-self.kv_tokens // self.page)
+        self.reservations = PageReservations(pages, self.page, self.context, verify_rows=self.width + 1)
         self.stops = stop_tokens(context.model, context.config)
         self.handles = 0
         if self.offload:
@@ -777,14 +784,15 @@ class ComposedModel(Shape):
 
     def _pass_counts(self, first, limit):
         """The chunks a pass would hold from position `first`: the spans up to `limit` or the pass's tokens, each a
-        prompt row to every pool (more tokens than a verify window, which the state pools commit as decode rows);
-        [] where no pass pays: a single chunk whose routes are fewer than a layer's experts runs as any chunk does."""
+        prompt row to every pool whatever its length (its phase, PREFILL: the state pools commit a prompt chunk by its
+        phase, never by its size); [] where no pass pays: a single chunk whose routes are fewer than a layer's experts
+        runs as any chunk does."""
         if not self.passes:
             return []
         at, counts = first, []
         while at < limit:
             rows = min(self.spans.rows(at), limit - at)
-            if rows <= self.width + 1 or (counts and at + rows - first > self.pass_tokens):
+            if counts and at + rows - first > self.pass_tokens:
                 break
             counts.append(rows)
             at += rows
@@ -866,7 +874,8 @@ class ComposedModel(Shape):
 
     # -- spans -----------------------------------------------------------------------------------------------------------
     def _spans(self, options):
-        seconds = float(options["span_seconds"])
+        # 0: every span the prefill chunk, untimed; CORE (the default) or a bound: Core's Steps.seconds
+        seconds = 0.0 if float(options["span_seconds"]) == 0 else self.step_plan.seconds(options["span_seconds"])
         if seconds <= 0 or not self.device.type == "cuda" or self.chunk <= QUANTUM:   # no shorter span to choose
             return self._budget(self.chunk)
         torch = self.torch
@@ -930,7 +939,7 @@ class ComposedModel(Shape):
                     step = self.chunk if window else FILL
                     for first in range(max(0, position - window - self.chunk) if window else 0, position, step):
                         count = min(step, position - first)
-                        batch = StepBatch.build([(sequence, first, count)], self.device)
+                        batch = StepBatch.build([(sequence, first, count, PREFILL)], self.device)
                         zeros = torch.zeros(count, pool.kv_heads, pool.head_dim, dtype=torch.bfloat16,
                                             device=self.device)
                         values = torch.zeros(count, pool.kv_heads, pool.value_dim, dtype=torch.bfloat16,
@@ -940,7 +949,7 @@ class ComposedModel(Shape):
                             pool.write(layer, slots, zeros, values)
                         pool.keep(sequence, first + count)
                 ids = torch.randint(3, self.vocabulary, (rows,), generator=g).to(self.device)
-                batch = StepBatch.build([(sequence, position, rows)], self.device)
+                batch = StepBatch.build([(sequence, position, rows, PREFILL)], self.device)
                 timed = {}
 
                 def chunk():
@@ -998,6 +1007,8 @@ class ComposedModel(Shape):
             found["draft_width"] = self.width
             found["draft_bytes_per_step"] = self.draft_bytes
             found["drafter_kind"] = "checkpoint MTP layer" if self.mtp else self.draft_block.name
+            if self.draft_companion is not None:   # a companion drafter's folder (companion.py)
+                found["draft_folder"] = str(self.draft_companion.folder)
             if self.rounds is not None:
                 found.update(self.rounds.width_facts())
         return found
@@ -1017,7 +1028,9 @@ class ComposedModel(Shape):
                                   if self.prompts is not None else
                                   {"buckets": [], "problems": [self.prompts_refused]} if self.prompts_refused else None),
                 "block_selection": next((("sparse-indexer" if layer.mixer.kernel is not None else "torch")
-                                         for layer in self.decoder if getattr(layer.mixer, "sparse", False)), None)}
+                                         for layer in self.decoder if getattr(layer.mixer, "sparse", False)), None),
+                # the layer kinds whose mixer runs the layout's `otherwise` block, and why (Shape._spec)
+                "mixers_instead": dict(self.instead) or None}
 
     def telemetry(self):
         found = self.rounds.telemetry() if self.rounds is not None else {}
@@ -1052,19 +1065,66 @@ class ComposedModel(Shape):
             found += [joined[i:i + k + 1] for i in range(len(inputs))]
         return self.torch.tensor(found, dtype=self.torch.int64, device=self.device).view(len(found), k + 1)
 
-    def _hidden(self, ids, batch, feature=False, windows=None, via_prompt=()):
+    def _hidden(self, ids, batch, feature=False, windows=None):
         """The hidden rows of the batch's tokens the head reads; with feature, also what a draft layer reads of them
         (the residual's: the same rows, or its streams). windows: _windows of the batch's rows (a round's come from
-        its token ring). via_prompt: the batch's decode rows that run as one-token prompt chunks (RowGroups.of)."""
+        its token ring). Each row's arithmetic follows its phase (RowGroups.of)."""
         x = self.embedded(ids)       # the embedding rows the residual starts from
         if self.window_tokens and windows is None:
             if not batch.round or self.ring is None:
                 raise RuntimeError("model-template: a step of a model whose blocks read token windows gives them")
             windows = self.ring.windows(ids.view(batch.rows, -1), self.window_tokens).reshape(-1, self.window_tokens)
-        ctx = Context(self, batch, self.rows.of(batch, via_prompt),
+        ctx = Context(self, batch, self.rows.of(batch),
                       self._reserve(batch, self.kv_keys), ids=ids, windows=windows)
         h, found = residual.forward(self, self.decoder, x, ctx)
         return (h, found) if feature else h
+
+    def layer_rows(self, ids):
+        """The residual's running row on entry to every layer application and the head's final-normed rows, for `ids`
+        as one fresh prompt through the prompt path, in prompt chunks of at most `chunk` tokens one after another (each
+        reading the earlier chunks' KV and recurrent states, as a prompt's chunks do): [(name, rows FP32
+        [tokens][hidden])], name "layer N" (N the application's index) and "final", the chunks' rows joined in order.
+        The layer localiser's tap (crit diff: each row against the reference's hidden state at the same place). A
+        residual that keeps no single row (several streams) gives none: ValueError."""
+        torch = self.torch
+        ids = list(ids)
+        taps = self.taps
+        sequence = ("rows", self.handles)
+        for key, pool in self.pools.items():
+            if key not in self.draft_keys:
+                pool.open(sequence)
+        self.taps = tuple(range(self.layers))
+        features = []
+        try:
+            for start in range(0, len(ids), self.chunk):
+                end = min(start + self.chunk, len(ids))
+                batch = StepBatch.build([(sequence, start, end - start, PREFILL)], self.device)
+                before = ids[max(0, start - self.window_tokens):start]
+                with torch.no_grad():
+                    _, feature = self._hidden(torch.tensor(ids[start:end], dtype=torch.int64, device=self.device),
+                                              batch, feature=True, windows=self._windows([(before, ids[start:end])]))
+                features.append(feature.float())
+                for states in self.state_pools:
+                    states.accept(sequence, end - start)
+                for pool in self.kv_pools:
+                    pool.keep(sequence, end)
+        finally:
+            self.taps = taps
+            for key, pool in self.pools.items():
+                if key not in self.draft_keys:
+                    pool.close(sequence)
+            self.step_plan.release(self.device)
+        feature = torch.cat(features) if len(features) > 1 else features[0]
+        width = self.hidden
+        names = [f"layer {i}" for i in range(self.layers)] + ["final"]
+        return [(name, feature[:, i * width:(i + 1) * width]) for i, name in enumerate(names)]
+
+    def layer_parts(self):
+        """Each layer application's parts as layer_rows() names them: [{layer, kind, mixer, ffn}], the block
+        classes the layer runs (its mixer and its FFN)."""
+        return [{"layer": i, "kind": layer.kind, "mixer": type(layer.mixer).__name__,
+                 "ffn": type(layer.ffn).__name__ if layer.ffn is not None else None}
+                for i, layer in enumerate(self.decoder)]
 
     def embedded(self, ids):
         """The embedding rows of ids, scaled where the family scales them (the layout's `embed_scale`: sqrt_hidden,
@@ -1101,13 +1161,11 @@ class ComposedModel(Shape):
         torch = self.torch
         packed, tokens, index = [], [], []
         for s, first, count, at in rows:
-            packed.append((s.handle, first, count))
+            packed.append((s.handle, first, count, PREFILL))
             tokens += s.prompt[first + 1:first + 1 + count]
             index += range(at, at + count)
         batch = StepBatch.build(packed, self.device)
-        batch.prompts = frozenset(range(batch.rows))
-        ctx = Context(self, batch, [(batch.starts[r], batch.starts[r + 1], True) for r in range(batch.rows)],
-                      self._reserve(batch, self.draft_keys))
+        ctx = Context(self, batch, self.rows.of(batch), self._reserve(batch, self.draft_keys))
         x = self._mtp_input(torch.tensor(tokens, dtype=torch.int64, device=self.device),
                             hidden[torch.tensor(index, dtype=torch.int64, device=self.device)], ctx)
         b = self.mtp_layer
@@ -1258,7 +1316,8 @@ class ComposedModel(Shape):
         # A request that asks decode_via_prompt (a debug option: crit smoke tells a decode gap's rounding from a fault
         # by it) has its decode rows computed as one-token prompt chunks, after the step's other decode rows, which
         # keep their decode arithmetic (an experts plugin splits a step's rows at its first prompt row).
-        via, via_prompt = (lambda p: p.phase == DECODE and _via_prompt(rows[p.item].session.request)), set()
+        def via(placement):
+            return placement.phase == DECODE and _via_prompt(rows[placement.item].session.request)
         for placement in sorted(layout.placements, key=lambda p: p.phase != DECODE or via(p)):
             s = rows[placement.item].session
             inputs = [s.pending] if placement.phase == DECODE else s.prompt[s.done:s.done + placement.rows]
@@ -1284,9 +1343,9 @@ class ComposedModel(Shape):
                 count = min(s.done + len(inputs), len(s.prompt) - 1) - s.done
                 if count > 0:
                     prompts.append((s, s.done, count, len(ids)))
-            if via(placement):
-                via_prompt.add(len(packed))
-            packed.append((s.handle, s.done, len(inputs)))
+            # The row's phase is its placement's; a decode row asked through the prompt path is a one-token prompt chunk.
+            packed.append((s.handle, s.done, len(inputs), PREFILL if placement.phase == PREFILL or via(placement)
+                           else DECODE))
             if self.window_tokens:   # the row's ids and the sequence's before it (its prompt, then its outputs)
                 before = s.prompt[:s.done] if s.done <= len(s.prompt) else s.prompt + s.outputs[:s.done - len(s.prompt)]
                 history.append((before[-self.window_tokens:], inputs))
@@ -1300,7 +1359,7 @@ class ComposedModel(Shape):
         if packed:
             batch = StepBatch.build(packed, self.device)
             head_rows, hidden = self._hidden(torch.tensor(ids, dtype=torch.int64, device=self.device), batch,
-                                             feature=True, windows=self._windows(history), via_prompt=via_prompt)
+                                             feature=True, windows=self._windows(history))
             eager_logits = self._logits_at(head_rows, logit_rows)
             del head_rows
             if mtp is not None and prompts:
@@ -1571,7 +1630,7 @@ class ComposedModel(Shape):
                         pool.keep(sequence, start)
                     continue
                 end = min(start + self._score_rows(self.spans.stop(start) - start), wanted.stop)
-                batch = StepBatch.build([(sequence, start, end - start)], self.device)
+                batch = StepBatch.build([(sequence, start, end - start, PREFILL)], self.device)
                 before = ids[max(0, start - self.window_tokens):start]
                 h = self._hidden(torch.tensor(ids[start:end], dtype=torch.int64, device=self.device), batch,
                                  windows=self._windows([(before, ids[start:end])]))
@@ -1591,4 +1650,6 @@ class ComposedModel(Shape):
     def close(self):
         if self.cache is not None:   # the prompt cache leaves the device's givers
             self.cache.close()
+        if getattr(self, "draft_companion", None) is not None:   # a companion drafter's files
+            self.draft_companion.close()
         self.decoder.clear()

@@ -5,10 +5,11 @@ measurement must look like, and how to read what Eval reports. AGENTS.md says wh
 `crit run ... next` says which step comes next; [Run records](RUN_RECORDS.md) defines every command and payload.
 Commands below omit crit run's global options (`--project CRIT_ROOT --root RUN_ROOT --id RUN_ID`, before the action).
 
-An engine build, like a release, starts only from a crit commit where the checkpoint manifest test
-(`tests/test_checkpoint_manifests.py`) and the stress test (`python tests/stress.py`) pass ([real
-checkpoints](CONTRIBUTING.md#real-checkpoints)): a toolkit bug they catch is one the build would otherwise spend its
-candidates finding.
+A release starts only from a crit commit where the checkpoint manifest test (`tests/test_checkpoint_manifests.py`)
+and the release-time stress test (`python tests/stress.py`) pass ([real checkpoints](CONTRIBUTING.md#real-checkpoints)).
+An engine build starts with the run's own preflight (`crit run ... preflight`, [below](#preflight)): the library at
+its defaults on the run's checkpoint, sized from the run, so a toolkit bug its geometry exposes is one the build sees
+in minutes instead of spending candidates finding it.
 
 ## 1. The request
 
@@ -46,6 +47,24 @@ An engine built outside a run (a proof of a model's plugins over the library, sa
 run's candidate. Create a run with `candidate_budget` 1, so its first candidate takes the full Eval, finish recon.md
 (say under Decisions how and where the source was built), record a first plan with no levers (it imports a baseline
 as is), and create the candidate from the package's `plugins/` folder.
+
+### Preflight
+
+Right after `create`, `next` names `preflight` (until the run has a report for this crit and checkpoint):
+
+```text
+crit run ... preflight [--budget-minutes 15]
+```
+
+It cuts the checkpoint, packages a candidate of the library's plugins at their defaults for it, serves it in one load
+per quality mode as `serve --check` does and runs the scenarios its facts make meaningful (the run's context, a 32k
+prompt, a reopen at a lower context, the engine's lanes at once, a cancel inside a prefill, a prompt-cache follow-up
+past the sliding window's ring, drafting where there is a draft layer or a companion drafter, a memory pressure where
+routed experts live partly off the device), every size from the run, in about 15 minutes. The report is
+`preflight/KEY/preflight.md` in the run folder ([preflight](RUN_RECORDS.md#preflight)). Read its failed scenarios
+before recon.md's plans: each is the library at its defaults failing on this checkpoint, so either the first
+candidate's plan works around it (another plugin, an option) or the build reports it as a crit bug. It is not a
+gate: the build goes on either way, and Eval and `serve --check` judge the candidates.
 
 ## 2. Recon and captured cases
 
@@ -92,7 +111,9 @@ The library's plugins are meant to give a fast engine from candidate 1 with no m
 a finished model plugin serves ([models/cache](../models/cache/README.md)), and a model plugin composed from the
 [model techniques](../models/techniques/README.md) on the [models core](../models/core/model-template/README.md) for
 another ([the model plugin](PLUGINS.md#the-model-plugin)): decode rounds captured through Core's round driver,
-short prompt chunks through Core's prompt graphs, the drafter over the model's device draft head, and the KV pool,
+short prompt chunks through Core's prompt graphs, the drafter over the model's device draft head (a draft layer in
+the checkpoint, or a companion drafter in a folder beside it that the plugin's layout reads), the family's own pieces
+its plugin holds, and the KV pool,
 attention, projections, recurrence and experts plugins each in its stored format with crit's kernel (built for the
 GPU, tuned by `crit kernels sweep`) or its torch fallback. A mixture of experts larger than the device needs no engine
 code for its experts: [expert-offload](../inference/techniques/experts/expert-offload/README.md) in the experts slot takes the same calls as
@@ -241,3 +262,14 @@ crit serve --workspace RUN_ROOT --run RUN_ID --candidate CANDIDATE_ID --project 
 
 `stop` records the reason, the critique and each goal's headroom ([stop](RUN_RECORDS.md#stop)); `resume` adds
 candidates and keeps prior attempts, criteria and sealed results ([recovery](RUN_RECORDS.md#recovery-and-resume)).
+
+### Where an engine's own piece goes once it works
+
+A sealed engine is not where the next build looks. A piece the engine wrote that any model can use is proposed to
+crit's shared code ([what belongs in crit](CONTRIBUTION_CRITERIA.md)). A piece only this model's family uses (its
+tool-call syntax, a drafter published beside its checkpoints, a technique only its layout composes) is proposed to
+the family's finished model plugin ([a family's own pieces](../models/cache/README.md#a-familys-own-pieces)): name it
+in `summary.md`'s toolkit feedback with where it lies in the engine and the tests that hold it (tiny random
+checkpoints of the family in two checkpoint layouts against the official implementation). Once it is promoted there,
+`crit run ... recon` lists it for the family's next build, and the library's layout uses it where the checkpoint calls
+for it.

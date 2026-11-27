@@ -1,5 +1,6 @@
 """Process supervisor for the opt-in resident host; commands, streams and results over its channel."""
 from pathlib import Path
+import os
 import subprocess
 import sys
 import threading
@@ -32,10 +33,32 @@ def work_line(work):
     return f"{work.get('what', 'working')}{counted}"
 
 
+def engine_key(spec):
+    """What makes an engine another one for its host: the candidate, its package, its limits and its configuration
+    (the identity the host's attach compares)."""
+    from crit.records import digest
+    spec = spec or {}
+    return digest({"identity": {k: spec.get(k) for k in ("run_id", "candidate_id", "package_sha256")},
+                   "limits": spec.get("limits") or {}, "configuration": spec.get("configuration")})
+
+
 class ResidentRuntime:
-    def __init__(self, ownership, host_limit, device_limit):
+    """The resident host process crit serve runs its engine in. one_process: one engine, one process: an engine
+    other than the one the host holds (another candidate, other limits, another configuration) loads in a fresh host,
+    and an unload ends the host, so everything a closed engine held returns to the system with its process (its CUDA
+    context, allocator caches, captured graphs). The default keeps one host across reloads, whose model pool keeps
+    the model's mapped files and host-side stores for the next engine."""
+
+    def __init__(self, ownership, host_limit, device_limit, one_process=False):
         self.ownership = ownership
         self.host_limit, self.device_limit = host_limit, device_limit
+        self.one_process = bool(one_process)
+        self.attached = None   # engine_key() of the engine the host holds (one_process)
+        # one_process: how the last engine whose host ended went (its host's own close report, or the process's end:
+        # its memory went back with the process), which outlasts the host it was in (ServedEngine.last_close)
+        self.last_exit = None
+        self.exits = 0
+        self.hosts = 0         # the hosts started, each a process
         self.tree = self.log = self.root = self.link = None
         self.last_work = None   # the work the newest load last reported (its status's `work`), kept past a retire
         self.lifecycle = threading.RLock()
@@ -56,8 +79,35 @@ class ResidentRuntime:
         write_json(config, {"root": str(self.root), "token": self.ownership.token, "port": self.link.port,
                    "host_limit": self.host_limit, "device_limit": self.device_limit}, immutable=True)
         self.log = (self.root / "runtime.log").open("xb")
+        self.hosts += 1
+        env = None
+        if self.one_process:   # the files kept stores outlast each host in (crit_core.engine.LoadContext.kept_file)
+            from crit_core.engine import KEPT_FILES
+            env = {**os.environ, KEPT_FILES: str(self.kept_files())}
         self.tree = guarded_tree([sys.executable, "-B", str(Path(__file__).with_name("host.py")), str(config)],
-                                 self.root, self.log, self.ownership, self.root)
+                                 self.root, self.log, self.ownership, self.root, env=env)
+
+    def kept_files(self):
+        """The folder of the files kept stores write themselves to under one_process, which outlasts each host and
+        goes with the server (forget_kept_files)."""
+        return self.ownership.directory / "kept-files"
+
+    def forget_kept_files(self):
+        """Delete the kept stores' files: the server stops, and no later host reopens them."""
+        import shutil
+        shutil.rmtree(self.kept_files(), ignore_errors=True)
+
+    def _ended(self, reported, closed=False):
+        """One engine's host ends (one_process): how its engine's close went, kept past the host. closed: the host
+        closed the engine itself first (an unload), whose own report (Core's close check) is the close's; else the
+        engine ends with the process, which returns everything it held to the system."""
+        self.exits += 1
+        if closed and isinstance(reported, dict):
+            self.last_exit = {**reported, "close": f"host-{self.exits}", "process_exit": True}
+        else:
+            self.last_exit = {"returned": True, "judged": True, "close": f"host-{self.exits}", "process_exit": True,
+                              "message": "the engine's host process ended with it (one engine, one process): its "
+                                         "device memory went back with the process"}
 
     def status(self):
         with self.lifecycle:
@@ -93,6 +143,28 @@ class ResidentRuntime:
         last advanced under that many seconds ago, and crit serve prints where the work stands."""
         if stop.is_set():
             return {"status": "cancelled", "error": "Stopped", "cleanup_settled": True}
+        key = engine_key(payload.get("spec")) if action == "load" else None
+        if self.one_process and key is not None:
+            with self.lifecycle:
+                fresh = self.tree is not None and self.attached is not None and self.attached != key
+            if fresh:   # another engine: the host's process ends with the engine it holds
+                self.announce("closed: one engine, one process: the next engine loads in a fresh host")
+                self._ended(self.status().get("last_close"))
+                self.close()
+        result = self._command(action, payload, stop, timeout, progress, request, progress_tools,
+                               progress_reasoning, on_started, stall)
+        if self.one_process and result.get("status") == "completed":
+            if action == "load":
+                self.attached = key
+            elif action in ("unload", "close"):   # a closed engine's memory goes back with its host's process
+                self.announce(f"closed: one engine, one process: the {action}ed engine's host ends")
+                self.attached = None
+                self._ended(self.status().get("last_close"), closed=True)
+                self.close()
+        return result
+
+    def _command(self, action, payload, stop, timeout, progress=None, request=None, progress_tools=None,
+                 progress_reasoning=None, on_started=None, stall=None):
         with self.lifecycle:
             if action not in RESPONDING:
                 self.start()
@@ -138,7 +210,8 @@ class ResidentRuntime:
                             pass  # a broken channel is reported below
                 if cancelled_at is not None and stamp - cancelled_at >= CANCEL_GRACE_SECONDS:
                     # An unload is no request to cancel: one past its bound is a close that did not end.
-                    self.announce(f"retired: the engine did not close within {timeout:g} s" if action == "unload" else
+                    self.announce(f"retired: the engine did not close within {timeout:g} s"
+                                  if action in ("unload", "close") else
                                   f"retired: the engine settled no cancel within {CANCEL_GRACE_SECONDS:g} s")
                     self.close()
                     return self._cancelled({"status": "timed_out" if timed_out else "cancelled",
@@ -200,6 +273,7 @@ class ResidentRuntime:
             self._close()
 
     def _close(self):
+        self.attached = None
         if self.tree:
             self.tree.close()
             self.tree = None

@@ -160,6 +160,17 @@ class BlockAttention:
         f, a = torch.tanh(fa[:, :hidden]), torch.tanh(fa[:, hidden:])
         return (1.0 - f) * x.float() + a * message.float()
 
+    def _fused_rows(self, messages, gates, ctx):
+        """The leading tokens whose looped-layer gates take row-ops' fused low_rank_gates: every token of a step or
+        round without prompt rows, else the decode tokens before its first prompt chunk (a step's decode rows come
+        first, StepLayout), so a decode row's gates are the same alone, beside a prompt chunk and in a round; 0 where
+        the kernel or the gates' low-rank form is not there, or there are no messages."""
+        if messages is None or self.ops is None or "down" not in gates:
+            return 0
+        if not ctx.prompt:
+            return messages.shape[0]
+        return next(first for first, _, prompt in ctx.groups if prompt)
+
     def _norm(self, x, weight, dtype):
         x = x.float()
         return self.m.norms.rms_norm(x if x.is_contiguous() else x.contiguous(), weight, self.m.eps, out_dtype=dtype)
@@ -175,16 +186,19 @@ class BlockAttention:
             found = self.mix(blocks, h, attention)
             inputs = [found[:, i] for i in range(found.shape[1])] if found.shape[1] == 3 else [found[:, 0]] * 3
         # A step's decode and verify rows: a looped layer's q, k and v gates in one fused call (one program a row:
-        # a round's few rows, where the products' launches would cost more than their arithmetic); a step with prompt
-        # rows takes them as GEMMs (each its tensor-core product over the step's rows)
-        few = messages is not None and not ctx.prompt and self.ops is not None and "down" in gates
-        if few:
-            shared = attention is None or found.shape[1] != 3
-            x = inputs[0][:, None, :].expand(-1, 3, -1) if shared else found
-            joined = self.ops.low_rank_gates(x, messages[:, :3], gates["down"][:3], gates["up"][:3])
-            inputs = [joined[:, i] for i in range(3)]
-        elif messages is not None:
-            inputs = [self._gate(x, messages[:, i], gates[n], ctx) for i, (x, n) in enumerate(zip(inputs, "qkv"))]
+        # a round's few rows, where the products' launches would cost more than their arithmetic), in a step beside
+        # prompt rows too; prompt rows take them as GEMMs (each its tensor-core product over the step's rows).
+        fused = self._fused_rows(messages, gates, ctx)
+        if messages is not None:
+            gated = None
+            if fused < messages.shape[0]:
+                gated = [self._gate(x, messages[:, i], gates[n], ctx) for i, (x, n) in enumerate(zip(inputs, "qkv"))]
+            if fused:
+                shared = attention is None or found.shape[1] != 3
+                x = (inputs[0][:, None, :].expand(-1, 3, -1) if shared else found)[:fused]
+                joined = self.ops.low_rank_gates(x, messages[:fused, :3], gates["down"][:3], gates["up"][:3])
+                gated = [joined[:, i] for i in range(3)] if gated is None else                     [torch.cat([joined[:, i].to(g.dtype), g[fused:]]) for i, g in enumerate(gated)]
+            inputs = gated
         if len(norms) == 3:
             rows = tuple(self._norm(x, w, dtype) for x, w in zip(inputs, norms))
         elif messages is None:
@@ -200,10 +214,13 @@ class BlockAttention:
         else:
             r = self.ops.scaled_add(h, a, 1.0, torch.float32) if quick else h.float() + r
         x = self.mix(blocks, r, ffn)[:, 0]
-        if few:
-            x = self.ops.low_rank_gates(x[:, None], messages[:, 3:4], gates["down"][3:], gates["up"][3:])[:, 0]
-        elif messages is not None:
-            x = self._gate(x, messages[:, 3], gates["mlp"], ctx)
+        if messages is not None:
+            gated = self._gate(x, messages[:, 3], gates["mlp"], ctx) if fused < messages.shape[0] else None
+            if fused:
+                joined = self.ops.low_rank_gates(x[:fused, None], messages[:fused, 3:4], gates["down"][3:],
+                                                 gates["up"][3:])[:, 0]
+                gated = joined if gated is None else torch.cat([joined.to(gated.dtype), gated[fused:]])
+            x = gated
         y = layer.ffn.forward(self._norm(x, post, dtype), ctx)
         y = layer.mixer.post_convolution("ffn", y, ctx)
         if quick:

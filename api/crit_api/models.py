@@ -14,6 +14,7 @@ import mmap
 import os
 from pathlib import Path
 import shutil
+import sys
 import time
 import uuid
 
@@ -227,7 +228,7 @@ class ModelPool:
                 raise
             # Capture ownership before inspecting backend metadata. An invalid
             # extent or callback must not drop the only reference to live memory.
-            entry = {"allocation": allocation, "users": 0, "nbytes": 0}
+            entry = {"allocation": allocation, "users": 0, "nbytes": 0, "device": compatibility["device"]}
             self.device[key] = entry
             try:
                 if not isinstance(allocation, DeviceAllocation):
@@ -244,6 +245,9 @@ class ModelPool:
             except BaseException:
                 self.blocked = True
                 raise
+            # The allocation outlives the engine that asked for it (the model's, until it unloads): Core's close
+            # check measures a closed engine without it (crit_plugins.memory.lease)
+            _lease(entry["device"], key, actual)
         elif nbytes is not None and entry["nbytes"] != nbytes:
             raise ValueError("Identical device representation has a different physical extent")
         return DeviceLease(self, key, entry)
@@ -267,6 +271,7 @@ class ModelPool:
             for key, entry in list(self.device.items()):
                 entry["allocation"].free()
                 self.device_bytes -= entry["nbytes"]
+                _lease(entry.get("device"), key, None)
                 del self.device[key]
         except BaseException:
             self.blocked = True
@@ -287,6 +292,22 @@ class ModelPool:
         self.sources.clear()
         self.paths.clear()
         self.generation = uuid.uuid4().hex
+
+
+LEASE_OWNER = "model-pool"   # the owner crit serve's device leases are listed under (crit_plugins.memory.lease)
+
+
+def _lease(device, key, nbytes):
+    """List a device lease's bytes on Core's device memory (nbytes None: unlist them), where Core's memory is loaded:
+    a backend without it has no close check to tell."""
+    memory = sys.modules.get("crit_plugins.memory")
+    if memory is None or not device:
+        return
+    found = memory.of(device)
+    if nbytes is None:
+        found.unlease(LEASE_OWNER, key[:16])
+    else:
+        found.lease(LEASE_OWNER, key[:16], nbytes)
 
 
 class ModelContext:

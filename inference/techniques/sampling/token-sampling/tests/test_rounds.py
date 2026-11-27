@@ -233,6 +233,18 @@ class RoundSamplerTests(PluginTestCase):
                 if kernel == "torch":
                     self.assertEqual(expected, "torch")
 
+    def test_each_sampler_holds_its_own_native_launches(self):
+        """Two engines' samplers share the kernel's module but not its device tensors (the empties for absent
+        buffers): a closed engine's go with it, none stays with the process to refuse the next load."""
+        if self.device() != "cuda":
+            self.skipTest("the CUDA sampler")
+        first = self.sampler("native").reserve(2, 3, 50, self.device()).native
+        second = self.sampler("native").reserve(2, 3, 50, self.device()).native
+        if first is None:
+            self.skipTest("the kernel did not build here")
+        self.assertIs(first.module, second.module)
+        self.assertIsNot(first._or(None, "cuda"), second._or(None, "cuda"))
+
     def test_rejection_sampling_keeps_the_target_law(self):
         """The first emitted token of a sampled round, its draft drawn from another law, follows the target's law
         (chi-square over 32,768 rounds of 6 tokens), and drafts are accepted at 1 - TV(p, q)."""

@@ -160,7 +160,8 @@ class HostProjections:
         return Matrix(format, rows, columns, found, activations)
 
     def matmul(self, x, matrix, out_dtype=None, prompt=False):
-        # Row by row on the host, or on int-block-experts' rows: a prompt chunk's rows are those of decode rows.
+        # Row by row on the host, or on int-block-experts' rows: a prompt chunk's rows are those of decode rows (on
+        # CUDA with prompt_gemm native, W4A4 prompt rows, however few, take gemm_native: code/device_int.py).
         import torch
         on = matrix.tensors["weight" if matrix.format == "bf16" else "codes"].device
         if x.device != on:
@@ -168,7 +169,7 @@ class HostProjections:
         tokens = x.shape[0]
         dtype = out_dtype or x.dtype
         if matrix.format != "bf16" and on.type == "cuda":
-            return self.cuda_rows.matmul(x, matrix, out_dtype)
+            return self.cuda_rows.matmul(x, matrix, out_dtype, prompt=prompt)
         if matrix.format == "bf16":
             w = matrix.tensors["weight"].float()
             xf = x.float()

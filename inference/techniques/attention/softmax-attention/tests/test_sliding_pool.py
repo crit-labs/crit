@@ -8,7 +8,7 @@ import math
 from types import SimpleNamespace
 
 from crit_plugins import StepBatch
-from crit_plugins.device import RoundBatch
+from crit_plugins.device import DECODE, PREFILL, RoundBatch
 from crit_plugins.testing import PluginTestCase
 
 USE = {"kv_cache": "attention-state"}
@@ -49,12 +49,12 @@ class SlidingPoolTests(PluginTestCase):
             lambda a, b: float((a.double() - b.double()).abs().max()) < 1e-5)
         for pool in (full, ring):
             pool.open("a"), pool.open("b")
-        a, b = self.step((full, ring), [("a", 0, 24), ("b", 0, 7)], dim, 1)   # prompt chunks
+        a, b = self.step((full, ring), [("a", 0, 24, PREFILL), ("b", 0, 7, PREFILL)], dim, 1)   # prompt chunks
         self.assertTrue(same(a, b))
         length = {"a": 24, "b": 7}
         for i in range(60):   # decode steps, every fifth a verify window of 4 that keeps 2
             width = 4 if i % 5 == 4 else 1
-            rows = [(s, length[s], width) for s in "ab"]
+            rows = [(s, length[s], width, DECODE) for s in "ab"]
             a, b = self.step((full, ring), rows, dim, 10 + i)
             self.assertTrue(same(a, b), (dtype, i))
             for s in "ab":
@@ -70,7 +70,7 @@ class SlidingPoolTests(PluginTestCase):
             pool.fork("a", "c")
         length["c"] = length["a"]
         for i in range(12):
-            a, b = self.step((full, ring), [(s, length[s], 1) for s in "ac"], dim, 100 + i)
+            a, b = self.step((full, ring), [(s, length[s], 1, DECODE) for s in "ac"], dim, 100 + i)
             self.assertTrue(same(a, b), (dtype, "fork", i))
             for s in "ac":
                 for pool in (full, ring):
@@ -102,7 +102,7 @@ class SlidingPoolTests(PluginTestCase):
         for pool in (full, ring):
             pool.open("a")
             for at in range(0, 48, SPAN):   # the prompt in chunks of the span
-                batch = StepBatch.build([("a", at, SPAN)], self.device())
+                batch = StepBatch.build([("a", at, SPAN, PREFILL)], self.device())
                 pool.write(0, pool.reserve(batch), *kv(range(at, at + SPAN)))
             pool.keep("a", 48)
             pool.bind(0, "a", 1500)
@@ -151,10 +151,10 @@ class SlidingPoolTests(PluginTestCase):
         ring = self.kv.pool([0], 2, 64, 256, device, "bf16", page=PAGE, sliding=WINDOW, span=SPAN, positions=512)
         ring.open("a")
         with self.assertRaisesRegex(ValueError, "past the sliding pool's span"):
-            ring.reserve(StepBatch.build([("a", 0, SPAN + 1)], device))
+            ring.reserve(StepBatch.build([("a", 0, SPAN + 1, PREFILL)], device))
         with self.assertRaisesRegex(ValueError, "past the pool's page tables"):
-            ring.reserve(StepBatch.build([("a", 520, 1)], device))
+            ring.reserve(StepBatch.build([("a", 520, 1, DECODE)], device))
         q = self.torch.zeros(1, 4, 64, device=device)
-        ring.reserve(StepBatch.build([("a", 0, 1)], device))
+        ring.reserve(StepBatch.build([("a", 0, 1, DECODE)], device))
         with self.assertRaisesRegex(ValueError, "over a sliding pool that keeps"):
-            self.attention.forward(0, q, ring, StepBatch.build([("a", 0, 1)], device), sliding=WINDOW + 1)
+            self.attention.forward(0, q, ring, StepBatch.build([("a", 0, 1, DECODE)], device), sliding=WINDOW + 1)

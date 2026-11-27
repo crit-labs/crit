@@ -247,6 +247,9 @@ class SmokeTests(unittest.TestCase):
         named = self.results("decode_rounding", facts={**hook, **levels}, only={"decode_matches_prefill"},
                              profile="strict")["decode_matches_prefill"]
         self.assertIn("(prompt below exact): experts-z, projections-x.", named["detail"])
+        # Both point at the layer localiser, which names the layer the gap starts in (crit diff)
+        for found in (rounded, named):
+            self.assertIn("crit diff --package PACKAGE --model MODEL names the first layer", found["detail"])
         fault = self.results("offset", facts=hook, only=decode)
         for name in decode:
             with self.subTest(test=name):

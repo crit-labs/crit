@@ -97,18 +97,47 @@ def core_folder():
     return Path(path[0]) if path else None
 
 
+def own_sources():
+    """(package, {key: folder}): the sources of the model plugin that extends this core, in its own folder (a
+    family's own techniques: models/cache/README.md, a family's own pieces), and the package they import under; (None,
+    {}) where the core runs outside such a plugin (crit.models.mounted, the core's own tests). Its source that is the
+    core itself, and any other plugin's folder, is not its own."""
+    import sys
+    from pathlib import Path
+    core = __package__.rsplit(".", 1)[0]
+    if "." not in core:
+        return None, {}
+    parent = core.rsplit(".", 1)[0]
+    package = sys.modules.get(parent)
+    manifest = getattr(package, "__crit_manifest__", None)
+    if manifest is None or not getattr(package, "__path__", None):
+        return None, {}
+    base = Path(package.__path__[0]).resolve()
+    found = {}
+    for key, source in manifest.get("sources", {}).items():
+        folder = (Path(source["folder"]) if isinstance(source, dict) else base / source).resolve()
+        if key != core.rsplit(".", 1)[1] and folder.is_relative_to(base) and not (folder / "plugin.json").is_file():
+            found[key] = folder
+    return parent, found
+
+
 def library():
     """(blocks, residuals, drafters): {name: class} of every model technique the plugin's sources mount. A technique's
     code is the source under a key, KEY.py in its folder, which gives BLOCKS, RESIDUALS or DRAFTERS (the draft blocks
-    a layout's draft names beside the core's mtp; models/techniques/*/*: code/KEY.py and entry.json); the plugin is model-template, or an engine's own model plugin over compose() whose manifest
-    mounts the techniques it composes the same way (README: an engine's own model plugin)."""
+    a layout's draft names beside the core's mtp; models/techniques/*/*: code/KEY.py and entry.json); the plugin is
+    model-template, or an engine's own model plugin over compose() whose manifest mounts the techniques it composes
+    the same way (README: an engine's own model plugin). The model plugin that extends the core mounts its own
+    techniques the same way, from its own folder (own_sources: a family's techniques in its finished model plugin,
+    models/cache/<family>/techniques), beside the core's; a name two techniques give is refused."""
     import importlib
     parent = __package__.rsplit(".", 1)[0]
+    mounted = [(parent, key) for key, folder in sources().items()
+               if key != __package__.rsplit(".", 1)[1] and (folder / f"{key}.py").is_file()]
+    package, own = own_sources()
+    mounted += [(package, key) for key, folder in own.items() if (folder / f"{key}.py").is_file()]
     blocks, residuals, drafters = {}, {}, {}
-    for key, folder in sources().items():
-        if key == __package__.rsplit(".", 1)[1] or not (folder / f"{key}.py").is_file():
-            continue
-        module = importlib.import_module(f"{parent}.{key}.{key}")
+    for where, key in mounted:
+        module = importlib.import_module(f"{where}.{key}.{key}")
         for found, kind in ((blocks, "BLOCKS"), (residuals, "RESIDUALS"), (drafters, "DRAFTERS")):
             for name, cls in getattr(module, kind, {}).items():
                 if name in found and found[name] is not cls:

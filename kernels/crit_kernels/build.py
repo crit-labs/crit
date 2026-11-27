@@ -204,7 +204,7 @@ def retire(manifest, tuning):
 def check_tuning(manifest, tuning):
     """The tuning, checked against the manifest: every knob a declared one with a declared value, config 0 the
     structure's defaults (filled in when missing), every table entry naming a configuration. A tuning written before
-    a structure retired is migrated first (retire)."""
+    a structure retired is migrated first (retire), and a knob a structure retired (retired_knobs) is dropped."""
     if tuning.get("schema") != TUNING_SCHEMA or tuning.get("kernel") != manifest["id"]:
         raise ValueError(f"tuning is {tuning.get('schema')} for {tuning.get('kernel')!r}, expected {TUNING_SCHEMA} for "
                          f"{manifest['id']!r}")
@@ -213,7 +213,11 @@ def check_tuning(manifest, tuning):
     for sid, spec in manifest.get("structures", {}).items():
         given = (tuning.get("structures") or {}).get(sid) or {"configs": [], "table": []}
         knobs = spec.get("knobs", {})
-        configs = [dict(defaults(manifest, sid), **c) for c in given.get("configs") or []]
+        # A knob the structure retired (kernel.json "retired_knobs": {name: why}) leaves a tuning written before it
+        # went: dropped from each configuration, so the table still loads and names the same entries.
+        retired = spec.get("retired_knobs") or {}
+        configs = [dict(defaults(manifest, sid), **{k: v for k, v in c.items() if k not in retired})
+                   for c in given.get("configs") or []]
         if not configs or configs[0] != defaults(manifest, sid):
             configs.insert(0, defaults(manifest, sid))
             shift = 1

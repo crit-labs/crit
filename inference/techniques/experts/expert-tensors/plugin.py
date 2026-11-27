@@ -61,6 +61,14 @@ class ExpertTensors:
             key = {"kept": kept, "layout": expert_store._jsonable(layout), "layers": int(layers),
                    "experts": int(experts), "device": str(device), "path": None if path is None else str(path),
                    "identity": expert_store._jsonable(identity)}
+            # A host that ends with its engine (crit serve --one-process) keeps the store as a file the next host
+            # reopens without building it again (the context's kept_file)
+            named = getattr(self.context, "kept_file", None)
+            if path is None and identity is not None and callable(named):
+                found = named("expert-tensors:store", key)
+                if found is not None:
+                    found.parent.mkdir(parents=True, exist_ok=True)
+                    path = found
 
             def made():
                 store = build()

@@ -48,6 +48,21 @@ class RunSettingsTest(unittest.TestCase):
         code, output = self.create()
         self.assertEqual(code, 0)
         self.assertEqual(self.limits(output)["ram_headroom_bytes"], 2 * GIB)
+        # Each value's source (crit_core.spec): the request gave the KV capacity and the VRAM headroom, the host's is
+        # the default
+        self.assertEqual(self.limits(output)["sources"], {"kv_tokens": "user", "vram_headroom_bytes": "user",
+                                                          "ram_headroom_bytes": "default"})
+
+    def test_a_headroom_the_request_or_settings_give_is_the_users_and_reaches_the_candidates_configuration(self):
+        (self.project / "settings.toml").write_text("vram_headroom_gib = 1.5\n", encoding="utf-8")
+        code, output = self.create()
+        self.assertEqual(code, 0)
+        run = json.loads(output)["run"]
+        self.assertEqual(run["spec"]["hardware_constraints"]["sources"]["vram_headroom_bytes"], "user")
+        from crit.run.store import with_headroom
+        configuration = with_headroom({"plugins": {"use": {"model": "m"}}}, run)
+        self.assertEqual((configuration["vram_headroom_bytes"], configuration["provenance"]),
+                         (run["spec"]["hardware_constraints"]["vram_headroom_bytes"], {"vram_headroom_bytes": "user"}))
 
     def test_settings_fill_omitted_headroom_and_request_wins(self):
         (self.project / "settings.toml").write_text('# This machine\nwsl_run_root = "/srv/crit/runs"\n'

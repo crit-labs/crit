@@ -251,7 +251,13 @@ class DeviceMatrices:
             self._encodings = {}
         return self._encodings
 
-    def matmul(self, x, matrix, out_dtype=None, prompt=False):
+    def matmul(self, x, matrix, out_dtype=None, *, prompt):
+        """y = x W^T (device_matrices.matmul). prompt (required, the rows' phase): True, a prompt chunk of any length;
+        False, decode rows, at most the facts' row_invariance rows a call (at least DECODE_ROWS)."""
+        if not prompt:
+            from crit_plugins.device import DECODE_ROWS, decode_call
+            decode_call(x.shape[0], max(DECODE_ROWS, self.invariant or device_matrices.GEMV_ROWS),
+                        "quantized-projections")
         return device_matrices.matmul(x, matrix, out_dtype, prompt=prompt)
 
     def exactness(self):
@@ -476,6 +482,48 @@ def create(context, options, parts):
         if found.scratch is not None:   # the engine's scratch: a call's activations and partial sums are taken there
             device_matrices.use_scratch(found.device, found.scratch)
     return found
+
+
+# The tensors a projections slot never holds for the target model: routed experts (the experts slot's), lookup tables
+# (the embeddings slot's) and a multimodal tower's (by the names checkpoints give them, safetensors' and GGUF's).
+NOT_TARGET = (".experts.", "_exps.", "embed_tokens.", "token_embd.", "vision", "visual")
+HEADS_NAMED = ("lm_head.weight", "output.weight")   # the output head's stored name
+
+
+def resolve(context, options, dry):
+    """Prices of the engine before any matrix loads (crit_plugins.assemble.PRICES, the EngineSpec's resolved values
+    crit Eval sizes an engine by): every target matrix stored in 16 bits (two dimensions, under a .weight name, not
+    a routed expert, a lookup table or a multimodal tower's) at its stored bytes (stored_matrix_bytes) and at the
+    bytes load() holds it in (held_matrix_bytes: held_bytes under the head and trunk options the quality mode
+    resolves, the head by its role, every other matrix as a role the plan does not know, as the models core's plan
+    prices it before its blocks load). Quantized matrices are held as stored and priced in neither. A checkpoint with
+    no head tensor ties its head to the token embeddings, and a model plugin loads that table through the slot as
+    the head, a matrix beside the table (the models core does): its held bytes count, its stored bytes do not (the
+    table stays a lookup table)."""
+    from crit_core.model import open_model
+    from crit_plugins.kernels import quality_mode
+    pricer = DeviceMatrices()
+    pricer.head, _ = asked_head(options["head"], quality_mode())
+    pricer.trunk, _ = asked_trunk(options["trunk"], quality_mode())
+    pricer.trunk_keep = role_names(options["trunk_keep"])
+    tensors = getattr(open_model(context.model).weights, "tensors", None) or {}
+    stored = held = 0
+    if not any(name.endswith(HEADS_NAMED) for name in tensors):   # a tied head: the embeddings loaded as the head
+        tables = [info for name, info in tensors.items() if name.endswith("embed_tokens.weight")
+                  and len(tuple(getattr(info, "shape", ()))) == 2 and str(info.dtype).upper() in ("BF16", "F16")]
+        if tables:
+            table = max(tables, key=lambda info: int(info.nbytes))
+            rows, columns = (int(n) for n in table.shape)
+            held += pricer.held_bytes("bf16", rows, columns, int(table.nbytes), HEAD_ROLE)
+    for name, info in tensors.items():
+        shape = tuple(getattr(info, "shape", ()))
+        if (not name.endswith(".weight") or len(shape) != 2 or str(info.dtype).upper() not in ("BF16", "F16")
+                or any(part in name for part in NOT_TARGET)):
+            continue
+        role = HEAD_ROLE if name.endswith(HEADS_NAMED) else None
+        stored += int(info.nbytes)
+        held += pricer.held_bytes("bf16", int(shape[0]), int(shape[1]), int(info.nbytes), role)
+    return {"stored_matrix_bytes": stored, "held_matrix_bytes": held}
 
 
 def memory(context, options):

@@ -38,7 +38,7 @@ import torch
 
 from . import device_matrices
 
-MAX_ROWS = 16      # the CUDA GEMVs' and the fallbacks' most rows a call (device_matrices.GEMV_ROWS)
+MAX_ROWS = device_matrices.GEMV_ROWS   # the CUDA GEMVs' and the fallbacks' most rows a call
 TRITON_ROWS = 8    # the Triton GEMV's
 ROWS, TILES, MMA, PINNED = ("decode-gemv", "fixed-tile-gemm", "mma-rows",
                              "pinned-gemm")
@@ -169,7 +169,8 @@ def prepare(device):
     captured graph would copy from the host during the capture."""
     key = device_matrices.device_key(device)
     if key not in _TABLES:
-        _TABLES[key] = torch.tensor(E2M1_VALUES, dtype=torch.float32, device=device)
+        _TABLES[key] = device_matrices.process_kept(device, "nvfp4.e2m1",
+                                                    torch.tensor(E2M1_VALUES, dtype=torch.float32, device=device))
         device_matrices.constants(device)
     return _TABLES[key]
 

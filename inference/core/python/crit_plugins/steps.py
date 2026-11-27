@@ -29,11 +29,15 @@ through its layers, a step a layer) says how many units a step ran (ran(..., uni
 Each chunk's span is a multiple of QUANTUM rows (few distinct shapes), at most the model's prefill chunk, and within
 `room` device bytes at `per_row` bytes a row where those are given.
 """
-# The step contract a model plugin states in its info ("step_contract"): 2, Core decides the engine's lanes, its
-# waiting places, the prompt spans' calibration, the activation reserve planned before Core measures its step arena,
-# and when cached device memory goes back (Steps; docs/PLUGINS.md#step-settings), and the model's options bound them.
-# A model plugin that states none (1) chose them itself, and Core still applies its runtime's cap over its info.
-CONTRACT = 2
+# The step contract a model plugin states in its info ("step_contract"): 3, Core decides the engine's lanes, its
+# waiting places, the prompt spans' bound, the activation reserve planned before Core measures its step arena and
+# when cached device memory goes back (Steps; docs/PLUGINS.md#step-settings); the model plugin declares what it can
+# take in its manifest (`steps`: the most lanes and waiting places, Steps.capable), and a configuration's option
+# bounds them only where it names one (CORE, the options' default, leaves each to Core). 2: the model's options sent
+# Core's values as bounds of their own; 1 (none stated): the model chose them itself, and Core still applies its
+# runtime's cap over its info.
+CONTRACT = 3
+CORE = -1              # a model option's value that leaves the setting to Core (the options' default, contract 3)
 LANES = 4              # the requests stepped at once where the model plugin bounds them no lower
 PENDING = 2            # the requests that wait for a lane beside them, where the model bounds them no lower
 ACTIVATIONS = 768 << 20   # the device bytes planned for a step's activations before Core measures its step arena
@@ -193,36 +197,49 @@ class Steps:
 
     def __init__(self, max_concurrent_requests=None, release_below=None, memory=None):
         self.budgets = []
+        self.most = {}   # the model plugin's manifest's `steps`: {"lanes": n, "pending": n}, the most it takes
         self.cap = None if max_concurrent_requests is None else int(max_concurrent_requests)
         # The configuration's release_below_mib in bytes (0: never release), None: Core's threshold (threshold()).
         self.release_below = None if release_below is None else int(release_below)
         self.memory = memory   # the device's memory (crit_plugins.memory), where the engine has one
 
+    def capable(self, steps=None):
+        """What the model plugin declares it can take (its manifest's `steps`): {"lanes": the most requests it steps
+        at once, "pending": the most that wait}; lanes() and pending() stay within it."""
+        self.most = {key: int(value) for key, value in (steps or {}).items()}
+        return self
+
     def lanes(self, bound=None):
         """The requests the engine steps at once, which the model sizes what each lane holds for (its states, a
-        captured round's rows): LANES, at most the model's bound (the most it takes), and at most the caller's cap
-        on the requests Core holds (but 2: every engine batches; Core's runtime applies the cap itself)."""
-        lanes = LANES if bound is None else max(1, int(bound))
+        captured round's rows): LANES, or the configuration's bound where it names one (None or CORE: Core's), at
+        most what the model plugin declares (capable) and at most the caller's cap on the requests Core holds (but 2:
+        every engine batches; Core's runtime applies the cap itself)."""
+        lanes = LANES if bound is None or int(bound) == CORE else max(1, int(bound))
+        if "lanes" in self.most:
+            lanes = min(lanes, max(1, self.most["lanes"]))
         return lanes if self.cap is None else min(lanes, max(2, self.cap))
 
     def pending(self, bound=None, lanes=None):
-        """The requests that wait for a lane in Core's runtime beside the lanes: PENDING, at most the model's bound,
-        and within the caller's cap less the lanes."""
-        pending = PENDING if bound is None else max(0, int(bound))
+        """The requests that wait for a lane in Core's runtime beside the lanes: PENDING, or the configuration's
+        bound (None or CORE: Core's), at most what the model plugin declares, and within the caller's cap less the
+        lanes."""
+        pending = PENDING if bound is None or int(bound) == CORE else max(0, int(bound))
+        if "pending" in self.most:
+            pending = min(pending, max(0, self.most["pending"]))
         if self.cap is not None:
             pending = min(pending, max(0, self.cap - (self.lanes() if lanes is None else int(lanes))))
         return pending
 
     def seconds(self, bound=None):
         """The bound a prompt step ends inside: SECONDS (a share of the cancel grace), the model's bound where it is
-        tighter; 0 or None: SECONDS."""
+        tighter; 0, None or CORE: SECONDS."""
         return SECONDS if not bound or float(bound) <= 0 else min(float(bound), SECONDS)
 
     def activations(self, need=None):
         """The device bytes the model plans for its steps' activations before Core measures them: its own need where
         it states one, else ACTIVATIONS. Once the warm requests ran, Core keeps its measured step arena free
         (crit_plugins.memory's size_arena) and the device's givers take the rest, whatever was planned."""
-        return ACTIVATIONS if need is None else max(0, int(need))
+        return ACTIVATIONS if need is None or int(need) < 0 else int(need)
 
     def threshold(self):
         """The free device memory below which a prompt's or a request's end hands back what torch's allocator caches

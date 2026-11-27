@@ -290,12 +290,22 @@ class Opening:
         served = chat.Server("http://127.0.0.1:%d/v1" % port, self.prepared, api.model).create_eval_engine(context)
         # Eval opens engines one after another: the next one is built in the same resident host (Served.open), or
         # an external engine started again at another context, and the server stops when Eval's attempt ends
-        # (Served.until).
-        served.close = lambda: None
+        # (Served.until). Eval's close is the engine's close in the host, whose report it reads (close_report).
+        served.close = self.close_report
         return served
+
+    def close_report(self):
+        """What Eval's close of an engine returns (crit-eval's docs/ADAPTER.md close()): None, an engine Eval cannot
+        see close (an external candidate's)."""
+        return None
 
 
 class EvalEngines(Opening, Served):
+    def close_report(self):
+        """The engine's close in the resident host (Served.close_engine) and Core's report of it ({returned, judged,
+        message}): Eval's lower-context round records it and fails the gate where the close kept its memory."""
+        return self.close_engine()
+
     def __init__(self, store, run_id, candidate_id, attempt, kv_tokens, prepared, log, deadline_at):
         # crit serve's own bound on a request is the attempt's deadline: Eval bounds each request by what it measured.
         super().__init__(store, run_id, candidate_id, attempt, kv_tokens, log, "Eval",
@@ -336,9 +346,11 @@ def _measure(store, run_id, candidate_id, attempt, deadline_at, model, data, out
             from crit_eval.quality.fixed import STORE
             from crit_eval.quality.packages import fetch, source
             # A published package's scores, when the data holds none and the source has them. Both quality modes judge
-            # against the same scores. Speed's limits also read the allowance (protocol quality.allowance): a package
-            # carries it when it has one, and score_data measures it by default where the data holds scores without
-            # it, so its absence is no reason to fetch again.
+            # against the same scores. Speed's limits also read the allowance (protocol quality.allowance), and every
+            # run lists the checkpoint's 16-bit baseline beside its drift (protocol quality.baseline, reported): a
+            # package carries both when it has them, and score_data measures each by default where the data holds
+            # scores without it (the first scoring of new data runs the baseline pass too), so their absence is no
+            # reason to fetch again.
             if source() is not None and not (data / STORE / "index.json").is_file():
                 fetch(model, data, source(), log)
             with own_allocator_env():
