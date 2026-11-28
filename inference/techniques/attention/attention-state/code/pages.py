@@ -76,13 +76,6 @@ def position_bytes(layers, kv_heads, head_dim, dtype="bf16", value_dim=None):
 BACK = 256
 
 
-def prompt_row(batch, r, window):
-    """Whether a step's row r is a prompt row (StepBatch.prompt_row: the model's mark, else more than `window`
-    tokens), not a window row."""
-    asked = getattr(batch, "prompt_row", None)
-    return asked(r, window) if callable(asked) else batch.row(r)[2] > window
-
-
 class FreshBuffer:
     """A prompt chunk's keys and values as the projections gave them, one buffer for a plugin's pools: `data` the
     uint8 device buffer, `tag` (pool, layer, tokens, reserve) of the write that holds it now, so a pool reads it only
@@ -93,9 +86,9 @@ class FreshBuffer:
 
 
 class KVPool:
-    """window: the most tokens of a row read as a window row (decode tokens, verify windows: the attention
-    plugins' split-KV reader); a longer row is a prompt row, and so is a shorter prompt chunk the model marks
-    (prompt_row). step_rows > 0 keeps a step's buffers at fixed
+    """window: the most tokens of a window row (a decode row: a decode token or a verify window, which the attention
+    plugins' split-KV reader reads) the step buffers hold; a row's phase is the batch's (StepBatch.prompt_row), so a
+    prompt chunk of any length is a prompt row. step_rows > 0 keeps a step's buffers at fixed
     addresses (step buffers): reserve() writes the slots of up to step_tokens tokens, and the first token, column
     count, first position, first partial row and page table of up to step_rows window rows (`windows`, in row order),
     into the same device tensors every step, so a model can capture a decode step in a CUDA graph and replay it after
@@ -339,7 +332,7 @@ class KVPool:
     def fresh_rows(self, layer, tokens):
         """The keys and values the last write() of `layer` stored for this step's `tokens` tokens, as it got them
         ([tokens][kv_heads][dim] each, the compute dtype), where the pool keeps them (FP8 and INT8 pages, a step with
-        prompt rows, a chunk the fresh buffer holds), else None: a prompt row (a StepBatch row past the window, a
+        prompt rows, a chunk the fresh buffer holds), else None: a prompt row (a StepBatch's prompt chunk however short, a
         PromptBatch's chunk from prompt_fresh_first on) attends its own chunk from them and the earlier positions
         from the pages."""
         if self.fresh_k is None or self._fresh_buffer.tag != (id(self), layer, tokens, self._reserves):
@@ -363,9 +356,9 @@ class KVPool:
         PromptBatch's are the ones stage_prompt staged (device work only)."""
         self._reserves += 1
         # Prompt tokens' keys and values are kept fresh for the step's attention: a PromptBatch's, a StepBatch's
-        # with a row past the window (a prompt row); never a round's.
+        # with a prompt row (a prompt chunk, however short); never a round's.
         self._staging = bool(getattr(batch, "prompt", False)) or (
-            not batch.round and any(batch.row(r)[2] > self.window for r in range(batch.rows)))
+            not batch.round and any(batch.prompt_row(r) for r in range(batch.rows)))
         if getattr(batch, "prompt", False):
             if self.prompt_slots is None:
                 raise ValueError("a prompt batch reads the slots stage_prompt(batch) staged: stage it first")
@@ -400,7 +393,10 @@ class KVPool:
         tables (unused entries at the dump page), into the step buffers in one asynchronous copy each; every row's table
         also as device_tables (for gather())."""
         torch = self.torch
-        windows = [r for r in range(batch.rows) if not prompt_row(batch, r, self.window)]
+        windows = [r for r in range(batch.rows) if not batch.prompt_row(r)]
+        if any(batch.row(r)[2] > self.window for r in windows):
+            raise ValueError(f"a decode row of more than the pool's window ({self.window} tokens) does not fit its "
+                             "step buffers")
         if len(slots) > self.step_tokens or len(windows) > self.step_rows:
             raise ValueError(f"a step of {len(slots)} tokens and {len(windows)} rows of up to {self.window} "
                              f"tokens is larger than the pool's step buffers ({self.step_tokens} tokens, "
@@ -590,7 +586,7 @@ class KVPool:
             row[:len(table)] = torch.tensor(table, dtype=torch.int32)
         self.prompt_table[0].copy_(row)
         if self.prompt_fresh_first is not None:
-            self.prompt_fresh_first.fill_(frontier if count > self.window else frontier + batch.bucket)
+            self.prompt_fresh_first.fill_(frontier)   # a prompt chunk however short: its own positions fresh
 
     def commit_prompt(self, batch):
         """After a captured prompt chunk: its sequence's valid length becomes batch.frontier + batch.count."""

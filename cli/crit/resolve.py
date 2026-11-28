@@ -29,6 +29,11 @@ def render(found, context=None):
 
 
 def main(args):
+    if getattr(args, "spec", False):   # the whole EngineSpec, every value with its source (crit_core.spec)
+        from crit_core.spec import describe, engine_spec
+        spec = engine_spec(args.package, args.model, context_tokens=args.context)
+        print(json.dumps(spec, indent=2) if args.json else "\n".join(describe(spec)))
+        return 0
     found = resolve(args.package, args.model, args.context)
     if args.json:
         print(json.dumps(found, indent=2))
@@ -45,4 +50,8 @@ def add_parser(subs):
     sub.add_argument("--model", type=Path, required=True, help="The checkpoint folder")
     sub.add_argument("--context", type=int, help="The context tokens the engine serves (default: the engine's own)")
     sub.add_argument("--json", action="store_true", help="Print the answer as JSON")
+    sub.add_argument("--spec", action="store_true", help="Print the engine's whole spec: its context, headrooms, "
+                                                         "quality mode, exactness, step bounds, every plugin's options "
+                                                         "and the resolved facts, each with its source "
+                                                         "(crit_core.spec)")
     return sub

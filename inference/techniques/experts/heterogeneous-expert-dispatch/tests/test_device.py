@@ -338,3 +338,34 @@ class DispatchDeviceTests(PluginTestCase):
         experts = self.assemble(USE)["experts"]
         with self.assertRaisesRegex(ValueError, "nvfp4, int4"):
             experts.load(0, 0, torch.zeros(2 * INTER, HIDDEN), torch.zeros(HIDDEN, INTER), "bf16")
+
+
+@unittest.skipIf(torch is None, "the device form's tensors are torch's")
+class PhaseTests(PluginTestCase):
+    """A call's arithmetic follows the phase its caller states: a decode call past max_tokens (an eager step's many
+    decode rows) keeps the declared order, so a decode row's bits never follow how many rows share its step; a prompt
+    call past it takes the tensor arithmetic (prompt_arithmetic tensor). The engine's routing on the CPU, with a
+    recording device part."""
+
+    def test_a_decode_call_past_max_tokens_keeps_the_declared_order(self):
+        import sys
+        self.assemble(USE, {"max_tokens": 4})
+        module = next(m for name, m in sys.modules.items() if name.endswith(".device_dispatch"))
+        ran = []
+
+        class Part:
+            def route_outputs(self, layer, x, ids, store, slots, arithmetic=None):
+                ran.append(arithmetic or "declared")
+                return x
+
+            def combine(self, y, ids, weights):
+                return y
+
+        engine = module.DeviceDispatch.__new__(module.DeviceDispatch)
+        engine.ext, engine.max_tokens, engine.prompt_arithmetic, engine.part = object(), 4, "tensor", Part()
+        engine.tensor_calls, engine._check = 0, (lambda layer, ids, slots: None)
+        ids, slots = torch.zeros(9, 2, dtype=torch.int64), torch.zeros(8, dtype=torch.int32)
+        for prompt, want in ((False, "declared"), (True, "tensor"), (None, "tensor")):
+            ran.clear()
+            engine.forward(0, torch.zeros(9, 4), ids, None, None, slots, prompt=prompt)
+            self.assertEqual(ran, [want], prompt)

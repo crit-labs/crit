@@ -40,6 +40,7 @@ from pathlib import Path
 import shutil
 import tempfile
 import threading
+import time
 import unittest
 
 from crit_plugins.testing import PluginTestCase, core_runtime, unchecked
@@ -64,8 +65,7 @@ PLUGINS = BASE + ["torch-norms"]
 USE = {"placement": "device-placement", "projections": "projections-dense",
        "attention": "softmax-attention", "kv_cache": "attention-state", "sampler": "token-sampling",
        "norms": "fused-norms", "embeddings": "memory-table-rows"}
-MOE = {"router": "topk-router", "experts": "experts-reference", "expert_source": "expert-tensors"}
-OPTIONS = {"context": 1024, "kv_margin": 256, "prefill_chunk": 64, "activations_mib": 64, "concurrency": 4}
+from crit_models.engines import ROUTED as MOE, SMALL_OPTIONS as OPTIONS   # noqa: E402,F401 - one definition (MOE re-exported for the model plugins' tests)
 
 
 def engine_device():
@@ -356,11 +356,13 @@ class Layout(Engines):
         (long,) = self.prompts(1, 200)
         dropped = passed.model.passed["dropped"]
         # The cancel is looked for every 10 ms (crit_core.native), and a host can run the whole pass in less: each
-        # step of an open pass waits until the cancel has been asked, so it lands inside the pass on any host.
+        # step of an open pass waits until the cancel has been asked, and then 50 ms more, so Core's next look for it
+        # comes before the pass's next step on any host (Windows' timers step by about 15.6 ms).
         asked, step = threading.Event(), passed.model._pass_step
 
         def waiting(row, deadline):
             asked.wait(1.0)
+            time.sleep(0.05)
             return step(row, deadline)
 
         def cancelled():
@@ -374,6 +376,10 @@ class Layout(Engines):
             passed.model._pass_step = step
         self.assertTrue(asked.is_set())
         self.assertEqual(found, (None, {"cancelled": True}))
+        # Core retires the cancelled session on its engine worker, which may come just after the request returned
+        settle = time.monotonic() + 10
+        while (passed.model.passed["dropped"], passed.model.passed["open"]) != (dropped + 1, 0)                 and time.monotonic() < settle:
+            time.sleep(0.01)
         self.assertEqual((passed.model.passed["dropped"], passed.model.passed["open"]), (dropped + 1, 0))
         self.assertEqual(passed.generate(long, 8, stop_tokens=[], sampling=GREEDY)[0],
                          plain.generate(long, 8, stop_tokens=[], sampling=GREEDY)[0])

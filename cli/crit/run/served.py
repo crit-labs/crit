@@ -55,8 +55,16 @@ def environment(values):
 class Served:
     """The candidate served through crit serve. `name` names the measurement in its deadline's message, and `log`
     receives a line when an engine loads and stops; `timeout` bounds each request. `variables`: crit's own
-    environment variables for the engine's host process (crit run profile: the kernel tracer)."""
+    environment variables for the engine's host process (crit run profile: the kernel tracer).
 
+    One engine, one process (crit serve --one-process, ResidentRuntime one_process) is the default wherever crit run
+    reloads engines (serve --check's reopens, ablate's variants, the preflight's reopens, Eval's lower context): each
+    engine loads in a fresh host process, so nothing a closed engine kept (its CUDA context, allocator caches, a leak)
+    reaches the next, and a reopen's close is the old host's exit, which returns everything (last_close reads it). A
+    kept store outlasts its host as a file the next host reopens. `crit run --same-host` reloads in the one host,
+    keeping the model's mapped files and device weights between engines."""
+
+    one_process = True   # crit run --same-host sets it False for the command
     def __init__(self, store, run_id, candidate_id, attempt, kv_tokens, log, name, timeout=600, address=("127.0.0.1", 0),
                  variables=None):
         self.store, self.run_id, self.candidate_id, self.attempt = store, run_id, candidate_id, attempt
@@ -71,6 +79,40 @@ class Served:
         # Core's counters of each load served before the current one (checks.core_counts), read before a reopen
         # replaces them: what the engine compiled after its loads and how its drafts fared, across every context.
         self.counted = []
+        # How each engine close in the host went (crit serve's last_close: returned, judged, message), one a reload
+        # and the check's own close (checks.close_item): Core refuses a reload beside a close that kept its memory.
+        self.closes = []
+
+    def closed(self, engine, tokens=None):
+        """Read how the host's last engine close went (ServedEngine.last_close) into `closes`, with the context the
+        engine was opened at next; a close that did not return its memory is logged with its report. Returns it."""
+        try:
+            found = engine.last_close()
+        except Exception:  # noqa: BLE001 - a host that does not answer says nothing about its close
+            found = None
+        if found is None or (self.closes and found.get("close") is not None
+                             and found.get("close") == self.closes[-1].get("close")):
+            return None   # no close, or the one read already (a reload that failed before closing the engine)
+        found = {**found, "reopened_at": tokens}
+        self.closes.append(found)
+        if found.get("returned") is False:
+            self.log(f"crit serve: the closed engine did not return its memory: {found.get('message')}")
+        return found
+
+    def close_engine(self):
+        """Close the engine served now in its resident host (ServedEngine.close_engine: the model's pool stays, so
+        the next open builds it again as a reload does) and return how the close went, as `closed` records it: the
+        report a caller that closes an engine (Eval's lower-context round) reads. None where none is served."""
+        with self.lock:
+            current = self.current
+        if current is None or current[1] is None:
+            return None
+        engine = current[0]
+        try:
+            engine.close_engine()
+        finally:
+            found = self.closed(engine)
+        return found
 
     def open(self, tokens=None, configuration=None):
         """Serve the candidate at `tokens` of context (default the run's), with `configuration`'s keys over its
@@ -87,18 +129,22 @@ class Served:
             engine, server = current
             from .checks import core_counts
             self.counted.append(core_counts(engine))
-            self.log(f"crit serve: reloading {self.candidate_id} at {tokens:,} tokens of context in the same host")
+            self.log(f"crit serve: reloading {self.candidate_id} at {tokens:,} tokens of context "
+                     + ("in a fresh host (one engine, one process)" if self.one_process else "in the same host"))
             try:
                 engine.reopen(None if tokens == self.kv_tokens else tokens, configuration=configuration)
             except BaseException:
+                self.closed(engine, tokens)   # a close that kept its memory refuses the reload: said here first
                 self.stop()
                 raise
+            self.closed(engine, tokens)
             return engine, server.api, server.server_address[1]
         self.stop()  # an engine that failed to open
         run_cache(self.store.directory(self.run_id))
         engine = ServedEngine(self.store.root, self.run_id, self.candidate_id, project=self.store.project,
                               timeout=self.timeout, attempt=self.attempt,
-                              kv_tokens=None if tokens == self.kv_tokens else tokens, configuration=configuration)
+                              kv_tokens=None if tokens == self.kv_tokens else tokens, configuration=configuration,
+                              one_process=self.one_process)
         with self.lock:
             if self.expired:
                 raise Expired(f"{self.name} passed its reserved deadline")
@@ -263,6 +309,7 @@ def serve(store, run_id, candidate_id, host="127.0.0.1", port=8000, seconds=None
                 if not external:   # what Core counted over every load the check served (checks.core_items)
                     from .checks import core_counts, core_items
                     report += core_items(served.counted + [core_counts(engine)], log)
+                    report.append(_close_check(served, engine, log))
                 log("crit run serve --check: stopping the engine")
             try:
                 while not check and not served.expired and not (stop is not None and stop.wait(.25)):
@@ -282,6 +329,22 @@ def serve(store, run_id, candidate_id, host="127.0.0.1", port=8000, seconds=None
                                                                      manifest, report, result["logs"])}
     attempt.finish()
     return result
+
+
+def _close_check(served, engine, log):
+    """The check's own close: the resident host closes the engine as a reload or a model switch would (crit serve's
+    unload) and Core measures whether it returned its memory; close_returns_memory judges it with every reload's
+    close before it (Served.closes)."""
+    from .checks import close_item
+    log("crit run serve --check: closing the engine, to see that it returns its memory")
+    try:
+        engine.unload()
+    except Exception as error:  # noqa: BLE001 - a close that fails is the item's failure
+        served.closed(engine)
+        return {"name": "close_returns_memory", "state": "failed",
+                "detail": f"closing the engine failed: {type(error).__name__}: {error}"[:2000]}
+    served.closed(engine)
+    return close_item(served.closes, log)
 
 
 @contextmanager

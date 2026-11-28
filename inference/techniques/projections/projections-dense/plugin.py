@@ -5,7 +5,7 @@ projections slot's device form promises, at the cost of reading the matrix once 
 and allocates only through torch, so captured decode rounds run it (rounds:projections)."""
 import math
 
-DECODE_ROWS = 8
+from crit_plugins.device import DECODE_ROWS   # the slot's decode rows (Core's contract), one definition
 
 
 class DenseProjections:
@@ -33,13 +33,18 @@ class DenseProjections:
             raise ValueError(f"projections-dense keeps matrices bf16; re-encoding to {encode} is quantized-projections'")
         return tensors["weight"].to(torch.bfloat16).contiguous()
 
-    def matmul(self, x, matrix, out_dtype=None, prompt=False):
-        """y = x W^T in BF16, or in out_dtype (FP32 for logits) from the same FP32 sums. prompt: a prompt chunk, which
-        multiplies as one GEMM at every length (a short one is not split into decode rows)."""
+    def matmul(self, x, matrix, out_dtype=None, *, prompt):
+        """y = x W^T in BF16, or in out_dtype (FP32 for logits) from the same FP32 sums. prompt (required, the rows'
+        phase): True, a prompt chunk, which multiplies as one GEMM at every length (a short one is not split into
+        decode rows); False, decode rows, at most DECODE_ROWS a call, each row's bits its own."""
         import torch
         x = x.to(torch.bfloat16)
-        if x.shape[0] <= DECODE_ROWS and x.shape[0] > 1 and not prompt:
-            return torch.cat([self.matmul(x[r:r + 1], matrix, out_dtype) for r in range(x.shape[0])])
+        if not prompt:
+            from crit_plugins.device import decode_call
+            decode_call(x.shape[0], DECODE_ROWS, "projections-dense")
+            if x.shape[0] > 1:
+                return torch.cat([self.matmul(x[r:r + 1], matrix, out_dtype, prompt=False)
+                                  for r in range(x.shape[0])])
         if out_dtype is not None and out_dtype != torch.bfloat16:
             if not x.is_cuda:   # torch has no CPU kernel for a BF16 GEMM into FP32: the same BF16 products in FP32
                 return (x.float() @ matrix.float().t()).to(out_dtype)

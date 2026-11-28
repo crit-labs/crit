@@ -7,6 +7,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.request import urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1].parent / "crit-eval"))
+# crit Eval imports crit Core's definitions (crit_plugins) from the crit-core beside it
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "inference" / "core" / "python"))
 from crit_eval.run import outcomes as bench  # noqa: E402
 
 

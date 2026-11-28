@@ -67,3 +67,40 @@ class RingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PhaseTests(unittest.TestCase):
+    """The head multiplies a prompt chunk's rows as one prompt call however few they are (a short chunk's cache rows
+    have the bits of the same rows in a longer chunk), and a round's draft rows in decode calls up to the decode
+    rows."""
+
+    def test_a_prompt_chunks_rows_are_one_prompt_call_at_every_count(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch")
+        from types import SimpleNamespace
+        from crit.models import mounted
+        d = mounted("block_drafter")
+        calls = []
+
+        class Rows:
+            decode_rows = 8
+
+            def rows(self, count):
+                return [(f, min(f + 8, count), False) for f in range(0, count, 8)]
+
+            def matmul(self, x, matrix, groups):
+                calls.append(groups)
+                return x
+
+        head = d.BlockHead.__new__(d.BlockHead)
+        head.torch, head.m = torch, SimpleNamespace(rows=Rows())
+        for n in (1, 5, 8, 9, 40):
+            calls.clear()
+            head._mm(torch.zeros(n, 4), None, prompt=True)
+            self.assertEqual(calls, [[(0, n, True)]], n)
+        for n, want in ((1, [(0, 1, False)]), (8, [(0, 8, False)]), (40, [(0, 40, True)])):
+            calls.clear()
+            head._mm(torch.zeros(n, 4), None)
+            self.assertEqual(calls, [want], n)

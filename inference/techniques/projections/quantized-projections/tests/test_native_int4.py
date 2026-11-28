@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from crit_plugins.testing import PluginTestCase
+from crit_plugins.testing import long_call
 
 AWQ_ORDER = (0, 2, 4, 6, 1, 3, 5, 7)
 
@@ -88,19 +89,20 @@ class NativeAndInt4Tests(PluginTestCase):
                     what = (gemv, format, group, act_order)
                     self.assertEqual((m.format, m.rows, m.columns, m.group), ("int4_zp", n, k, group), what)
                     self.assertEqual(m.perm is not None, act_order, what)
-                    full = plugin.matmul(x, m, torch.float32)
+                    full = plugin.matmul(x, m, torch.float32, prompt=long_call(x, plugin))
                     self.within(full, x, ck.values, 2e-5, what)
-                    alone = [plugin.matmul(x[r:r + 1].clone(), m, torch.float32)[0] for r in range(16)]
+                    alone = [plugin.matmul(x[r:r + 1].clone(), m, torch.float32,
+                                           prompt=long_call(x[r:r + 1].clone(), plugin))[0] for r in range(16)]
                     for rows in (2, 7, 16):
-                        batch = plugin.matmul(x[:rows], m, torch.float32)
+                        batch = plugin.matmul(x[:rows], m, torch.float32, prompt=long_call(x[:rows], plugin))
                         self.within(batch, x[:rows], ck.values, 2e-5, what + (rows,))
                         for r in range(rows):
                             self.assertTrue(torch.equal(batch[r], alone[r]), what + (rows, r))
                     if m.mma is not None:   # every prompt row its decode row's bits (the prompt tile)
                         for r in (0, 15, 120, 199):
                             self.assertTrue(torch.equal(full[r], plugin.matmul(x[r:r + 1].clone(), m,
-                                                                               torch.float32)[0]), what + (r,))
-                    self.assertEqual(plugin.matmul(x[:3], m).dtype, torch.bfloat16)
+                                                                               torch.float32, prompt=long_call(x[r:r + 1].clone(), plugin))[0]), what + (r,))
+                    self.assertEqual(plugin.matmul(x[:3], m, prompt=long_call(x[:3], plugin)).dtype, torch.bfloat16)
                 facts = plugin.facts()
                 self.assertEqual(facts["prompt_arithmetic"]["int4_zp"],
                                  {"weights": "exact", "activations": "bf16", "sums": "fp32"})
@@ -123,8 +125,9 @@ class NativeAndInt4Tests(PluginTestCase):
             plugin = self.assemble()["projections"]
             m = plugin.load(ck.gptq(), "gptq")
             self.assertEqual((m.path, m.prompt_kernel), ("torch", "torch"))
-            self.within(plugin.matmul(x, m, torch.float32), x, ck.values, 2e-5, "prompt")
-            self.within(plugin.matmul(x[:5], m, torch.float32), x[:5], ck.values, 2e-5, "decode")
+            self.within(plugin.matmul(x, m, torch.float32, prompt=long_call(x, plugin)), x, ck.values, 2e-5, "prompt")
+            self.within(plugin.matmul(x[:5], m, torch.float32,
+                                      prompt=long_call(x[:5], plugin)), x[:5], ck.values, 2e-5, "decode")
 
     def test_unreadable_int4_matrices_are_refused(self):
         torch = self.torch
@@ -198,17 +201,17 @@ class NativeAndInt4Tests(PluginTestCase):
             self.assertEqual(facts["prompt_kernels"][format.split(":")[0]], [kernel], what)
             for rows in (17, 100, 384):
                 x = self.x(rows, k, seed=rows)
-                got = native.matmul(x, m, torch.float32).double()
+                got = native.matmul(x, m, torch.float32, prompt=long_call(x, native)).double()
                 exact, magnitude = self.declared(x, m)
                 self.assertLessEqual(float(((got - exact).abs() - magnitude * bound).max()), 1e-30, what + (rows,))
                 # the provider path and the decode rows: the same arithmetic in other orders
-                want = provider.matmul(x, p, torch.float32).double()
+                want = provider.matmul(x, p, torch.float32, prompt=long_call(x, provider)).double()
                 self.assertLess(float((got - want).abs().max() / want.abs().max()), 1e-5, what + (rows,))
-                self.assertEqual(native.matmul(x, m).dtype, torch.bfloat16)
+                self.assertEqual(native.matmul(x, m, prompt=long_call(x, native)).dtype, torch.bfloat16)
             if format == "mxfp8":   # decode rows on the MXFP8 values: the prompt rows' arithmetic in another order
                 x = self.x(9, k)
                 exact, magnitude = self.declared(x, m)
-                got = native.matmul(x, m, torch.float32).double()
+                got = native.matmul(x, m, torch.float32, prompt=long_call(x, native)).double()
                 self.assertLessEqual(float(((got - exact).abs() - magnitude * 2e-5).max()), 1e-30, what)
                 self.assertEqual(native.facts()["decode_activations"]["mxfp8"], "mxfp8")
 
@@ -240,7 +243,7 @@ class NativeAndInt4Tests(PluginTestCase):
             m, p = native.load(tensors, format), provider.load(tensors, format)
             self.assertEqual((m.prompt_kernel, p.prompt_kernel), ("fixed-tile-gemm", "provider"), format)
             x = self.x(300, 1024)
-            got, want = native.matmul(x, m, torch.float32), provider.matmul(x, p, torch.float32)
+            got, want = native.matmul(x, m, torch.float32, prompt=long_call(x, native)), provider.matmul(x, p, torch.float32, prompt=long_call(x, provider))
             self.assertLess(float((got - want).abs().max() / want.abs().max()), 2e-5, format)
         # weight-only NVFP4 prompts in fp8: FP8-decoded chunks on fp8-block-rows' per-channel GEMM
         options = {"activations": "bf16", "prompt": "fp8"}
@@ -250,9 +253,9 @@ class NativeAndInt4Tests(PluginTestCase):
         m, p = native.load(tensors, "nvfp4"), provider.load(tensors, "nvfp4")
         self.assertEqual((m.prompt_kernel, p.prompt_kernel), ("fp8-block-rows gemm-native-channel", "provider"))
         x = self.x(300, 2048)
-        got, want = native.matmul(x, m, torch.float32), provider.matmul(x, p, torch.float32)
+        got, want = native.matmul(x, m, torch.float32, prompt=long_call(x, native)), provider.matmul(x, p, torch.float32, prompt=long_call(x, provider))
         self.assertLess(float((got - want).abs().max() / want.abs().max()), 2e-5)
-        self.assertEqual(native.matmul(x, m).dtype, torch.bfloat16)
+        self.assertEqual(native.matmul(x, m, prompt=long_call(x, native)).dtype, torch.bfloat16)
         # every kind of NATIVE_AUTO True: auto is native everywhere
         with patch.dict(self.dm.NATIVE_AUTO, {kind: True for kind in self.dm.NATIVE_AUTO}):
             plugin = self.assemble(options={"mxfp8_activations": "mxfp8"})["projections"]
@@ -284,14 +287,14 @@ class NativeAndInt4Tests(PluginTestCase):
         for format, tensors in (("fp8:channel", self.fp8_channel(256, 1024)), ("nvfp4", self.nvfp4(256, 1024))):
             m = plugin.load(tensors, format)
             x = self.x(96, 1024)
-            eager = plugin.matmul(x, m)
+            eager = plugin.matmul(x, m, prompt=long_call(x, plugin))
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                out = plugin.matmul(x, m)
+                out = plugin.matmul(x, m, prompt=long_call(x, plugin))
             x.copy_(self.x(96, 1024, seed=99))
             graph.replay()
             torch.cuda.synchronize()
-            self.assertTrue(torch.equal(out, plugin.matmul(x, m)), format)
+            self.assertTrue(torch.equal(out, plugin.matmul(x, m, prompt=long_call(x, plugin))), format)
             self.assertFalse(torch.equal(out, eager), format)
 
 

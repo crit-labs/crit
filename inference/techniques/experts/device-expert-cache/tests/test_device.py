@@ -1036,6 +1036,7 @@ class LendingTests(PluginTestCase):
         torch = __import__("torch")
         device = self.device()
         from crit_plugins import StepBatch
+        from crit_plugins.device import PREFILL
         import expert_store
         layers, experts = 2, 8
         store = expert_store.BundleStore({"bundle_bytes": B}, layers, experts, device)
@@ -1058,7 +1059,7 @@ class LendingTests(PluginTestCase):
             cache.plan(l, torch.arange(experts, device=device))
         pool.open("a")
         keys = torch.randn(400, 1, 64, generator=g).to(device)
-        batch = StepBatch.build([("a", 0, 400)], device)
+        batch = StepBatch.build([("a", 0, 400, PREFILL)], device)
         pool.write(0, pool.reserve(batch), keys, keys)
         self.assertLess(cache.telemetry()["lent"], lent)
         for begin, page_bytes, pages in pool.regions:

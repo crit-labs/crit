@@ -4,6 +4,7 @@ form's merge_partials does."""
 import math
 
 from crit_plugins import StepBatch
+from crit_plugins.device import DECODE, PREFILL
 from crit_plugins.testing import PluginTestCase
 
 USE = {"kv_cache": "attention-state"}
@@ -21,7 +22,7 @@ class PartitionedDeviceTests(PluginTestCase):
         pool = self.kv.pool([0], 2, 64, 2048, self.dev, dtype if self.dev == "cuda" else "fp32")
         for sequence, (keys, values) in rows.items():
             pool.open(sequence)
-            batch = StepBatch.build([(sequence, 0, keys.shape[0])], self.dev)
+            batch = StepBatch.build([(sequence, 0, keys.shape[0], PREFILL)], self.dev)
             pool.write(0, pool.reserve(batch), keys.to(self.dev), values.to(self.dev))
             pool.keep(sequence, keys.shape[0])
         return pool
@@ -53,7 +54,7 @@ class PartitionedDeviceTests(PluginTestCase):
         # The query sees every position: the last of the whole sequence and of each shard (a step each: reserve()
         # first, as a model does, though the keys are written already).
         def step(pool, sequence, position):
-            batch = StepBatch.build([(sequence, position, 1)], self.dev)
+            batch = StepBatch.build([(sequence, position, 1, DECODE)], self.dev)
             pool.reserve(batch)
             return self.attention.forward(0, q, pool, batch, lse=True)
         out, lse = step(whole, "s", 299)
@@ -85,7 +86,7 @@ class PartitionedDeviceTests(PluginTestCase):
         rows = {s: (torch.randn(n, 2, 64, generator=g), torch.randn(n, 2, 64, generator=g))
                 for s, n in (("a", 700), ("b", 64), ("c", 1))}
         pool = self.pool(rows)
-        batch = StepBatch.build([("a", 699, 1), ("b", 60, 4), ("c", 0, 1)], "cuda")
+        batch = StepBatch.build([("a", 699, 1, DECODE), ("b", 60, 4, DECODE), ("c", 0, 1, DECODE)], "cuda")
         q = torch.randn(batch.tokens, 4, 64, generator=g).cuda().to(torch.bfloat16)
         self.assertTrue(torch.equal(self.attention.forward(0, q, pool, batch), reference.forward(0, q, pool, batch)))
         # reader flash: the flash structures in both, the same bits, within the readers' rounding of split's

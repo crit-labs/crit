@@ -233,16 +233,29 @@ def test_it_refuses_what_it_cannot_read():
         mr.mm_rows(activations(2, 256), w, out[:2], "nvfp4", scales, inverse, acts="nvfp4", input_scale=3.0)
 
 
-def test_plan_comes_from_the_shape_and_the_device():
-    sms = torch.cuda.get_device_properties(dev).multi_processor_count
+def test_the_sums_order_is_the_matrixs_alone():
+    # plan()'s splits, the order of every output's sum, come from the matrix only (order_splits): the shipped
+    # table's count for the shape (orders.ORDERS), else the rule; the same on every device and in every tuning, so two
+    # GPUs and two tunings give the same bits.
+    ORDERS = mr.ORDERS
     for n, k, weights in ((34816, 5120, "nvfp4"), (5120, 17408, "nvfp4"), (16384, 5120, "fp8"), (96, 5120, "bf16"),
                           (248320, 2560, "fp8"), (2560, 640, "nvfp4"), (44032, 7168, "nvfp4"), (7168, 22016, "nvfp4")):
         groups, warps, splits = mr.plan(n, k, weights)
         assert (groups, warps, splits) == mr.plan(n, k, weights)
+        assert splits == mr.order_splits(n, k, weights)
         assert groups in (1, 2) and 1 <= warps <= 4
-        assert 1 <= splits <= min(32, math.ceil(k / mr.VALUES[weights]))
-        tiles = mr.row_tiles(n, groups, warps)
-        assert tiles * splits >= min(sms, tiles * math.ceil(k / mr.VALUES[weights]), tiles * 32)
+        steps = math.ceil(k / mr.VALUES[weights])
+        assert 1 <= splits <= min(32, max(1, steps // 2))
+        if (weights, "bf16", n, k) in ORDERS:
+            assert splits == ORDERS[(weights, "bf16", n, k)]
+            continue
+        tiles = mr.row_tiles(n, 1, mr.WARPS)
+        assert tiles * splits >= min(mr.ORDER_CTAS, tiles * max(1, steps // 2), tiles * 32)
+    for (weights, mma, n, k), splits in ORDERS.items():   # every shipped count is one the kernel takes
+        acts = "nvfp4_mma" if mma == "fp4" else "bf16"
+        assert mr.plan(n, k, weights, acts=acts)[2] == splits
+        steps = k // mr.FP4_STEP if mma == "fp4" else math.ceil(k / mr.VALUES[weights])
+        assert splits == 1 or 2 * splits <= steps
     with pytest.raises(ValueError, match="multiple of 32"):
         mr.plan(100, 200, "nvfp4")
 
@@ -328,18 +341,19 @@ def test_the_fp4_mma_captures_with_its_pre_pass_and_refuses_what_it_cannot_read(
 
 
 # Knobs other than the defaults (one build for every structure). The decode tile's and the FP4 MMA's plan comes from
-# them (groups, warps and splits; the split is part of the sums' order, the rest is speed only); HOIST and the prompt
+# them (groups and warps, speed only; the splits are the sums' order, never a knob); HOIST and the prompt
 # tile's warps, rows a CTA, parts, stages, weights ahead and row groups a warp only change when loads run and which
 # outputs a CTA computes, never an output's chain.
-OTHER_KNOBS = {"decode-tile": {"GROUPS": 2, "WARPS": 2, "SPLITS": 3},
-               "fp4-tile": {"WARPS": 2, "SPLITS": 4, "HOIST": 4},
+OTHER_KNOBS = {"decode-tile": {"GROUPS": 2, "WARPS": 2},
+               "fp4-tile": {"WARPS": 2, "HOIST": 4},
                "prompt-tile": {"PW": 4, "PT": 32, "PK": 2, "PS": 2, "PF": 0, "PR": 2}}
 
 
 def test_other_knobs_plan_from_the_tuning_and_keep_the_default_bits():
     other = kbuild.load("mma-rows", knobs=OTHER_KNOBS)
     assert other is not mr
-    assert other.plan(1000, 2048, "nvfp4") == (2, 2, 3)
+    # the tuning's groups and warps; the splits are the matrix's (order_splits), which no knob reaches
+    assert other.plan(1000, 2048, "nvfp4") == (2, 2, mr.order_splits(1000, 2048, "nvfp4"))
     assert other.plan(1000, 96, "bf16") == (2, 2, 1)   # splits capped at the matrix's steps
     for weights, acts, blocked in FORMATS:
         stored, _ = matrix(weights, 1000, 2048, blocked)
@@ -365,7 +379,8 @@ def test_other_knobs_plan_from_the_tuning_and_keep_the_default_bits():
                             counters=torch.zeros(64, dtype=torch.int32, device=dev))
             assert torch.equal(prompt, want), ("prompt in parts", weights, acts, rows)
     if mr.fp4_mma(dev):
-        assert other.plan(1024, 2048, "nvfp4", dev, acts="nvfp4_mma") == (1, 2, 4)
+        assert other.plan(1024, 2048, "nvfp4", dev, acts="nvfp4_mma") == (
+            1, 2, mr.order_splits(1024, 2048, "nvfp4", "nvfp4_mma"))
         stored, _ = matrix("nvfp4", 1024, 2048, True)
         x = activations(16, 2048)
         for rows in (1, 9, 16):

@@ -65,6 +65,7 @@ class ServeEndToEndTests(MeasureFixture, unittest.TestCase):
         package = with_plugins(self.root / ("package-" + candidate))
         manifest = self.store.package(self.run_id, candidate, package, {"build": {"toolchain": {"fixture": "host-python"},
                                                                                   "dependencies": [], "command": ["fixture"]}})
+        self.eval_completed(candidate)   # a measurement starts on a completed Eval (crit.run.state)
         self.checks(record, manifest)   # recorded before measure, as check --from-eval records them
         from crit.run import measure
         measure.measure(self.store, self.run_id, candidate)   # what sealing asks for: crit serve serves sealed ones

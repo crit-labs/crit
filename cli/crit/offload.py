@@ -13,6 +13,8 @@ the engine serves."""
 import json
 from pathlib import Path
 
+from crit_plugins.exactness import DEFAULT_QUALITY_MODE
+
 GIB = 1 << 30
 INFERENCE = Path(__file__).resolve().parents[2] / "inference" / "techniques"
 CPU_FORMATS = ("nvfp4", "int4")   # the formats the CPU expert tier computes in the device's bits
@@ -137,7 +139,13 @@ def read_trace(path):
     return [(int(group[0]), [int(e) for e in group[1]]) for group in data]
 
 
-def plan(model, device, tokens, quality_mode="speed", vram_headroom_bytes=None, ram_headroom_bytes=2 * GIB,
+def _recurrent(config):
+    """Whether a config.json's model has linear-attention (recurrent) layers, whose states a recurrence plugin keeps."""
+    from crit_models.config import architecture
+    return "linear_attention" in architecture(config).layer_kinds()
+
+
+def plan(model, device, tokens, quality_mode=DEFAULT_QUALITY_MODE, vram_headroom_bytes=None, ram_headroom_bytes=None,
          reserve_bytes=None, trace=None, settings=None, cores=None, profile=None):
     """The offload plan of MODEL (a checkpoint folder) on DEVICE (a crit eval probe result, a dict) at `tokens` of
     context: the placement Eval prices, the derived plugin options and, with a trace, the replayed hit rates."""
@@ -152,13 +160,19 @@ def plan(model, device, tokens, quality_mode="speed", vram_headroom_bytes=None, 
         from crit.settings import vram_headroom_bytes as headroom_of
         from crit_eval import machine_settings
         vram_headroom_bytes = headroom_of(machine_settings())
+    if ram_headroom_bytes is None:    # the machine's setting, else Core's default (crit_plugins.memory.HOST_HEADROOM)
+        from crit.settings import ram_headroom_bytes as host_headroom_of
+        from crit_eval import machine_settings
+        ram_headroom_bytes = host_headroom_of(machine_settings())
     if settings is None:
         from crit_eval import EVAL_DIR
         settings = json.loads((Path(EVAL_DIR) / "protocol.json").read_text(encoding="utf-8"))["context"]
     if reserve_bytes is not None:
         settings = {**settings, "reserve_gib": reserve_bytes / GIB}
     from crit_eval.limits.context import placement
-    found = placement(str(model), device, vram_headroom_bytes, ram_headroom_bytes, settings, int(tokens))
+    from crit.spec import library_spec   # the engine a build starts from, sized as Core resolves it
+    found = placement(str(model), device, vram_headroom_bytes, ram_headroom_bytes, settings, int(tokens),
+                      spec=library_spec(model, quality_mode=quality_mode, tables_off_device=True))
     if not found:
         raise ValueError("crit Eval cannot size the model on this device")
     floors = found.get("plain_pass_floor_ms") or {}
@@ -191,6 +205,8 @@ def plan(model, device, tokens, quality_mode="speed", vram_headroom_bytes=None, 
     # The KV pools hold only the pages sequences use (attention-state's elastic pools): the expert cache the rest.
     out["options"] = {"device-placement": {"off_device": ""}, "expert-offload": plugin,
                       "attention-state": {"elastic": True}}
+    if _recurrent(config):   # the states of sequences that are not open are the cache's too
+        out["options"]["sequential-recurrence"] = {"elastic": True}
     out["selection"] = {"experts": "expert-offload", "expert_source": "expert-tensors"}
     out["cache"] = {"slots": slots, "bytes": slots * size,
                     "share": round(slots / (layers * experts), 4) if layers * experts else 0}
@@ -212,8 +228,9 @@ def plan(model, device, tokens, quality_mode="speed", vram_headroom_bytes=None, 
                         f"{layers * experts * size / 1e9:.1f} GB, {slots / (layers * experts):.0%}) at Eval's margins: "
                         "expert-offload sizes the cache itself from the device's free memory while the engine "
                         "serves, and elastic KV pools (attention-state) leave it what their sequences do not use")
-    out["notes"].append("a model that keeps recurrent state: give its recurrence plugin `elastic` too, so the states "
-                        "of sequences that are not open are the cache's")
+    if "sequential-recurrence" in out["options"]:
+        out["notes"].append("the model keeps recurrent state: its recurrence plugin's states are elastic too, so the "
+                            "states of sequences that are not open are the cache's")
     if trace:
         rows = replay_trace(trace, layers, experts, slots)
         out["trace"] = {"groups": len(trace), "replay": rows}
@@ -268,7 +285,7 @@ def main(args):
     trace = read_trace(args.trace) if args.trace else None
     headroom = None if args.vram_headroom_gib is None else round(args.vram_headroom_gib * GIB)
     value = plan(args.model, device, args.context, args.quality_mode, vram_headroom_bytes=headroom,
-                 ram_headroom_bytes=round(args.ram_headroom_gib * GIB),
+                 ram_headroom_bytes=None if args.ram_headroom_gib is None else round(args.ram_headroom_gib * GIB),
                  reserve_bytes=None if args.reserve_gib is None else round(args.reserve_gib * GIB),
                  trace=trace, cores=args.cores, profile=read_profile(args.profile) if args.profile else None)
     print(render(value))
@@ -285,7 +302,7 @@ def add_parser(subs):
     sub.add_argument("--device-file", type=Path, required=True, help="A crit eval probe result for this machine")
     sub.add_argument("--context", type=int, required=True, help="The context tokens the engine must serve")
     from crit_plugins.exactness import QUALITY_MODES
-    sub.add_argument("--quality-mode", choices=QUALITY_MODES, default="speed")
+    sub.add_argument("--quality-mode", choices=QUALITY_MODES, default=DEFAULT_QUALITY_MODE)
     sub.add_argument("--trace", type=Path, help="A routing trace: [layer, [experts]] groups per routed layer of each "
                                                  "decoded token (JSON or JSON Lines; expert-offload's trace_path)")
     sub.add_argument("--profile", type=Path, help="With --trace: a routing or residency profile (its keys, hottest "
@@ -295,7 +312,8 @@ def add_parser(subs):
     sub.add_argument("--vram-headroom-gib", type=float,
                      help="Device memory left free at every moment (default: settings.toml vram_headroom_gib, else "
                           "crit Eval's)")
-    sub.add_argument("--ram-headroom-gib", type=float, default=2.0)
+    sub.add_argument("--ram-headroom-gib", type=float,
+                     help="Host memory left available (default: settings.toml ram_headroom_gib, else Core's)")
     sub.add_argument("--reserve-gib", type=float, help="Device memory kept out of the KV cache (default: Eval's)")
     sub.add_argument("--out", type=Path, help="Write the plan as JSON")
     return sub

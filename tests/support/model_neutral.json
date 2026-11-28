@@ -1,4 +1,12 @@
 {
+  "cli/crit/preflight/geometry.py": {
+    "Gemma4ForCausalLM": {"field": "a config.json architectures value (transformers' class a random checkpoint is written with)", "in": ["sample"]},
+    "Qwen3ForCausalLM": {"field": "a config.json architectures value (transformers' class a random checkpoint is written with)", "in": ["sample"]},
+    "Qwen3MoeForCausalLM": {"field": "a config.json architectures value (transformers' class a random checkpoint is written with)", "in": ["sample"]},
+    "gemma4_text": {"field": "a config.json model_type value (transformers' name of the architecture a random checkpoint is written with)", "in": ["sample"]},
+    "qwen3": {"field": "a config.json model_type value (transformers' name of the architecture a random checkpoint is written with)", "in": ["sample"]},
+    "qwen3_moe": {"field": "a config.json model_type value (transformers' name of the architecture a random checkpoint is written with)", "in": ["sample"]}
+  },
   "inference/core/python/crit_core/model/gguf_files.py": {
     "deepseek-r1-qwen": {"field": "a GGUF tokenizer.ggml.pre value (the format's name of a pre-tokenizer)",
                          "in": ["PRE_TOKENIZERS"]},

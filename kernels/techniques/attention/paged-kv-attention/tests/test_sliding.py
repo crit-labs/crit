@@ -92,13 +92,14 @@ def test_prompt_chunks_with_a_sliding_window_match_float64_attention(flash):
 
 @pytest.mark.parametrize("family", FAMILIES, ids=IDS)
 def test_a_long_cache_under_a_short_window_reads_only_the_window(family):
-    cache = Cache("bf16", 2, 128, 128, 64, [60000], seed=5)
+    cache = Cache("bf16", 2, 128, 128, 64, [240000], seed=5)
     q = _q(1, 8, 128, 6).to(torch.bfloat16)
     zero = torch.zeros(1, dtype=torch.int32, device=dev)
-    first = torch.tensor([59999], dtype=torch.int64, device=dev)
+    first = torch.tensor([239999], dtype=torch.int64, device=dev)
     out = torch.empty(1, 8, 128, dtype=torch.bfloat16, device=dev)
 
-    def timed(**kw):   # ten launches in a CUDA graph: the kernels' time, not the host's
+    def timed(**kw):   # ten launches in a CUDA graph: the kernels' time, not the host's (a cache long enough that
+        # reading it all costs several times the launches' fixed cost, which a window's read cannot go below)
         def launch():
             pk.attend(q, cache.k, cache.v, "bf16", cache.tables, zero, zero, first, 1, 64, out=out, **kw, **family)
         launch()

@@ -54,8 +54,10 @@ def advance(model, layers, i, state, ctx):
         return model.residual.advance(layers, i, state, ctx)
     inner, taps = tuple(state[:-1]), state[-1]
     if i in model.taps:
+        # A copy of the first tapped row: the residual may add into its stream in place (a fused add and norm) once
+        # the layer has run, and the tap is the row on entry (each later row is copied by the cat).
         row = tapped_row(model, inner)
-        taps = row if taps is None else model.torch.cat([taps, row], dim=-1)
+        taps = row.clone() if taps is None else model.torch.cat([taps, row], dim=-1)
     return tuple(model.residual.advance(layers, i, inner, ctx)) + (taps,)
 
 

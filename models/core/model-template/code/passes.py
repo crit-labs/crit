@@ -33,6 +33,7 @@ positions.
 """
 import time
 
+from crit_core.batch import PREFILL
 from crit_plugins import StepBatch
 
 from .blocks import Context
@@ -197,7 +198,7 @@ class Pass:
         once: its readers at a reserve, its states' rows at the batch's first use), the slots of the pools that
         layer's blocks write, and what the chunk's blocks share."""
         m = self.m
-        batch = StepBatch.build([(self.sequence, chunk.first, chunk.count)], m.device)
+        batch = StepBatch.build([(self.sequence, chunk.first, chunk.count, PREFILL)], m.device)
         ctx = Context(m, batch, m.rows.of(batch), m._reserve(batch, m.layer_pools[self.layer]),
                       ids=chunk.ids, windows=chunk.windows)
         ctx.shared = chunk.shared

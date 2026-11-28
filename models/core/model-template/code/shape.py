@@ -20,7 +20,7 @@ from crit_plugins.kernels import quality_mode
 from .blocks import library
 from .residual import DEFAULT
 
-PAGE = 16             # KV page tokens
+PAGE = 16             # KV page tokens where the kv_cache plugin states none (its `page`: the model's pools take it)
 
 # The precision options whose auto follows the quality mode the engine states (crit_plugins.kernels.quality_mode):
 # in speed the 8- or 4-bit one the mode's arithmetic starts from, otherwise the stored one. kv's auto is resolved
@@ -50,16 +50,21 @@ def _own_price(layers, kv_heads, head_dim, dtype="bf16", value_dim=None):
 
 
 class Shape:
+    page = PAGE   # the KV page tokens: the kv_cache plugin's where it states one (ComposedModel), PAGE before
     def __init__(self, config, options, layout, blocks, checkpoint, *, residuals=None, context_tokens=None,
-                 drafter=False, steps=None):
+                 drafter=False, steps=None, facts=None):
         """config: the checkpoint's parsed config (crit_core.model.parse_model_config, read with its mechanisms:
         crit_models.config.architecture); options: the plugin's over
         compose's DEFAULTS; checkpoint: its headers (`name in checkpoint`, names()); drafter: whether the selection
         fills the drafter slot; steps: Core's step plan (LoadContext.steps; Core's defaults without a loader), whose
-        lanes and waiting places the model sizes for, its options concurrency and pending their bounds."""
+        lanes and waiting places the model sizes for, its options concurrency and pending their bounds; facts: the
+        selection's facts of a slot (facts(slot): the loaded parts' at a load, the manifests' in a dry resolve), which a
+        block that serves a layer only beside some slot's fact reads (serves: a mixer's `otherwise`)."""
         from crit_models.config import architecture
         config = architecture(config)   # the generic fields and the mechanisms' sections and rules (crit_models)
         self.options, self.layout = precision(options), layout
+        self.slot_facts = facts or (lambda slot: ())
+        self.instead = {}   # {layer kind: why its mixer runs the layout's `otherwise` block} (_spec)
         options = self.options
         found, joins, drafts = library()   # the model techniques the core mounts, then the model plugin's own
         self.blocks, self.residuals = {**found, **(blocks or {})}, {**joins, **(residuals or {})}
@@ -99,16 +104,23 @@ class Shape:
         draft = layout.get("draft") or {}
         self.draft_prefix = draft.get("prefix")
         kind = draft.get("block", "mtp")
-        wanted = bool(options["mtp"]) and drafter and self.draft_prefix is not None
+        wanted = bool(options["mtp"]) and drafter and (self.draft_prefix is not None or bool(draft.get("companion")))
         self.mtp = wanted and kind == "mtp" and self.residual.draft_stored(self.draft_prefix)
-        # A drafter technique's draft block beside the model (DRAFTERS: its own layers and cache, no MTP pool)
-        self.draft_block = None
+        # A drafter technique's draft block beside the model (DRAFTERS: its own layers and cache, no MTP pool), stored
+        # in the checkpoint under the draft prefix or in a companion folder of its own (companion.py)
+        self.draft_block = self.draft_companion = None
         self.taps = ()   # the layer applications whose entry rows a drafter technique reads (residual.py)
         if wanted and kind != "mtp":
             if kind not in self.drafters:
                 raise ValueError(f"model-template: the layout drafts from {kind!r}, which no mounted drafter "
                                  f"technique gives ({', '.join(sorted(self.drafters)) or 'none'})")
-            if self.drafters[kind].stored(checkpoint, self.draft_prefix):
+            if draft.get("companion"):
+                from .companion import find
+                self.draft_companion = find(draft, getattr(checkpoint, "folder", None), options["draft_folder"],
+                                            self.drafters[kind], self)
+                if self.draft_companion is not None:
+                    self.draft_block = self.drafters[kind](self, self.draft_prefix, draft)
+            elif self.drafters[kind].stored(checkpoint, self.draft_prefix):
                 self.draft_block = self.drafters[kind](self, self.draft_prefix, draft)
         self.width = int(options["width"]) if self.mtp or self.draft_block is not None else 0
         # The decoder's tensor prefix: where layer 0's anchor tensor is, outside the draft layer.
@@ -155,7 +167,8 @@ class Shape:
             heads, dim = self.shapes[window]
             found.append({"key": ("kv", window) if window else "kv", "kind": "kv", "layers": list(layers),
                           "kv_heads": heads, "head_dim": dim, "value_dim": None, "dtype": self.kv_dtype,
-                          "tokens": self.sequences * (window + self.chunk + 2 * PAGE) if window else self.kv_tokens,
+                          "tokens": (self.sequences * (window + self.chunk + 2 * self.page) if window
+                                     else self.kv_tokens),
                           "sliding": window})
         if self.mtp:
             found.append({"key": "mtp", "kind": "mtp", "layers": [self.layers], "kv_heads": self.kv_heads,
@@ -164,7 +177,7 @@ class Shape:
         for d in self.declared:
             if d["kind"] == "keys":
                 found.append({"key": d["key"], "kind": "keys", "layers": list(d["layers"]), "kv_heads": d["heads"],
-                              "head_dim": d["dim"], "value_dim": 0, "dtype": "bf16", "tokens": self.kv_tokens,
+                              "head_dim": d["dim"], "value_dim": 0, "dtype": d.get("dtype", "bf16"), "tokens": self.kv_tokens,
                               "sliding": 0})
         return found
 
@@ -176,14 +189,25 @@ class Shape:
     def kv_device_bytes(self, price=None):
         """The device bytes the KV pools take, whole pages (the placement plan's "kv"): price, the kv_cache plugin's
         position_bytes, else the model's own count of a position."""
-        return sum(self._price(pool, price) * -(-pool["tokens"] // PAGE) * PAGE for pool in self.planned_pools())
+        return sum(self._price(pool, price) * -(-pool["tokens"] // self.page) * self.page
+                   for pool in self.planned_pools())
 
     def kv_facts(self, price):
         """The KV facts the engine's kv_cache plugin will state of the pools made (its facts()), priced by its own
         position_bytes: kv_bytes_per_token over every pool but a sliding window's (a ring a sequence, whatever its
-        length)."""
-        return {"kv_bytes_per_token": sum(self._price(pool, price) for pool in self.planned_pools()
-                                          if not pool["sliding"])}
+        length), and kv_elements_per_token, the same pools' elements a token; and kv_ring_bytes, the device bytes of
+        the sliding windows' rings (whole pages, as kv_device_bytes and the placement plan count them), which do not
+        grow with the context (a price: crit Eval adds it to the fixed state it sizes a context by)."""
+        pools = self.planned_pools()
+        grown = [pool for pool in pools if not pool["sliding"]]
+        rings = sum(self._price(pool, price) * -(-pool["tokens"] // self.page) * self.page
+                    for pool in pools if pool["sliding"])
+        return {"kv_bytes_per_token": sum(self._price(pool, price) for pool in grown), "kv_ring_bytes": rings,
+                # the same pools' elements a token (keys and values, a pool of keys only its keys): a price
+                # (crit_plugins.assemble.PRICES) crit Eval multiplies by its protocol's KV precision
+                "kv_elements_per_token": sum(len(pool["layers"]) * pool["kv_heads"]
+                                             * (pool["head_dim"] + (pool["head_dim"] if pool["value_dim"] is None
+                                                                    else pool["value_dim"])) for pool in grown)}
 
     def layer_prefix(self, layer):
         """The tensor prefix of the checkpoint layer that layer `layer` runs (its source)."""
@@ -199,7 +223,17 @@ class Shape:
         if spec is None:
             raise ValueError(f"model-template: the layout has no block for {name or kind} layers (its mixers: "
                              f"{', '.join(sorted(mixers)) or 'none'})")
-        return {**spec, "kind": kind}
+        spec = {**spec, "kind": kind}
+        # A block that serves a layer only where the checkpoint or a slot's fact calls for it (its class's
+        # serves(shape, spec): None, or why not) gives way to the layout's `otherwise` block there.
+        otherwise = spec.pop("otherwise", None)
+        serves = getattr(self.blocks.get(spec.get("block")), "serves", None)
+        if otherwise and callable(serves):
+            why = serves(self, spec)
+            if why:
+                self.instead[name or kind] = f"{otherwise}, not {spec['block']}: {why}"
+                spec["block"] = otherwise
+        return spec
 
     def _layer_spec(self, layer):
         return self._spec(self.kinds[layer], self.types[layer])

@@ -26,7 +26,7 @@ Why a kernel compiled again. Triton specializes a runtime argument it is not tol
 1 becomes a constant, one divisible by 16 says so, a pointer says it is 16-byte aligned; each mix is a kernel of its
 own. An argument that follows the request (a token count, a key count, a position, the stride of a buffer made per
 call) then compiles a kernel the first time a request brings a new mix, whatever ran at load. Core's loader records
-every compile from the start of the load (record()), and a compile with the constexprs of one the process made
+every compile from the start of the load to the engine's close (record()), and a compile with the constexprs of one the process made
 before names the arguments whose specialization changed ("T is now 1, was divisible by 16"): such an argument
 belongs in its kernel's do_not_specialize (do_not_specialize_on_alignment for a pointer), or its launcher keeps it
 in one class (a buffer padded to 16). A compile with constexprs the process never compiled is a class of its own,
@@ -42,7 +42,8 @@ FIRST = 8   # the compiles a report names one by one
 _lock = threading.Lock()
 _watches = []      # the running watches
 _installed = {}    # what the hooks replaced: "triton" -> (runtime, previous hook), "extension" -> (module, function)
-_recording = False  # record() ran: the hooks stay for the process and every compile is kept in _compiled
+_recorders = []     # the recorders running (record(): one an open engine), a list the module never rebinds
+_recording = False  # a recorder runs: the hooks stay and every compile is kept in _compiled
 _compiled = {}     # "module.kernel" -> [(constexprs, {argument: its specialization})], each compile the process made
 
 
@@ -218,23 +219,59 @@ WATCHED = ("triton", "torch.utils.cpp_extension")   # the modules whose import i
 _on_import = _OnImport()
 
 
+class Recording:
+    """One recorder of the process's compiles (record()): recording runs while any recorder has not stopped."""
+
+    def __init__(self):
+        self.stopped = False
+
+    def stop(self):
+        """This recorder's end (an engine's close); the hooks go once nothing records and no watch runs. Idempotent."""
+        with _lock:
+            if self.stopped:
+                return
+            self.stopped = True
+            if self in _recorders:
+                _recorders.remove(self)
+            _sync()
+
+
 def record(on=True):
-    """Keep every compile from here on (Core's loader, as an engine's load starts): the hooks stay for the process,
-    so a later compile of a kernel with constexprs it compiled before names what changed (the module's
-    description); a hook whose module is not imported yet goes in when it is. record(False) stops it (a test), the
-    hooks going once no watch runs."""
-    global _recording
+    """Keep every compile from here on, while the returned Recording has not stopped (Core's loader, for an engine's
+    life: its close stops it): the hooks stay meanwhile, so a later compile of a kernel with constexprs the process
+    compiled before names what changed (the module's description); a hook whose module is not imported yet goes in
+    when it is. Recording runs while any recorder runs, so engines open together each keep it. record(False) stops
+    every recorder (a test)."""
     with _lock:
-        _recording = bool(on)
-        if _recording:
-            if _on_import not in sys.meta_path:
-                sys.meta_path.insert(0, _on_import)
-            _install()
+        found = Recording() if on else None
+        if on:
+            _recorders.append(found)
         else:
-            if _on_import in sys.meta_path:
-                sys.meta_path.remove(_on_import)
-            if not _watches:
-                _uninstall()
+            for recorder in _recorders:
+                recorder.stopped = True
+            _recorders.clear()
+        _sync()
+    return found
+
+
+def recording():
+    """Whether the process records its compiles now (an engine is open, or a recorder runs)."""
+    return _recording
+
+
+def _sync():
+    """The hooks and the import watch as the recorders ask; called under _lock."""
+    global _recording
+    _recording = bool(_recorders)
+    if _recording:
+        if _on_import not in sys.meta_path:
+            sys.meta_path.insert(0, _on_import)
+        _install()
+    else:
+        if _on_import in sys.meta_path:
+            sys.meta_path.remove(_on_import)
+        if not _watches:
+            _uninstall()
 
 
 def _uninstall():

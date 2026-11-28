@@ -9,7 +9,7 @@ another reduction) stays within the bound its facts state. reader "flash" (crit'
 bound. The fresh buffer is off: a prompt chunk's own fresh keys
 and values are a stated difference (test_fresh)."""
 from crit_plugins import StepBatch
-from crit_plugins.device import PromptBatch, RoundBatch
+from crit_plugins.device import DECODE, PREFILL, PromptBatch, RoundBatch
 from crit_plugins.testing import PluginTestCase
 
 USE = {"kv_cache": "attention-state"}
@@ -49,9 +49,9 @@ class ReaderAgreementTests(PluginTestCase):
         return self.rows(positions, 3, HQ).to(self.torch.bfloat16)
 
     def step(self, attention, pool, rows, layer=0):
-        """A StepBatch of (sequence, first position, count) rows: its keys and values written, its attention read."""
+        """A StepBatch of (sequence, first position, count, phase) rows: its keys and values written, its attention read."""
         batch = StepBatch.build(rows, "cuda")
-        positions = [p + i for _, p, n in rows for i in range(n)]
+        positions = [p + i for _, p, n, _ in rows for i in range(n)]
         pool.write(layer, pool.reserve(batch), *self.kv(positions, layer))
         return attention.forward(layer, self.q(positions), pool, batch)
 
@@ -76,18 +76,18 @@ class ReaderAgreementTests(PluginTestCase):
         torch = self.torch
         pool.open(sequence)
         if prefix:
-            self.step(attention, pool, [(sequence, 0, prefix)], layer)
+            self.step(attention, pool, [(sequence, 0, prefix, PREFILL)], layer)
             pool.keep(sequence, prefix)
-        prompt = self.step(attention, pool, [(sequence, prefix, CHUNK)], layer)
+        prompt = self.step(attention, pool, [(sequence, prefix, CHUNK, PREFILL)], layer)
         # (The sequence's valid length stays at prefix: each later row reads up to its own position.)
         for at in (0, 1, 37, 63, 64, 99):
-            self.assertTrue(torch.equal(self.step(attention, pool, [(sequence, prefix + at, 1)], layer),
+            self.assertTrue(torch.equal(self.step(attention, pool, [(sequence, prefix + at, 1, DECODE)], layer),
                                         prompt[at:at + 1]), case + ("decode", at))
         # A verify window of 8 columns, beside another sequence's decode row.
         pool.open(other)
-        self.step(attention, pool, [(other, 0, 30)], layer)
+        self.step(attention, pool, [(other, 0, 30, PREFILL)], layer)
         pool.keep(other, 30)
-        window = self.step(attention, pool, [(other, 30, 1), (sequence, prefix + 10, 8)], layer)
+        window = self.step(attention, pool, [(other, 30, 1, DECODE), (sequence, prefix + 10, 8, DECODE)], layer)
         self.assertTrue(torch.equal(window[1:], prompt[10:18]), case + ("window",))
         # A round's 8 columns.
         pool.bind(0, sequence, prefix + CHUNK + 16)
@@ -138,12 +138,12 @@ class ReaderAgreementTests(PluginTestCase):
         for dtype in ("fp8", "bf16"):
             pool = self.pool(kv, dtype)
             pool.open("a")
-            self.step(attention, pool, [("a", 0, prefix)])
+            self.step(attention, pool, [("a", 0, prefix, PREFILL)])
             pool.keep("a", prefix)
             positions = list(range(prefix, prefix + CHUNK))
-            prompt = self.sparse(attention, pool, StepBatch.build([("a", prefix, CHUNK)], "cuda"), positions, size)
+            prompt = self.sparse(attention, pool, StepBatch.build([("a", prefix, CHUNK, PREFILL)], "cuda"), positions, size)
             for at in (0, 1, 37, 63, 64, 99):
-                decoded = self.sparse(attention, pool, StepBatch.build([("a", prefix + at, 1)], "cuda"),
+                decoded = self.sparse(attention, pool, StepBatch.build([("a", prefix + at, 1, DECODE)], "cuda"),
                                       [prefix + at], size)
                 self.assertTrue(torch.equal(decoded, prompt[at:at + 1]), (dtype, "decode", at))
             pool.bind(0, "a", prefix + CHUNK + 16)
@@ -173,11 +173,11 @@ class ReaderAgreementTests(PluginTestCase):
         for dtype in ("int8", "fp8:row"):
             pool = self.pool(kv, dtype)
             pool.open("a")
-            self.step(attention, pool, [("a", 0, 600)])
+            self.step(attention, pool, [("a", 0, 600, PREFILL)])
             pool.keep("a", 600)
-            prompt = self.step(attention, pool, [("a", 600, CHUNK)])
+            prompt = self.step(attention, pool, [("a", 600, CHUNK, PREFILL)])
             for at in (0, 50, 99):
-                decoded = self.step(attention, pool, [("a", 600 + at, 1)])
+                decoded = self.step(attention, pool, [("a", 600 + at, 1, DECODE)])
                 self.assertLess(float((decoded.float() - prompt[at:at + 1].float()).abs().max()), 1.6e-2, dtype)
 
     def test_a_short_prompt_chunk_has_the_bits_of_the_same_rows_in_a_longer_chunk(self):
@@ -191,8 +191,7 @@ class ReaderAgreementTests(PluginTestCase):
         self.assertEqual(attention.device_form.exactness()["prompt"], "row-exact")
 
         def chunk(pool, sequence, prefix, count):
-            batch = StepBatch.build([(sequence, prefix, count)], "cuda")
-            batch.prompts = frozenset({0})
+            batch = StepBatch.build([(sequence, prefix, count, PREFILL)], "cuda")
             positions = list(range(prefix, prefix + count))
             pool.write(0, pool.reserve(batch), *self.kv(positions))
             return attention.forward(0, self.q(positions), pool, batch)
@@ -202,7 +201,7 @@ class ReaderAgreementTests(PluginTestCase):
                 for sequence in ("long", "short"):
                     pool.open(sequence)
                     if prefix:
-                        self.step(attention, pool, [(sequence, 0, prefix)])
+                        self.step(attention, pool, [(sequence, 0, prefix, PREFILL)])
                         pool.keep(sequence, prefix)
                 whole = chunk(pool, "long", prefix, CHUNK)
                 for count in (2, 5, 9, 16):
@@ -237,11 +236,11 @@ class ReaderAgreementTests(PluginTestCase):
         for dtype in ("int8", "fp8:row"):
             pool = self.pool(kv, dtype)
             pool.open("a")
-            self.step(attention, pool, [("a", 0, 600)])
+            self.step(attention, pool, [("a", 0, 600, PREFILL)])
             pool.keep("a", 600)
-            prompt = self.step(attention, pool, [("a", 600, CHUNK)])
+            prompt = self.step(attention, pool, [("a", 600, CHUNK, PREFILL)])
             for at in (0, 50, 99):
-                decoded = self.step(attention, pool, [("a", 600 + at, 1)])
+                decoded = self.step(attention, pool, [("a", 600 + at, 1, DECODE)])
                 self.assertLess(float((decoded.float() - prompt[at:at + 1].float()).abs().max()), 1.6e-2, dtype)
 
     def test_the_cuda_reader_reads_every_row_kind_with_the_same_bits(self):
@@ -266,9 +265,9 @@ class ReaderAgreementTests(PluginTestCase):
         for dtype in ("int8", "fp8:row", "bf16"):
             pool = self.pool(kv, dtype)
             pool.open("a")
-            self.step(attention, pool, [("a", 0, 600)])
+            self.step(attention, pool, [("a", 0, 600, PREFILL)])
             pool.keep("a", 600)
-            prompt = self.step(attention, pool, [("a", 600, CHUNK)])
+            prompt = self.step(attention, pool, [("a", 600, CHUNK, PREFILL)])
             for at in (0, 50, 99):
-                decoded = self.step(attention, pool, [("a", 600 + at, 1)])
+                decoded = self.step(attention, pool, [("a", 600 + at, 1, DECODE)])
                 self.assertLess(float((decoded.float() - prompt[at:at + 1].float()).abs().max()), 1.6e-2, dtype)

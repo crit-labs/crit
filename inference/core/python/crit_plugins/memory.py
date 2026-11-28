@@ -149,11 +149,18 @@ A captured graph's temporaries live in a memory pool of its own, which torch kee
 pool(owner, name) makes one and lists it as owner/name, so the device's readings say which graph holds what; a
 driver captures inside capturing(pool). The steps' own pools (step_pool()) are listed as core/steps. After record(), the device also notes which code made each allocation:
 every block of torch's allocator carries the code that made it (blocks()), and each pool the allocations made in it
-while its graphs were captured (`recorded`), which crit_plugins.audit reads."""
+while its graphs were captured (`recorded`), which crit_plugins.audit reads.
+
+What outlives an engine is the process's or a leak (crit_plugins.lifetime measures each close): capturing(pool,
+graph) follows the captured graph by a weak reference (live_graphs()), pool(..., process=True) names a pool the
+process keeps for every engine (the capture stream's cuBLAS workspaces), and process(owner, name, tensor) a tensor it
+keeps (a plugin's constant table, buffers every engine's matrices share), so a closed engine is measured without
+them."""
 import ctypes
 import os
 import sys
 import threading
+import weakref
 import time
 from bisect import bisect_right
 from collections import Counter, deque
@@ -645,6 +652,15 @@ class _Torch:
         import torch
         return tuple(torch.cuda.graph_pool_handle())
 
+    def clear_workspaces(self):
+        """Free the cuBLAS and cuBLASLt workspaces torch keeps for every handle and stream of the process (they
+        outlive the engine whose threads made them). Safe here: every graph Core captures takes its workspace from
+        the process's capture-workspace pool (crit_plugins.rounds.capture_workspaces), so no live graph writes a
+        workspace freed back to torch's shared pools."""
+        import torch
+        if torch.cuda.is_initialized():
+            torch._C._cuda_clearCublasWorkspaces()
+
     def record(self, entries):
         import torch
         torch.cuda.memory._record_memory_history(enabled="all" if entries else None, context="all", stacks="python",
@@ -705,8 +721,13 @@ class _Unreadable:
     def pool(self):
         return None
 
+    def clear_workspaces(self):
+        pass
 
-HOST_HEADROOM = 2 << 30   # host memory left available when a range backs units from it
+
+# Host memory left available: when a range backs units from it, and the run's RAM headroom where settings.toml names
+# none (the one default: crit run, crit Eval and the engine's spec, crit_core.spec, take it from here).
+HOST_HEADROOM = 2 << 30
 RELIEVE_S = 0.2        # relieve() reads the device at most this often
 # A settle grows the givers back for at most this long, SETTLE_SLICE bytes at a time: backing device memory costs
 # the driver time by the granule (half a millisecond each under WSL, a second for two gigabytes), a settle runs
@@ -746,6 +767,16 @@ def kv_fit(free_bytes, kv_bytes_per_token, *, headroom=HEADROOM, reserve=0, held
     if not kv_bytes_per_token:
         return {"budget": budget, "tokens": None}
     return {"budget": budget, "tokens": 0 if budget <= 0 else budget // kv_bytes_per_token // granularity * granularity}
+
+
+def kv_need(kv_bytes_per_token, tokens, *, headroom=HEADROOM, reserve=0, held=()):
+    """The device bytes an engine of `tokens` KV positions needs free: kv_fit's arithmetic read the other way (the
+    headroom, the reserve, each amount of `held` and the KV at the context), so kv_fit(kv_need(k, n, ...), k, ...)
+    fits n positions. crit run's preflight sizes the free memory a cut's ballast leaves by it."""
+    need = headroom + reserve
+    for amount in held:
+        need += amount
+    return need + int(kv_bytes_per_token or 0) * int(tokens)
 # The step arena: the device bytes an engine's steps take for their temporaries, kept free beside the headroom while
 # nothing uses them. Core's loader sets it once the warm requests ran: the most a step took then, or a model's own
 # word for its deepest step (info's step_bytes), whichever is more, ARENA_SLACK beyond. A step that takes more is let
@@ -875,6 +906,17 @@ class DeviceMemory:
         self._unsettled = False   # a prompt step ended and the givers have not grown back since
         self._allocator = None    # Core's allocator once a step pool was made here: its log is this ledger's
         self._draining = threading.Lock()   # one thread counts the log at a time, in its order
+        # What outlives an engine (crit_plugins.lifetime): the graphs captured here (weak references: a live one is one
+        # something still holds), the state that is the process's and not an engine's (pools and tensors, named), the
+        # engines open on the device now and the last close that did not return its memory.
+        self.graphs = []            # [(weak reference to a captured graph, its pool's name, the capture's number)]
+        self.captures = 0           # graphs captured here so far
+        self.process_pools = set()  # pool handles that are the process's (the capture stream's cuBLAS workspaces)
+        self.process_tensors = {}   # "owner/name" -> a tensor the process keeps for every engine (a constant table)
+        self.leased = {}            # "owner/name" -> bytes a host keeps past its engines (crit serve's device leases)
+        self.opened = []            # crit_plugins.lifetime's Opened of each engine open on the device, oldest first
+        self.leaking = None         # the Opened of the last close that did not return its memory, until one does
+        self.abandoned = []         # Opened of engines dropped without close(), measured at the next load (lifetime)
 
     # -- readings -----------------------------------------------------------------------------------------------------
     @property
@@ -978,19 +1020,24 @@ class DeviceMemory:
         return Scratch(self, owner, poison)
 
     # -- captured graphs' pools ---------------------------------------------------------------------------------------
-    def pool(self, owner, name, handle=None):
+    def pool(self, owner, name, handle=None, process=False):
         """A memory pool of its own for captured graphs (torch's handle, for torch.cuda.graph(pool=)), listed as
-        owner/name in the device's readings; `handle` names a pool made elsewhere (a torch.cuda.MemPool's id)."""
+        owner/name in the device's readings; `handle` names a pool made elsewhere (a torch.cuda.MemPool's id).
+        process: the pool is the process's, kept for every engine (the capture stream's cuBLAS workspaces), and a
+        closed engine's memory is measured without it (crit_plugins.lifetime)."""
         handle = tuple(handle) if handle is not None else self.readings.pool()
         if handle is not None:
             self.pools[handle] = f"{owner}/{name}"
+            if process:
+                self.process_pools.add(handle)
         return handle
 
     @contextmanager
-    def capturing(self, pool):
+    def capturing(self, pool, graph=None):
         """A graph is captured into `pool` inside the block. While the device records (record()), the allocations
         the capture made there are kept by the code that made them (`recorded`): once a graph is captured its
-        temporaries are free blocks of its pool, and nothing else says what they are."""
+        temporaries are free blocks of its pool, and nothing else says what they are. `graph`: the graph captured
+        (torch.cuda.CUDAGraph), which the device then follows (captured())."""
         try:
             yield
         finally:
@@ -999,6 +1046,54 @@ class DeviceMemory:
                 for nbytes, frames, at in self.readings.allocations(pool, found.get("read", 0)):
                     found[(int(nbytes), where(frames))] += 1
                     found["read"] = max(found["read"], at)
+        if graph is not None:
+            self.captured(graph, pool)
+
+    def captured(self, graph, pool=None):
+        """Follow `graph` (a captured graph) by a weak reference, under its pool's name: live_graphs() lists it while
+        something holds it, and a closed engine's graph still alive is one something keeps, with its pool's memory
+        (crit_plugins.lifetime). Returns the graph."""
+        import weakref
+        self.captures += 1
+        name = self.pools.get(tuple(pool), "unnamed") if pool is not None else "unnamed"
+        self.graphs = [entry for entry in self.graphs if entry[0]() is not None]
+        try:
+            self.graphs.append((weakref.ref(graph), name, self.captures))
+        except TypeError:   # a graph type without weak references cannot be followed
+            pass
+        return graph
+
+    def live_graphs(self, after=0):
+        """The graphs captured here (captured()) that something still holds, those captured after capture number
+        `after`: [(the capture's number, its pool's name, the graph)]."""
+        found = [(number, name, ref()) for ref, name, number in self.graphs if number > after]
+        return [(number, name, graph) for number, name, graph in found if graph is not None]
+
+    def process(self, owner, name, tensor):
+        """A tensor the process keeps on this device for every engine (a plugin's constant table, buffers every
+        engine's matrices share and its memory() declares), listed as owner/name: a closed engine's memory is
+        measured without it (crit_plugins.lifetime). `tensor`: the tensor, or a callable that makes it. Returns the
+        one the process keeps under the name: the one kept already where it has the same shape and dtype (every
+        engine's package imports its own copy of a plugin's code, and each copy's module cache asks again; a second
+        tensor under the name would outlive every engine unnamed), else `tensor`, now kept."""
+        key = f"{owner}/{name}"
+        kept = self.process_tensors.get(key)
+        if kept is not None and (callable(tensor) or (tuple(kept.shape) == tuple(tensor.shape)
+                                                      and kept.dtype == tensor.dtype)):
+            return kept
+        made = tensor() if callable(tensor) else tensor
+        self.process_tensors[key] = made
+        return made
+
+    def lease(self, owner, name, nbytes):
+        """Device bytes a host keeps here past the engines that use them (crit serve's model pool: a device lease's
+        allocation, shared by every engine of the model until the model unloads), listed as owner/name: a closed
+        engine's memory is measured without them (crit_plugins.lifetime), by the bytes the host accounts for."""
+        self.leased[f"{owner}/{name}"] = int(nbytes)
+
+    def unlease(self, owner, name):
+        """The lease's bytes are freed: they count again (nothing, where none was listed)."""
+        self.leased.pop(f"{owner}/{name}", None)
 
     def record(self, entries=RECORDED):
         """From now on torch's allocator notes the code that makes each allocation here (its stack, the last
@@ -1162,27 +1257,41 @@ class DeviceMemory:
         while the device stays short. also: another reason the engine must run a step of its own, a callable read
         each time (a host handoff that failed: the engine's next step ends it). While a settle left memory owed
         to the givers it asks too, every time it looks, so the givers grow back a settle a step although Core
-        launches the engine's rounds without it. unwatch() ends the thread. One watch a device."""
+        launches the engine's rounds without it. unwatch() ends the thread. One watch a device. A bound method `ask`
+        is held weakly: the thread keeps no engine alive, and ends once its engine is gone (an engine dropped
+        without its close is collected, and crit_plugins.lifetime measures it at the next load)."""
         self.unwatch()
         stop = threading.Event()
+        held = weakref.WeakMethod(ask) if hasattr(ask, "__self__") and hasattr(ask, "__func__") else None
+        strong = None if held is not None else ask   # the thread's only strong hold: a plain callable's
+        asked = [None]   # the free bytes the last ask was for
+
+        def look(ask):
+            if (also is not None and also()) or (self.owed and self.serving and self.clock() >= self._hold):
+                ask()   # memory owed to the givers: the engine's own step settles some more
+            floor, seen = self._floor, self._seen
+            if not self.serving or not self.givers or floor is None or seen is None:
+                return
+            try:
+                free = self.readings.free()
+            except Exception:   # the device went with its engine
+                return
+            if free is None or free >= floor or free >= seen:
+                asked[0] = None            # room again, or as short as the engine left it
+            elif asked[0] is None or free < asked[0]:
+                asked[0] = free
+                ask()
 
         def run():
-            asked = None
             while not stop.wait(every):
-                if (also is not None and also()) or (self.owed and self.serving and self.clock() >= self._hold):
-                    ask()   # memory owed to the givers: the engine's own step settles some more
-                floor, seen = self._floor, self._seen
-                if not self.serving or not self.givers or floor is None or seen is None:
+                if held is None:
+                    look(strong)
                     continue
-                try:
-                    free = self.readings.free()
-                except Exception:   # the device went with its engine
-                    continue
-                if free is None or free >= floor or free >= seen:
-                    asked = None            # room again, or as short as the engine left it
-                elif asked is None or free < asked:
-                    asked = free
-                    ask()
+                method = held()   # held only while it looks: the engine is not kept alive between looks
+                if method is None:   # its engine is gone: nothing left to ask
+                    return
+                look(method)
+                del method
         thread = threading.Thread(target=run, name="crit-memory-watch", daemon=True)
         self._watch = (thread, stop)
         thread.start()
@@ -1475,16 +1584,19 @@ class DeviceMemory:
         return {name: {"rank": self.rank(name), **dict(self.given.get(name) or {})} for name in self.givers}
 
     # -- the census ---------------------------------------------------------------------------------------------------
-    def holdings(self, plugins):
+    def holdings(self, plugins, packages=None):
         """Every device tensor that can be reached from an engine's plugins, each once: (plugin, name, tensor).
         plugins: {plugin id: its object} in creation order. The walk starts at the plugin objects and then at the
         globals of the plugins' own modules (a buffer a module keeps for every object of its plugin). A tensor is
         the plugin's whose code made the object holding it (the object's class lies in that plugin's package; an
         object of any other class belongs to whoever holds it), and its name says where it is held: the nearest
-        object's class, the attribute and the keys below it ("StatePool.windows", "Matrix.tensors[weight]")."""
+        object's class, the attribute and the keys below it ("StatePool.windows", "Matrix.tensors[weight]").
+        packages: {package: plugin} whose modules' globals are walked too (a closed engine's plugins' packages,
+        whose objects are gone)."""
         from .observe import PLUGIN_MODULES, _entries, unwrap
         torch = sys.modules["torch"]
-        packages = {(type(made).__module__ or "").split(".")[0]: plugin for plugin, made in plugins.items()}
+        packages = {**(packages or {}),
+                    **{(type(made).__module__ or "").split(".")[0]: plugin for plugin, made in plugins.items()}}
         packages = {package: plugin for package, plugin in packages.items() if package.startswith(PLUGIN_MODULES)}
         queue = deque((made, plugin, "", False) for plugin, made in plugins.items())
         for name, module in sorted(sys.modules.items()):
@@ -1587,6 +1699,12 @@ class DeviceMemory:
             found["givers"] = self.givings()
         if self.held is not None:
             found.update(self.held)
+        if self.process_tensors:   # what the process keeps here for every engine (process())
+            found["process"] = sorted(self.process_tensors)
+        if self.leased:   # what a host keeps here past its engines (lease())
+            found["leased"] = dict(sorted(self.leased.items()))
+        if self.leaking is not None and self.leaking.report is not None:   # a close that did not return its memory
+            found["leaking"] = self.leaking.report.get("message")
         return found
 
 

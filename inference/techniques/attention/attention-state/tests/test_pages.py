@@ -1,6 +1,7 @@
 """attention-state's device form: the paged KV pool keeps each sequence's rows where its host form keeps them, in torch
 and through crit's paged-kv-attention writes (the same codes and scales)."""
 from crit_plugins import StepBatch
+from crit_plugins.device import DECODE, PREFILL
 from crit_plugins.testing import PluginTestCase
 
 
@@ -16,8 +17,9 @@ class KVPoolTests(PluginTestCase):
         return self.torch.randn(n, 2, width, generator=g)
 
     def step(self, pool, device, rows, layer=3, seed=0):
-        """Reserve and write `rows` of (sequence, first position, count); returns the keys and values written."""
-        batch = StepBatch.build(rows, device)
+        """Reserve and write `rows` of (sequence, first position, count[, phase]: a prompt chunk unless given); returns
+        the keys and values written."""
+        batch = StepBatch.build([row if len(row) == 4 else (*row, PREFILL) for row in rows], device)
         slots = pool.reserve(batch)
         width = pool.head_dim
         keys, values = self.rows(batch.tokens, seed, width).to(device), self.rows(batch.tokens, seed + 1, width).to(device)
@@ -32,11 +34,11 @@ class KVPoolTests(PluginTestCase):
         pool.open("a")
         done = 0
         for count in [24] + [1] * 40:
-            pool.reserve(StepBatch.build([("a", done, count)], "cpu"))
+            pool.reserve(StepBatch.build([("a", done, count, PREFILL if done == 0 else DECODE)], "cpu"))
             done += count
         self.assertEqual(pool.resumes_from("a"), 0)                     # 64 positions: the ring has not wrapped
         for _ in range(160):
-            pool.reserve(StepBatch.build([("a", done, 1)], "cpu"))
+            pool.reserve(StepBatch.build([("a", done, 1, DECODE)], "cpu"))
             done += 1
         oldest = (-(-done // 16) - pool.ring) * 16                      # the first position the ring still holds
         self.assertEqual(pool.resumes_from("a"), oldest + 40)
@@ -60,7 +62,7 @@ class KVPoolTests(PluginTestCase):
         pool.open("a")
         self.step(pool, device, [("a", 0, 16)])
         pool.keep("a", 16)
-        _, keys, _ = self.step(pool, device, [("a", 16, 4)], seed=5)   # a verify window of 4
+        _, keys, _ = self.step(pool, device, [("a", 16, 4, DECODE)], seed=5)   # a verify window of 4
         pool.keep("a", 17)   # one row accepted
         self.assertEqual((pool.length("a"), len(pool.table("a"))), (17, 2))
         self.assertTrue(self.torch.equal(pool.gather(3, "a", 17)[0][16].cpu(), keys[0].cpu()))

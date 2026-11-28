@@ -174,7 +174,16 @@ def _drafters(paths, architecture, model=None):
         except ConfigError as error:
             raise ValueError(f"Drafter {path}: {error}") from None
         if drafter is None:
-            raise ValueError(f"Drafter {path}: not a hidden-state drafter crit reads (EAGLE-3, DFlash or DSpark)")
+            draft = _companion_draft(path, model)
+            if draft is None:
+                raise ValueError(f"Drafter {path}: not a hidden-state drafter crit reads (EAGLE-3, DFlash or DSpark), "
+                                 "nor a companion drafter the model's model plugin reads (its layout's draft "
+                                 "companion)")
+            out.append({"path": str(path), "config_sha256": file_sha(config), "kind": "companion draft block",
+                        "format": draft["companion"], "block": draft["block"], "read_by": draft["plugin"],
+                        "taps": [], "drafts_per_pass": 1, "draft_vocab_size": None, "block_size": None,
+                        "speculative_tokens": None, **_drafter_bytes(path, model)})
+            continue
         hidden = architecture.get("hidden_size")
         if drafter.target_hidden_size and isinstance(hidden, int) and drafter.target_hidden_size != hidden:
             raise ValueError(f"Drafter {path}: its taps are {drafter.target_hidden_size} wide; the target's hidden size is {hidden}")
@@ -186,6 +195,35 @@ def _drafters(paths, architecture, model=None):
                     "confidence_head": drafter.confidence_head, "speculative_tokens": drafter.speculative_tokens,
                     "verifier": drafter.verifier, "format": drafter.source, **_drafter_bytes(path, model)})
     return out
+
+
+def _companion_draft(path, model):
+    """The draft entry of the model's finished model plugin where its layout reads the drafter folder `path` as its
+    draft block (the models core's companion drafter), with the plugin's id; else None."""
+    if model is None:
+        return None
+    from ..models import _types, companion_draft, plugin_for
+    try:
+        plugin = plugin_for(_types(model))
+    except Exception:  # a model whose config crit cannot read: no model plugin reads its drafter
+        return None
+    draft = companion_draft(plugin, path)
+    return {**draft, "plugin": plugin["id"]} if draft else None
+
+
+def family(model):
+    """The pieces the finished model plugin that serves the model holds of its own (crit.models.family_pieces:
+    its techniques, its tool-call and reasoning syntax): {plugin, pieces}, or None where no finished plugin serves it
+    or it holds none."""
+    from ..models import _types, plugin_for
+    try:
+        plugin = plugin_for(_types(model))
+    except Exception:  # a model whose config crit cannot read
+        return None
+    if not plugin or not plugin["pieces"]:
+        return None
+    return {"plugin": plugin["id"], "pieces": [{k: v for k, v in piece.items() if k != "folder"}
+                                               for piece in plugin["pieces"]]}
 
 
 def _drafter_bytes(path, model):
@@ -216,9 +254,11 @@ def placement(run):
     if basis.get("reserve_bytes") is not None:
         settings = {**settings, "reserve_gib": basis["reserve_bytes"] / GIB}
     drafters = [row["path"] for row in basis.get("companion_drafters") or []]
+    from crit.spec import library_spec   # the engine a build starts from, sized as Core resolves it
+    spec = library_spec(run["spec"]["model_path"], quality_mode=run["spec"]["correctness"].get("quality_mode"))
     try:
         found = where(run["spec"]["model_path"], read_json(Path(device)), hardware["vram_headroom_bytes"],
-                      hardware["ram_headroom_bytes"], settings, hardware["kv_tokens"], drafters)
+                      hardware["ram_headroom_bytes"], settings, hardware["kv_tokens"], drafters, spec=spec)
     except (OSError, ValueError, KeyError) as error:
         return {"scenario": None, "reason": f"Eval cannot size the model on the run's device: {error}"}
     return found or {"scenario": None, "reason": "Eval cannot size the model on the run's device"}
@@ -269,6 +309,7 @@ def gather(model, run=None, drafters=()):
         # Files the weights' own metadata supplied (a GGUF without the base model's files beside it).
         "derived_files": list(source.derived_names),
         "drafters": _drafters(drafters, architecture, model),
+        "family": family(model),   # the model plugin's own pieces (models/cache/README.md)
     }
     if run is not None:
         gathered["eval_sampling"] = eval_sampling(generation, run)
@@ -673,12 +714,21 @@ def scaffold(value):
     card = (f"Read `{g['model_card']}` in the model folder (or the model's Hugging Face page)"
             if g["model_card"] else "No README.md in the model folder: read the model's Hugging Face page")
     found = g.get("drafters") or []
-    drafters = "".join(f"- `{d['path']}`: {d['kind']} ({d['format']}), taps {d['taps']}, {d['drafts_per_pass']} draft(s) per "
+    drafters = "".join((f"- `{d['path']}`: {d['kind']} ({d['format']}), read by {d['read_by']} as its draft block "
+                        f"{d['block']} (its device draft head: the selection's drafter, option mtp, option "
+                        f"draft_folder where it is not beside the checkpoint), 1 draft per pass\n") if d.get("read_by") else
+                       f"- `{d['path']}`: {d['kind']} ({d['format']}), taps {d['taps']}, {d['drafts_per_pass']} draft(s) per "
                        f"pass" + (f", block {d['block_size']}, mask token {d['mask_token_id']}" if d["block_size"] else "")
                        + (f", draft vocabulary {d['draft_vocab_size']} (map through d2t)" if d["draft_vocab_size"] else "")
                        + (f", publisher width {d['speculative_tokens']}" if d["speculative_tokens"] else "") + "\n"
                        for d in found) or ("- none given: `crit run ... recon --force --drafter PATH` records a published "
-                                         "EAGLE-3, DFlash or DSpark drafter\n")
+                                         "EAGLE-3, DFlash or DSpark drafter, or a companion drafter the model plugin's "
+                                         "layout reads\n")
+    own = g.get("family")
+    pieces = "".join(f"- {p['kind']} `{p['id']}`: {p['summary']}\n" for p in own["pieces"]) if own else ""
+    family = (f"`{own['plugin']}` holds pieces of its own for this model family (models/cache/README.md, a family's "
+              f"own pieces), which its layout and manifest use by themselves:\n\n{pieces}" if own else
+              "The model plugin holds library techniques only.\n")
     if g.get("derived_files"):
         card += (f". {', '.join(f'`{n}`' for n in g['derived_files'])} came from the weights' own metadata (crit "
                  "derives them from a GGUF); check them against the base model's repository")
@@ -755,9 +805,16 @@ distribution p, sample from max(p - q, 0) on the first rejection; a greedy draft
 the model's distribution and passes the `sampling` gate, and sample on the device inside the decode graph. Say which
 drafter, draft width and acceptance you expect at these settings, and what a request at other settings gets.
 
-Companion drafters read (Inference's hidden-state-drafters entry wires them):
+Companion drafters read (Inference's hidden-state-drafters entry wires a hidden-state drafter; a drafter the model
+plugin's layout names is its own draft block):
 
 {drafters}
+## The model family's own pieces
+
+{family}
+A piece this engine writes for this family alone and gets working (a tool format, a drafter, a technique only its
+layout composes) is proposed back to the family's model plugin as toolkit feedback (AGENTS.md).
+
 ## Prefill arithmetic plan
 
 TODO. How the engine prefills fast inside the drift budget, as the drafting plan says for decode. For each matrix

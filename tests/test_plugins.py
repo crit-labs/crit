@@ -284,6 +284,11 @@ class AssemblyTests(PluginFixture, unittest.TestCase):
         self.assertEqual(resolution_problems(found, stated), [])
         self.assertEqual(resolution_problems(found, {**stated, "kv_bytes_per_token": 96}),
                          ["kv-fp8 + draft-eagle's resolve() states kv_bytes_per_token 128, and the loaded engine 96"])
+        # A price (PRICES: sizing an engine before it exists) adds up as kv_bytes_per_token does, and the loaded engine
+        # is not held to it: the plan that sized the load is
+        priced = {"facts": {**found["facts"], "held_matrix_bytes": 4096}, "by": {**found["by"],
+                                                                                "held_matrix_bytes": "projections"}}
+        self.assertEqual(resolution_problems(priced, stated), [])
         for answer, refusal in (("{'kv_dtype': 'bf16'}", "attn-fp8: resolve\\(\\) states kv_dtype 'bf16', which "
                                                           "kv-fp8 states as 'fp8'"),
                                 ("{'kv_bytes_per_token': 1.5}", "attn-fp8: resolve\\(\\) states kv_bytes_per_token "
@@ -574,13 +579,88 @@ class DeviceFormTests(unittest.TestCase):
         except ImportError:
             self.skipTest("a step batch's tensors are torch's")
         from crit_plugins import StepBatch
-        batch = StepBatch.build([("a", 0, 3), ("b", 7, 1), ("c", 4, 2)], "cpu")
+        from crit_plugins.device import DECODE, PREFILL
+        batch = StepBatch.build([("a", 0, 3, PREFILL), ("b", 7, 1, DECODE), ("c", 4, 2, DECODE)], "cpu")
         self.assertEqual((batch.rows, batch.tokens, batch.starts), (3, 6, [0, 3, 4, 6]))
         self.assertEqual(batch.positions, [0, 1, 2, 7, 4, 5])
         self.assertEqual(batch.rows_t.tolist(), [0, 0, 0, 1, 2, 2])
         self.assertEqual(batch.row(2), ("c", 4, 2, 4))
         with self.assertRaisesRegex(ValueError, "one or more tokens"):
-            StepBatch.build([("a", 0, 0)], "cpu")
+            StepBatch.build([("a", 0, 0, PREFILL)], "cpu")
+
+    def test_a_rows_phase_is_the_models_never_its_length(self):
+        """Each row carries its phase: a one-token prompt chunk is a prompt row, a verify window of any width a decode
+        row; a row without a phase, or with another, is refused (no plugin infers it from a length)."""
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("a step batch's tensors are torch's")
+        from crit_plugins import StepBatch
+        from crit_plugins.device import DECODE, PREFILL, PromptBatch, RoundBatch
+        batch = StepBatch.build([("a", 9, 1, PREFILL), ("b", 7, 40, DECODE), ("c", 0, 40, PREFILL),
+                                 ("d", 3, 1, DECODE)], "cpu")
+        self.assertEqual([batch.prompt_row(r) for r in range(4)], [True, False, True, False])
+        self.assertEqual(batch.prompts, {0, 2})
+        with self.assertRaisesRegex(ValueError, "phase"):
+            StepBatch.build([("a", 0, 3)], "cpu")
+        with self.assertRaisesRegex(ValueError, "phase"):
+            StepBatch.build([("a", 0, 3, "prompt")], "cpu")
+        round_ = RoundBatch(2, 3, "cpu").fill(2, 3, torch.zeros(2, dtype=torch.int64),
+                                               torch.zeros(2, 4, dtype=torch.int64))
+        self.assertEqual(([round_.prompt_row(r) for r in range(2)], round_.prompts), ([False, False], frozenset()))
+        chunk = PromptBatch(16, "cpu")
+        chunk.fill(16, "a", 0, [5])
+        self.assertEqual((chunk.prompt_row(0), chunk.prompts), (True, {0}))
+
+    def test_a_steps_calls_follow_its_rows_phases(self):
+        """row_groups: a prompt chunk alone however short, decode tokens (decode rows, verify windows of any width) in
+        runs of the decode rows, cut as a round cuts its columns."""
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("a step batch's tensors are torch's")
+        from crit_plugins import StepBatch
+        from crit_plugins.device import DECODE, PREFILL, RoundBatch, row_groups
+        batch = StepBatch.build([("a", 9, 1, DECODE), ("b", 0, 12, DECODE), ("c", 4, 1, PREFILL), ("d", 0, 3, DECODE),
+                                 ("e", 0, 40, PREFILL)], "cpu")
+        self.assertEqual(row_groups(batch, 8), [(0, 8, False), (8, 13, False), (13, 14, True), (14, 17, False),
+                                                (17, 57, True)])
+        round_ = RoundBatch(3, 3, "cpu").fill(3, 3, torch.zeros(3, dtype=torch.int64), torch.zeros(3, 4, dtype=torch.int64))
+        self.assertEqual(row_groups(round_, 8), [(0, 8, False), (8, 12, False)])
+
+    def test_the_routing_conformance_harness_fails_a_plugin_that_routes_by_length(self):
+        """assertRoutesByPhase over its phase x length grid: a route by the phase passes, one by a row's length (a
+        short prompt chunk read as a decode row) or by the rows beside it fails."""
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("a step batch's tensors are torch's")
+        from crit_plugins.testing import PluginTestCase, routing_grid
+
+        class Case(PluginTestCase):
+            def plugin_id(self):
+                return "a plugin"
+
+            def runTest(self):
+                pass
+        case = Case()
+
+        def route(choose):
+            def run(batch):
+                return [choose(batch, r) for r in range(batch.rows) for _ in range(batch.row(r)[2])]
+            return run
+        found = case.assertRoutesByPhase(route(lambda b, r: "prompt" if b.prompt_row(r) else "decode"))
+        self.assertEqual({phase: list(paths) for phase, paths in found.items()},
+                         {"prefill": [("prompt",)], "decode": [("decode",)]})
+        with self.assertRaisesRegex(AssertionError, "prefill rows take other paths at other lengths"):
+            case.assertRoutesByPhase(route(lambda b, r: "prompt" if b.row(r)[2] > 16 else "decode"))
+        with self.assertRaisesRegex(AssertionError, "follows the rows beside it"):
+            case.assertRoutesByPhase(route(lambda b, r: "decode" if not b.prompt_row(r) else
+                                           "prompt" if b.rows == 1 else "prompt beside others"))
+        case.assertRoutesByPhase(route(lambda b, r: f"chunk of {b.row(r)[2]}" if b.prompt_row(r) else "decode"),
+                                 vary=("prefill",))
+        self.assertTrue(any(phase == "prefill" and count == 1 for _, rows in routing_grid()
+                            for _, _, count, phase in rows), "the grid holds a one-token prompt chunk")
 
 
 PASSING = '''from crit_plugins.testing import PluginTestCase
@@ -924,6 +1004,26 @@ class AblationTests(PluginFixture, unittest.TestCase):
         mixed = [measured("full", 150, 800), {**measured("base", 100, 1000), "also": ["without:attn-fp8"]}]
         (row,) = blame(mixed, one)
         self.assertEqual(row["verdict"], "trades")
+
+    def test_a_variant_that_failed_beside_an_engine_as_built_that_failed_too_is_not_blamed(self):
+        # crit run ablate serves the engine as built again after a failed variant: where that fails too, the failure
+        # was the machine's (infrastructure), and neither an option nor a plugin is blamed for it
+        from crit_plugins.ablation import settings
+        def measured(name, decode, prefill):
+            return {"name": name, "state": "measured", "kpis": {"decode_tps": decode, "prefill_tps": prefill,
+                                                                 "ttft_ms": 1000 / prefill}, "smoke": {"failed": []}}
+        infrastructure = "the engine as built failed right after it too (RuntimeError: CUDA error: device lost)"
+        report = [measured("full", 150, 900),
+                  {"name": "set:a.x=1", "state": "failed", "detail": "RuntimeError: device lost",
+                   "infrastructure": infrastructure},
+                  {"name": "set:b.y=2", "state": "failed", "detail": "ValueError: the option is refused"}]
+        rows = {row["plugin"]: row for row in settings(report)}
+        self.assertEqual((rows["set:a.x=1"]["verdict"], rows["set:a.x=1"]["detail"]), ("unmeasured", infrastructure))
+        self.assertEqual(rows["set:b.y=2"]["verdict"], "breaks")   # the engine as built served after it: its doing
+        one = {"use": {"attention": "attn-fp8"}, "base": {"attention": "attn-plain"}}
+        (row,) = blame([measured("full", 150, 900), {"name": "base", "state": "failed", "also": ["without:attn-fp8"],
+                                                      "infrastructure": infrastructure}], one)
+        self.assertEqual(row["verdict"], "unmeasured")
 
     def test_rounds_are_combined_and_compared_round_by_round(self):
         from crit_plugins.ablation import PAIRED_NOISE, combine

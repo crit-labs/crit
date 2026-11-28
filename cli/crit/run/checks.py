@@ -542,6 +542,32 @@ def core_items(counts, log):
     return items
 
 
+def close_item(closes, log):
+    """close_returns_memory, from every engine close the check made in the resident host (crit serve's last_close
+    after each reload, and the check's own close at its end: crit.run.served's Served.closes): Core measured each
+    against the device's level before that engine's load (crit_plugins.lifetime). It fails where a close kept memory
+    (an elastic range, a giver, a captured graph or torch's bytes past the close: the next engine in the process
+    would run out of memory, so Core refuses it), and is unverified where no close was judged (the device's memory
+    cannot be read, or the host reported none)."""
+    kept = [found for found in closes if found.get("returned") is False]
+    judged = [found for found in closes if found.get("returned") is True]
+    if kept:
+        state = "failed"
+        detail = (f"{len(kept)} of {len(closes)} engine closes did not return their memory; the first: "
+                  f"{kept[0].get('message')}")
+    elif judged:
+        state = "passed"
+        detail = (f"every engine close of the check returned its memory ({len(judged)} judged: its ranges, givers "
+                  "and captured graphs gone, torch's bytes back at their level before the load)")
+    else:
+        state = "unverified"
+        detail = ("no engine close was judged: " + (closes[-1].get("message") or "no report") if closes
+                  else "the host reported no engine close")
+    item = {"name": "close_returns_memory", "state": state, "detail": detail}
+    log(f"serve check {item['name']}: {item['state']} ({item['detail']})")
+    return item
+
+
 def step_memory_item(counts):
     """step_memory, from Core's allocator over every load the check served (core_counts' steps, counted since each
     load began serving): failed where a step's segment was refused (the device had not the bytes: a request failed

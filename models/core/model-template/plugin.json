@@ -30,17 +30,17 @@
   "options": {
     "concurrency": {
       "type": "int",
-      "default": 4,
-      "min": 2,
+      "default": -1,
+      "min": -1,
       "max": 64,
-      "description": "the most requests the model steps at once: Core's lanes are at most this (crit_plugins.steps, Steps.lanes; under crit serve's --max-concurrency fewer), and each lane holds one recurrent state where the model has gated-delta layers"
+      "description": "the most requests the model steps at once, where the configuration bounds them: -1 (the default) leaves them to Core (crit_plugins.steps, Steps.lanes: LANES, within the manifest's steps.lanes and crit serve's --max-concurrency); each lane holds one recurrent state where the model has gated-delta layers"
     },
     "pending": {
       "type": "int",
-      "default": 2,
-      "min": 0,
+      "default": -1,
+      "min": -1,
       "max": 64,
-      "description": "the most requests that wait for a lane in Core's runtime (Steps.pending: at most this, within crit serve's --max-concurrency)"
+      "description": "the most requests that wait for a lane in Core's runtime, where the configuration bounds them: -1 (the default) leaves them to Core (Steps.pending: PENDING, within the manifest's steps.pending and crit serve's --max-concurrency)"
     },
     "context": {
       "type": "int",
@@ -84,10 +84,10 @@
     },
     "span_seconds": {
       "type": "float",
-      "default": 0.75,
-      "min": 0.0,
+      "default": -1.0,
+      "min": -1.0,
       "max": 60.0,
-      "description": "the time a prompt step may take at any position: spans are timed at load (a short and a full chunk at position 0, a full chunk at the deepest position served) and each position takes the longest span predicted within it. crit serve retires an engine whose cancel does not settle within one second, and a cancel settles between steps, so the default and the most Core takes is three quarters of that (Steps.seconds; Core calibrates the spans, Steps.calibrated): a step's fixed part (an experts plugin's copies of a chunk's experts) is paid once a step, and a smaller budget pays it for fewer tokens. Where that part alone passes the budget, spans are the ones that prefill fastest (the facts' spans.over_budget). 0: every span the prefill chunk, untimed"
+      "description": "the time a prompt step may take at any position: spans are timed at load (a short and a full chunk at position 0, a full chunk at the deepest position served) and each position takes the longest span predicted within it. crit serve retires an engine whose cancel does not settle within one second, and a cancel settles between steps, so Core's bound, the default (-1) and the most Core takes, is three quarters of that (Steps.seconds; Core calibrates the spans, Steps.calibrated): a step's fixed part (an experts plugin's copies of a chunk's experts) is paid once a step, and a smaller budget pays it for fewer tokens. Where that part alone passes the budget, spans are the ones that prefill fastest (the facts' spans.over_budget). 0: every span the prefill chunk, untimed"
     },
     "passes": {
       "type": "choice",
@@ -108,10 +108,10 @@
     },
     "activations_mib": {
       "type": "int",
-      "default": 768,
-      "min": 0,
+      "default": -1,
+      "min": -1,
       "max": 65536,
-      "description": "MiB the model plans on the device for a step's activations and scoring temporaries before Core measures them (Steps.activations); once the warm requests ran, Core keeps its measured step arena free and the device's givers take the rest"
+      "description": "MiB the model plans on the device for a step's activations and scoring temporaries before Core measures them, where the configuration names a need: -1 (the default) takes Core's (Steps.activations: ACTIVATIONS); once the warm requests ran, Core keeps its measured step arena free and the device's givers take the rest"
     },
     "release_below_mib": {
       "type": "int",
@@ -206,6 +206,15 @@
       "type": "str",
       "default": "",
       "description": "a folder beside this plugin holding crit kernels sweep tables (<kernel>.json) the engine's kernels build with; empty: CRIT_KERNEL_TUNING or the kernels' default knobs"
+    },
+    "draft_folder": {
+      "type": "str",
+      "default": "",
+      "description": "the folder of the companion drafter the layout's draft names (a draft model published in a folder of its own, its config.json the layout's companion model_type; a run's --drafter); empty: the one beside the checkpoint that fits the model (code/companion.py), if any"
     }
+  },
+  "steps": {
+    "lanes": 64,
+    "pending": 64
   }
 }

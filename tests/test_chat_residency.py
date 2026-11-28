@@ -37,6 +37,30 @@ class ResidentTests(ServeFixture, unittest.TestCase):
         self.assertEqual(after['calls'], before['calls'] + 1)
         self.assertEqual(after['device'], before['device'])
 
+    def test_the_status_says_how_the_last_engine_close_went(self):
+        # A reload closes the engine first: Core's close report, in brief, is the host's last_close, and a close
+        # that did not return its memory is reported as such (Core refuses the next load beside it).
+        engine = self.engine(open=False)
+        engine.default = self.a
+        sent = []
+        host = Host(self.root / 'close-host', 1024, 1024, sent.append)
+        try:
+            host.attach(engine.spec(self.a))
+            host.attach(engine.spec(self.b))
+            self.assertIsNone(host.last_close)   # the synthetic engine reports no close: nothing to say
+            returned = {'returned': True, 'judged': True, 'message': 'returned', 'ranges': []}
+            with patch.object(host.engine, 'close', return_value=returned):
+                host.attach(engine.spec(self.a))
+            self.assertEqual(host.last_close, {'returned': True, 'judged': True, 'message': 'returned', 'close': 2})
+            self.assertEqual(sent[-1]['status']['last_close'], host.last_close)
+            leaked = {'returned': False, 'judged': True, 'message': 'elastic range attention-state/pages is open'}
+            with patch.object(host.engine, 'close', return_value=leaked):
+                host.attach(engine.spec(self.b))
+            self.assertEqual(host.last_close, {**leaked, 'close': 3})
+            self.assertEqual(sent[-1]['status']['last_close']['message'], leaked['message'])
+        finally:
+            host.handle({'action': 'unload', 'payload': {}}, Cancellation())
+
     def test_load_progress_reports_actual_reads_and_allocation_then_reuse(self):
         engine = self.engine(open=False)
         engine.default = self.a
@@ -137,6 +161,21 @@ class ResidentTests(ServeFixture, unittest.TestCase):
         again = self.ask(engine, candidate=self.b)
         self.assertEqual(again['pid'], first['pid'])
         self.assertNotEqual((again['generation'], again['device']), (first['generation'], first['device']))
+        self.assertEqual(engine.status()['engine_loads'], 2)
+
+    def test_close_engine_closes_the_engine_alone_and_keeps_the_models_pool_for_the_next_load(self):
+        # Eval's close of a served engine (crit run eval): the host closes the engine as a reload does first, keeping
+        # the model's pool, and says how the close went; the next request loads it again in the same host.
+        engine = self.engine()
+        first = self.ask(engine)
+        before = engine.status()
+        self.assertEqual(engine.close_engine(), engine.last_close())
+        status = engine.status()
+        self.assertEqual((status['state'], status['engine']), ('unloaded', None))
+        self.assertEqual(status['host_bytes'], before['host_bytes'])   # the model's pool stays
+        self.assertIsNone(engine.close_engine())   # nothing loaded: nothing to close
+        again = self.ask(engine)
+        self.assertEqual(again['pid'], first['pid'])
         self.assertEqual(engine.status()['engine_loads'], 2)
 
     def test_unload_drains_the_active_request_and_holds_later_ones_until_it_is_done(self):
@@ -589,6 +628,19 @@ class ModelPoolTests(unittest.TestCase):
         self.assertEqual(self.events.count('allocate'), 1)
         again.close(); self.pool.close()
 
+    def test_a_device_lease_is_listed_on_cores_device_memory_until_the_model_unloads(self):
+        # Core's close check measures a closed engine without the allocations the pool keeps past it
+        # (crit_plugins.memory.lease): listed while the pool holds them, unlisted once they are freed.
+        from crit_plugins import memory
+        device = memory.of(self.key['device'])
+        lease = self.pool.acquire_device(self.key, None, self.allocation)
+        listed = {name: nbytes for name, nbytes in device.leased.items() if name.startswith('model-pool/')}
+        self.assertEqual(list(listed.values()), [4])
+        lease.close()
+        self.assertEqual(len([n for n in device.leased if n.startswith('model-pool/')]), 1)   # the model's still
+        self.pool.close()
+        self.assertEqual([n for n in device.leased if n.startswith('model-pool/')], [])
+
     def test_invalid_allocation_metadata_retains_owner_until_process_retirement(self):
         for declared in (None, 4):
             for actual in (None, -1, 0, True, 1.5, float('nan'), 2 ** 61):
@@ -778,6 +830,89 @@ class RuntimeStatusTests(unittest.TestCase):
         self.assertEqual(self.runtime.status()['state'], 'interrupted')
         self.runtime.tree = None
         self.assertEqual(self.runtime.status(), {'state': 'unloaded', 'host_bytes': 0, 'device_bytes': 0})
+
+
+class OneProcessTests(unittest.TestCase):
+    """One engine, one process (crit serve --one-process): another engine than the host holds loads in a fresh host,
+    an unload ends the host, and the same engine again keeps it; without the flag one host serves every reload."""
+
+    def runtime(self, one_process):
+        from unittest.mock import Mock
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        runtime = ResidentRuntime(RuntimeOwnership(temp.name), 16, 16, one_process=one_process)
+        events = []
+
+        def start():
+            if runtime.tree is None:
+                runtime.hosts += 1
+                runtime.tree = Mock()
+                events.append(("start", runtime.hosts))
+
+        def close():
+            if runtime.tree is not None:
+                events.append(("close", runtime.hosts))
+            runtime.tree, runtime.attached = None, None
+
+        def command(action, payload, *args, **kwargs):
+            start()
+            events.append((action, runtime.hosts))
+            return {"status": "completed", "error": None, "cleanup_settled": True}
+        runtime.start, runtime.close, runtime._command = start, close, command
+        return runtime, events
+
+    def spec(self, candidate, context=None):
+        return {"run_id": "run", "candidate_id": candidate, "package_sha256": candidate + "-sha",
+                "limits": {"context_tokens": context} if context else {}}
+
+    def load(self, runtime, spec):
+        return runtime.call("load", {"spec": spec}, threading.Event(), 5)
+
+    def test_an_engine_whose_host_ended_reports_its_close_as_returned_past_the_host(self):
+        # crit run counts a reopen's close (crit_plugins.lifetime's report, last_close) and a host that ends with its
+        # engine returned everything; the record outlasts the host, numbered by host, and an unload's own report
+        # (the host's Core judged it before the host ended) is kept as it was.
+        runtime, _ = self.runtime(True)
+        runtime.status = lambda: {"state": "ready"}   # the fake host reports no close of its own
+        self.load(runtime, self.spec("a"))
+        self.assertIsNone(runtime.last_exit)
+        self.load(runtime, self.spec("b"))
+        self.assertEqual((runtime.last_exit["returned"], runtime.last_exit["close"]), (True, "host-1"))
+        self.assertIn("ended with it", runtime.last_exit["message"])
+        kept = {"returned": False, "judged": True, "message": "4 captured graph(s) alive", "close": 3}
+        runtime.status = lambda: {"state": "ready", "last_close": kept}
+        runtime.call("unload", {}, threading.Event(), 5)
+        self.assertEqual(runtime.last_exit, {**kept, "close": "host-2", "process_exit": True})
+
+    def test_each_engine_runs_in_a_host_of_its_own_and_an_unload_ends_it(self):
+        runtime, events = self.runtime(True)
+        self.load(runtime, self.spec("a"))
+        self.load(runtime, self.spec("a"))            # the same engine: the same host
+        self.load(runtime, self.spec("a", 2048))      # other limits: another engine
+        self.load(runtime, self.spec("b"))
+        runtime.call("unload", {}, threading.Event(), 5)
+        self.assertEqual(events, [("start", 1), ("load", 1), ("load", 1), ("close", 1), ("start", 2), ("load", 2),
+                                  ("close", 2), ("start", 3), ("load", 3), ("unload", 3), ("close", 3)])
+        self.assertIsNone(runtime.tree)
+
+    def test_the_kept_files_folder_outlasts_each_host_and_goes_with_the_server(self):
+        runtime, _ = self.runtime(True)
+        folder = runtime.kept_files()
+        self.assertEqual(folder.parent, runtime.ownership.directory)
+        (folder / "store").parent.mkdir(parents=True)
+        (folder / "store").write_bytes(b"bundles")
+        runtime.close()
+        self.assertTrue((folder / "store").is_file())   # the next host reopens it
+        runtime.forget_kept_files()
+        self.assertFalse(folder.exists())
+
+    def test_without_it_one_host_serves_every_reload(self):
+        runtime, events = self.runtime(False)
+        for spec in (self.spec("a"), self.spec("a", 2048), self.spec("b")):
+            self.load(runtime, spec)
+        runtime.call("unload", {}, threading.Event(), 5)
+        self.assertEqual({host for _, host in events}, {1})
+        self.assertNotIn("close", [event for event, _ in events])
 
 
 class OwnershipReadTests(unittest.TestCase):

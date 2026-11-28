@@ -42,6 +42,11 @@ class SoftmaxAttention:
         return self.device_form.forward(layer, queries, pool, batch, scale, blocks, block_size, parents, lse,
                                         sinks=sinks, sliding=sliding, latent=latent, bias=bias)
 
+    def forward_latent_layers(self, layers, queries, pool, batch, rank, scale=None):
+        """attention:latent over several of the pool's layers in one call (device_attention.DeviceAttention.
+        forward_latent_layers)."""
+        return self.device_form.forward_latent_layers(layers, queries, pool, batch, rank, scale)
+
     def facts(self):
         """The device form's engine facts (device_attention.DeviceAttention.facts)."""
         return self.device_form.facts()

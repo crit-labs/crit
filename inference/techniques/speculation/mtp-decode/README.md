@@ -149,6 +149,7 @@ A sampled request's drafts are verified by rejection sampling: accept draft `x` 
 all accepts draw a bonus. This preserves the target distribution, not the seeded token sequence.
 [token-sampling](../../sampling/token-sampling/README.md) supplies the predictions under which the greedy accept rule is this
 rule, on the device and in its Python mirror; [device-speculative-round](../device-speculative-round/README.md)'s
-`WidthPolicy` chooses the draft width per round from measured acceptance, and
+Core's round driver's width policy `rate` (`crit_plugins.rounds`) chooses the draft width per round from measured
+acceptance, and
 [hidden-state-drafters](../hidden-state-drafters/README.md)' confidence cuts shorten a draft by its drafter's own
 confidence.

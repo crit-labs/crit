@@ -777,6 +777,31 @@ class KvFitTests(unittest.TestCase):
         self.assertEqual(memory.kv_fit(memory.HEADROOM + 4096, 2)["tokens"], 2048)   # Core's headroom by default
 
 
+class ProcessTensorTests(unittest.TestCase):
+    def test_a_name_the_process_keeps_is_one_tensor_whatever_copy_of_a_plugin_asks(self):
+        # every engine's package imports its own copy of a plugin's code; each copy's module cache asks for the
+        # process's buffers again, and gets the one kept, not a second tensor that would outlive every engine
+        import torch
+        device = memory.DeviceMemory("fake:0", Readings(1000))
+        first = device.process("plugin", "table", torch.zeros(4))
+        self.assertIs(device.process("plugin", "table", torch.ones(4)), first)
+        made = []
+        self.assertIs(device.process("plugin", "table", lambda: made.append(1) or torch.ones(4)), first)
+        self.assertEqual(made, [])
+        other = device.process("plugin", "table", torch.zeros(8))   # another shape: the new one is kept
+        self.assertIsNot(other, first)
+        self.assertIs(device.process_tensors["plugin/table"], other)
+        self.assertEqual(tuple(device.process("plugin", "fresh", lambda: torch.zeros(2)).shape), (2,))
+
+
+class KvNeedTests(unittest.TestCase):
+    def test_the_need_at_a_context_is_what_kv_fit_fits_that_context_in(self):
+        held = (2_000, 100)
+        need = memory.kv_need(7, 4096, headroom=1_000, reserve=500, held=held)
+        self.assertEqual(need, 1_000 + 500 + 2_000 + 100 + 7 * 4096)
+        self.assertEqual(memory.kv_fit(need, 7, headroom=1_000, reserve=500, held=held)["tokens"], 4096)
+
+
 class StepPoolNameTests(unittest.TestCase):
     def test_step_pools_are_named_and_the_names_of_those_holding_nothing_go(self):
         # Core's step pools are listed as core/steps among the device's pools, as a graph's pool is listed by its

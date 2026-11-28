@@ -37,6 +37,10 @@ def tables(device):
         e2m1 = torch.tensor(E2M1, dtype=torch.float64, device=device)
         _TABLES[key] = {"e4m3": e4m3, "e4m3_mids": (e4m3[1:] + e4m3[:-1]) / 2,
                         "e2m1": e2m1, "e2m1_mids": (e2m1[1:] + e2m1[:-1]) / 2}
+        # The process keeps them for every engine on the device: named on its memory, so a closed engine's close
+        # is measured without them (crit_plugins.lifetime).
+        from .memory import of
+        _TABLES[key] = {name: of(device).process("encodings", name, table) for name, table in _TABLES[key].items()}
     return _TABLES[key]
 
 

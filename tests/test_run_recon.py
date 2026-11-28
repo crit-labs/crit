@@ -61,7 +61,14 @@ class ReconTests(unittest.TestCase):
                              "alternative": {"name": "none", "ceiling": "unknown", "evidence": "fixture"},
                              "choice": "current", "reason": "fixture"},
                 "forecast": None, "gates": "fixture", "prompt_activations": "stored"}
-        plan_id = self.store.plan(self.run_id, plan)["plan_id"]
+        try:
+            plan_id = self.store.plan(self.run_id, plan)["plan_id"]
+        except ValueError as error:   # the same open plan recorded again is refused: its candidates build from it
+            import re
+            found = re.search(r"recorded already, as (plan-\d+)", str(error))
+            if found is None:
+                raise
+            plan_id = found.group(1)
         return self.store.candidate(self.run_id, source, {"label": "Fixture", "rationale": "Recon freezing",
             "strategy": "Fixture", "configuration": {"plugins": selection(), **configuration}, "store_decisions": {},
             "plan_id": plan_id, "lever_fates": {}})
@@ -121,6 +128,33 @@ class ReconTests(unittest.TestCase):
             self.store.recon(self.run_id, force=True, drafters=[deep])
         with self.assertRaisesRegex(ValueError, "not a hidden-state drafter"):
             self.store.recon(self.run_id, force=True, drafters=[self.model])
+
+    def test_a_companion_drafter_the_model_plugin_reads_and_the_familys_own_pieces(self):
+        # A Gemma 4 config's model plugin (gemma4-model) reads a gemma4_assistant folder as its draft block and holds
+        # pieces of its own; a folder of another model_type it does not read.
+        model = self.root / "gemma"
+        model.mkdir()
+        (model / "config.json").write_text(json.dumps({
+            "model_type": "gemma4_text", "hidden_size": 128, "num_hidden_layers": 2, "num_attention_heads": 4,
+            "num_key_value_heads": 2, "head_dim": 32, "vocab_size": 256, "intermediate_size": 256,
+            "layer_types": ["sliding_attention", "full_attention"], "sliding_window": 24}), encoding="utf-8")
+        assistant = self.root / "gemma-assistant"
+        assistant.mkdir()
+        (assistant / "config.json").write_text(json.dumps({"model_type": "gemma4_assistant",
+                                                           "backbone_hidden_size": 128}), encoding="utf-8")
+        draft = recon._companion_draft(assistant, model)
+        self.assertEqual((draft["plugin"], draft["block"], draft["companion"]),
+                         ("gemma4-model", "gemma4-assistant", "gemma4_assistant"))
+        self.assertIsNone(recon._companion_draft(model, model))
+        self.assertIsNone(recon._companion_draft(assistant, self.model))   # its plugin names no companion
+        own = recon.family(model)
+        self.assertEqual(own["plugin"], "gemma4-model")
+        self.assertEqual({(p["kind"], p["id"]) for p in own["pieces"]},
+                         {("technique", "shared-kv-attention"), ("technique", "assistant-drafter"),
+                          ("tool_format", "tools.py:TOOL_FORMAT"), ("reasoning_format", "tools.py:REASONING_FORMAT")})
+        (row,) = recon._drafters([assistant], {"hidden_size": 128, "num_hidden_layers": 2}, model)
+        self.assertEqual((row["kind"], row["read_by"], row["block"], row["drafts_per_pass"]),
+                         ("companion draft block", "gemma4-model", "gemma4-assistant", 1))
 
     def test_template_switches_are_listed_and_rerun_needs_force_but_keeps_notes(self):
         (self.model / "chat_template.jinja").write_text(THINKING, encoding="utf-8")
@@ -349,7 +383,9 @@ class ReconTests(unittest.TestCase):
                           "exactness": {"decode": "row-exact", "prompt": "row-exact"},
                           "quality_mode": "speed", "prompt_activations": "stored",
                           "vram_headroom_bytes": store.get(run_id)["run"]["spec"]["hardware_constraints"][
-                              "vram_headroom_bytes"]})
+                              "vram_headroom_bytes"],
+                          # where the run's values came from (crit_core.spec's sources): Core's default headroom
+                          "provenance": {"vram_headroom_bytes": "default"}})
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 
 from crit_plugins.testing import PluginTestCase
+from crit_plugins.testing import long_route_call
 
 try:
     import torch
@@ -87,7 +88,7 @@ class OffloadDeviceTests(PluginTestCase):
         fits = self.offload()
         self.assertEqual(fits.tier, "device")
         x, ids, weights = self.routes(random.Random(1))
-        out = fits.forward(0, x, ids, weights)
+        out = fits.forward(0, x, ids, weights, prompt=long_route_call(ids, fits))
         self.assertEqual(tuple(out.shape), (4, HIDDEN))
         self.assertEqual(fits.facts()["expert_offload"]["tier"], "device")
 
@@ -99,10 +100,14 @@ class OffloadDeviceTests(PluginTestCase):
         rng = random.Random(12)
         for tokens in (3, 24):                                                # decode rows, then a prompt chunk
             x, ids, weights = self.routes(rng, tokens=tokens)
-            want = whole.forward(1, x, ids[:, :2].contiguous(), weights[:, :2].contiguous())
-            self.assertTrue(torch.equal(bits(cut.forward(1, x, ids, weights)), bits(want)))
-            self.assertTrue(torch.equal(bits(offloaded.forward(1, x, ids, weights)), bits(want)))
-            self.assertFalse(torch.equal(bits(whole.forward(1, x, ids, weights)), bits(want)))
+            want = whole.forward(1, x, ids[:, :2].contiguous(), weights[:, :2].contiguous(),
+                                 prompt=long_route_call(ids[:, :2].contiguous(), whole))
+            self.assertTrue(torch.equal(bits(cut.forward(1, x, ids, weights,
+                                                         prompt=long_route_call(ids, cut))), bits(want)))
+            self.assertTrue(torch.equal(bits(offloaded.forward(1, x, ids, weights,
+                                                               prompt=long_route_call(ids, offloaded))), bits(want)))
+            self.assertFalse(torch.equal(bits(whole.forward(1, x, ids, weights,
+                                                            prompt=long_route_call(ids, whole))), bits(want)))
             offloaded.end_step(False)
         self.assertEqual(cut.facts()["expert_offload"]["keep_routes"], 2)
         self.assertNotIn("keep_routes", whole.facts()["expert_offload"])
@@ -115,10 +120,11 @@ class OffloadDeviceTests(PluginTestCase):
         for _ in range(6):
             layer = rng.randrange(LAYERS)
             x, ids, weights = self.routes(rng)
-            self.assertTrue(torch.equal(bits(offloaded.forward(layer, x, ids, weights)),
-                                        bits(fits.forward(layer, x, ids, weights))))
+            self.assertTrue(torch.equal(bits(offloaded.forward(layer, x, ids, weights,
+                                                               prompt=long_route_call(ids, offloaded))),
+                                        bits(fits.forward(layer, x, ids, weights, prompt=long_route_call(ids, fits)))))
         x, ids, weights = self.routes(rng, tokens=37)   # a prompt chunk: staged through the ring
-        self.assertTrue(torch.equal(bits(offloaded.forward(0, x, ids, weights)), bits(fits.forward(0, x, ids, weights))))
+        self.assertTrue(torch.equal(bits(offloaded.forward(0, x, ids, weights, prompt=long_route_call(ids, offloaded))), bits(fits.forward(0, x, ids, weights, prompt=long_route_call(ids, fits)))))
         offloaded.end_step()
         line = offloaded.telemetry()["expert_offload"]["diagnosis"]
         self.assertIn("ram tier", line)
@@ -141,8 +147,10 @@ class OffloadDeviceTests(PluginTestCase):
         for tokens in (4, 37):   # decode rows, then a prompt chunk staged through the ring
             x, ids, weights = self.routes(rng, tokens=tokens)
             want = self.all_device(offloaded, 1, x, ids, weights, arithmetic)
-            self.assertTrue(torch.equal(bits(fits.forward(1, x, ids, weights)), bits(want)))
-            self.assertTrue(torch.equal(bits(offloaded.forward(1, x, ids, weights)), bits(want)))
+            self.assertTrue(torch.equal(bits(fits.forward(1, x, ids, weights,
+                                                          prompt=long_route_call(ids, fits))), bits(want)))
+            self.assertTrue(torch.equal(bits(offloaded.forward(1, x, ids, weights,
+                                                               prompt=long_route_call(ids, offloaded))), bits(want)))
             offloaded.end_step(False)
         self.assertEqual(offloaded.exactness(), {"decode": "row-exact", "prompt": "exact"})
         kernels.use_quality_mode("preserve")
@@ -171,7 +179,8 @@ class OffloadDeviceTests(PluginTestCase):
         for tokens, arithmetic in ((4, "tensor"), (37, "fp4-row")):
             x, ids, weights = self.routes(rng, tokens=tokens)
             want = self.all_device(offloaded, 1, x, ids, weights, arithmetic)
-            self.assertTrue(torch.equal(bits(offloaded.forward(1, x, ids, weights)), bits(want)), tokens)
+            self.assertTrue(torch.equal(bits(offloaded.forward(1, x, ids, weights,
+                                                               prompt=long_route_call(ids, offloaded))), bits(want)), tokens)
             offloaded.end_step(False)
         self.assertEqual(offloaded.exactness(), {"decode": "row-exact", "prompt": "row-exact"})
         kernels.use_exactness({"decode": "row-exact", "prompt": "exact"})   # exact prompt rows: never fp4-row
@@ -189,7 +198,8 @@ class OffloadDeviceTests(PluginTestCase):
             for layer in range(LAYERS):
                 x, ids, weights = self.routes(rng)
                 want = self.all_device(offloaded, layer, x, ids, weights, "declared")
-                self.assertTrue(torch.equal(bits(offloaded.forward(layer, x, ids, weights)), bits(want)))
+                self.assertTrue(torch.equal(bits(offloaded.forward(layer, x, ids, weights,
+                                                                   prompt=long_route_call(ids, offloaded))), bits(want)))
         facts = offloaded.facts()["expert_offload"]
         self.assertEqual((facts["misses"], facts["decode_arithmetic"], facts["policy"]), ("cpu", "declared", "recent"))
         self.assertEqual(offloaded.exactness(), {"decode": "declared", "prompt": "declared"})
@@ -218,7 +228,8 @@ class OffloadDeviceTests(PluginTestCase):
             self.assertEqual(len(auto.cache.ring_slots), EXPERTS)
             x, ids, weights = self.routes(random.Random(5), tokens=37)
             want = self.all_device(auto, 0, x, ids, weights, "declared")
-            self.assertTrue(torch.equal(bits(auto.forward(0, x, ids, weights)), bits(want)))
+            self.assertTrue(torch.equal(bits(auto.forward(0, x, ids, weights,
+                                                          prompt=long_route_call(ids, auto))), bits(want)))
             auto.end_step()
             link = self.offload(tier="ram", misses="link", settings=str(settings), reserve_mib=0,
                                 elastic=False)
@@ -270,7 +281,8 @@ class OffloadDeviceTests(PluginTestCase):
             self.assertEqual(offloaded.exactness(), {"decode": "declared", "prompt": level}, asked)
             x, ids, weights = self.routes(random.Random(5), tokens=37)   # a prompt chunk in that arithmetic
             want = self.all_device(offloaded, 0, x, ids, weights, arithmetic)
-            self.assertTrue(torch.equal(bits(offloaded.forward(0, x, ids, weights)), bits(want)), asked)
+            self.assertTrue(torch.equal(bits(offloaded.forward(0, x, ids, weights,
+                                                               prompt=long_route_call(ids, offloaded))), bits(want)), asked)
             offloaded.end_step()
         kernels.use_exactness("exact")   # an option set to one arithmetic is that arithmetic, whatever is asked
         pinned = self.offload(tier="ram", misses="cpu", prompt_arithmetic="tensor")
@@ -314,7 +326,8 @@ class OffloadDeviceTests(PluginTestCase):
                 for layer in range(LAYERS):
                     x, ids, weights = self.routes(rng, tokens=tokens)
                     want = self.all_device(pinned, layer, x, ids, weights, "declared")
-                    self.assertTrue(torch.equal(bits(pinned.forward(layer, x, ids, weights)), bits(want)))
+                    self.assertTrue(torch.equal(bits(pinned.forward(layer, x, ids, weights,
+                                                                    prompt=long_route_call(ids, pinned))), bits(want)))
                 if tokens > 4:
                     pinned.end_step(False)
             torch.cuda.synchronize()
@@ -346,7 +359,8 @@ class OffloadDeviceTests(PluginTestCase):
                     for layer in range(LAYERS):
                         x, ids, weights = self.routes(rng)
                         want = self.all_device(offloaded, layer, x, ids, weights, "declared")
-                        self.assertTrue(torch.equal(bits(offloaded.forward(layer, x, ids, weights)), bits(want)))
+                        self.assertTrue(torch.equal(bits(offloaded.forward(layer, x, ids, weights,
+                                                                           prompt=long_route_call(ids, offloaded))), bits(want)))
             decode(3)
             device.serve()   # Core's call after the warm requests: the load is over, the givers take what is left
             self.assertEqual(offloaded.cache.backed_slots(), LAYERS * EXPERTS)   # the free memory holds every expert
@@ -364,7 +378,8 @@ class OffloadDeviceTests(PluginTestCase):
                         x, ids, weights = self.routes(rng, tokens=tokens)
                         for layer in range(LAYERS):
                             want = self.all_device(offloaded, layer, x, ids, weights, "declared")
-                            self.assertTrue(torch.equal(bits(offloaded.forward(layer, x, ids, weights)), bits(want)))
+                            self.assertTrue(torch.equal(bits(offloaded.forward(layer, x, ids, weights,
+                                                                               prompt=long_route_call(ids, offloaded))), bits(want)))
                     del scratch
                 offloaded.end_step(False)
                 device.end_step(False)
@@ -382,6 +397,7 @@ class OffloadDeviceTests(PluginTestCase):
         # sized for a long context backs its pages as a sequence grows: the ledger has the cache give the bytes back
         # (its coldest experts first), the pool gets its pages, and every route keeps its bits.
         from crit_plugins import StepBatch, memory
+        from crit_plugins.device import PREFILL
         device = memory.of("cuda")
         if not device.elastic_ranges:
             self.skipTest("the driver's virtual memory API is not reachable here")
@@ -403,7 +419,7 @@ class OffloadDeviceTests(PluginTestCase):
         # is one the cache gives back.
         device.headroom = device.free()
         pool.open("a")
-        slots = pool.reserve(StepBatch.build([("a", 0, 32768)], "cuda"))
+        slots = pool.reserve(StepBatch.build([("a", 0, 32768, PREFILL)], "cuda"))
         self.assertEqual(int(slots.numel()), 32768)
         self.assertGreater(pool.elastic.bytes, 8 << 20)
         self.assertLess(offloaded.cache.backed_slots(), before)
@@ -419,7 +435,8 @@ class OffloadDeviceTests(PluginTestCase):
         store = torch.stack([offloaded.store.bundle(1, e) for e in range(count)]).cuda()
         table = torch.arange(count, dtype=torch.int32, device="cuda")
         want = offloaded.part.combine(offloaded.part.route_outputs(1, x, ids, store, table, "tensor"), ids, weights)
-        self.assertTrue(torch.equal(bits(offloaded.forward(1, x, ids, weights)), bits(want)))
+        self.assertTrue(torch.equal(bits(offloaded.forward(1, x, ids, weights,
+                                                           prompt=long_route_call(ids, offloaded))), bits(want)))
         pool.close("a")
         device.headroom = 0
 
@@ -499,7 +516,7 @@ class OffloadDeviceTests(PluginTestCase):
             self.assertEqual((disk.tier, disk.misses), ("disk", "link"))
             self.assertTrue(disk.round_problems())   # misses read on the host: no captured rounds
             x, ids, weights = self.routes(random.Random(5))
-            self.assertTrue(torch.equal(bits(disk.forward(1, x, ids, weights)), bits(fits.forward(1, x, ids, weights))))
+            self.assertTrue(torch.equal(bits(disk.forward(1, x, ids, weights, prompt=long_route_call(ids, disk))), bits(fits.forward(1, x, ids, weights, prompt=long_route_call(ids, fits)))))
             disk.close()
 
     def test_the_hosts_cache_keeps_the_store_between_loads(self):
@@ -528,18 +545,20 @@ class OffloadDeviceTests(PluginTestCase):
             first, complete = load()
             self.assertFalse(complete)
             self.assertIn("later loads reopen it", first.facts()["expert_offload"]["reasons"]["store"])
-            want = bits(first.forward(1, x, ids, weights))
+            want = bits(first.forward(1, x, ids, weights, prompt=long_route_call(ids, first)))
             first.close()
             (built,) = sorted(stores.glob("experts-*.bin"))
             again, complete = load()
             self.assertTrue(complete)
             self.assertIn("reopened", again.facts()["expert_offload"]["reasons"]["store"])
-            self.assertTrue(torch.equal(bits(again.forward(1, x, ids, weights)), want))
+            self.assertTrue(torch.equal(bits(again.forward(1, x, ids, weights,
+                                                           prompt=long_route_call(ids, again))), want))
             again.close()
             code.write_text("READS = 2\n", encoding="utf-8")
             changed, complete = load()
             self.assertFalse(complete)
-            self.assertTrue(torch.equal(bits(changed.forward(1, x, ids, weights)), want))
+            self.assertTrue(torch.equal(bits(changed.forward(1, x, ids, weights,
+                                                             prompt=long_route_call(ids, changed))), want))
             changed.close()
             (rebuilt,) = sorted(stores.glob("experts-*.bin"))
             self.assertNotEqual(rebuilt, built)
@@ -550,7 +569,8 @@ class OffloadDeviceTests(PluginTestCase):
             self.assertFalse(complete)
             self.assertIn("GiB floor", none.facts()["expert_offload"]["reasons"]["store"])
             self.assertEqual(sorted(stores.glob("experts-*.bin")), [])   # the checkpoint's old store went first
-            self.assertTrue(torch.equal(bits(none.forward(1, x, ids, weights)), want))
+            self.assertTrue(torch.equal(bits(none.forward(1, x, ids, weights,
+                                                          prompt=long_route_call(ids, none))), want))
             none.close()
 
     def mixed(self, **options):
@@ -577,7 +597,8 @@ class OffloadDeviceTests(PluginTestCase):
         fits = self.mixed()
         rng = random.Random(9)
         calls = [(layer, *self.routes(rng)) for layer in (2, 0, 2, 1, 2)]
-        want = [bits(fits.forward(layer, x, ids, weights)) for layer, x, ids, weights in calls]
+        want = [bits(fits.forward(layer, x, ids, weights,
+                                  prompt=long_route_call(ids, fits))) for layer, x, ids, weights in calls]
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
             for options in (dict(tier="ram", misses="cpu"), dict(tier="ram", misses="auto"),
                             dict(tier="ram", misses="link"), dict(tier="disk", misses="auto", store_dir=folder)):
@@ -589,7 +610,7 @@ class OffloadDeviceTests(PluginTestCase):
                 self.assertEqual((offloaded.resident, offloaded.link_layers), ({}, [2] if served == "cpu" else []),
                                  options)
                 for (layer, x, ids, weights), expected in zip(calls, want):
-                    found = bits(offloaded.forward(layer, x, ids, weights))
+                    found = bits(offloaded.forward(layer, x, ids, weights, prompt=long_route_call(ids, offloaded)))
                     if layer == 2 or served != "cpu":   # the kernel's tensor arithmetic: the device tier's bits
                         self.assertTrue(torch.equal(found, expected), (options, layer))
                     else:                               # the CPU's order on the W4A4 layers
@@ -627,11 +648,13 @@ class OffloadDeviceTests(PluginTestCase):
             for layer in (0, 1, 2):
                 x, ids, weights = self.routes(rng)
                 before = link.cache.telemetry(sync=True)["fills"]
-                found = bits(link.forward(layer, x, ids, weights))
+                found = bits(link.forward(layer, x, ids, weights, prompt=long_route_call(ids, link)))
                 if layer == 2:
                     fills += link.cache.telemetry(sync=True)["fills"] - before
-                    self.assertTrue(torch.equal(found, bits(fits.forward(2, x, ids, weights))), r)
-                    self.assertTrue(torch.equal(found, bits(whole.forward(2, x, ids, weights))), r)
+                    self.assertTrue(torch.equal(found, bits(fits.forward(2, x, ids, weights,
+                                                                         prompt=long_route_call(ids, fits)))), r)
+                    self.assertTrue(torch.equal(found, bits(whole.forward(2, x, ids, weights,
+                                                                          prompt=long_route_call(ids, whole)))), r)
                 else:
                     want = self.all_device(link, layer, x, ids, weights, "declared")
                     self.assertTrue(torch.equal(found, bits(want)), (r, layer))
@@ -641,7 +664,7 @@ class OffloadDeviceTests(PluginTestCase):
         self.assertEqual(seen["failure"], 0)
         self.assertNotIn(2, link.dispatch.layers)
         x, ids, weights = self.routes(rng, tokens=37)                 # a prompt chunk: staged through the ring
-        self.assertTrue(torch.equal(bits(link.forward(2, x, ids, weights)), bits(fits.forward(2, x, ids, weights))))
+        self.assertTrue(torch.equal(bits(link.forward(2, x, ids, weights, prompt=long_route_call(ids, link))), bits(fits.forward(2, x, ids, weights, prompt=long_route_call(ids, fits)))))
         link.end_step()
 
     def test_a_link_layers_reserve_is_what_a_decode_round_routes_so_a_tight_cache_still_stages_prompts(self):
@@ -669,12 +692,13 @@ class OffloadDeviceTests(PluginTestCase):
         for r in range(16):   # one decode row a round: what the reserve was sized for, never a route lost
             for layer in (0, 1, 2):
                 x, ids, weights = self.routes(rng, tokens=1)
-                found = bits(capped.forward(layer, x, ids, weights))
+                found = bits(capped.forward(layer, x, ids, weights, prompt=long_route_call(ids, capped)))
                 if layer == 2:
-                    self.assertTrue(torch.equal(found, bits(fits.forward(2, x, ids, weights))), r)
+                    self.assertTrue(torch.equal(found, bits(fits.forward(2, x, ids, weights,
+                                                                         prompt=long_route_call(ids, fits)))), r)
         self.assertEqual(capped.cache.telemetry(sync=True)["failure"], 0)
         x, ids, weights = self.routes(rng, tokens=37)
-        self.assertTrue(torch.equal(bits(capped.forward(2, x, ids, weights)), bits(fits.forward(2, x, ids, weights))))
+        self.assertTrue(torch.equal(bits(capped.forward(2, x, ids, weights, prompt=long_route_call(ids, capped))), bits(fits.forward(2, x, ids, weights, prompt=long_route_call(ids, fits)))))
         capped.end_step()
 
     def test_a_store_with_compressed_scales_sends_its_misses_over_the_link(self):
@@ -688,7 +712,7 @@ class OffloadDeviceTests(PluginTestCase):
         self.assertEqual(offloaded.misses, "link")
         self.assertIn("compressed", offloaded.reasons["misses"])
         x, ids, weights = self.routes(random.Random(11))
-        self.assertTrue(torch.equal(bits(offloaded.forward(1, x, ids, weights)), bits(fits.forward(1, x, ids, weights))))
+        self.assertTrue(torch.equal(bits(offloaded.forward(1, x, ids, weights, prompt=long_route_call(ids, offloaded))), bits(fits.forward(1, x, ids, weights, prompt=long_route_call(ids, fits)))))
         refused = self.offload(tier="ram", misses="cpu", **csf)
         with self.assertRaisesRegex(ValueError, "csf_scales"):
             refused.open()
@@ -696,7 +720,7 @@ class OffloadDeviceTests(PluginTestCase):
     def test_recorded_routes_are_the_decode_routes(self):
         offloaded = self.offload(tier="ram", misses="link", record_routes=16)
         x, ids, weights = self.routes(random.Random(6), tokens=2)
-        offloaded.forward(1, x, ids, weights)
+        offloaded.forward(1, x, ids, weights, prompt=long_route_call(ids, offloaded))
         want = [(1, [e for e in row if e >= 0]) for row in ids.tolist()]
         self.assertEqual(offloaded.routes(), want)
 
@@ -780,8 +804,9 @@ class GgufOffloadTests(PluginTestCase):
         for tokens in (1, 4, 40):   # decode rows, a round's columns, a prompt chunk (grouped by slot)
             for layer in range(LAYERS):
                 x, ids, weights = self.routes(rng, tokens=tokens)
-                want = fits.forward(layer, x, ids, weights)
-                self.assertTrue(torch.equal(bits(offloaded.forward(layer, x, ids, weights)), bits(want)))
+                want = fits.forward(layer, x, ids, weights, prompt=long_route_call(ids, fits))
+                self.assertTrue(torch.equal(bits(offloaded.forward(layer, x, ids, weights,
+                                                                   prompt=long_route_call(ids, offloaded))), bits(want)))
                 if tokens > 4:
                     offloaded.end_step(False)
                 ref = self.reference(layer, x, ids, weights)
@@ -789,8 +814,9 @@ class GgufOffloadTests(PluginTestCase):
                 self.assertLess((want.cpu() - ref).abs().max().item(), 0.05 * scale + 1e-3, (tokens, layer))
         # a prompt chunk's rows have the bits of the same routes decoded one token at a time
         x, ids, weights = self.routes(rng, tokens=24)
-        chunk = fits.forward(0, x, ids, weights)
-        rows = torch.cat([fits.forward(0, x[t:t + 1], ids[t:t + 1], weights[t:t + 1]) for t in range(24)])
+        chunk = fits.forward(0, x, ids, weights, prompt=long_route_call(ids, fits))
+        rows = torch.cat([fits.forward(0, x[t:t + 1], ids[t:t + 1], weights[t:t + 1],
+                                       prompt=long_route_call(ids[t:t + 1], fits)) for t in range(24)])
         self.assertTrue(torch.equal(bits(chunk), bits(rows)))
         facts = offloaded.facts()["expert_offload"]
         self.assertEqual((facts["format"], facts["misses"]), ("gguf", "link"))
@@ -816,10 +842,11 @@ class GgufOffloadTests(PluginTestCase):
         for tokens in (1, 40):
             for layer in (0, 7, 19):
                 x, ids, weights = self.routes(rng, tokens=tokens)
-                got = offloaded.forward(layer, x, ids, weights)
+                got = offloaded.forward(layer, x, ids, weights, prompt=long_route_call(ids, offloaded))
                 if tokens > 16:
                     offloaded.end_step(False)
-                self.assertTrue(torch.equal(bits(got), bits(fits.forward(layer, x, ids, weights))), (layer, tokens))
+                self.assertTrue(torch.equal(bits(got), bits(fits.forward(layer, x, ids, weights,
+                                                                         prompt=long_route_call(ids, fits)))), (layer, tokens))
 
     def test_the_cpu_tier_computes_gguf_misses_in_the_devices_bits(self):
         # The CPU tier computes a GGUF expert in gguf-rows' declared order on the host (Core's declared_rows, the
@@ -847,8 +874,9 @@ class GgufOffloadTests(PluginTestCase):
             self.assertTrue(torch.equal(bits(host.bfloat16()), bits(device.cpu())), layer)
             for tokens in (1, 3, 40):
                 x, ids, weights = self.routes(rng, tokens=tokens)
-                got = offloaded.forward(layer, x, ids, weights)
+                got = offloaded.forward(layer, x, ids, weights, prompt=long_route_call(ids, offloaded))
                 if tokens > 16:
                     offloaded.end_step(False)
-                self.assertTrue(torch.equal(bits(got), bits(fits.forward(layer, x, ids, weights))), (layer, tokens))
+                self.assertTrue(torch.equal(bits(got), bits(fits.forward(layer, x, ids, weights,
+                                                                         prompt=long_route_call(ids, fits)))), (layer, tokens))
         self.assertGreater(tier.stats()["routes"], 0)

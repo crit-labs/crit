@@ -28,6 +28,7 @@ FAMILIES = (
     ("hub", "crit.pull.report", "Add a crit bench result to its crit-hub card (crit hub report); use crit hub --help"),
     ("kernels", "crit_kernels", "Inspect kernel applicability and retain verified dependency bytes"),
     ("models", "crit.models", "Build a model's support: inspect a checkpoint, tiny checkpoints, diff, cache; use crit models --help"),
+    ("diff", "crit.diff", "Where an engine leaves the reference, layer by layer, beside the 16-bit baseline; use crit diff --help"),
     ("mcp", "crit_mcp.server", "Serve these commands to an agent as MCP tools over stdio; use crit mcp --help"),
 )
 

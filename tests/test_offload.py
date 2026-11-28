@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-for _folder in ("inference/core/python", "cli"): sys.path.insert(0, str(ROOT / _folder))
+for _folder in ("inference/core/python", "models/core/python", "cli"): sys.path.insert(0, str(ROOT / _folder))
 from crit import offload  # noqa: E402
 
 CONFIG = {"architectures": ["Qwen4ExpForConditionalGeneration"],
@@ -71,6 +71,15 @@ class OffloadTests(unittest.TestCase):
                                     tables={"bytes": 3 << 30, "tier": "host"}))
         self.assertEqual(value["options"]["device-placement"]["off_device"], "tables.")
         self.assertTrue(any("token embeddings" in note and "embeddings slot" in note for note in value["notes"]))
+
+    def test_recurrent_states_are_elastic_beside_the_cache_as_the_kv_pools_are(self):
+        value = self.plan(placement(cache_bytes=10 * self.size, floors={"link": 10.0}))
+        self.assertNotIn("sequential-recurrence", value["options"])
+        text = {**CONFIG["text_config"], "full_attention_interval": 2}
+        (self.model / "config.json").write_text(json.dumps({**CONFIG, "text_config": text}), encoding="utf-8")
+        value = self.plan(placement(cache_bytes=10 * self.size, floors={"link": 10.0}))
+        self.assertEqual(value["options"]["attention-state"], {"elastic": True})
+        self.assertEqual(value["options"]["sequential-recurrence"], {"elastic": True})
 
     def test_experts_that_fit_need_no_cache(self):
         value = self.plan(placement("fits_device"))

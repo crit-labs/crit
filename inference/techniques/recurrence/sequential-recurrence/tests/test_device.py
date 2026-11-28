@@ -12,7 +12,7 @@ import random
 import sys
 
 from crit_plugins import StepBatch
-from crit_plugins.device import RoundBatch
+from crit_plugins.device import DECODE, PREFILL, RoundBatch
 from crit_plugins.testing import PluginTestCase
 
 GEOMETRY = {"keys": 4, "values": 3, "epsilon": 1e-6, "query_scale": 0.5, "normalize_keys": True,
@@ -21,6 +21,14 @@ HEADS = 2
 SCAN = dict(atol=1e-5, rtol=1e-4)
 PROMPT = dict(atol=2e-3, rtol=2e-2)
 COMMITS = ("deferred", "checkpoints", "recompute")
+
+
+def phased(rows, pool):
+    """Rows of (sequence, first position, tokens) with their phase, as a model marks them: a row that fits the pool's
+    verify window (widest + 1 tokens) decodes (a step's verify window, committed by prefix), a longer one is a prompt
+    chunk. A row given with its phase (a fourth field) keeps it: a short prompt chunk is PREFILL however short, and
+    the pool commits it as a prompt row (its final state) by that phase."""
+    return [row if len(row) == 4 else (*row, DECODE if row[2] <= pool.capacity else PREFILL) for row in rows]
 
 
 class View:
@@ -68,12 +76,12 @@ class Rig:
                                self.key_heads, rows)
 
     def cat(self, parts, name):
-        return self.torch.cat([self.seq[s][name][p:p + n] for s, p, n in parts])
+        return self.torch.cat([self.seq[s][name][p:p + n] for s, p, n, *_ in parts])
 
     def step(self, recurrence, pool, parts, accept=None, layers=(0, 1)):
         """A StepBatch of rows (sequence, first position, tokens) through every layer; accept: the counts to commit
         (all of each row by default; None in the list skips that row's accept). Returns {layer: (outputs, conv)}."""
-        batch = StepBatch.build(parts, self.device)
+        batch = StepBatch.build(phased(parts, pool), self.device)
         found = {}
         for layer in layers:
             conv = None
@@ -82,8 +90,8 @@ class Rig:
             out = recurrence.forward(layer, self.cat(parts, "q"), self.cat(parts, "k"), self.cat(parts, "v"),
                                      self.cat(parts, "g"), self.cat(parts, "b"), pool, batch, self.geometry)
             found[layer] = (out, conv)
-        counts = accept if accept is not None else [n for _, _, n in parts]
-        for (s, _, _), count in zip(parts, counts):
+        counts = accept if accept is not None else [n for _, _, n, *_ in parts]
+        for (s, *_), count in zip(parts, counts):
             if count is not None:
                 pool.accept(s, count)
         return found
@@ -167,7 +175,7 @@ class DeviceRecurrenceTests(PluginTestCase):
         return [t(name).to(self.device()) for name in ("query", "key", "value", "log_decay", "beta")]
 
     def run_rows(self, pool, rows):
-        batch = StepBatch.build(rows, self.device())
+        batch = StepBatch.build(phased(rows, pool), self.device())
         parts = [self.tensors(s, p, n) for s, p, n in rows]
         q, k, v, g, b = (self.torch.cat([part[i] for part in parts]) for i in range(5))
         return batch, self.recurrence.forward(0, q, k, v, g, b, pool, batch, GEOMETRY).cpu()
@@ -378,6 +386,38 @@ class DeviceRecurrenceTests(PluginTestCase):
                         torch.testing.assert_close(prompt[layer][1], conv, atol=1e-6, rtol=1e-6)
                     self.assertTrue(torch.equal(whole.state(layer, "a"), serial.state(layer, "a")))
                     self.assertTrue(torch.equal(whole.window(layer, "a"), serial.window(layer, "a")))
+
+    def test_a_prompt_chunk_commits_by_its_phase_however_short_and_a_long_decode_row_is_refused(self):
+        # A prompt chunk of one or two tokens (PREFILL) keeps its final state, as a long one does: accept takes all of
+        # it or none, never a prefix, and its state and window are the serial decode's. The commit follows the
+        # batch's phase, never the row's size (a row of up to widest + 1 tokens was a verify window by its size).
+        torch = self.torch
+        from crit_plugins.device import PREFILL as PROMPT, DECODE as WINDOW
+        for name, plugin in self.plugins(exact_rows=64):
+            for count in (1, 2):
+                with self.subTest(kernel=name, tokens=count):
+                    rig = Rig(torch, self.device(), *self.shapes()[-1], channels=16, tokens=12, seed=5)
+                    short, serial = rig.pool(plugin, widest=3), rig.pool(plugin, widest=3)
+                    short.open("a")
+                    serial.open("a")
+                    if count > 1:   # all of it or none: no prefix of a prompt chunk is kept
+                        with self.assertRaisesRegex(ValueError, "keeps its final state only"):
+                            rig.step(plugin, short, [("a", 0, count, PROMPT)], accept=[count - 1])
+                        short.close("a")
+                        short.open("a")
+                    rig.step(plugin, short, [("a", 0, count, PROMPT)])
+                    for t in range(count):
+                        rig.step(plugin, serial, [("a", t, 1, WINDOW)])
+                    for layer in (0, 1):
+                        torch.testing.assert_close(short.state(layer, "a"), serial.state(layer, "a"), **SCAN)
+                        torch.testing.assert_close(short.window(layer, "a"), serial.window(layer, "a"), atol=1e-6,
+                                                   rtol=1e-6)
+            with self.subTest(kernel=name, decode_row="past the verify window"):
+                rig = Rig(torch, self.device(), *self.shapes()[-1], channels=16, tokens=12, seed=5)
+                pool = rig.pool(plugin, widest=3)
+                pool.open("a")
+                with self.assertRaisesRegex(ValueError, "a decode row of 6 tokens in a pool of verify rows up to 4"):
+                    rig.step(plugin, pool, [("a", 0, 6, WINDOW)])
 
     # -- exact promises --------------------------------------------------------------------------------------------------
     def test_a_decode_or_verify_row_has_the_bits_it_has_alone(self):
@@ -741,13 +781,13 @@ class DeviceRecurrenceTests(PluginTestCase):
                         serial, other = rig.pool(plugin), rig.pool(chunked)
                         for p in (pool, serial, other):
                             p.open("a")
-                        batch = StepBatch.build([("a", 0, tokens)], self.device())
+                        batch = StepBatch.build([("a", 0, tokens, PREFILL)], self.device())
                         plan = pool._plan(batch)
                         self.assertEqual(pool.delta_rows(plan, pool.scan_rows, kind)[1], [states.FINAL])
                         # its final states wait for their accept in the pool's lowest free unit: no allocation
                         self.assertEqual((pool.delta_rows(plan, pool.scan_rows, kind)[3], pool.final_units),
                                          (True, {"a": 1}))
-                        long = StepBatch.build([("a", 0, pool.scan_rows + 1)], self.device())
+                        long = StepBatch.build([("a", 0, pool.scan_rows + 1, PREFILL)], self.device())
                         self.assertEqual(pool.delta_rows(pool._plan(long), pool.scan_rows, kind)[1], [states.FLUSH])
                         for p in (pool, serial, other):
                             p.last.clear()

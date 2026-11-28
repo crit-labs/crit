@@ -43,6 +43,8 @@ OWNED = {
     "VRAM headroom": {"home": "inference/core/python/crit_plugins/memory.py", "name": "HEADROOM",
                       "names": ("HEADROOM", "VRAM_HEADROOM", "VRAM_HEADROOM_GIB", "VRAM_HEADROOM_BYTES",
                                 "DEFAULT_HEADROOM")},
+    "RAM headroom": {"home": "inference/core/python/crit_plugins/memory.py", "name": "HOST_HEADROOM",
+                     "names": ("HOST_HEADROOM", "RAM_HEADROOM", "RAM_HEADROOM_GIB", "RAM_HEADROOM_BYTES")},
 }
 # Module state of the process, not of an engine: what `global` may rebind in Core's Python.
 PROCESS = {
@@ -51,7 +53,8 @@ PROCESS = {
     "inference/core/python/crit_plugins/memory.py": {"_CU"},   # the CUDA driver library, loaded once a process
     "inference/core/python/crit_plugins/policy.py": {"_process"},   # the policy outside any engine (tests, a quick try)
 }
-SKIP = {"__pycache__", "build", "manifests", "tests"}   # tests spell values out; checkpoint manifests are data
+SKIP = {"__pycache__", "build", "manifests", "tests", "case-studies"}   # tests spell values out; checkpoint manifests
+# are data; case-studies (ignored by git) holds a checkout's own build records, not crit's source
 BUILTINS = set(dir(builtins))
 
 

@@ -1220,10 +1220,10 @@ class ExpertOffload:
         return found
 
     # -- the routed layer -------------------------------------------------------------------------------------------
-    def forward(self, layer, x, ids, weights, rows=None, prompt=None):
-        """out [tokens][hidden] FP32: the routed SwiGLU block of each token over its routes. prompt: a prompt chunk
-        (stages the layer's misses, admits nothing); None takes a call of more than max_tokens tokens for one. rows:
-        the batch's row of each token in a captured round (its per-row reads and hits)."""
+    def forward(self, layer, x, ids, weights, rows=None, *, prompt):
+        """out [tokens][hidden] FP32: the routed SwiGLU block of each token over its routes. prompt (required, the
+        rows' phase, experts:phases): True, a prompt chunk of any length (stages the layer's misses, admits nothing);
+        False, decode rows. rows: the batch's row of each token in a captured round (its per-row reads and hits)."""
         if self.part is None:
             self.open()
         layer = int(layer)
@@ -1233,8 +1233,6 @@ class ExpertOffload:
             # out (not renormalized), in every tier and for decode rows and prompt chunks alike, so a row's result
             # stays a function of its own routes and never of what the cache holds.
             ids, weights = ids[:, :keep].contiguous(), weights[:, :keep].contiguous()
-        if prompt is None:
-            prompt = ids.shape[0] > int(self.options["max_tokens"])
         if self.tier == "device":
             return self._rows(layer, x, ids, weights, self.stores[layer], None, self._tensor(layer, prompt))
         if layer in self.resident:
@@ -1258,7 +1256,7 @@ class ExpertOffload:
                 times = self.miss_times
                 slots = self.cache.prompt_cpu(layer, ids, times.get("compute", times["cpu"]), times["link"], CPU_WINS)
                 if slots is not None:
-                    return self.dispatch.forward(layer, x, ids, weights, self.cache.store, slots)
+                    return self.dispatch.forward(layer, x, ids, weights, self.cache.store, slots, prompt=True)
             store, slots = self.cache.prompt(layer, ids)
             return self._rows(layer, x, ids, weights, store, slots, arithmetic)
         if self._prompt_open:
@@ -1272,7 +1270,7 @@ class ExpertOffload:
             self.part.a4 = True
             decided = (lambda table: self.dispatch.post(layer, x, ids, table))
             slots = self.cache.plan(layer, ids, rows=rows, decided=decided)
-            return self.dispatch.forward(layer, x, ids, weights, self.cache.store, slots)
+            return self.dispatch.forward(layer, x, ids, weights, self.cache.store, slots, prompt=False)
         slots = self.cache.plan(layer, ids, rows=rows)
         return self._rows(layer, x, ids, weights, self.cache.store, slots, self._tensor(layer))
 

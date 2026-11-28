@@ -3,6 +3,7 @@ behind (nothing further back), with sinks, sliding windows and log-sum-exps, for
 the device form's torch readers (the CPU's, and the GPU's for any call with a bias)."""
 
 from crit_plugins import StepBatch
+from crit_plugins.device import DECODE, PREFILL
 from crit_plugins.testing import PluginTestCase
 
 USE = {"kv_cache": "attention-state"}
@@ -33,12 +34,12 @@ class DistanceBiasTests(PluginTestCase):
         def write(rows):
             batch = StepBatch.build(rows, device)
             slots = pool.reserve(batch)
-            pool.write(0, slots, torch.cat([keys[s][p:p + n] for s, p, n in rows]).to(device),
-                       torch.cat([values[s][p:p + n] for s, p, n in rows]).to(device))
+            pool.write(0, slots, torch.cat([keys[s][p:p + n] for s, p, n, _ in rows]).to(device),
+                       torch.cat([values[s][p:p + n] for s, p, n, _ in rows]).to(device))
             return batch
 
-        write([("a", 0, 40), ("b", 0, 20)])
-        batch = write([("a", 40, 1), ("b", 20, 30)])   # a decode row and a prompt row
+        write([("a", 0, 40, PREFILL), ("b", 0, 20, PREFILL)])
+        batch = write([("a", 40, 1, DECODE), ("b", 20, 30, PREFILL)])   # a decode row and a prompt row
         q = torch.randn(batch.tokens, 4, d, generator=torch.Generator().manual_seed(12)).to(device)
         if dtype == "bf16":
             q = q.to(torch.bfloat16)
@@ -83,7 +84,7 @@ class DistanceBiasTests(PluginTestCase):
         torch, device = self.torch, self.where
         pool = self.kv.pool([0], 2, 8, 256, device, "fp32", page=16)
         pool.open("a")
-        batch = StepBatch.build([("a", 0, 4)], device)
+        batch = StepBatch.build([("a", 0, 4, PREFILL)], device)
         pool.write(0, pool.reserve(batch), torch.zeros(4, 2, 8, device=device), torch.zeros(4, 2, 8, device=device))
         q = torch.zeros(4, 4, 8, device=device)
         with self.assertRaisesRegex(ValueError, "bias is contiguous FP32"):

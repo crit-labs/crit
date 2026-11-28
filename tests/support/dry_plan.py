@@ -25,7 +25,6 @@ import re
 import sys
 import tempfile
 import traceback
-import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -54,21 +53,20 @@ def _module(name, path):
     return module
 
 
-def template():
-    """The models core's compose module, imported as the core's package lays its sources out (model-template's
-    plugin.json `sources`: its code as `template`, each model technique's under its key, attention-state's rope code
-    as `rope`)."""
-    if "dry_template" not in sys.modules:
-        plugin = ROOT / "models" / "core" / "model-template"
-        sources = json.loads((plugin / "plugin.json").read_text(encoding="utf-8"))["sources"]
-        package = types.ModuleType("dry_template")
-        package.__path__ = [str(plugin)]   # the plugin's folder, whose plugin.json names the techniques it mounts
-        sys.modules["dry_template"] = package
-        for name, folder in sources.items():
-            sub = types.ModuleType(f"dry_template.{name}")
-            sub.__path__ = [str((plugin / folder).resolve())]
-            sys.modules[sub.__name__] = sub
-    return importlib.import_module("dry_template.template.compose")
+def family_compose(folder):
+    """The compose module of the model plugin in `folder` as its package imports it, the core beside it and the
+    plugin's own techniques mounted (blocks.own_sources: a family's blocks and drafters its layout may name), as
+    Core's loader composes it."""
+    from crit_plugins.assemble import plugin_package
+    from crit_plugins.manifest import load_manifest
+    return importlib.import_module(f"{plugin_package(load_manifest(Path(folder))).__name__}.core.template.compose")
+
+
+def _torch_norms():
+    """The norms slot's torch form (fused-norms' torch_norms): a block that turns a probe row at load (a family's
+    shared-KV attention counts its rotated dimensions so) runs it on the CPU."""
+    name = "dry_torch_norms"
+    return sys.modules.get(name) or _module(name, ROOT / "inference/techniques/norms/fused-norms/code/torch_norms.py")
 
 
 def _constants(path, *names):
@@ -363,7 +361,6 @@ def _plan(manifest, placement, options, attention):
     config = manifest["configs"].get("config.json") or {}
     report = {"name": manifest["name"], "model_type": config.get("model_type"), "placement": placement,
               "plugin": None, "error": None, "formats": {}, "read": 0, "unread": []}
-    compose = template()
     from crit.models import plugin_for
     types = [t for t in ((config.get("text_config") or {}).get("model_type"), config.get("model_type")) if t]
     found = plugin_for(types)
@@ -371,6 +368,7 @@ def _plan(manifest, placement, options, attention):
         report["error"] = f"no finished model plugin serves model_type {config.get('model_type')!r}"
         report["covered"] = False
         return report
+    compose = family_compose(found["folder"])   # the family's own techniques are blocks its layout may name
     layout = compose.read(found["folder"] / compose.LAYOUT)
     report["covered"], report["plugin"] = True, found["id"]
     rec = Recorder()
@@ -378,11 +376,13 @@ def _plan(manifest, placement, options, attention):
         for name, data in manifest["configs"].items():
             Path(folder, name).write_text(json.dumps(data), encoding="utf-8")
         ck = ManifestCheckpoint(manifest, folder)
-        has_draft = bool(layout.get("draft")) and any(n.startswith(layout["draft"]["prefix"]) for n in ck.names())
+        # a draft layer in the checkpoint (a companion drafter's folder lies beside it, which a manifest has not)
+        has_draft = bool((layout.get("draft") or {}).get("prefix")) and any(
+            n.startswith(layout["draft"]["prefix"]) for n in ck.names())
         context = SimpleNamespace(config=config, model=Path(folder), context_tokens=4096, device="cpu",
                                   checkpoint=ck, memory=None, cache=None, package=None)
         instances = {"projections": Projections(rec), "attention": SimpleNamespace(),
-                     "kv_cache": KvCache(), "sampler": SimpleNamespace(), "norms": SimpleNamespace(),
+                     "kv_cache": KvCache(), "sampler": SimpleNamespace(), "norms": _torch_norms(),
                      "embeddings": Embeddings(rec, ck), "recurrence": Recurrence(), "router": Router(),
                      "experts": Experts(rec), "placement": Placement(placement == "tables-off")}
         if has_draft:

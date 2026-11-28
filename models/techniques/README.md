@@ -34,6 +34,12 @@ it serves whole engines of tiny random checkpoints against the reference in two 
 tensor names, the config values its reference assumes) is that family's layout: its finished model plugin's in
 [models/cache](../cache/README.md), or the one an engine builds.
 
+A technique only one family's layout composes may instead live in that family's finished model plugin
+(`models/cache/<family>/techniques/ID`, [a family's own pieces](../cache/README.md#a-familys-own-pieces)): laid out as
+the ones here, with its entry and `reads` held by the same tests, mounted by that plugin's manifest. It moves here,
+under its general name and without its family's name in its code, in the change that makes a second family's layout
+compose it.
+
 ## What a technique reads
 
 `entry.json`'s `reads` lists, each sorted, what the technique's code reads and nothing else:

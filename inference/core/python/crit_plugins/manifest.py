@@ -100,6 +100,23 @@ def _option(name, spec, where):
     return dict(spec)
 
 
+def _steps(value, manifest, where):
+    """steps: what a model plugin can take of Core's step settings (crit_plugins.steps, Steps.capable): {"lanes":
+    the most requests it steps at once (2 or more), "pending": the most that wait for a lane (0 or more)}; a plugin
+    that extends another takes its base's, its own replacing one of the same name."""
+    if value is None:
+        return {}
+    if manifest["fills"] not in (["model"], []):
+        raise PluginError(f"{where}: steps is a model plugin's, or a core's that model plugins extend (what it can "
+                          "take of Core's step settings)")
+    least = {"lanes": 2, "pending": 0}
+    if not isinstance(value, dict) or set(value) - set(least) or not all(
+            isinstance(n, int) and not isinstance(n, bool) and n >= least[key] for key, n in value.items()):
+        raise PluginError(f"{where}: steps is {{\"lanes\": the most requests the model steps at once (2 or more), "
+                          "\"pending\": the most that wait for a lane (0 or more)}")
+    return dict(value)
+
+
 def check_option(name, spec, value, where):
     """A value for option `name`, as its spec allows."""
     kind = spec["type"]
@@ -203,6 +220,7 @@ def _extends(value, manifest, folder, where, through):
         raise PluginError(f"{where}: extends goes round in a circle")
     base = load_manifest(source["folder"], (*through, here))
     manifest["options"] = {**base["options"], **manifest["options"]}
+    manifest["steps"] = {**base.get("steps", {}), **manifest.get("steps", {})}   # what it can take, as its base
     return {"source": value, "id": base["id"]}
 
 
@@ -250,7 +268,7 @@ def load_manifest(folder, _through=()):
     required = {"schema", "id", "title", "fills"}
     optional = {"entry", "provides", "needs", "needs_when", "conflicts", "options", "reference", "test_with", "sources",
                 "tests", "description", "requires", "requires_when", "devices", "kernels", "tool_format",
-                "reasoning_format", "extends", "defines"}
+                "reasoning_format", "extends", "defines", "steps"}
     missing, unknown = required - set(data), set(data) - required - optional
     if missing or unknown:
         raise PluginError(f"{where}: " + "; ".join(
@@ -277,6 +295,7 @@ def load_manifest(folder, _through=()):
     }
     if "model" in manifest["fills"] and manifest["fills"] != ["model"]:
         raise PluginError(f"{where}: a model plugin fills only model; the slots its step calls are plugins of their own")
+    manifest["steps"] = _steps(data.get("steps"), manifest, where)
     required = set(manifest["requires"]) | {slot for slots in manifest["requires_when"].values() for slot in slots}
     if required & set(manifest["fills"]):
         raise PluginError(f"{where}: requires names the other slots the plugin calls, not its own")

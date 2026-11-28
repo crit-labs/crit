@@ -499,7 +499,7 @@ def prompt_chunks(case, norms, device, buckets=(16, 64, 128, 512)):
     """prompts:norms: a prompt forward through every method over crit_plugins.prompt_graphs' padded buckets gives the
     unpadded eager chunk's bits on its real rows, padded eagerly (any device) and captured and replayed (CUDA), and junk
     in the padding (another token, a row of NaN) leaves the real rows as they are: no method lets a row see another."""
-    from crit_plugins.device import StepBatch
+    from crit_plugins.device import PREFILL, StepBatch
     from crit_plugins.prompt_graphs import PromptGraphs
     torch = _torch()
     g = Inputs(device, seed=51)
@@ -547,7 +547,7 @@ def prompt_chunks(case, norms, device, buckets=(16, 64, 128, 512)):
     case.assertEqual(captured, sorted(buckets) if cuda else [])
     for frontier, count in ((0, 5), (5, 16), (21, 40), (61, 100), (161, 512), (700, 1)):
         tokens = [(frontier * 7 + 3 * i) % (vocab - 1) for i in range(count)]
-        unpadded = StepBatch.build([("chunk", frontier, count)], device)
+        unpadded = StepBatch.build([("chunk", frontier, count, PREFILL)], device)
         unpadded.tokens_t = torch.tensor(tokens, dtype=torch.int64, device=device)
         expected = forward(unpadded)
         bucket = next(b for b in sorted(buckets) if b >= count)

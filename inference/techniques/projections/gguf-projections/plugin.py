@@ -22,7 +22,7 @@ from pathlib import Path
 
 from .gguf.host import GgufWeight, check_rows, dense_rows, encode_q8_0, project_rows
 
-DECODE_ROWS = 8
+from crit_plugins.device import DECODE_ROWS   # noqa: E402 - the slot's decode rows (Core's contract), one definition
 # The decode tile's partial sums of a call (DECODE_ROWS rows) at a matrix's K splits are at most this many bytes; a
 # matrix whose plan asks more takes fewer splits (the prompt tile the same, so its rows keep the decode rows' bits).
 PARTIAL_BYTES = 16 << 20
@@ -169,13 +169,17 @@ class GgufProjections:
                                      partial=self.partial, counters=self.counters)
         return self.tile.mm_prompt(x16, matrix.dense, out, "bf16", splits=splits)
 
-    def matmul(self, x, matrix, out_dtype=None, prompt=False):
-        """y = x W^T in BF16 (or out_dtype). Up to DECODE_ROWS rows (not a prompt chunk) each row's bits its own."""
+    def matmul(self, x, matrix, out_dtype=None, *, prompt):
+        """y = x W^T in BF16 (or out_dtype). prompt (required, the rows' phase): False, decode rows, at most
+        DECODE_ROWS a call, each row's bits its own; True, a prompt chunk of any length."""
         import torch
         if x.shape[-1] != matrix.columns:
             raise ValueError(f"activations of width {x.shape[-1]} for a matrix of {matrix.columns} columns")
         dtype = out_dtype or torch.bfloat16
-        decode = x.shape[0] <= DECODE_ROWS and not prompt
+        decode = not prompt
+        if decode:
+            from crit_plugins.device import decode_call
+            decode_call(x.shape[0], DECODE_ROWS, "gguf-projections")
         if matrix.kernel is not None:
             if decode:
                 return self.kernel.gemv(x.to(torch.bfloat16), matrix.kernel).to(dtype)

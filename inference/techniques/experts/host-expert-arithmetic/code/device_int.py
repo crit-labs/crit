@@ -2,10 +2,12 @@
 against activations quantized per block, on crit's kernel int-block-experts (built for the engine's device with the
 engine's tuning or the default knobs).
 
-- Decode rows (calls of up to DECODE_ROWS rows) on its `rows`: the integer block order declared in host_int.h, every
-  output the bits crit's CPU rows give (the native rows or the torch order of declared.py), whatever rows share the
-  call.
-- Prompt rows, with prompt_gemm declared, on `gemm_staged`: the same order and bits. With prompt_gemm native (the
+- Decode rows (a call the model makes with prompt=False, of up to CALL_ROWS rows) on its `rows`: the integer block
+  order declared in host_int.h, every output the bits crit's CPU rows give (the native rows or the torch order of
+  declared.py), whatever rows share the call.
+- Prompt rows (a call with prompt=True, however few its rows: a short chunk has the bits of the same rows in a longer
+  one; or, as the projections slot defines it, a call past CALL_ROWS rows), with prompt_gemm declared, on
+  `gemm_staged` (or `rows` up to CALL_ROWS): the same order and bits. With prompt_gemm native (the
   default) W4A4 prompt rows (activations e2m1x2) on `gemm_native`: the activations by its quantize_nvfp4 (the same E2M1
   codes and E4M3 scale bytes as the declared quantizer), accumulated in the tensor cores (block-scaled FP4 MMAs on
   sm_120a for NVFP4 weights; the s8 MMA a 16-block for INT4 weights): NOT the declared order and not row invariant (a
@@ -18,7 +20,7 @@ the table's post, and each row's inverse global scale multiplies the FP32 output
 scalings apart, so the output is the CPU rows' total * (factor * inverse) bit for bit. Every call runs on tensors made at
 load or by the call itself (no host synchronization; a call at a fixed row count captures in a CUDA graph)."""
 
-DECODE_ROWS = 16   # rows a decode call takes: jobs of up to 8 tokens each
+CALL_ROWS = 16   # rows a decode call takes here (jobs of up to 8 tokens each): this plugin's, at least the slot's decode rows
 JOB_TOKENS = 8
 
 
@@ -50,7 +52,7 @@ class CudaRows:
                  "jobs": torch.zeros(3, dtype=torch.int32, device=device), "int4": weights == "int4"}
         if input_scale is not None:
             found["input"] = float(input_scale)
-        for tokens in range(1, DECODE_ROWS + 1):
+        for tokens in range(1, CALL_ROWS + 1):
             self.row_jobs(tokens, device)
         return found
 
@@ -58,14 +60,15 @@ class CudaRows:
         """Whether prompt rows of this activation format take gemm_native."""
         return self.prompt_gemm == "native" and activations == "e2m1x2"
 
-    def matmul(self, x, matrix, out_dtype):
-        """x [T][K] (CUDA) times the matrix -> [T][N] in out_dtype (x's by default) from FP32 outputs."""
+    def matmul(self, x, matrix, out_dtype, prompt=False):
+        """x [T][K] (CUDA) times the matrix -> [T][N] in out_dtype (x's by default) from FP32 outputs; prompt: the
+        rows are a prompt chunk's (the module's description)."""
         import torch
         t, ib = matrix.tensors, self.ib
         tokens, rows = x.shape[0], matrix.rows
         xf = x.float().contiguous()
         out = torch.empty(tokens, rows, dtype=torch.float32, device=x.device)
-        if tokens > DECODE_ROWS and self.native_prompts(matrix.activations):
+        if (prompt or tokens > CALL_ROWS) and self.native_prompts(matrix.activations):
             codes, scales = ib.quantize_nvfp4(xf, t["input"])
             t["jobs"][2:3].fill_(tokens)
             ib.gemm_native(t["table"], t["jobs"].view(torch.uint8), rows, tokens, codes, scales, t["input"], out,
@@ -77,7 +80,7 @@ class CudaRows:
             else:
                 values, scales = ib.quantize_int8(xf, 32)
                 block = 32
-            if tokens <= DECODE_ROWS:
+            if tokens <= CALL_ROWS:
                 ib.rows(t["table"], self.row_jobs(tokens, x.device), rows, values, scales, block, out)
             else:
                 t["jobs"][2:3].fill_(tokens)

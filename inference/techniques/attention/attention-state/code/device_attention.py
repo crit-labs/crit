@@ -4,9 +4,9 @@ share: each token attends its sequence's positions up to its own, read where the
 Arithmetic comes from crit's paged-kv-attention kernels (crit_plugins.kernels: built on this GPU with the engine's
 tuned knobs or the defaults), then from torch where they do not load; FlashInfer serves nothing unless the plugins'
 option flashinfer is "auto" (a yardstick to compare with: its paged prefill for eager prompt rows of 16-bit and FP8
-pages, and with decode "flashinfer" a step's window rows). A row of up to the pool's `window` tokens is a window row
-(decode tokens, verify windows), a longer one a prompt row, and so is a shorter one the model marks a prompt chunk
-(StepBatch.prompts: a short prompt chunk's rows keep the bits of the same rows in a longer one):
+pages, and with decode "flashinfer" a step's window rows). A row's phase is the batch's (StepBatch.prompt_row), never
+its length: a decode row (a decode token, a verify window) is a window row, a prompt chunk however short a prompt
+row (its rows keep the bits of the same rows in a longer chunk):
 
 - prompt rows: with prompt_reader "decode", as window rows of up to 64 columns through crit's split-KV reader, each
   program folding its partitions as the merge does (fused, no partials): a prompt token's bits are those of the same
@@ -47,6 +47,7 @@ SPLIT_TOKENS, CHUNK, PIECE_TOKENS, PIECE_ROWS and PIECE_PARTITIONS are defaults 
 from crit_plugins.device import capturing
 import itertools
 import math
+import sys
 
 from . import pages as kv_pages
 
@@ -159,27 +160,39 @@ def _too_small(tokens):
 
 
 _OWNERS = itertools.count(1)
+_POOLS = itertools.count(1)
 
 
-class _OwnedKernels:
-    """crit's paged-kv-attention module for one DeviceAttention: every launch runs inside the module's owner() of this
-    reader, so its partials, its fused launches' ring and sync words and its prompt chunks' state are never another
-    reader's (two engines of a process may launch and replay their graphs side by side). Everything else is the
-    module's."""
+def pool_identity(pool):
+    """A number of the pool's own that no other pool of the process ever has: what a step's cached metadata and the
+    warmed launches are keyed by. pool_identity(pool) is not one: a new pool Python allocates at a freed pool's address has the
+    old one's id, and with the same step count it would read the old pool's metadata."""
+    found = pool.__dict__.get("_crit_identity")
+    if found is None:
+        found = pool._crit_identity = next(_POOLS)
+    return found
+
+
+class OwnedKernels:
+    """A kernel module (crit's paged-kv-attention, latent-attention) for one DeviceAttention or KV cache: every call of
+    a module function runs inside the module's owner() of this reader, so its partials, its fused launches' ring and
+    sync words, its prompt chunks' state, its dummies and its ragged plans are never another reader's (two engines of a
+    process may launch and replay their graphs side by side) and go with the reader's close (release()). Constants and
+    classes are the module's."""
 
     def __init__(self, kernels):
         self._kernels, self._key = kernels, ("attention-state", next(_OWNERS))
 
     def __getattr__(self, name):
-        return getattr(self._kernels, name)
+        found = getattr(self._kernels, name)
+        if not callable(found) or isinstance(found, type) or name in ("owner", "release"):
+            return found
+        kernels, key = self._kernels, self._key
 
-    def attend(self, *args, **kwargs):
-        with self._kernels.owner(self._key):
-            return self._kernels.attend(*args, **kwargs)
-
-    def prefill(self, *args, **kwargs):
-        with self._kernels.owner(self._key):
-            return self._kernels.prefill(*args, **kwargs)
+        def owned(*args, **kwargs):
+            with kernels.owner(key):
+                return found(*args, **kwargs)
+        return owned
 
     def release(self):
         self._kernels.release(self._key)
@@ -218,7 +231,7 @@ class DeviceAttention:
                              "prompt rows as decode rows")
         # crit's paged-kv-attention module (launching in this reader's own workspaces where the build has owners), or
         # None
-        self.kernels = _OwnedKernels(kernels) if hasattr(kernels, "owner") else kernels
+        self.kernels = OwnedKernels(kernels) if hasattr(kernels, "owner") else kernels
         self._latent_loader, self._latent_kernels = latent, False
         # flash: False (reader split), True (the Triton flash structures) or "cuda" (the CUDA flash tile), as the
         # kernel's attend and prefill take it; "auto" (reader auto): "cuda" for each pool the CUDA tile takes, False
@@ -357,8 +370,10 @@ class DeviceAttention:
         if self._own_scratch:
             self.scratch.close()
         self.scratch, self._own_scratch = None, False
-        if isinstance(self.kernels, _OwnedKernels):
+        if isinstance(self.kernels, OwnedKernels):
             self.kernels.release()
+        if isinstance(self._latent_kernels, OwnedKernels):
+            self._latent_kernels.release()
         self._wrappers.clear()
         self._steps.clear()
         self._warmed.clear()
@@ -458,7 +473,7 @@ class DeviceAttention:
         else:
             # Window rows: decode tokens and verify windows (a prompt chunk, however short, is a prompt row: its rows
             # the bits of the same rows in a longer chunk).
-            short = [r for r in range(batch.rows) if not kv_pages.prompt_row(batch, r, pool.window)]
+            short = [r for r in range(batch.rows) if not batch.prompt_row(r)]
             # decode "split" (the default): a step's window rows as a round reads them (the split-KV reader, else its
             # torch fallback), so a decode row's bits are the same in a step and in a round; else torch's gathered
             # SDPA.
@@ -466,7 +481,7 @@ class DeviceAttention:
                 meta, extent = self._step_windows(pool, batch, short, q.device)
                 self._windows(layer, q, pool, meta, scale, blocks, block_size, parents, out, found,
                               reader == "split", extent)
-                rest = [r for r in range(batch.rows) if kv_pages.prompt_row(batch, r, pool.window)]
+                rest = [r for r in range(batch.rows) if batch.prompt_row(r)]
             else:
                 rest = list(range(batch.rows))
         if rest:
@@ -478,13 +493,15 @@ class DeviceAttention:
         """Latent attention (multi-head latent attention, absorbed): queries [tokens][heads][R + P] (the latent
         part, the key up-projection absorbed, then the rotary part) over a pool of keys only with one KV head whose
         rows are each position's latent then its rotary key -> out [tokens][heads][R] in the latent space (the value
-        up-projection follows in the model), and lse. Decode tokens, verify windows (up to 64 tokens) and captured
-        rounds through crit's latent-attention decode reader (attend: split over KV partitions, merged); prompt rows
-        and captured prompt chunks through its prompt reader (prefill: the chunk's tokens times heads in tiles, its
-        output written directly; another reduction than the decode reader's), or, with prompt_reader "decode", as
-        window rows of up to 64 columns through the decode reader's fused launch (each program folding its partitions
-        as the merge does: a prompt token's bits are those of the same position decoded). Pages BF16, FP16 or fp8:row
-        (E4M3 with a scale a position); FP32 pools and a GPU without the kernel in torch."""
+        up-projection follows in the model), and lse. A row's phase is the batch's (StepBatch.prompt_row), never its
+        length: decode rows (decode tokens, verify windows of up to 64 tokens) and captured rounds through crit's
+        latent-attention decode reader (attend: split over KV partitions, merged); prompt rows of any length (a
+        one-token chunk too) and captured prompt chunks through its prompt reader (prefill: the chunk's tokens times
+        heads in tiles, its output written directly; another reduction than the decode reader's), or, with
+        prompt_reader "decode", as window rows of up to 64 columns through the decode reader's fused launch (each
+        program folding its partitions as the merge does: a prompt token's bits are those of the same position
+        decoded). Pages BF16, FP16 or fp8:row (E4M3 with a scale a position); FP32 pools and a GPU without the kernel
+        in torch."""
         torch = _torch()
         if pool.value_dim or pool.kv_heads != 1 or queries.shape[-1] != pool.head_dim:
             raise ValueError(f"latent attention reads a pool of keys only (value_dim 0) with one KV head of the queries' "
@@ -525,7 +542,9 @@ class DeviceAttention:
             kernels.attend(q, cache, pool.round_tables, batch.slots_t, batch.starts_t[:rows], batch.frontier_t, cols,
                            pool.page, out=out, lse=found, **common)
             return (out, found) if lse else out
-        windows = [r for r in range(batch.rows) if batch.row(r)[2] <= kernels.MAX_COLUMNS]
+        windows = [r for r in range(batch.rows) if not batch.prompt_row(r)]
+        if any(batch.row(r)[2] > kernels.MAX_COLUMNS for r in windows):
+            raise ValueError(f"latent attention reads a decode row of up to {kernels.MAX_COLUMNS} tokens")
         if windows:
             meta = _windows_of(pool, [batch.row(r) for r in windows], q.device)
             kernels.attend(q, cache, meta.tables, meta.rows, meta.starts, meta.firsts, meta.columns, pool.page,
@@ -533,9 +552,9 @@ class DeviceAttention:
         pieces = []   # prompt_reader decode: a prompt row as pieces of up to 64 tokens, window rows of the fused launch
         prompts = []  # prompt_reader prefill: the step's prompt rows in one launch (prefill_rows: each row's bits)
         for r in range(batch.rows):
-            sequence, first, count, position = batch.row(r)
-            if count <= kernels.MAX_COLUMNS:
+            if not batch.prompt_row(r):
                 continue
+            sequence, first, count, position = batch.row(r)
             if decode:
                 pieces.extend((sequence, first + at, min(kernels.MAX_COLUMNS, count - at), position + at)
                               for at in range(0, count, kernels.MAX_COLUMNS))
@@ -559,12 +578,78 @@ class DeviceAttention:
                            counts=meta.counts, out=out, lse=found, fused=True, **common)
         return (out, found) if lse else out
 
+    def forward_latent_layers(self, layers, queries, pool, batch, rank, scale=None):
+        """attention:latent-layers: latent attention over several of the pool's layers in one call. queries
+        [tokens][len(layers) x group][R + P], layer i's `group` query heads at i x group -> out [tokens][len(layers) x
+        group][R], each layer's heads with the bits _latent gives them alone. Where the layers lie consecutively in the
+        pool (their pages one cache of len(layers) x the pages, each layer's windows reading it through its own table
+        rows, page ids offset by the layers before it) and the step's prompt rows read as window pieces through the
+        decode reader's fused launch (prompt_reader decode: an eager step of prompt rows only, or a captured prompt
+        chunk), every layer's pieces go in ONE launch: the fused launch runs a program a tile, each walking every
+        cached position, so one layer's launch costs about the same at 64 or 512 tokens; each window's bits are its
+        own in any launch. Elsewhere (decode rows, rounds, the prompt reader prefill, torch) a _latent call a layer."""
+        torch = _torch()
+        layers = list(layers)
+        if not layers or queries.shape[1] % len(layers):
+            raise ValueError(f"{queries.shape[1]} query heads over {len(layers)} layers: a whole group each")
+        group = queries.shape[1] // len(layers)
+        parts = [queries[:, i * group:(i + 1) * group] for i in range(len(layers))]
+        merged = self._latent_merged(layers, parts, pool, batch, int(rank), scale)
+        if merged is not None:
+            return merged
+        return torch.cat([self._latent(layer, part.contiguous(), pool, batch, int(rank), scale, False, None)
+                          for layer, part in zip(layers, parts)], dim=1)
+
+    def _latent_merged(self, layers, parts, pool, batch, rank, scale):
+        """forward_latent_layers' one launch, or None where it does not apply (forward_latent_layers)."""
+        from crit_plugins.device import capturing
+        torch = _torch()
+        q0 = parts[0]
+        kernels = self._latent_module(pool, q0)
+        captured = bool(getattr(batch, "prompt", False))   # a captured prompt chunk (Core's prompt graphs)
+        if (kernels is None or self.prompt_reader != "decode" or len(layers) < 2 or getattr(batch, "round", False)
+                or (capturing() and not captured)):
+            return None
+        if pool.value_dim or pool.kv_heads != 1 or q0.shape[-1] != pool.head_dim or not 0 < rank < pool.head_dim:
+            return None   # _latent refuses it, naming why
+        first = pool.layers[layers[0]]
+        if [pool.layers[i] for i in layers] != list(range(first, first + len(layers))):
+            return None
+        if captured:   # the bucket's windows over the prompt table, positions from the device (capture-safe)
+            meta = self._prompt_windows(pool.prompt_table, batch, q0.device)
+        else:
+            rows = list(range(batch.rows))
+            if not rows or not all(batch.prompt_row(r) for r in rows):
+                return None
+            pieces = []
+            for r in rows:
+                sequence, start, count, position = batch.row(r)
+                pieces.extend((sequence, start + at, min(kernels.MAX_COLUMNS, count - at), position + at)
+                              for at in range(0, count, kernels.MAX_COLUMNS))
+            meta = _windows_of(pool, pieces, q0.device)
+        groups, tokens, stored = len(layers), q0.shape[0], pool.pages + 1
+        dtype = torch.float16 if pool.dtype == "fp16" else torch.bfloat16
+        q = torch.cat(parts).to(dtype).contiguous()                               # [layers x tokens][group][R + P]
+        width = meta.tables.shape[0]
+        tables = torch.cat([meta.tables + g * stored for g in range(groups)])    # layer g's pages, its dump page too
+        rows_of = torch.cat([meta.rows + g * width for g in range(groups)])      # each window row's table row
+        starts = torch.cat([meta.starts + g * tokens for g in range(groups)])
+        counts = meta.counts.repeat(groups) if meta.counts is not None else None
+        cache = pool.k[first:first + groups].reshape(groups * stored, pool.page, pool.head_dim)
+        scales = (pool.k_scales[first:first + groups].reshape(groups * stored, pool.page, 1)
+                  if pool.dtype == "fp8:row" else None)
+        scale = scale if scale is not None else q0.shape[-1] ** -0.5
+        out = kernels.attend(q, cache, tables, rows_of, starts, meta.firsts.repeat(groups), meta.columns, pool.page,
+                             counts=counts, rank=rank, scale=scale, scales=scales, fused=True)
+        return torch.cat(out.split(tokens), dim=1)
+
     def _latent_module(self, pool, q):
         """crit's latent-attention module where it reads this pool (a CUDA pool of 16-bit or fp8:row pages), else None."""
         if self.mode == "torch" or not q.is_cuda or pool.dtype not in ("bf16", "fp16", "fp8:row"):
             return None
         if self._latent_kernels is False:
-            self._latent_kernels = self._latent_loader() if self._latent_loader is not None else None
+            found = self._latent_loader() if self._latent_loader is not None else None
+            self._latent_kernels = OwnedKernels(found) if hasattr(found, "owner") else found
         return self._latent_kernels
 
     def _latent_torch(self, layer, q, pool, batch, rank, scale, sinks, out, found):
@@ -630,7 +715,7 @@ class DeviceAttention:
         out = queries.new_empty(queries.shape[0], queries.shape[1], pool.value_dim)
         found = queries.new_empty(queries.shape[0], queries.shape[1], dtype=torch.float32) if lse else None
         fresh = _fresh(pool, layer, q.shape[0], blocks)
-        if fresh is not None:   # from the pool's first fresh position (the chunk past the window), on the device
+        if fresh is not None:   # from the pool's first fresh position (the chunk's frontier), on the device
             fresh = (fresh[0], fresh[1], pool.prompt_fresh_first)
         given = (fresh[0], fresh[1], batch.frontier_t, fresh[2]) if fresh is not None else None
         biased = self._bias is not None and paged and self._bias_prompts(pool, q, out)
@@ -749,7 +834,7 @@ class DeviceAttention:
 
     def _step_windows(self, pool, batch, chosen, device):
         """The chosen short rows' metadata and extent for one step (made at its first layer, kept for the others)."""
-        key = (id(pool), pool.steps, tuple(chosen))
+        key = (pool_identity(pool), pool.steps, tuple(chosen))
         cached = self._steps.get("windows")
         if cached is not None and cached[0] == key:
             return cached[1]
@@ -773,14 +858,15 @@ class DeviceAttention:
             self._decode_rows(layer, q, pool, batch, rows, scale, out, found, fresh, reader == "split")
             return
         if fresh is not None:
-            # Prompt rows (past the window): their own chunk's keys and values as the projections gave them, the
-            # earlier positions from the pages. The other rows read the pages.
-            own = [r for r in rows if batch.row(r)[2] > pool.window]
+            # Prompt rows (prompt chunks, however short): their own chunk's keys and values as the projections gave
+            # them, the earlier positions from the pages. The other rows (decode rows a decode "flashinfer" step reads
+            # here) read the pages.
+            own = [r for r in rows if batch.prompt_row(r)]
             if self._split_reads(pool, q) and q.shape[-1] == pool.value_dim:
                 self._prefill_rows(layer, q, pool, batch, own, scale, out, found, fresh)
             else:
                 self._eager(layer, q, pool, batch, own, scale, None, None, None, out, found, fresh)
-            rows = [r for r in rows if batch.row(r)[2] <= pool.window]
+            rows = [r for r in rows if not batch.prompt_row(r)]
             if not rows:
                 return
         # crit's prompt reader reads every page kind its split-KV reader does (16-bit, FP8, fp8:row, INT8), with or
@@ -805,20 +891,20 @@ class DeviceAttention:
         """Prompt rows in the decode's reduction (prompt_reader "decode"): pieces of up to 64 tokens as window rows,
         through a fused split-KV launch with the pool's partitions and piece (each program folding its partitions as
         the merge does: no partials) where it serves, else the torch fallback over the same page tables; a prompt
-        token's bits are those of the same position decoded. With `fresh` a prompt row's (past the window) own
-        positions from the step's keys and values as write() got them."""
+        token's bits are those of the same position decoded. With `fresh` a prompt row's own positions from the
+        step's keys and values as write() got them."""
         torch = _torch()
-        planned = [batch.row(r) for r in rows]
+        planned = [(*batch.row(r), batch.prompt_row(r)) for r in rows]
         # The step's pieces, made at its first layer and kept for the others (their page tables and metadata cross
         # to the device once a step, not once a layer).
-        key = (id(pool), getattr(pool, "steps", None), tuple(planned), fresh is not None, str(q.device))
+        key = (pool_identity(pool), getattr(pool, "steps", None), tuple(planned), fresh is not None, str(q.device))
         cached = self._steps.get("pieces")
         if cached is not None and cached[0] == key and key[1] is not None:
             meta, marks, extent = cached[1]
         else:
             pieces, shifts, firsts = [], [], []
-            for sequence, first, count, position in planned:
-                own = fresh is not None and count > pool.window
+            for sequence, first, count, position, prompt in planned:
+                own = fresh is not None and prompt
                 for at in range(0, count, 64):
                     pieces.append((sequence, first + at, min(64, count - at), position + at))
                     shifts.append(position - first)              # a fresh row's index: its position - shift
@@ -840,14 +926,14 @@ class DeviceAttention:
         prompt chunk's or a round's warm-up, or Core's first request: an engine makes them all at load) launches the
         split-KV reader once for each query tile a window row of 1 .. pool.window columns gets (_launch_columns),
         and with prompt_reader decode each tile a prompt piece of 1 .. 64 tokens gets in its fused launch, one row
-        over the dump page; with crit's prompt reader, the launch a prompt row past the window gets (_prefill_rows:
+        over the dump page; with crit's prompt reader, the launch a prompt row gets (_prefill_rows:
         one token over the dump page, and again with fresh rows where the pool keeps them), which compiles the
         kernel for every tuned block size a row's length can read. A request's window rows of any width and length
         and its prompt rows of any length then compile nothing (draft trees and block lists aside: their launches
         compile at their first step: block lists compile at their first call, which is the load's, in _warm_blocks)."""
         q = self._queries(queries, pool)
         bias = self._bias
-        key = (str(q.device), tuple(q.shape[1:]), q.dtype, id(pool), bool(lse), self._sinks is not None,
+        key = (str(q.device), tuple(q.shape[1:]), q.dtype, pool_identity(pool), bool(lse), self._sinks is not None,
                self._sliding, None if bias is None else int(bias.shape[2]))
         if key in self._warmed or not self._split_reads(pool, q):
             return
@@ -924,7 +1010,7 @@ class DeviceAttention:
         prompt's first steps past the budget launched the kernel at widths no short prompt had)."""
         q = self._queries(queries, pool)
         k = int(blocks.shape[-1])
-        key = ("blocks", str(q.device), tuple(q.shape[1:]), q.dtype, id(pool), bool(lse), self._sinks is not None, k,
+        key = ("blocks", str(q.device), tuple(q.shape[1:]), q.dtype, pool_identity(pool), bool(lse), self._sinks is not None, k,
                int(block_size))
         if key in self._warmed or not self._split_reads(pool, q):
             return
@@ -1050,7 +1136,7 @@ class DeviceAttention:
     def _prompt_tables(self, pool, rows, device):
         """The page tables of a step's prompt rows (sequence, first token, count, first position) as one int32
         [rows][width] tensor, made at the step's first layer and kept for the others (_windows_of's tables)."""
-        key = (id(pool), getattr(pool, "steps", None), tuple(rows), str(device))
+        key = (pool_identity(pool), getattr(pool, "steps", None), tuple(rows), str(device))
         cached = self._steps.get("prompt_tables")
         if cached is not None and cached[0] == key and key[1] is not None:
             return cached[1]
@@ -1080,7 +1166,8 @@ class DeviceAttention:
             return
         for r in rows:
             sequence, first, count, position = batch.row(r)
-            keys, values = _with_fresh(pool, pool.gather(layer, sequence, position + count), fresh, first, count)
+            own = fresh if batch.prompt_row(r) else None
+            keys, values = _with_fresh(pool.gather(layer, sequence, position + count), own, first, count)
             span = slice(first, first + count)
             windows_dense(q[span], keys, values, position, scale, blocks[span] if blocks is not None else None,
                           block_size, parents[span] if parents is not None else None, out[span],
@@ -1095,11 +1182,12 @@ class DeviceAttention:
         for index, wrapper in plans:
             got = wrapper.run(_take(q, index).contiguous(), pages[:2], k_scale=k_scale, v_scale=v_scale)
             _place(out, got, index)
+        _flashinfer_kept(q.device)
 
     def _flashinfer_plan(self, pool, batch, chosen, q, scale):
         """The step's FlashInfer plans for the chosen rows, made at its first layer (a step is one reserve())."""
         torch = _torch()
-        key = (id(pool), pool.steps, q.shape[1], tuple(chosen))
+        key = (pool_identity(pool), pool.steps, q.shape[1], tuple(chosen))
         cached = self._steps.get("flashinfer")
         if cached is not None and cached[0] == key:
             return cached[1]
@@ -1246,6 +1334,20 @@ def _flashinfer_installed():
 TABLE_WIDTH = 16
 
 
+def _flashinfer_kept(device):
+    """FlashInfer's own process caches on `device` (flashinfer.utils' buffers by name: the ALiBi slopes its run makes
+    whether a call reads them or not, its workspaces), named as the process's (crit_plugins.memory's process): they
+    outlive every engine by FlashInfer's design, and a closed engine's close is measured without them."""
+    utils = sys.modules.get("flashinfer.utils")
+    if utils is None:
+        return
+    from crit_plugins.memory import of
+    for cache in (getattr(utils, "_cache_buf", {}), getattr(utils, "_stream_cache_buf", {})):
+        for key, buf in list(cache.items()):
+            if getattr(buf, "device", None) == device:
+                of(device).process("flashinfer", ".".join(str(k) for k in key), buf)
+
+
 def _windows_of(pool, rows, device):
     """Windows of host rows (sequence, first token, count, first position), their tables and metadata in one copy to
     the device each, their partials packed by their tokens. Not under a capture (host values)."""
@@ -1300,10 +1402,10 @@ def _fresh(pool, layer, tokens, blocks=None, parents=None):
     return read(layer, tokens) if callable(read) else None
 
 
-def _with_fresh(pool, gathered, fresh, first, count):
-    """A row's gathered keys and values, a prompt row's (past the pool's window) with its own last `count` positions
-    from `fresh` (tokens first ..)."""
-    if fresh is None or count <= pool.window:
+def _with_fresh(gathered, fresh, first, count):
+    """A row's gathered keys and values, a prompt row's (`fresh` given: the caller passes it for prompt rows only) with
+    its own last `count` positions from `fresh` (tokens first ..)."""
+    if fresh is None:
         return gathered
     keys, values = gathered
     keys, values = keys.clone(), values.clone()
@@ -1319,7 +1421,8 @@ def _gathered(layer, queries, pool, batch, rows, scale, out, fresh=None):
     heads = queries.shape[1]
     for r in rows:
         sequence, first, count, position = batch.row(r)
-        keys, values = _with_fresh(pool, pool.gather(layer, sequence, position + count), fresh, first, count)
+        own = fresh if batch.prompt_row(r) else None
+        keys, values = _with_fresh(pool.gather(layer, sequence, position + count), own, first, count)
         q = queries[first:first + count].transpose(0, 1).unsqueeze(0).to(keys.dtype)
         k, v = keys.transpose(0, 1).unsqueeze(0), values.transpose(0, 1).unsqueeze(0)
         # One token sees every position held (no mask); a chunk from position 0 is plain causal; only a later chunk

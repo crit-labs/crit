@@ -6,7 +6,7 @@ prompt_reader decode, a prompt row's tokens with the bits of the same tokens dec
 from types import SimpleNamespace
 
 from crit_plugins import StepBatch
-from crit_plugins.device import RoundBatch
+from crit_plugins.device import DECODE, PREFILL, RoundBatch
 from crit_plugins.testing import PluginTestCase
 
 USE = {"kv_cache": "attention-state"}
@@ -62,7 +62,7 @@ class LatentTests(PluginTestCase):
         alone, beside a window row, on BF16 and fp8:row pages."""
         torch = self.torch
         for dtype in ("bf16", "fp8:row"):
-            rows = [("a", 0, 100), ("b", 0, 130), ("c", 0, 3), ("d", 0, 65)]
+            rows = [("a", 0, 100, PREFILL), ("b", 0, 130, PREFILL), ("c", 0, 3, DECODE), ("d", 0, 65, PREFILL)]
             together = self.pool(dtype)
             for s in "abcd":
                 together.open(s)
@@ -87,9 +87,9 @@ class LatentTests(PluginTestCase):
             pool = self.pool(dtype)
             for s in "ab":
                 pool.open(s)
-            for i, rows in enumerate(([("a", 0, 100), ("b", 0, 30)],      # a prompt row and a window row
-                                      [("a", 100, 1), ("b", 30, 5)],      # a decode token and a verify window
-                                      [("a", 101, 70), ("b", 35, 1)])):   # a prompt row past a cached prefix
+            for i, rows in enumerate(([("a", 0, 100, PREFILL), ("b", 0, 30, PREFILL)],      # prompt rows, one under 64
+                                      [("a", 100, 1, DECODE), ("b", 30, 5, DECODE)],      # a decode token and a verify window
+                                      [("a", 101, 70, PREFILL), ("b", 35, 1, DECODE)])):   # a prompt row past a cached prefix
                 batch = StepBatch.build(rows, self.device())
                 self.write(pool, batch)
                 q = self.queries(batch.tokens, 10 + i)
@@ -106,13 +106,13 @@ class LatentTests(PluginTestCase):
         for dtype in ("bf16", "fp8:row"):
             pool = self.pool(dtype)
             pool.open("a")
-            prompt = StepBatch.build([("a", 0, 300)], self.device())
+            prompt = StepBatch.build([("a", 0, 300, PREFILL)], self.device())
             self.write(pool, prompt)
             pool.keep("a", 300)
             q = self.queries(4, 21)
             steps = []
             for c in range(4):   # each token decoded alone in a step (its KV the round's: a function of the position)
-                batch = StepBatch.build([("a", 300 + c, 1)], self.device())
+                batch = StepBatch.build([("a", 300 + c, 1, DECODE)], self.device())
                 self.write(pool, batch)
                 steps.append(self.attention.forward(0, q[c:c + 1], pool, batch, scale=SCALE, latent=R))
                 pool.keep("a", 301 + c)
@@ -166,7 +166,7 @@ class LatentTests(PluginTestCase):
         for dtype in ("bf16", "fp8:row"):
             pool = self.pool(dtype)
             pool.open("a")
-            batch = StepBatch.build([("a", 0, 150)], self.device())
+            batch = StepBatch.build([("a", 0, 150, PREFILL)], self.device())
             self.write(pool, batch)
             q = self.queries(150, 41)
             out = attention.forward(0, q, pool, batch, scale=SCALE, latent=R)
@@ -176,9 +176,9 @@ class LatentTests(PluginTestCase):
             for t in (0, 1, 63, 64, 100, 149):   # the token decoded alone, in a sequence of the same rows before it
                 pool.open(t)                      # (a position's row is a function of the position)
                 if t:
-                    self.write(pool, StepBatch.build([(t, 0, t)], self.device()))
+                    self.write(pool, StepBatch.build([(t, 0, t, PREFILL)], self.device()))
                     pool.keep(t, t)
-                one = StepBatch.build([(t, t, 1)], self.device())
+                one = StepBatch.build([(t, t, 1, DECODE)], self.device())
                 self.write(pool, one)
                 alone = attention.forward(0, q[t:t + 1], pool, one, scale=SCALE, latent=R)
                 self.assertTrue(torch.equal(alone[0], out[t]), (dtype, t))
@@ -186,7 +186,7 @@ class LatentTests(PluginTestCase):
     def test_what_latent_attention_cannot_read_is_refused(self):
         pool = self.kv.pool([0], 2, 64, 256, self.device(), "bf16", page=16)
         pool.open("a")
-        batch = StepBatch.build([("a", 0, 1)], self.device())
+        batch = StepBatch.build([("a", 0, 1, DECODE)], self.device())
         pool.reserve(batch)
         with self.assertRaisesRegex(ValueError, "a pool of keys only"):
             self.attention.forward(0, self.queries(1, 1)[:, :, :64], pool, batch, latent=32)

@@ -104,8 +104,9 @@ class WheelInstallTests(unittest.TestCase):
         borrowed = site.getsitepackages() + ([site.getusersitepackages()] if site.ENABLE_USER_SITE else [])
         # crit Eval too where this Python imports it from a checkout on its path rather than its site folders (an
         # editable install's or a PYTHONPATH's): the folder holds crit_eval alone, none of this checkout's sources.
-        import crit_eval
-        borrowed.append(str(Path(crit_eval.__file__).resolve().parents[1]))
+        # found, not imported: crit_eval imports crit Core's definitions, which this Python may not have on its path
+        import importlib.util
+        borrowed.append(str(Path(importlib.util.find_spec("crit_eval").origin).resolve().parents[1]))
         (cls.purelib / "crit-test-borrowed.pth").write_text(
             f"import site; list(map(site.addsitedir, {borrowed!r}))\n", encoding="utf-8")
         cls.crit = shutil.which("crit", path=str(scripts))

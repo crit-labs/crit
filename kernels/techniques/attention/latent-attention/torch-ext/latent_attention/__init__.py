@@ -24,6 +24,8 @@ Knobs (structure window, keyed by R, P, heads, page and the cache kind, KIND 0 1
 PARTS (order), WARPS and STAGES; PARTS 0 is the rule: about two programs a multiprocessor for a decode row, at most
 32, from the heads and the device only.
 """
+import contextlib
+import threading
 from typing import Optional
 
 import torch
@@ -92,6 +94,11 @@ def _hardware_fp8(device):
     return torch.cuda.get_device_capability(device) >= (8, 9)
 
 
+# The multiprocessors the partitions rule counts: a definition (the RTX 5090's 170 SMs, where it was measured), never
+# this device's, so a row sums in the same order on every GPU.
+ORDER_MULTIPROCESSORS = 170
+
+
 def _multiprocessors(device):
     index = device.index if device.index is not None else torch.cuda.current_device()
     if index not in _SMS:
@@ -101,11 +108,12 @@ def _multiprocessors(device):
 
 def partitions(device, heads, rank, rope, page, kind=0):
     """The partitions a launch over this geometry splits a row's positions into: the tuning's PARTS, else the rule
-    (about two programs a multiprocessor for one decode token: 2 x SMs over the heads' 16-row tiles, 1 to 32)."""
+    (about two programs a multiprocessor for one decode token: 2 x SMs over the heads' 16-row tiles, 1 to 32), the SMs
+    ORDER_MULTIPROCESSORS's, never the device's: a row's bits follow the partitions, so every GPU takes the same."""
     parts = int(_knobs({"R": rank, "P": rope, "H": heads, "PAGE": int(page), "KIND": kind}, 1)["PARTS"])
     if parts:
         return parts
-    return max(1, min(MAX_PARTS, (2 * _multiprocessors(device)) // max(1, -(-heads // 16))))
+    return max(1, min(MAX_PARTS, (2 * ORDER_MULTIPROCESSORS) // max(1, -(-heads // 16))))
 
 
 def write(latent, rope, slots, cache, scales=None):
@@ -191,14 +199,35 @@ def prefill(q, cache, table, position, page, *, rank, scale=None, out: Optional[
     return out
 
 
-_ragged_plans = {}   # (device, BLOCK_M, heads, starts, counts, positions) -> (tile map, metadata)
+_ragged_plans = {}   # (owner, device, BLOCK_M, heads, starts, counts, positions) -> (tile map, metadata)
+# Who launches (owner()): the device tensors the module keeps (the ragged prompt plans) are an owner's, released with
+# it (release()), so an engine's close leaves none of its own on the device for the process to keep.
+_owner = threading.local()
+
+
+@contextlib.contextmanager
+def owner(key):
+    """Launches inside this block keep their plans as `key`'s (any hashable; None: the module's own)."""
+    before = getattr(_owner, "key", None)
+    _owner.key = key
+    try:
+        yield
+    finally:
+        _owner.key = before
+
+
+def release(key):
+    """Drop an owner's ragged prompt plans."""
+    for at in [at for at in _ragged_plans if at[0] == key]:
+        del _ragged_plans[at]
 
 
 def _ragged_plan(device, block_m, heads, starts, counts, positions):
     """The tile map ([tiles][2] int32: the sequence, its tile) and metadata ([sequences][3] int64: first token, tokens,
     first position) of a ragged prompt launch, made once a set of rows (every layer of a step takes the same) and kept
-    for the last 64 sets."""
-    key = (str(device), int(block_m), int(heads), tuple(starts), tuple(counts), tuple(positions))
+    for the last 64 sets, the current owner's (release() drops them)."""
+    key = (getattr(_owner, "key", None), str(device), int(block_m), int(heads), tuple(starts), tuple(counts),
+           tuple(positions))
     found = _ragged_plans.get(key)
     if found is None:
         tiles = [(r, m) for r, n in enumerate(counts) for m in range(triton.cdiv(int(n) * heads, block_m))]

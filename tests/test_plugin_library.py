@@ -444,8 +444,9 @@ class AddTests(unittest.TestCase):
 
     def test_needs_no_plugin_of_the_engine_provides_are_reported(self):
         report = add(self.dest, ["draft-trees", "experts-reference"])
-        # the model's: the finished model plugins whose layout has a draft layer provide it
-        self.assertEqual(report["unmet"]["draft:head"], ["inkling2-loop-model", "qwen3-5-model", "qwen4-exp-model"])
+        # the model's: the finished model plugins whose layout has a draft layer (Gemma 4's: its companion) provide it
+        self.assertEqual(report["unmet"]["draft:head"], ["gemma4-model", "inkling2-loop-model",
+                                                         "qwen3-5-model", "qwen4-exp-model"])
         self.assertNotIn("experts:source", report["unmet"])    # its tests bring expert-tensors
         report = add(self.dest, ["heterogeneous-expert-dispatch"])
         self.assertEqual(report["unmet"], {})

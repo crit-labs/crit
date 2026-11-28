@@ -125,3 +125,45 @@ class HostArithmeticDeviceTests(PluginTestCase):
             p.load(tensors, "nvfp4")
         with self.assertRaisesRegex(ValueError, "loads bf16, nvfp4, int4"):
             p.load(tensors, "fp8:channel")
+
+
+@unittest.skipIf(torch is None, "the device form's tensors are torch's")
+class CudaRowsPhaseTests(PluginTestCase):
+    """The CUDA form picks a call's kernel by its phase: with prompt_gemm native, W4A4 prompt rows take gemm_native
+    however few they are (a short chunk the bits of the same rows in a longer one), decode calls the declared rows.
+    On the CPU with a recording kernel module in place of int-block-experts."""
+
+    def test_a_prompt_call_takes_the_prompt_gemm_at_every_count(self):
+        from importlib import import_module
+        plugin = self.assemble()["projections"]
+        CudaRows = import_module(f"{plugin.code.__name__}.device_int").CudaRows
+        ran = []
+
+        class Kernels:
+            def quantize_nvfp4(self, x, scale):
+                return x, x
+
+            quantize_e2m1x2 = quantize_int8 = quantize_nvfp4
+
+            def gemm_native(self, *args, **kwargs):
+                ran.append("native")
+
+            def gemm_staged(self, *args, **kwargs):
+                ran.append("staged")
+
+            def rows(self, *args, **kwargs):
+                ran.append("rows")
+
+            def row_jobs(self, jobs, device):
+                return jobs
+
+        from types import SimpleNamespace
+        rows = CudaRows(Kernels(), "native")
+        matrix = SimpleNamespace(rows=4, activations="e2m1x2",
+                                 tensors={"table": None, "jobs": torch.zeros(3, dtype=torch.int32), "input": 1.0,
+                                          "int4": False, "inverse": torch.ones(4)})
+        for count, prompt, want in ((1, True, "native"), (5, True, "native"), (40, True, "native"),
+                                    (1, False, "rows"), (8, False, "rows")):
+            ran.clear()
+            rows.matmul(torch.zeros(count, 32), matrix, None, prompt=prompt)
+            self.assertEqual(ran, [want], (count, prompt))

@@ -925,8 +925,13 @@ class StepEngine(_Runtime):
     CONSTRAINTS = ("json_object", "grammar", "tokens")
 
     def __init__(self, model, library=None, facts=None, close=None, telemetry=None, frames=(), relieve=None,
-                 health=None, memory=None, timed=None, scope=None, max_concurrent_requests=None, pending_timeout=None):
+                 health=None, memory=None, timed=None, scope=None, max_concurrent_requests=None, pending_timeout=None,
+                 returned=None):
         self.model, self._close_parts = model, close
+        # returned() -> the close's report: once close() dropped every reference the engine holds, whether the device
+        # got back what the load took (crit_plugins.lifetime's Opened.close, which Core's loader passes). The report
+        # stays as close_report, and the closed engine's telemetry carries it ("close").
+        self._returned, self.close_report = returned, None
         self._scope = scope or nullcontext
         # health() -> None, or why the engine cannot serve on (a host handoff that failed: crit_plugins.host's
         # failures): read as each step begins, and the step then fails the engine with it.
@@ -1361,6 +1366,24 @@ class StepEngine(_Runtime):
         import contextlib
         return self._memory.step_pool() if self._memory is not None else contextlib.nullcontext()
 
+    def layer_rows(self, ids):
+        """The layer localiser's tap (crit diff), a Core fact any model plugin may offer: the model's layer_rows(ids)
+        (the residual's rows on entry to every layer application and the final-normed rows, [(name, rows FP32)]) and
+        layer_parts() ([{layer, kind, mixer, ffn}]), the models core's own. ValueError, naming the contract, for a
+        model plugin that offers none."""
+        taps = getattr(self.model, "layer_rows", None)
+        if not callable(taps):
+            raise ValueError("the engine's model plugin offers no layer rows: a model plugin gives crit diff its tap "
+                             "with layer_rows(ids) and layer_parts() (docs/PLUGINS.md, The layer localiser's tap); "
+                             "the models core's plugins do")
+        with self._lease():
+            return taps(list(ids))
+
+    def layer_parts(self):
+        """The model's layer_parts() where it states them (layer_rows' places, the blocks each layer runs), else None."""
+        parts = getattr(self.model, "layer_parts", None)
+        return parts() if callable(parts) else None
+
     def ask_step(self):
         """The next decode step runs the model's step() although a native round could run it (any thread): Core's
         code that only runs in a step gets its turn between two rounds. Nothing without native rounds, where every
@@ -1407,6 +1430,8 @@ class StepEngine(_Runtime):
         if self._probed is not None:
             found["core"]["probe"] = {kind: {**value, "recent": [list(sample) for sample in value["recent"]]}
                                       for kind, value in list(self._probed.items())}
+        if self.close_report is not None:   # the engine is closed: whether it returned its memory (close())
+            found["close"] = self.close_report
         return found
 
     def _retire(self, _user, session, finish):
@@ -1467,21 +1492,36 @@ class StepEngine(_Runtime):
             self._matchers.close()
             self._matchers = None
         if self.model is not None:
-            with self._scope():
-                if self._close_parts is not None:
-                    self._close_parts()
-                elif callable(getattr(self.model, "close", None)):
-                    self.model.close()
-            self.model = self._telemetry = self._request_facts = self.audit = None
-            self.plugins = {}
-            self._sessions.clear()
-            # A model's device memory returns only once its objects are freed. Parts that refer to each other (a
-            # drafter and its model) wait for a collection, and crit serve opens an engine again in the same host
-            # (Eval's lower-context comparison), so collect now and hand torch's cached blocks back.
-            gc.collect()
-            torch = sys.modules.get("torch")
-            if torch is not None and torch.cuda.is_initialized():
-                torch.cuda.empty_cache()
+            try:
+                with self._scope():
+                    if self._close_parts is not None:
+                        self._close_parts()
+                    elif callable(getattr(self.model, "close", None)):
+                        self.model.close()
+            finally:
+                self._drop()
+
+    def _drop(self):
+        """Every reference the closed engine holds to the model and its parts goes (a model's device memory returns
+        only once nothing refers to its objects, and crit serve, Eval and crit run open an engine again in the same
+        process): the model, its parts' step frames (their bound methods), its sessions and requests. Parts that
+        refer to each other (a drafter and its model) wait for a collection, which runs now with torch's cached
+        blocks handed back; where Core's loader passed returned(), it then proves the device got back what the load
+        took, raising or warning where it did not (crit_plugins.lifetime), and its report is close_report."""
+        self.model = self._telemetry = self._request_facts = self.audit = None
+        self._close_parts = self._health = self._timed = None
+        self._begin, self._end = [], []
+        self.plugins = {}
+        for name in ("_sessions", "_handles", "_attachments", "_constrained", "_pending_facts"):
+            getattr(self, name, {}).clear()
+        returned, self._returned = self._returned, None
+        if returned is not None:
+            self.close_report = returned()
+            return
+        gc.collect()
+        torch = sys.modules.get("torch")
+        if torch is not None and torch.cuda.is_initialized():
+            torch.cuda.empty_cache()
 
     # Free device memory below which a WDDM device counts as full: other processes (a desktop) share it, so the engine
     # can page with its own peak below the device's size.

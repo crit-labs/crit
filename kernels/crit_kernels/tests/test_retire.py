@@ -65,3 +65,18 @@ def test_a_tuning_without_retired_structures_is_untouched():
     m = _manifest()
     tuning = build.default_tuning(m)
     assert build.retire(m, tuning) is tuning
+
+
+def test_a_tuning_written_with_a_retired_knob_loads_with_the_knob_dropped():
+    # mma-rows retired SPLITS (the sums' order is the matrix's, never a tuning's): an engine's tuning swept before
+    # still loads, each configuration without it and every entry naming the same configuration
+    m = build.find("mma-rows")[1]
+    old = {"schema": build.TUNING_SCHEMA, "kernel": "mma-rows",
+           "structures": {"decode-tile": {"configs": [{"GROUPS": 1, "WARPS": 4, "SPLITS": 3, "SW": 0, "SPF": 0}],
+                                          "table": [{"key": {"weights": 0, "N": 34816, "K": 5120}, "rows": [1, 8],
+                                                     "config": 0}]}}}
+    got = build.check_tuning(m, old)["structures"]["decode-tile"]
+    assert all("SPLITS" not in config for config in got["configs"])
+    assert got["configs"][got["table"][0]["config"]] == {"GROUPS": 1, "WARPS": 4, "SW": 0, "SPF": 0}
+    with pytest.raises(ValueError, match="unknown knob 'SPLIT'"):
+        build.check_tuning(m, {**old, "structures": {"decode-tile": {"configs": [{"SPLIT": 3}], "table": []}}})

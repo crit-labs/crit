@@ -79,6 +79,76 @@ class NextStepTests(RunFixture, unittest.TestCase):
         self.assertIn("--lifecycle build_failed", found["command"])
 
 
+class TransitionTableTests(RunFixture, unittest.TestCase):
+    """The one transition table (crit.run.state.OPERATIONS): every state has a legal action, next names only commands
+    the table allows in the candidate's state, and every operation refuses outside its states with the table's reason;
+    an interrupted attempt (an ablate's, unsettled) holds every other operation until it is settled."""
+
+    def test_every_state_has_a_legal_action_and_each_step_is_one_the_table_allows(self):
+        from crit.run import state
+        for name in state.CANDIDATE_STATES:
+            with self.subTest(state=name):
+                legal = [op for op, states in state.OPERATIONS.items() if name in states]
+                # running waits or settles, sealed plans from it: neither starts an operation on the candidate
+                self.assertTrue(legal or name in state.NEVER, name)
+                self.assertIn(name, state.WHY)
+                row = {"candidate": "candidate-0009", "state": name, "detail": "fixture"}
+                for op in state.OPERATIONS:
+                    refused = state.refusal(op, row)
+                    self.assertEqual(refused is None, name in state.OPERATIONS[op], (op, name))
+                    if refused:
+                        self.assertIn(state.WHY[name].split(":")[0].format(cid="candidate-0009", detail="fixture"),
+                                      refused)
+        for step, op in state.STEP_OPERATION.items():
+            self.assertIn(op, state.OPERATIONS, step)
+
+    def test_next_names_a_command_the_table_allows_on_the_open_candidate(self):
+        from crit.run import state
+        self.resolve()
+        cid = self.candidate(plan_id=self.first_plan(), lever_fates={})["candidate_id"]
+        found = self.store.next(self.run_id)
+        row = found["state"]["candidates"][0]
+        self.assertEqual((found["step"], row["state"]), ("build", "created"))
+        self.assertIsNone(state.refusal(state.STEP_OPERATION[found["step"]], row))
+        # show lists the same state and the operations the table allows in it
+        self.assertEqual(self.store.get(self.run_id)["candidate_states"][cid],
+                         {"state": "created", "allowed": ["build", "seal"]})
+
+    def test_reserve_holds_every_caller_to_the_phase_order(self):
+        # No Eval before a passed serve --check, no measurement before a completed Eval, for every caller of reserve
+        self.resolve()
+        cid = self.candidate(plan_id=self.first_plan(), lever_fates={})["candidate_id"]
+        with self.assertRaisesRegex(ValueError, "is created, where crit run's eval does not start: it is not built"):
+            self.store.reserve(self.run_id, cid, "eval")
+        self.package({"candidate_id": cid})
+        with self.assertRaisesRegex(ValueError, "is packaged, where crit run's eval does not start: its serve --check "
+                                                "has not passed"):
+            self.store.reserve(self.run_id, cid, "eval")
+        self.serve_checked(cid)
+        with self.assertRaisesRegex(ValueError, "is serve_checked, where crit run's benchmark does not start: it has "
+                                                "no completed Eval"):
+            self.store.reserve(self.run_id, cid, "benchmark")
+        self.eval_completed(cid)
+        self.store.reserve(self.run_id, cid, "benchmark")   # evaluated: a measurement starts
+
+    def test_an_unsettled_attempt_holds_every_operation_with_the_tables_reason(self):
+        # 2026-11-23: an ablation interrupted before it settled left its attempt reserved; nothing may start beside
+        # it, and next says to wait for it or settle it.
+        self.resolve()
+        cid = self.candidate(plan_id=self.first_plan(), lever_fates={})["candidate_id"]
+        reservation = self.store.reserve(self.run_id, cid, "build")
+        self.assertEqual(self.store.next(self.run_id)["step"], "wait")
+        for op in ("build", "check", "eval", "benchmark"):
+            with self.subTest(operation=op), self.assertRaisesRegex(ValueError, "is running, where crit run's "
+                                                                                f"{op} does not start: .*settle"):
+                self.store.reserve(self.run_id, cid, op)
+        with self.assertRaisesRegex(ValueError, "is running, where crit run's seal does not start"):
+            self.store.seal(self.run_id, cid, "build_failed", failure="fixture")
+        self.store.settle(self.run_id, reservation, {"outcome": "interrupted", "ended_at": now(), "exit_code": 130,
+                                                     "cleanup_settled": True, "logs": [], "failure": "fixture"})
+        self.store.reserve(self.run_id, cid, "build")   # settled: the table's build starts again
+
+
 class EvaluatedStepTests(unittest.TestCase):
     """An evaluated candidate's next step is one its command takes: where its checks keep its benchmarks exploratory,
     measure refuses it and a completed seal needs them, so next names seal built, and the refusals name it too."""

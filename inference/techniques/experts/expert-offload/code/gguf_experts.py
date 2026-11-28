@@ -29,7 +29,6 @@ declared_rows, the kernel's splits on the device), the bits a slot gives it, in 
 outside a capture."""
 
 ALIGN = 64
-MAX_ROWS = 8          # gguf-rows' gemv takes up to 8 rows a call
 DECODE_ROUTES = 128   # a call of up to this many routes (or a captured one) runs the gathered gemv; the same bits
 OUTSIZED = 1 / 16     # the most of every expert's bytes the layers past the slot size may hold (kept whole on the device)
 
@@ -177,12 +176,13 @@ class GgufRoutes:
         slot = torch.where(flat >= 0, found, torch.zeros_like(found)).to(torch.int32).contiguous()
         xr = x.to(torch.bfloat16).repeat_interleave(top, dim=0)
         if routes <= DECODE_ROUTES or torch.cuda.is_current_stream_capturing():
-            # Decode rows (a round's columns): the gathered gemv, MAX_ROWS routes a call.
-            both = torch.cat([self.kernel.gemv(xr[a:a + MAX_ROWS], gate_up, slot[a:a + MAX_ROWS])
-                              for a in range(0, routes, MAX_ROWS)])
+            # Decode rows (a round's columns): the gathered gemv, the kernel's MAX_ROWS routes a call.
+            most = self.kernel.MAX_ROWS
+            both = torch.cat([self.kernel.gemv(xr[a:a + most], gate_up, slot[a:a + most])
+                              for a in range(0, routes, most)])
             h = self._gate(both)
-            return torch.cat([self.kernel.gemv(h[a:a + MAX_ROWS], down, slot[a:a + MAX_ROWS])
-                              for a in range(0, routes, MAX_ROWS)])
+            return torch.cat([self.kernel.gemv(h[a:a + most], down, slot[a:a + most])
+                              for a in range(0, routes, most)])
         # A prompt chunk: its routes sorted by slot, each slot's rows times its expert's matrices in gguf-rows' grouped
         # GEMM (one staging and one GEMM launch a batch of experts; each row the bits of the plain call on its expert)
         order = torch.argsort(slot, stable=True)

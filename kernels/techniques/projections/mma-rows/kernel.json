@@ -34,7 +34,7 @@
   ],
   "structures": {
     "decode-tile": {
-      "what": "1 to 64 rows on mma.m16n8k16 (BF16 operands, FP32 sums): a warp's 16 x GROUPS matrix rows the A operand, 8 activation rows a column the B operand, K's steps in SPLITS contiguous parts added in part order by a row tile's last CTA; up to 16 rows also as the staged tile (SW > 0): the same MMAs in the same order, each step's activations staged once a CTA in shared memory; every weight format a Row decoder over the kernel core's (INT4 with a zero point as two BF16 parts, each MMA run on both)",
+      "what": "1 to 64 rows on mma.m16n8k16 (BF16 operands, FP32 sums): a warp's 16 x GROUPS matrix rows the A operand, 8 activation rows a column the B operand, K's steps in the matrix's splits (order_splits: the shipped table's count for the shape, else its rule; never tuned), contiguous parts added in part order by a row tile's last CTA; up to 16 rows also as the staged tile (SW > 0): the same MMAs in the same order, each step's activations staged once a CTA in shared memory; every weight format a Row decoder over the kernel core's (INT4 with a zero point as two BF16 parts, each MMA run on both)",
       "call": "mm_rows",
       "rows": [
         1,
@@ -73,24 +73,6 @@
           "order": true,
           "what": "warps a CTA"
         },
-        "SPLITS": {
-          "values": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            6,
-            8,
-            12,
-            16,
-            24,
-            32
-          ],
-          "default": 0,
-          "order": true,
-          "what": "parts of K's steps, one a CTA (the sums' order); 0: plan()'s rule from the multiprocessors' resident CTAs, as before the knobs; capped at the matrix's steps"
-        },
         "SW": {
           "values": [
             0,
@@ -112,10 +94,13 @@
       "yardstick": {
         "library": "NVFP4: flashinfer mm_bf16_fp4 (W4A16, backend cute-dsl-native) on the stored codes, block scales in its 128 x 4 layout once, per-row inverse scale left out; BF16: cuBLAS (torch.matmul); FP8: cuBLAS on the values times row scales widened to BF16 once (no library takes FP8 weights against BF16 activations); INT4 with a zero point: torch's W4A16 INT4 group GEMM (torch._weight_int4pack_mm, tinygemm) on the same codes repacked once"
       },
-      "bench": "bench.py:DecodeTile"
+      "bench": "bench.py:DecodeTile",
+      "retired_knobs": {
+        "SPLITS": "the sums' order (the splits of K) is the matrix's alone (order_splits: the shipped orders.py table, else its rule), never a tuning's: a tuning written with it still loads, the knob dropped"
+      }
     },
     "fp4-tile": {
-      "what": "W4A4 rows on the block-scaled FP4 MMA (mma.sync kind::mxf4nvf4 m16n8k64, sm_120 family): the activations quantized to NVFP4 by a pre-pass, E2M1 codes with their UE4M3 block scales on both operands, FP32 sums, SPLITS parts of K added in part order",
+      "what": "W4A4 rows on the block-scaled FP4 MMA (mma.sync kind::mxf4nvf4 m16n8k64, sm_120 family): the activations quantized to NVFP4 by a pre-pass, E2M1 codes with their UE4M3 block scales on both operands, FP32 sums, the matrix's splits of K (order_splits) added in part order",
       "call": "mm_rows",
       "rows": [
         1,
@@ -144,24 +129,6 @@
           "order": true,
           "what": "warps a CTA (one plan a matrix, as decode-tile's)"
         },
-        "SPLITS": {
-          "values": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            6,
-            8,
-            12,
-            16,
-            24,
-            32
-          ],
-          "default": 0,
-          "order": true,
-          "what": "parts of K's 128-value steps; 0: plan()'s rule from the FP4 MMA's resident CTAs"
-        },
         "HOIST": {
           "values": [
             1,
@@ -175,7 +142,10 @@
       "yardstick": {
         "library": "cuBLASLt's block-scaled NVFP4 GEMM (torch._scaled_mm, float4_e2m1fn_x2 with blocked UE4M3 scales); the activations quantized once outside the timed call, so the tile's pre-pass (about 1 us) is in its time only; per-row inverse scale left out"
       },
-      "bench": "bench.py:Fp4Tile"
+      "bench": "bench.py:Fp4Tile",
+      "retired_knobs": {
+        "SPLITS": "the sums' order (the splits of K) is the matrix's alone (order_splits: the shipped orders.py table, else its rule), never a tuning's: a tuning written with it still loads, the knob dropped"
+      }
     },
     "prompt-tile": {
       "what": "any number of rows with the decode tile's bits (mm_prompt): each output the same chain of mma.m16n8k16 the decode tile runs, a CTA of PW warps reusing each decoded weight for PT rows staged in shared memory (cp.async, PS buffers); with partial and counters, a tile's splits of K in PK CTAs (part 0 adds its splits' chains, every later split's chain is stored on its own, the tile's last CTA adds them in split order), so short prompts and narrow matrices fill the GPU",

@@ -1,5 +1,6 @@
 """gemma4-model as a whole engine (crit_models.testing): a Gemma 4 checkpoint against transformers'
 log-probabilities and greedy choices of the same checkpoint."""
+import json
 from pathlib import Path
 import unittest
 
@@ -69,12 +70,50 @@ class SandwichTests(t.Layout):
         shapes = [(layer.mixer.kv_heads, layer.mixer.head_dim, layer.mixer.window) for layer in model.decoder]
         self.assertEqual(shapes, [(2, 32, 24), (1, 64, 0), (2, 32, 24), (1, 64, 0)])
         self.assertEqual([layer.mixer.shared_values for layer in model.decoder], [False, True, False, True])
-        self.assertEqual(sorted(str(key) for key in model.kv_keys), ["('kv', 24)", "kv"])
+        # the full layers keep keys and values as one row a KV head (shared-kv-attention, the package's own)
+        self.assertEqual([type(layer.mixer).__name__ for layer in model.decoder],
+                         ["Attention", "SharedKVAttention"] * 2)
+        self.assertEqual(sorted(str(key) for key in model.kv_keys), ["('kv', 24)", "kv-once"])
         self.assertEqual([type(layer.ffn).__name__ for layer in model.decoder], ["ParallelMoE"] * 4)
         self.assertEqual([round(layer.res[4], 2) for layer in model.decoder], [0.5, 0.75, 1.0, 1.25])
         # the full layer's table is as wide as its head and turns its first quarter
         freqs = model.decoder[1].mixer.rope.freqs.tolist()
         self.assertEqual((len(freqs), sum(1 for f in freqs if f > 0)), (32, 8))
+
+
+    def test_shared_kv_rows_score_as_the_plain_attention_path_with_less_kv(self):
+        # One row a KV head, [values | rotated key dimensions] (64 + 16), read through latent attention, against the
+        # library's attention keeping keys and values apart (the layout's `otherwise`, which the same checkpoint gets
+        # where its config does not set attention_k_eq_v): both follow transformers, they differ within BF16's
+        # rounding, and the shared rows take less KV a position.
+        import shutil
+        from crit_core.engine import load
+        model = self.engine.model
+        pool = next(p for p in model.planned_pools() if p["key"] == "kv-once")
+        self.assertEqual((pool["kv_heads"], pool["head_dim"], pool["value_dim"], len(pool["layers"])), (1, 80, 0, 2))
+        apart = Path(self.temp.name) / "apart"
+        if not apart.exists():
+            shutil.copytree(self.model, apart)
+            config = json.loads((apart / "config.json").read_text(encoding="utf-8"))
+            config["attention_k_eq_v"] = False
+            (apart / "config.json").write_text(json.dumps(config), encoding="utf-8")
+        plain = load(self.package, apart, None, device=self.device)
+        self.engines.append(plain)
+        self.assertEqual([type(layer.mixer).__name__ for layer in plain.model.decoder], ["Attention"] * 4)
+        self.assertIn("attention_k_eq_v", plain.model.facts()["mixers_instead"]["full_attention"])
+        self.assertIsNone(model.facts()["mixers_instead"])
+        shared, apart = (e.info()["kv_bytes_per_token"] for e in (self.engine, plain))
+        self.assertEqual((shared, apart), (2 * 1 * 80 * 2, 2 * 1 * 128 * 2))   # two full layers, BF16 pages
+        (ids,) = self.prompts(1, 90)
+        found = [e.score(ids, 1, "prefill", top_k=1).target for e in (self.engine, plain)]
+        # Each engine's BF16 rounding moves this small model's log-probabilities by about 0.1 nat a position from
+        # transformers' FP32 (the class's mean_limit holds both): the two paths differ by no more than that.
+        gaps = [abs(a - b) for a, b in zip(*found)]
+        self.assertLess(sum(gaps) / len(gaps), self.mean_limit, gaps)
+        self.assertScores(self.engine, ids)
+        self.assertScores(plain, ids)
+        plain.close()
+        self.engines.remove(plain)
 
 
 # A release's own spelling of the Gemma 4 checkpoint (another decoder prefix, its layers numbered from 1, other part

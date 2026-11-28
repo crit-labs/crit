@@ -67,6 +67,10 @@ SERVED = ["prefill", "decode", "chat-json-v1", "chat-resident-v1", "chat-stream-
 
 
 class MeasureFixture(RunFixture):
+    # served() leaves the candidate with a passed serve --check and a completed Eval, where a measurement starts;
+    # a test that runs serve --check or Eval itself sets it False
+    evaluated = True
+
     content = "x" * 512  # the case's message: the workload's 512 prompt tokens
 
     def setUp(self):
@@ -88,18 +92,26 @@ class MeasureFixture(RunFixture):
     def served(self, adapter=ADAPTER, capabilities=SERVED, checks=True):
         """A packaged candidate whose package serves `adapter`; with `checks`, its checks recorded and passed, as
         crit run ... check --from-eval leaves them before measure."""
-        self.record = self.candidate()
+        earlier = getattr(self, "record", None)   # a later candidate plans from the one whose Eval it follows
+        self.record = self.candidate(**({"parent_candidate_id": earlier["candidate_id"]} if earlier else {}))
         candidate = self.record["candidate_id"]
         scripted_serving(self, capabilities)
         package = scripted_package(self.root / ("package-" + candidate), adapter)
         self.manifest = self.store.package(self.run_id, candidate, package, RECIPE)
+        if self.evaluated:   # a measurement starts on a completed Eval (crit.run.state)
+            self.eval_completed(candidate)
         if checks:
             self.checks(self.record, self.manifest)
         self.folder = self.directory / "candidates" / candidate
         return candidate
 
+    def attempts(self):
+        """The operations of the candidate's attempts, in order."""
+        return [read_json(path).get("operation") for path in sorted(self.folder.glob("attempts/*/reservation.json"))]
+
     def attempt(self):
-        return read_json(self.folder / "attempts/attempt-0001/result.json")
+        """The candidate's newest attempt's result (a measurement's follows the Eval served() leaves before it)."""
+        return read_json(sorted(self.folder.glob("attempts/attempt-*"))[-1] / "result.json")
 
     def benchmarks(self):
         return list((self.folder / "benchmarks").glob("*.json"))
@@ -121,7 +133,7 @@ class RunMeasureTests(MeasureFixture, unittest.TestCase):
         # crit serve's telemetry: 128 output tokens over 43 decode rounds.
         self.assertEqual(record["metrics"]["accepted_tokens_per_round"]["samples"], [128 / 43] * 3)
         self.assertEqual(record["extensions"], {"measured_by": "crit run measure", "served_by": "crit serve",
-                                                "attempt_id": "attempt-0001", "output_tokens": [128] * 3,
+                                                "attempt_id": "attempt-0002", "output_tokens": [128] * 3,
                                                 "sampling": {"temperature": 1.0}})
         for key in ("peak_vram_bytes", "minimum_free_vram_bytes", "peak_ram_bytes", "minimum_free_ram_bytes"):
             self.assertTrue(key in record["metrics"] or key in record["missing_metrics"], key)
@@ -134,7 +146,7 @@ class RunMeasureTests(MeasureFixture, unittest.TestCase):
         attempt = self.attempt()
         self.assertEqual((attempt["outcome"], attempt["cleanup_settled"]), ("completed", True))
         log = attempt["logs"][0]
-        self.assertEqual(log["path"], f"candidates/{candidate}/logs/measure-attempt-0001.log")
+        self.assertEqual(log["path"], f"candidates/{candidate}/logs/measure-attempt-0002.log")
         logged = (self.directory / log["path"]).read_text()
         self.assertIn(f"crit serve: loading {candidate} at 8,192 tokens of context", logged)
         self.assertIn("case-0001 rep 3: ttft", logged)
@@ -187,7 +199,7 @@ class RunMeasureTests(MeasureFixture, unittest.TestCase):
         self.store.seal(self.run_id, candidate, "built")
         with self.assertRaisesRegex(ValueError, "Sealed candidate is immutable"):
             measure.measure(self.store, self.run_id, candidate)
-        self.assertFalse((self.folder / "attempts").exists())
+        self.assertEqual(self.attempts(), ["eval"])   # no measurement was reserved
 
     def test_the_deadline_stops_the_served_engine_and_settles_a_timeout(self):
         self.case["messages"][0]["content"] = "hold" + "x" * 508
@@ -238,13 +250,13 @@ class RunMeasureTests(MeasureFixture, unittest.TestCase):
         attempt = self.attempt()
         self.assertEqual((attempt["outcome"], attempt["cleanup_settled"], attempt["logs"]), ("failed", False, []))
         self.assertEqual(self.benchmarks(), [])
-        self.assertTrue((self.folder / "logs/measure-attempt-0001.log").is_file())
+        self.assertTrue((self.folder / "logs/measure-attempt-0002.log").is_file())
 
     def test_a_late_completion_settles_as_a_timeout_and_records_no_benchmark(self):
         candidate = self.served()
 
         def after_deadline():
-            reservation = read_json(self.folder / "attempts/attempt-0001/reservation.json")
+            reservation = read_json(self.folder / "attempts/attempt-0002/reservation.json")
             return (timestamp_for_test(reservation["deadline_at"])
                     + timedelta(seconds=1)).isoformat()
         with patch.object(run_attempt, "now", after_deadline):   # the attempt settles at this time
@@ -284,13 +296,13 @@ class MeasureChecksTests(MeasureFixture, unittest.TestCase):
     def refused(self, pattern):
         with self.assertRaisesRegex(ValueError, pattern):
             measure.measure(self.store, self.run_id, self.record["candidate_id"])
-        self.assertFalse((self.folder / "attempts").exists())
+        self.assertEqual(self.attempts(), ["eval"])   # the Eval it was measured after, and no measurement
         self.assertEqual(self.benchmarks(), [])
 
     def test_measure_refuses_a_candidate_until_its_checks_are_recorded(self):
         candidate = self.served(checks=False)
         self.refused("^crit run measure refuses candidate-0001: its benchmarks would stay exploratory, since case-0001 "
-                     "has no arithmetic check; case-0001 has no functional check; case-0001 has no resources check\\. "
+                     "has no arithmetic check; case-0001 has no resources check\\. "
                      "Record its checks first: crit run \\.\\.\\. check --candidate candidate-0001 --from-eval records "
                      "the arithmetic, functional and resources checks of every case from its completed Eval \\(crit run "
                      "\\.\\.\\. eval --candidate candidate-0001\\), then measure\\. To measure it anyway \\(telemetry, "
@@ -302,11 +314,11 @@ class MeasureChecksTests(MeasureFixture, unittest.TestCase):
         # A benchmark binds each gate's latest check: a reported one, in a run that requires artifact_verified evidence,
         # until a verified one follows it.
         self.check("resources", evidence_level="reported")
-        self.refused("since resources check check-0003 \\(case-0001\\) is reported, the run requires artifact_verified "
+        self.refused("since resources check check-0004 \\(case-0001\\) is reported, the run requires artifact_verified "
                      "evidence\\. Record its checks first")
         self.check("resources")
         (record,) = measure.measure(self.store, self.run_id, candidate)
-        self.assertEqual([Path(ref["path"]).stem for ref in record["checks"]], ["check-0001", "check-0002", "check-0004"])
+        self.assertEqual([Path(ref["path"]).stem for ref in record["checks"]], ["check-0002", "check-0003", "check-0005"])
         series = read_json(self.folder / "telemetry.json")["series"][0]
         self.assertEqual((series["gates"]["arithmetic"], series["gates"]["functional"]), ("passed", "passed"))
 
@@ -315,7 +327,7 @@ class MeasureChecksTests(MeasureFixture, unittest.TestCase):
         self.check("arithmetic", "failed")
         self.check("functional")
         self.check("resources", "unverified")
-        lasting = ("since arithmetic check check-0001 \\(case-0001\\) failed; resources check check-0003 \\(case-0001\\) "
+        lasting = ("since arithmetic check check-0002 \\(case-0001\\) failed; resources check check-0004 \\(case-0001\\) "
                    "unverified\\. No later record undoes that, so candidate-0001 cannot become eligible: seal it built "
                    "\\(crit run \\.\\.\\. seal --candidate candidate-0001 --lifecycle built\\) and build the fix "
                    "as a new candidate \\(its plan repairs a failed check with a requirement lever serving "
@@ -347,9 +359,10 @@ class MeasureChecksTests(MeasureFixture, unittest.TestCase):
         self.assertIn("ERROR: crit run measure refuses candidate-0001", errors.getvalue())
         self.assertIn("crit run ... check --candidate candidate-0001 --from-eval", errors.getvalue())
         (record,) = measure.measure(self.store, self.run_id, candidate, exploratory=True)
-        self.assertEqual(record["checks"], [])
+        # it binds the one check recorded before it: serve --check's functional check
+        self.assertEqual([Path(ref["path"]).stem for ref in record["checks"]], ["check-0001"])
         self.assertEqual(read_json(self.folder / "telemetry.json")["series"][0]["qualification"], "exploratory")
-        logged = (self.folder / "logs/measure-attempt-0001.log").read_text()
+        logged = (self.folder / "logs/measure-attempt-0002.log").read_text()
         self.assertIn("crit run measure --exploratory: the benchmarks stay exploratory, since case-0001 has no "
                       "arithmetic check", logged)
         errors = io.StringIO()
@@ -367,7 +380,7 @@ class EarlyReplyTests(MeasureFixture, unittest.TestCase):
         self.assertEqual(record["extensions"]["output_tokens"], [40] * 3)
         self.assertEqual(record["metrics"]["accepted_tokens_per_round"]["samples"], [40 / 13] * 3)
         self.assertEqual(len(record["metrics"]["decode_tps"]["samples"]), 3)
-        logged = (self.folder / "logs/measure-attempt-0001.log").read_text()
+        logged = (self.folder / "logs/measure-attempt-0002.log").read_text()
         self.assertIn("the reply ended after 40 of 128 tokens", logged)
 
 
@@ -389,7 +402,7 @@ class UncapturedCaseTests(MeasureFixture, unittest.TestCase):
         candidate = self.served()
         with self.assertRaisesRegex(ValueError, "No retained chat request for the case"):
             measure.measure(self.store, self.run_id, candidate)
-        self.assertFalse((self.folder / "attempts").exists())
+        self.assertEqual(self.attempts(), ["eval"])   # no measurement was reserved
 
 
 class HostMemoryTests(unittest.TestCase):

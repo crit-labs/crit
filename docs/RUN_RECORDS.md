@@ -35,6 +35,7 @@ vram_headroom_gib = 0.25            # device memory free at the engine's peak (d
 context_reserve_gib = 3             # device memory kept out of the KV cache (default 3)
 context_tokens = 200000             # the context wanted, prompt plus output (default 200,000)
 eval_packages = "/srv/crit/packages" # reference package source, a folder or https URL; unset: none
+gpu_lock = "/var/lock/gpu.lock"     # the machine's shared GPU lock, an flock file preflight's loads take; unset: none
 ```
 
 `crit eval run` and `crit eval context` read `vram_headroom_gib`, `context_reserve_gib` and
@@ -48,8 +49,9 @@ Eval reads the same `settings.toml` as the run.
 | Action | Arguments / effect |
 | --- | --- |
 | `create` | `--record request.json [--from-engine ENGINE_DIR]`; new run and first segment; with an engine folder of a crit-hub checkout, the run starts from that engine ([origin engine](#origin-engine)) |
+| `preflight` | `[--budget-minutes 15] [--gpu-lock FILE] [--plugin-tests]`; before the build, on a created run: cuts the run's own checkpoint, packages the library's plugins at their defaults for it and serves it as `serve --check` does, with the scenarios its facts make meaningful, every size from the run; keeps the report in `preflight/KEY/` and records nothing else ([preflight](#preflight)) |
 | `resolve` | `--record inputs.json`; freezes verified model and input identities |
-| `next` | Prints the run's one next step: where the run and its open candidate stand ([states](#states)), the command to run and why |
+| `next` | Prints the run's one next step: where the run and its open candidate stand ([states](#states)), the command to run and why; before the first candidate, `preflight` while the run has no [preflight](#preflight) report for this crit and checkpoint, and the newest report's counts and failed scenarios beside every step |
 | `plan` | `--record plan.json [--check \| --draft]`; records the next candidate's plan after the parent stands on the [candidate ladder](#the-candidate-ladder) and before any code, freezes the parent's Eval and computes the priorities ([plan](#plan)); `--check` runs the same checks and prints the record, recording nothing; `--draft` writes the plan's skeleton to the `--record` file and prints the facts crit computes for it |
 | `candidate` | `--source DIR --record proposal.json`; allocates an ID, retains source |
 | `capture` | `[--case ID] [--text FILE] [--instruction TEXT] [--system TEXT] [--template-kwargs JSON] [--inputs INPUTS_JSON]`; before `resolve`, after `recon`: writes `captured/CASE/request.json`, a chat request whose messages render to the workload's `prompt_tokens` with recon's frozen `template_variables` under its own `chat_template_kwargs` (the given text or a neutral passage, cut to whole words and padded to the exact count), prints its manifest row and sets it in the inputs payload |
@@ -60,7 +62,7 @@ Eval reads the same `settings.toml` as the run.
 | `check`, `benchmark` | `--candidate ID --record payload.json`; appends evidence. `check --candidate ID --from-eval [ATTEMPT]` instead records every case's arithmetic, functional and resources check from the candidate's retained Eval result (default its newest; [Check](#check)) |
 | `measure` | `--candidate ID [--seconds N] [--exploratory]`; after `check --from-eval`: reserves a benchmark attempt, serves the packaged candidate through `crit serve`, streams every resident case's chat request to it, settles it and records one benchmark per case ([measured benchmarks](#measured-benchmarks)). Refuses, before reserving, a candidate whose checks would leave its benchmarks exploratory; `--exploratory` measures it anyway |
 | `serve` | `--candidate ID [--host HOST] [--port 8000] [--seconds N] [--check [--data DATA]] [--no-smoke] [--no-plugin-tests]`; reserves a check attempt, serves the packaged, not yet sealed candidate through `crit serve` at `http://HOST:PORT/v1` until Ctrl+C or the reservation's deadline, for the checks a candidate passes before sealing, and settles the attempt (log `logs/serve-ATTEMPT.log`); with `--check` crit first runs the package's plugin tests (`crit plugins test`, cached; `--no-plugin-tests` leaves them out), then the standard serving checks itself (consecutive greedy requests, a system message, streaming, a stop string, a client cancelling, a tool call and its result, log-probabilities, a template switch, each where declared, the prompt activations the candidate's plan declared against the ones the engine's facts say it serves, and stopping the engine) and [crit smoke](../smoke/README.md) at the run's context and again with the engine reopened at a quarter of it (`--no-smoke` leaves it out), with `--data` crit-eval's gate pre-check (its items hints, as crit-eval states them: reported and marked in the report, never failing the check, which the Eval's gates judge; a pre-check that cannot run fails it), keeps their report as `logs/serve-check-ATTEMPT.json` and records a functional check per case: the one check before a candidate's Eval or seal; `crit serve` serves the candidate once it is sealed. An [external engine](#external-engines) is started from its launch command instead and has no plugin tests |
-| `ablate` | `--candidate ID [--variant NAME ...] [--set ...] [--repetitions 3] [--rounds 1] [--data EVAL_DATA [--quality]] [--no-smoke] [--smoke-test TEST ...] [--seconds N]`; reserves a check attempt, serves the packaged, not yet sealed candidate built from plugins through `crit serve`, builds it again in the same resident host with each variant of its plugins, benches the run's resident cases and runs crit smoke on each, and keeps the report as `logs/ablation-ATTEMPT.json` ([ablation](#ablation)); an [external engine](#external-engines) is served A/B on the options it declares only With `--data` and `--quality` each variant's Eval quality texts are also scored against the reference by the run's drift budget in the first round (the variant's `quality`: state, budget_used, worst_set), so an option that approximates the model is judged by its drift too |
+| `ablate` | `--candidate ID [--variant NAME ...] [--set ...] [--repetitions 3] [--rounds 1] [--data EVAL_DATA [--quality]] [--no-smoke] [--smoke-test TEST ...] [--seconds N]`; reserves a check attempt, serves the packaged, not yet sealed candidate built from plugins through `crit serve`, builds it again with each variant of its plugins, each in a fresh host (one engine, one process; `crit run --same-host` keeps one host), benches the run's resident cases and runs crit smoke on each, and keeps the report as `logs/ablation-ATTEMPT.json` ([ablation](#ablation)); an [external engine](#external-engines) is served A/B on the options it declares only With `--data` and `--quality` each variant's Eval quality texts are also scored against the reference by the run's drift budget in the first round (the variant's `quality`: state, budget_used, worst_set), so an option that approximates the model is judged by its drift too |
 | `kernels` | `--candidate ID [--nvcc PATH] [--seconds N]`; an [external engine](#external-engines) only: reserves a check attempt, starts it with crit-eval's CUPTI tracer in its environment, sends each resident case once to warm and once traced, and keeps the kernels per phase as `logs/kernels-ATTEMPT.json`; where tracing is not possible (not Linux, no CUDA toolkit with CUPTI, no kernel recorded) the report says why. A plugin package is traced in process with `crit eval kernels --package` |
 | `profile` | `--candidate ID [--case ID] [--tokens 32] [--families JSON] [--nvcc PATH] [--hipcc PATH] [--seconds N]`; where a served engine's time goes per token: reserves a check attempt, serves the packaged, not yet sealed candidate (a plugin package through `crit serve` or an [external engine](#external-engines)) with the kernel profiler the run's device has in its environment (crit-eval's tracer: CUPTI on `cuda`, rocprofiler-sdk on `hip`; Linux), sends one short request of the case (default the run's first resident case, at `--tokens` output tokens) once to warm and once traced, and prints per prompt token (up to the first reply piece, per prompt token computed) and per decode token the GPU time, share and launches by kernel family (`matmul` for GEMV and GEMM, `attention`, `recurrence`, `norms`, `elementwise`, `routing`, `copies`, `other`; the built-in names include crit's own kernels), and the decode step's time against recon's plain-pass floor (`work/recon.json`'s placement: the path past the device its experts take, else the device). Kernel time is exclusive; the device's memory copies join `copies` with the time it only copied, so the families sum to its busy time. The families come from names (`crit.run.profile.FAMILIES`), after the rules `--families` gives (`[{"match": NAME_PART, "family": FAMILY}]`, text or a file); every name none classes counts as `other` and is listed. Keeps `logs/profile-ATTEMPT.json`; records no check and no benchmark; where profiling is not possible (a device without a profiler, not Linux, no toolkit, no kernel recorded) the report says why |
 | `eval` | `--candidate ID --data EVAL_DATA_DIR [--only PART] [--baseline RESULT|CANDIDATE] [--label TEXT] [--seconds N] [--stage 1|2|3|full] [--certify] [--budget-minutes N] [--resume [ATTEMPT]]`; on the [candidate ladder](#the-candidate-ladder) measures as far as the candidate's rung allows and refuses candidate 1; reserves a benchmark attempt, serves the packaged candidate through `crit serve`, scores the data's quality texts on the run's model unless stored, runs Eval over the chat API with the run's quality terms and `kv_tokens`, settles it and retains the result as `candidates/ID/eval/ATTEMPT.json` beside its journal `ATTEMPT.journal.jsonl` ([Eval evidence](#eval-evidence)); for a candidate created from a plan it writes the plan's [outcome](#outcome), and it prints the priorities the result's fractions give. `--resume` goes on from an attempt that stopped (default the newest with a journal) in a new attempt; `--baseline` takes a result's path (from the working directory or the run folder) or a candidate's id, for its newest completed Eval |
@@ -72,7 +74,7 @@ Eval reads the same `settings.toml` as the run.
 | `resume` | `--candidates N [--minutes N] [--attempt-limit N] [--external-agent-stopped]`; new segment for N more candidates on the ladder (`--minutes`: its safety window). `--quality-budget JSON`, `--exactness MODE`, `--approved-by NAME` amend quality terms from this segment on, recorded as the segment's `amendment` |
 | `cost` | `--transcript PATH [--transcript PATH ...] [--agent NAME] [--prices JSON] [--until TIMESTAMP]`; accounts the run's build cost from the agent's transcripts and writes `cost.json` ([cost](#cost)) |
 | `replay` | `--at CANDIDATE` or `--before PLAN`, `--out DIR [--count N] [--agent CMD]`; copies the run as it stood when the candidate's Eval finished (or just before the plan was recorded) into `DIR/replay-1` ... `DIR/replay-N`, for an agent to say what it would do next with today's crit and crit-eval; `--agent CMD` starts any harness on every replay at once and collects; `--collect` checks and lists the plans the replays wrote ([replays](#replays)) |
-| `show`, `recover` | Inspect; or prove abandoned ownership and rebuild active projections |
+| `show`, `recover` | Inspect (with the newest [preflight](#preflight) report's counts, `preflight`); or prove abandoned ownership and rebuild active projections |
 
 ## Payloads
 
@@ -222,6 +224,17 @@ open candidate is in one state:
 | `eval_stopped` | its newest Eval attempt stopped | `eval --resume` |
 | `evaluated` | a completed Eval | `check --from-eval`, then `measure`, then seal `completed` |
 | `running` | an attempt runs | wait, or settle it when its process is gone |
+
+The same table says which operations may start in each state (`crit.run.state.OPERATIONS`): `build` in `created` and
+`build_failed`; a check attempt (`serve`, `ablate`, `profile`, `record-routes`) on any packaged candidate; an Eval
+only after a passed `serve --check` (`serve_checked`, `eval_stopped` for its resume, `evaluated` for another); a
+benchmark (`measure`) only on a completed Eval (`evaluated`); a seal in any state but `running` and `sealed`. `reserve`
+holds every caller to this phase order with the table's reason (an Eval before `serve --check` passed, a measurement
+before an Eval), and no operation starts beside a running attempt or on a sealed candidate (`seal` refuses those
+too, so an interrupted attempt is settled first); next names only steps the table allows, and `next` and `show` list each
+candidate's `allowed` operations. A plan recorded again while the same plan is still open (no candidate built from
+it) is refused as the plan already recorded. A stop plan from the newest candidate on the ladder stands where that
+candidate has no completed Eval (it was sealed `built` below its rung's Eval) and so froze none.
 
 With every candidate sealed the next step is a candidate from a recorded plan, a new plan (`plan --draft`), or the
 stop. A candidate **qualifies** when it is sealed `completed` on the full rung, its certified Eval passed the gates,
@@ -823,6 +836,8 @@ run-ID/
     telemetry.json             active projection
     outcome.json, seal.json     final outcome and complete inventory
   cost.json                    build cost from the agent's transcripts (crit run cost)
+  preflight/KEY/               preflight.json and preflight.md: a preflight's report (crit run preflight)
+  .plugin-cache/               what the engines' plugins and the preflight build again at will (crit run stop removes it)
   chats/                       separate requests, replies and conversations
 ```
 
@@ -848,6 +863,51 @@ If sealing is interrupted after writing the outcome, repeat `seal` with the same
 lifecycle and failure. It preserves the original outcome and completes the seal.
 If the seal was already published, the retry verifies its inventory and updates only
 run state and history. A different outcome or damaged sealed artifact is rejected.
+
+## Preflight
+
+`crit run ... preflight` is the check before a build: crit's library at its defaults on the run's own checkpoint, in
+minutes and without an agent, so a toolkit bug the checkpoint's geometry exposes (a head width no kernel takes, a
+cache sized for another vocabulary, a pool that evicts what the prompt cache keeps) is seen before the build pays
+candidates for it. It needs a checkpoint folder of safetensors weights and a GPU, and it takes the machine's GPU
+lock for each load (`--gpu-lock`, else `CRIT_GPU_LOCK`, else `settings.toml`'s `gpu_lock`; empty: none) and crit's
+engine lock.
+
+It cuts the checkpoint (`crit.preflight.cut`: the decoder's first layers up to the first of every layer kind, the
+draft layer its model plugin reads, the lookup tables, every kept tensor byte for byte, a shard kept whole
+hard-linked) into `.plugin-cache/preflight/REVISION/`, prepares crit-eval's data for the cut, and packages one
+candidate of the library's plugins at their defaults for it in a run of its own beside the cut
+(`crit.preflight.candidate`: the finished model plugin of its model_type and the library's device plugin of every
+slot it calls, the router's rule from the checkpoint, the lookup tables off the device where the run's placement puts
+them there, elastic KV pools beside an expert cache). A checkpoint no finished model plugin serves gets a report
+saying so: the build writes that plugin first. Then one load per quality mode the run asks, `serve --check` of that
+candidate (its serving checks, crit smoke at the run's context and at smoke's lower one, the full-context prompt,
+crit-eval's gate pre-check) with these scenarios inside, as `crit.preflight.plan` finds them meaningful:
+
+| Scenario | Planned where | Sized by |
+| --- | --- | --- |
+| `short_request`, `cancel_in_prefill` | always | a 64k prompt or the run's context less 1,024 tokens, the smaller |
+| `prompt_32k` | the run's context holds it | 32,768 tokens |
+| `reopen_at_NNk` | the run's context is above smoke's lower one | smoke's lower context; fails where a closed engine's elastic ranges outlive it |
+| `concurrency` | always | the lanes the engine states: each request at once decodes what it decodes alone |
+| `prompt_cache_followup` | always | a first turn past the sliding window's ring (twice the window, at least 4,096 tokens, at most half the context): the follow-up's prompt cache must serve half of it |
+| `drafting_draft_layer`, `drafting_drafter_seam` | the checkpoint has a draft layer | the greedy reply through each drafter |
+| `drafting_companion` | the run names a companion drafter (request `drafters`, `recon --drafter`) | hidden-state-drafters' greedy reply against the reply without it |
+| a second load, `MODE/pressure` | routed experts the whole model keeps partly off the device at the run's context | a VRAM ballast leaves the cut its own room at the run's context and the whole model's share of its experts (crit-eval's placement on the run's device); the prompt ladder runs there |
+
+Prompts are sized by the tokens the engine counts for the filler text, so any tokenizer. Gates that judge a cut
+model's text against a whole model's (smoke's `fluent` and `recall`, a tool call's arguments) are reported skipped,
+self-consistency gates stay. Each load prints its ETA; a scenario the time budget (`--budget-minutes`, default 15) has
+no room for is left out and says so; the estimates come from the run's previous report, else first guesses. What the
+plan leaves out is in the report too, with why.
+
+The report, `preflight/KEY/preflight.json` and `preflight.md` (a scenario a row: scenario, state, seconds, detail),
+is keyed by crit's engine code (the commit's trees of `inference`, `cli`, `api`, `smoke`, `kernels`, `models` and
+`pyproject.toml`, with a digest of their uncommitted changes) and the checkpoint's revision (its config, index and
+weight file sizes), and holds the facts, the cut, the selection and the budget. `show` and `next` give its counts and
+failed scenarios. A failed scenario is toolkit feedback at the library's defaults: what the build will meet first,
+and may fix in its own candidate or report as a crit bug; it is never a gate a candidate must pass, and the run's
+records are unchanged by it.
 
 ## Replays
 

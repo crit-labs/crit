@@ -9,6 +9,10 @@
 
 namespace er = crit::techniques::exl3_rows;
 
+// The multiprocessors the untuned split rule counts: a definition (an RTX 5090's 170 SMs, where the rule was measured),
+// never this device's, so a row's sums take the same order on every GPU.
+constexpr int kOrderMultiprocessors = 170;
+
 namespace {
 int kind_of(const torch::Tensor& t, const char* what) {
     if (t.scalar_type() == torch::kFloat32) return 0;
@@ -66,9 +70,8 @@ void rotate(const torch::Tensor& rows, const std::optional<torch::Tensor>& pre,
 int64_t splits(const torch::Tensor& trellis, int64_t codebook, int64_t rows) {
     const er::Matrix w = matrix(trellis, codebook);
     const c10::cuda::CUDAGuard guard(trellis.device());
-    int count = 0;
-    cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, trellis.get_device());
-    return er::splits(w, static_cast<int>(rows), count);
+    // the order's multiprocessors, never this device's: a row's bits follow the splits
+    return er::splits(w, static_cast<int>(rows), kOrderMultiprocessors);
 }
 
 void tiles(const torch::Tensor& trellis, int64_t codebook, const torch::Tensor& xr, torch::Tensor& yr) {

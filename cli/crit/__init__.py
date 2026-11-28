@@ -1,5 +1,5 @@
 """crit: run records, Kernels, Eval dispatch and the serving API's command line."""
-__version__ = "0.24.0"
+__version__ = "0.25.0"
 
 
 def _models():

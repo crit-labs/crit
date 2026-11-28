@@ -3,6 +3,7 @@ kernels (a bf16 pool) and on the torch fallback (an fp32 pool), decode rows, ver
 and without log-sum-exps; sinks of -inf change no bit."""
 
 from crit_plugins import StepBatch
+from crit_plugins.device import DECODE, PREFILL
 from crit_plugins.testing import PluginTestCase
 
 USE = {"kv_cache": "attention-state"}
@@ -29,13 +30,13 @@ class SinkTests(PluginTestCase):
         def write(rows):
             batch = StepBatch.build(rows, device)
             slots = pool.reserve(batch)
-            k = torch.cat([keys[s][p:p + n] for s, p, n in rows]).to(device)
-            v = torch.cat([values[s][p:p + n] for s, p, n in rows]).to(device)
+            k = torch.cat([keys[s][p:p + n] for s, p, n, _ in rows]).to(device)
+            v = torch.cat([values[s][p:p + n] for s, p, n, _ in rows]).to(device)
             pool.write(0, slots, k, v)
             return batch
 
-        write([("a", 0, 40), ("b", 0, 20)])
-        batch = write([("a", 40, 1), ("b", 20, 30)])   # a decode row and a prompt row
+        write([("a", 0, 40, PREFILL), ("b", 0, 20, PREFILL)])
+        batch = write([("a", 40, 1, DECODE), ("b", 20, 30, PREFILL)])   # a decode row and a prompt row
         q = torch.randn(batch.tokens, 4, d, generator=torch.Generator().manual_seed(6)).to(device)
         sinks = torch.tensor([0.5, 6.0, float("-inf"), -1.0], device=device)
         out, lse = self.attention.forward(0, q, pool, batch, lse=True, sinks=sinks)
@@ -69,7 +70,7 @@ class SinkTests(PluginTestCase):
         g = torch.Generator().manual_seed(8)
         keys, values = torch.randn(90, 2, d, generator=g), torch.randn(90, 2, d, generator=g)
         pool.open("a")
-        for rows in ([("a", 0, 60)], [("a", 60, 30)]):   # a prompt, then a prompt row past the window
+        for rows in ([("a", 0, 60, PREFILL)], [("a", 60, 30, PREFILL)]):   # a prompt, then a prompt row past the window
             batch = StepBatch.build(rows, device)
             slots = pool.reserve(batch)
             pool.write(0, slots, keys[rows[0][1]:rows[0][1] + rows[0][2]].to(device),

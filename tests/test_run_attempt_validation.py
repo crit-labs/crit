@@ -216,6 +216,7 @@ class AttemptReservationTests(AttemptFixture, unittest.TestCase):
         self.directory = self.store.directory(self.run_id)
         candidate = self.candidate()
         self.package(candidate)
+        self.serve_checked(candidate)   # an Eval starts after a passed serve --check (crit.run.state)
         reservation = self.store.reserve(self.run_id, candidate["candidate_id"], "eval")
         # Past the benchmark cap, up to the segment's deadline.
         self.assertGreater((timestamp(reservation["deadline_at"], "deadline")
@@ -250,23 +251,34 @@ class AttemptReservationTests(AttemptFixture, unittest.TestCase):
         build = self.store.reserve(self.run_id, candidate_id, "build", 10)
         self.assertIsNone(build["package_sha256"])
         package = self.package(candidate)
-        reservations = [build] + [self.store.reserve(self.run_id, candidate_id, operation, 10)
-                                  for operation in ("check", "benchmark")]
-        reservations += [self.store.reserve(self.run_id, None, operation, 10) for operation in ("agent", "discovery")]
-        for reservation in reservations:
+        # One attempt of a candidate at a time (crit.run.state's table: nothing starts beside a running attempt)
+        with self.assertRaisesRegex(ValueError, "is running, where crit run's check does not start"):
+            self.store.reserve(self.run_id, candidate_id, "check", 10)
+        reservations = [build]
+
+        def settled(reservation):
             self.store.settle(self.run_id, reservation, self.payload(
                 reservation, outcome="completed", exit_code=0, failure=None))
+            return reservation
+        settled(build)
+        reservations.append(settled(self.store.reserve(self.run_id, candidate_id, "check", 10)))
+        self.eval_completed(candidate_id)   # a measurement starts on a completed Eval (crit.run.state)
+        reservations.append(settled(self.store.reserve(self.run_id, candidate_id, "benchmark", 10)))
+        reservations += [self.store.reserve(self.run_id, None, operation, 10) for operation in ("agent", "discovery")]
+        for reservation in reservations[3:]:
+            settled(reservation)
         paths = [self.path(r, name) for r in reservations for name in ("reservation.json", "result.json")]
         retained = {p: p.read_bytes() for p in paths}
         projection = candidate_projection(self.directory, self.run, candidate_id)
-        self.assertEqual(projection["attempt_count"], 3)
+        self.assertEqual(projection["attempt_count"], 4)   # build, check, the Eval before the measurement, benchmark
         self.assertFalse(projection["unresolved_cleanup"])
         self.assertIsNotNone(projection["identities"]["package_sha256"])
         self.assertEqual(read_json(self.directory / f"candidates/{candidate_id}/package/manifest.json"), package)
-        self.assertEqual(self.store.recover(self.run_id)["state"]["budget"]["attempts"], 5)
+        self.assertEqual(self.store.recover(self.run_id)["state"]["budget"]["attempts"], 6)
         self.assertEqual(candidate_projection(self.directory, self.run, candidate_id), projection)
         self.assertEqual({p: p.read_bytes() for p in paths}, retained)
-        self.assertCountEqual(self.store.attempts(self.directory), reservations)
+        self.assertCountEqual([a for a in self.store.attempts(self.directory) if a["operation"] != "eval"],
+                              reservations)
 
 
 if __name__ == "__main__":

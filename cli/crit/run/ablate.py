@@ -341,7 +341,7 @@ def _external_variant(store, run_id, served, variant, cases, smoke, smoke_tests,
         if served.expired or isinstance(error, Expired):
             raise
         log(f"crit run ablate: {variant['name']} failed: {type(error).__name__}: {error}")
-        return dict(row, state="failed", detail=f"{type(error).__name__}: {error}"[:2000])
+        return _recheck(served, dict(row, state="failed", detail=f"{type(error).__name__}: {error}"[:2000]), log)
 
 
 def _round_seconds(wave):
@@ -407,6 +407,7 @@ def _variant(store, run_id, served, variant, cases, smoke, smoke_tests, log, jud
         log(f"crit run ablate: {variant['name']} ({shown}) is refused by its plugins: {variant['error']}")
         return dict(row, state="refused", detail=variant["error"])
     log(f"crit run ablate: {variant['name']}: {shown}")
+    closes = len(served.closes)
     try:
         started = time.perf_counter()
         # A variant is asked no prompt activations: it measures what other plugins or options serve (its facts say
@@ -431,7 +432,35 @@ def _variant(store, run_id, served, variant, cases, smoke, smoke_tests, log, jud
         if served.expired or isinstance(error, Expired):
             raise
         log(f"crit run ablate: {variant['name']} failed: {type(error).__name__}: {error}")
-        return dict(row, state="failed", detail=f"{type(error).__name__}: {error}"[:2000])
+        failed = dict(row, state="failed", detail=f"{type(error).__name__}: {error}"[:2000])
+        if row["name"] in ("full", "base"):
+            return _closed(served, closes, failed)
+        return _recheck(served, _closed(served, closes, failed), log)
+    return _closed(served, closes, row)
+
+
+def _recheck(served, row, log):
+    """A variant that failed: the engine as built is served again right after it. Where that fails too, the failure was
+    not the option's (the machine, the device, the host: an infrastructure failure), so the row says so
+    (`infrastructure`) and the verdicts blame nothing on it (crit_plugins.ablation: unmeasured)."""
+    try:
+        served.open()
+    except Exception as error:   # noqa: BLE001 - recorded: the variant's failure is then not the option's doing
+        if served.expired or isinstance(error, Expired):
+            raise
+        row["infrastructure"] = (f"the engine as built failed right after it too ({type(error).__name__}: "
+                                 f"{error})")[:2000]
+        log(f"crit run ablate: {row['name']}: the engine as built failed right after it too, so its failure is not "
+            "blamed on it")
+    return row
+
+
+def _closed(served, closes, row):
+    """A variant's row with how the engine served before it closed (crit serve's last_close, read by Served.open):
+    "previous_close" {returned, judged, message}. A close that kept memory refuses the variant's load (Core), so its
+    row fails with the report, and the previous variant is the one that leaked."""
+    if len(served.closes) > closes:
+        row["previous_close"] = {key: served.closes[closes].get(key) for key in ("returned", "judged", "message")}
     return row
 
 
@@ -451,7 +480,8 @@ def _quality_terms(store, root, run, attempt, data, kv_tokens):
 
 def _quality(judge, port, model_name, log, name):
     """The served variant's quality texts scored against the reference by the run's drift budget, as the gate
-    pre-check scores them (crit_eval.run.precheck.quality_item): {state, detail, budget_used, worst_set}. An option
+    pre-check scores them (crit_eval.run.precheck.quality_item): {state, detail, budget_used, worst_set, baseline: what
+    a plain 16-bit engine of the model uses of the same budget on that set, reported, never judged}. An option
     that approximates the model (fewer routed experts, a narrower KV) is judged by this, not by its speed."""
     from crit_eval.run.adapters import open_engine
     from crit_eval.run.chat import Server
@@ -462,9 +492,11 @@ def _quality(judge, port, model_name, log, name):
     item = quality_item(engine, info, judge["prepared"], judge["protocol"], judge["data"], judge["mode"],
                         judge["budget"], lambda line: log("crit run ablate: " + line))
     used = item.get("budget_used")
+    sixteen = (item.get("baseline") or {}).get("budget_used")
     log(f"crit run ablate: {name}: quality {item['state']}"
-        + (f", {used:.0%} of the drift budget (worst {item.get('worst_set')})" if used is not None else ""))
-    return {key: item[key] for key in ("state", "detail", "budget_used", "worst_set") if key in item}
+        + (f", {used:.0%} of the drift budget (worst {item.get('worst_set')})" if used is not None else "")
+        + (f", the 16-bit baseline {sixteen:.0%} of it there" if sixteen is not None else ""))
+    return {key: item[key] for key in ("state", "detail", "budget_used", "worst_set", "baseline") if key in item}
 
 
 def _bench(store, run_id, served, engine, port, load_ms, cases, smoke, smoke_tests, log, row, client=None):

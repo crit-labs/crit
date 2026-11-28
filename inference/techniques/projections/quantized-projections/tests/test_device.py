@@ -6,6 +6,7 @@ import struct
 import unittest
 
 from crit_plugins.testing import PluginTestCase
+from crit_plugins.testing import long_call
 
 
 def torch_rows(torch, rows, width=256, seed=21):
@@ -48,7 +49,8 @@ class DeviceMatrixTests(PluginTestCase):
     def test_bf16_and_fp8_matrices_multiply_as_their_values(self):
         torch = self.torch
         bf16 = self.plugin.load({"weight": self.w}, "bf16")
-        self.assertClose(self.plugin.matmul(self.x, bf16).float().flatten().tolist(),
+        self.assertClose(self.plugin.matmul(self.x, bf16,
+                                            prompt=long_call(self.x, self.plugin)).float().flatten().tolist(),
                          (self.x @ self.w.t()).flatten().tolist(), atol=0.05, rtol=0.02)
         scale = self.w.abs().amax(dim=1) / 448
         stored = (self.w / scale[:, None]).to(torch.float8_e4m3fn)
@@ -59,16 +61,16 @@ class DeviceMatrixTests(PluginTestCase):
             fp8 = plugin.load({"weight": stored, "scale": scale}, "fp8:channel")
             # Decode rows (up to 16): the prompt rows' E4M3 activations (at most a relative step of 1/16 per product),
             # or W8A16 (exact products in FP32 sums). Prompt rows: the E4M3 activations through cuBLASLt.
-            prompt = plugin.matmul(x, fp8, torch.float32).double()
+            prompt = plugin.matmul(x, fp8, torch.float32, prompt=long_call(x, plugin)).double()
             for rows, bound in ((7, 1e-5 if decode == "bf16" else 0.06), (16, 1e-5 if decode == "bf16" else 0.06),
                                 (40, 0.06)):
-                found = plugin.matmul(x[:rows], fp8, torch.float32).double()
+                found = plugin.matmul(x[:rows], fp8, torch.float32, prompt=long_call(x[:rows], plugin)).double()
                 self.assertLess(float((found - exact[:rows]).abs().max() / exact[:rows].abs().max()), bound,
                                 (decode, rows))
                 if decode == "prompt":   # the same quantized activations: decode and prompt rows differ in order only
                     self.assertLess(float((found - prompt[:rows]).abs().max() / prompt[:rows].abs().max()), 1e-5, rows)
             tensor = plugin.load({"weight": stored, "scale": scale.max()}, "fp8:tensor")
-            self.assertEqual(tuple(plugin.matmul(self.x, tensor).shape), (7, 96))
+            self.assertEqual(tuple(plugin.matmul(self.x, tensor, prompt=long_call(self.x, plugin)).shape), (7, 96))
             self.assertEqual(plugin.facts()["decode_activations"], {"fp8": "fp8" if decode == "prompt" else "bf16"})
             self.assertIn(plugin.facts()["decode_paths"]["fp8"][0], ("mma", "dot", "gemv", "cublaslt", "torch"))
 
@@ -83,7 +85,7 @@ class DeviceMatrixTests(PluginTestCase):
         x = torch.randn(40, 256, generator=torch.Generator().manual_seed(3)).cuda().to(torch.bfloat16)
         exact = x.double() @ values.t()
         for rows in (1, 9, 16, 40):   # decode rows (W8A16 GEMV) and prompt rows (exact BF16 values, torch's GEMM)
-            found = plugin.matmul(x[:rows], m, torch.float32).double()
+            found = plugin.matmul(x[:rows], m, torch.float32, prompt=long_call(x[:rows], plugin)).double()
             self.assertLess(float((found - exact[:rows]).abs().max() / exact[:rows].abs().max()), 1e-5, rows)
         self.assertEqual(plugin.facts()["prompt_activations"], {"mxfp8": "bf16"})
         with self.assertRaisesRegex(ValueError, "E8M0 scales"):
@@ -110,7 +112,8 @@ class DeviceMatrixTests(PluginTestCase):
             plugin = self.assemble(options={"prompt_gemm": gemm})["projections"]
             m = plugin.load(stored, "fp8:block")
             exact = x.double() @ codec.dense(m).double().t()
-            rows = {n: plugin.matmul(x[:n], m, torch.float32) for n in (1, 8, 9, 16, 40)}
+            rows = {n: plugin.matmul(x[:n], m, torch.float32,
+                                     prompt=long_call(x[:n], plugin)) for n in (1, 8, 9, 16, 40)}
             for n, y in rows.items():
                 self.assertLess(float((y.double() - exact[:n]).abs().max() / exact[:n].abs().max()), 0.06, (gemm, n))
             found[gemm] = rows
@@ -140,7 +143,8 @@ class DeviceMatrixTests(PluginTestCase):
             plugin = self.assemble(options={"prompt_gemm": "provider", "fp8_block_layout": layout})["projections"]
             m = plugin.load(stored, "fp8:block")
             self.assertEqual(m.layout, layout)
-            outs[layout] = {n: plugin.matmul(x[:n], m, torch.float32) for n in (1, 8, 9, 40)}
+            outs[layout] = {n: plugin.matmul(x[:n], m, torch.float32,
+                                             prompt=long_call(x[:n], plugin)) for n in (1, 8, 9, 40)}
         for n in outs["plain"]:
             self.assertTrue(torch.equal(outs["plain"][n].view(torch.int32), outs["visit"][n].view(torch.int32)), n)
         native = self.assemble(options={"prompt_gemm": "auto", "fp8_block_layout": "visit"})["projections"]
@@ -187,7 +191,8 @@ class DeviceMatrixTests(PluginTestCase):
             self.assertNotIn("scale_rows", m.tensors)   # the decode GEMV reads the blocked scales: no second copy
             values = codec.dense(m).double()
             weight_only = x.double() @ values.t()
-            found[decode] = [plugin.matmul(x[:rows], m, torch.float32).double() for rows in (1, 16, 40)]
+            found[decode] = [plugin.matmul(x[:rows], m, torch.float32,
+                                           prompt=long_call(x[:rows], plugin)).double() for rows in (1, 16, 40)]
             self.assertEqual(plugin.facts()["decode_activations"], {"nvfp4": "nvfp4" if decode == "prompt" else "bf16"})
             self.assertEqual(plugin.facts()["prompt_activations"], {"nvfp4": "stored"})
         prompt = found["prompt"][2]
@@ -209,7 +214,7 @@ class DeviceMatrixTests(PluginTestCase):
         decoded = (codec.decode_e2m1(codes.view(self.torch.uint8)).view(20, -1, 16)
                    * codec.from_blocked(scales, 20, 16).float()[..., None]).reshape(20, 256) / m.tensors["input_scale"]
         exact = decoded @ values.t()
-        found = self.plugin.matmul(x, m).float()
+        found = self.plugin.matmul(x, m, prompt=long_call(x, self.plugin)).float()
         self.assertLess(float((found - exact).abs().max() / exact.abs().max()), 0.01)
 
     def test_a_row_keeps_its_bits_alone_and_among_up_to_16_rows_in_every_format(self):
@@ -232,9 +237,10 @@ class DeviceMatrixTests(PluginTestCase):
             most = min(16, plugin.facts()["row_invariance"]["rows"])   # past 16: test_tiles
             self.assertIn(most, (8, 16))
             for out_dtype in (None, torch.float32):
-                alone = [plugin.matmul(x[r:r + 1].clone(), m, out_dtype)[0] for r in range(most)]
+                alone = [plugin.matmul(x[r:r + 1].clone(), m, out_dtype,
+                                       prompt=long_call(x[r:r + 1].clone(), plugin))[0] for r in range(most)]
                 for rows in range(2, most + 1):
-                    batch = plugin.matmul(x[:rows], m, out_dtype)
+                    batch = plugin.matmul(x[:rows], m, out_dtype, prompt=long_call(x[:rows], plugin))
                     for r in range(rows):
                         self.assertTrue(torch.equal(batch[r], alone[r]),
                                         (m.format, m.activations, m.decode, rows, r, out_dtype))
@@ -245,9 +251,10 @@ class DeviceMatrixTests(PluginTestCase):
         plugin = self.assemble(options={"activations": "bf16", "prompt_gemm": "fixed_tiles"})["projections"]
         x = torch.randn(300, 256, generator=torch.Generator().manual_seed(13)).cuda().to(torch.bfloat16)
         for m in (plugin.load({"weight": self.w}, "bf16"), plugin.load(stored, "nvfp4")):
-            whole = plugin.matmul(x, m)
+            whole = plugin.matmul(x, m, prompt=long_call(x, plugin))
             for first, rows in ((0, 17), (7, 40), (100, 200)):   # more rows than a decode call takes
-                self.assertTrue(torch.equal(plugin.matmul(x[first:first + rows].clone(), m), whole[first:first + rows]),
+                self.assertTrue(torch.equal(plugin.matmul(x[first:first + rows].clone(), m,
+                                                          prompt=long_call(x[first:first + rows].clone(), plugin)), whole[first:first + rows]),
                                 (m.format, first, rows))
         self.assertEqual(plugin.facts()["row_invariance"], {"rows": 16, "prompt_rows": True,
                                                              "prompt_exact": False})
@@ -281,7 +288,7 @@ class DeviceMatrixTests(PluginTestCase):
         for m in (plugin.load({"weight": self.w.cpu()}, "bf16"),
                   plugin.load({k: v.cpu() for k, v in stored.items()}, "nvfp4")):
             self.assertTrue(all(t.is_cuda for t in m.tensors.values() if hasattr(t, "is_cuda")), m.format)
-            self.assertEqual(tuple(plugin.matmul(self.x, m).shape), (7, 96))
+            self.assertEqual(tuple(plugin.matmul(self.x, m, prompt=long_call(self.x, plugin)).shape), (7, 96))
 
     def test_weight_only_nvfp4_multiplies_16_bit_activations_by_the_stored_values(self):
         # activations bf16: the GEMV (up to 8 rows) and the decoded GEMM (more) both give x times the stored values.
@@ -292,12 +299,13 @@ class DeviceMatrixTests(PluginTestCase):
         x = self.torch.randn(20, 256, generator=self.torch.Generator().manual_seed(9)).cuda().to(self.torch.bfloat16)
         for rows in (1, 2, 5, 8, 9, 20):
             exact = x[:rows].float() @ values.t()
-            found = plugin.matmul(x[:rows], m).float()
+            found = plugin.matmul(x[:rows], m, prompt=long_call(x[:rows], plugin)).float()
             self.assertLess(float((found - exact).abs().max() / exact.abs().max()), 1e-2, rows)
         # A decode row is the same alone and among up to 8 (the GEMV's order does not depend on the row count).
-        batch = plugin.matmul(x[:8], m)
+        batch = plugin.matmul(x[:8], m, prompt=long_call(x[:8], plugin))
         for t in range(8):
-            self.assertTrue(bool((plugin.matmul(x[t:t + 1], m) == batch[t:t + 1]).all()), t)
+            self.assertTrue(bool((plugin.matmul(x[t:t + 1], m,
+                                                prompt=long_call(x[t:t + 1], plugin)) == batch[t:t + 1]).all()), t)
 
     def test_weight_only_nvfp4_prompt_rows_differ_from_decode_rows_in_summation_order_only(self):
         # The prompt rows multiply e2m1 x scale (exact in BF16) and apply the inverse global scale to the FP32 sums,
@@ -308,8 +316,9 @@ class DeviceMatrixTests(PluginTestCase):
             plugin = self.assemble(options=options)["projections"]
             m = plugin.load(stored, "nvfp4")
             x = torch.randn(17, 256, generator=torch.Generator().manual_seed(14)).cuda().to(torch.bfloat16)
-            prompt = plugin.matmul(x, m, torch.float32)
-            decode = torch.cat([plugin.matmul(x[r:r + 1], m, torch.float32) for r in range(17)])
+            prompt = plugin.matmul(x, m, torch.float32, prompt=long_call(x, plugin))
+            decode = torch.cat([plugin.matmul(x[r:r + 1], m, torch.float32,
+                                              prompt=long_call(x[r:r + 1], plugin)) for r in range(17)])
             self.assertLess(float((prompt - decode).abs().max() / decode.abs().max()), 1e-5, options)
 
     def test_decode_rows_caps_the_rows_a_decode_call_takes_and_the_facts_promise(self):
@@ -325,7 +334,8 @@ class DeviceMatrixTests(PluginTestCase):
         x = torch.randn(9, 256, generator=torch.Generator().manual_seed(15)).cuda().to(torch.bfloat16)
         from crit_plugins.assemble import load_module
         matrices = load_module(self.registry()["quantized-projections"]).device_matrices
-        self.assertTrue(torch.equal(plugin.matmul(x, m), matrices._prompt_rows(x, m, None)))   # 9 rows: prompt rows
+        self.assertTrue(torch.equal(plugin.matmul(x, m,
+                                                  prompt=long_call(x, plugin)), matrices._prompt_rows(x, m, None)))   # 9 rows: prompt rows
         for rows in (7, 17):
             with self.subTest(rows=rows), self.assertRaisesRegex(ValueError, "8 to 16 rows"):
                 matrices.load(stored, "nvfp4", "cuda", decode_rows=rows)
@@ -340,11 +350,12 @@ class DeviceMatrixTests(PluginTestCase):
         # the slices below fill too few and take the small one: the switch keeps every row's order.
         rows_all = 45056
         x = torch.randn(rows_all, 256, generator=torch.Generator().manual_seed(4)).cuda().to(torch.bfloat16)
-        batch = plugin.matmul(x, m)
+        batch = plugin.matmul(x, m, prompt=long_call(x, plugin))
         exact = x.float() @ values.t()
         self.assertLess(float((batch.float() - exact).abs().max() / exact.abs().max()), 1e-2)
         for first, rows in ((0, 17), (17, 40), (300, 700), (rows_all - 17, 17)):
-            self.assertTrue(torch.equal(plugin.matmul(x[first:first + rows], m), batch[first:first + rows]),
+            self.assertTrue(torch.equal(plugin.matmul(x[first:first + rows], m,
+                                                      prompt=long_call(x[first:first + rows], plugin)), batch[first:first + rows]),
                             (first, rows))
         with self.assertRaises(ValueError):
             self.assemble(options={"activations": "bf16", "prompt": "fp8", "prompt_gemm": "fixed_tiles"})
@@ -359,7 +370,7 @@ class DeviceMatrixTests(PluginTestCase):
         for role, arith in (("gate_up", "fp8"), ("down", "bf16"), ("qkv", "fp16_acc"), (None, "fp16_acc")):
             m = plugin.load(stored, "nvfp4", role=role)
             self.assertEqual(m.prompt, arith, role)
-            found = plugin.matmul(x, m).float()
+            found = plugin.matmul(x, m, prompt=long_call(x, plugin)).float()
             self.assertLess(float((found - exact).abs().max() / exact.abs().max()), 5e-2, role)
         self.assertEqual(plugin.facts()["prompt_activations"]["nvfp4_by_role"], {"gate_up": "fp8", "down": "bf16"})
         with self.assertRaises(ValueError):
@@ -403,13 +414,15 @@ class DeviceMatrixTests(PluginTestCase):
             self.assertEqual(m.decode_rows, 8 if path == "triton" else 16)
             exact = x[:8].float() @ codec.dense(m).t()
             for dtype in (None, torch.float32):
-                batch = plugin.matmul(x[:8], m, dtype)
+                batch = plugin.matmul(x[:8], m, dtype, prompt=long_call(x[:8], plugin))
                 for rows in (1, 3, 8, *((12, 16) if path != "triton" else ())):
                     for r in range(rows):
-                        alone = plugin.matmul(x[r:r + 1].clone(), m, dtype)
-                        self.assertTrue(torch.equal(alone[0], plugin.matmul(x[:rows], m, dtype)[r]), (path, rows, r))
+                        alone = plugin.matmul(x[r:r + 1].clone(), m, dtype,
+                                              prompt=long_call(x[r:r + 1].clone(), plugin))
+                        self.assertTrue(torch.equal(alone[0], plugin.matmul(x[:rows], m, dtype,
+                                                                            prompt=long_call(x[:rows], plugin))[r]), (path, rows, r))
                 self.assertLess(float((batch.float() - exact).abs().max() / exact.abs().max()), 1e-2, path)
-            found[path] = plugin.matmul(x[:8], m, torch.float32)
+            found[path] = plugin.matmul(x[:8], m, torch.float32, prompt=long_call(x[:8], plugin))
             # 16-bit FP16 activations, a misaligned view and an output of another dtype take the same path.
             wide = torch.zeros(3, 260, dtype=torch.bfloat16, device="cuda")   # rows 8 bytes off 16-byte boundaries
             wide[:, 4:] = x[:3]
@@ -456,7 +469,7 @@ class DeviceMatrixTests(PluginTestCase):
         codec, stored = self.nvfp4_weight()
         plugin = self.assemble(options={"activations": "bf16", "prompt_gemm": "fixed_tiles"})["projections"]
         m = plugin.load(stored, "nvfp4")
-        plugin.matmul(torch_rows(self.torch, 20), m)
+        plugin.matmul(torch_rows(self.torch, 20), m, prompt=long_call(torch_rows(self.torch, 20), plugin))
         record = kernels.loaded()
         for name in ("decode-gemv", "fixed-tile-gemm"):
             self.assertIn(name, record)
@@ -476,10 +489,10 @@ class DeviceMatrixTests(PluginTestCase):
             plugin = self.assemble(options={"activations": "bf16", "prompt": prompt})["projections"]
             m = plugin.load(stored, "nvfp4")
             exact = x.float() @ codec.dense(m).t()
-            found = plugin.matmul(x, m)
+            found = plugin.matmul(x, m, prompt=long_call(x, plugin))
             self.assertEqual(found.dtype, dtype, prompt)
             self.assertLess(float((found.float() - exact).abs().max() / exact.abs().max()), bound, prompt)
-            one = plugin.matmul(x[:1], m).float()
+            one = plugin.matmul(x[:1], m, prompt=long_call(x[:1], plugin)).float()
             self.assertLess(float((one - exact[:1]).abs().max() / exact[:1].abs().max()), 1e-2, prompt)
 
     def test_it_reports_the_prompt_activations_of_what_it_loaded(self):
@@ -505,9 +518,10 @@ class DeviceMatrixTests(PluginTestCase):
         for activations in ("nvfp4", "bf16"):
             plugin = self.assemble(options={"activations": activations})["projections"]
             x = self.x.to(self.torch.bfloat16)
-            together = plugin.matmul(x, plugin.load(stacked, "nvfp4")).float()
-            apart = self.torch.cat([plugin.matmul(x, plugin.load(first, "nvfp4")),
-                                    plugin.matmul(x, plugin.load(second, "nvfp4"))], dim=1).float()
+            together = plugin.matmul(x, plugin.load(stacked, "nvfp4"), prompt=long_call(x, plugin)).float()
+            apart = self.torch.cat([plugin.matmul(x, plugin.load(first, "nvfp4"), prompt=long_call(x, plugin)),
+                                    plugin.matmul(x, plugin.load(second, "nvfp4"),
+                                                  prompt=long_call(x, plugin))], dim=1).float()
             self.assertLess(float((together - apart).abs().max()), float(apart.abs().max()) * 1e-2, activations)
 
     def test_a_projection_captures_in_a_cuda_graph(self):
@@ -518,15 +532,15 @@ class DeviceMatrixTests(PluginTestCase):
             plugin = self.assemble(options={"activations": activations})["projections"]
             m = plugin.load(stored, "nvfp4")
             x = self.x[:1].to(torch.bfloat16).clone()
-            eager = plugin.matmul(x, m)
+            eager = plugin.matmul(x, m, prompt=long_call(x, plugin))
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
-                plugin.matmul(x, m)
+                plugin.matmul(x, m, prompt=long_call(x, plugin))
             torch.cuda.current_stream().wait_stream(stream)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                out = plugin.matmul(x, m)
+                out = plugin.matmul(x, m, prompt=long_call(x, plugin))
             graph.replay()
             torch.cuda.synchronize()
             self.assertTrue(bool((out == eager).all()), activations)
@@ -629,14 +643,15 @@ class DraftEncodingTests(PluginTestCase):
         self.assertEqual((m.format, m.activations), ("nvfp4", "bf16"))   # W4A16: no calibrated activation scale
         x = torch.randn(9, 96, generator=torch.Generator().manual_seed(2)).to(self.where).to(torch.bfloat16)
         exact = x.double() @ self.matrices.dense(m).double().t()
-        found = plugin.matmul(x, m).double()
+        found = plugin.matmul(x, m, prompt=long_call(x, plugin)).double()
         self.assertLess(float((found - exact).abs().max() / exact.abs().max()), 1e-2)
         for rows in (2, 5, 8):
-            batch = plugin.matmul(x[:rows], m)
+            batch = plugin.matmul(x[:rows], m, prompt=long_call(x[:rows], plugin))
             for r in range(rows):
-                self.assertTrue(torch.equal(batch[r], plugin.matmul(x[r:r + 1].clone(), m)[0]), (rows, r))
+                self.assertTrue(torch.equal(batch[r], plugin.matmul(x[r:r + 1].clone(), m,
+                                                                    prompt=long_call(x[r:r + 1].clone(), plugin))[0]), (rows, r))
         if self.where == "cuda":   # FP8 through torch's scaled matmul (cuBLASLt)
-            self.assertEqual(tuple(plugin.matmul(x, head).shape), (9, 32))
+            self.assertEqual(tuple(plugin.matmul(x, head, prompt=long_call(x, plugin)).shape), (9, 32))
         facts = plugin.facts()
         self.assertEqual(facts["draft_encoding"], {
             "mtp.gate_up": {"stored": "bf16", "encoded": "nvfp4", "matrices": 2, "stored_bytes": 2 * 40 * 96 * 2,
@@ -697,11 +712,13 @@ class DraftEncodingTests(PluginTestCase):
                 if self.where == "cuda":   # the logits stay within FP8's rounding of the 16-bit head's
                     x = torch.randn(9, 96, generator=torch.Generator().manual_seed(2)).to(self.where).to(torch.bfloat16)
                     want = x.double() @ w.double().t()
-                    got = plugin.matmul(x, head, torch.float32).double()
+                    got = plugin.matmul(x, head, torch.float32, prompt=long_call(x, plugin)).double()
                     self.assertLess(float((got - want).abs().max() / want.abs().max()), 5e-2)
                     for r in range(9):   # each decode row's bits are its own
-                        self.assertTrue(torch.equal(plugin.matmul(x[r:r + 1].clone(), head, torch.float32)[0],
-                                                    plugin.matmul(x, head, torch.float32)[r]), r)
+                        self.assertTrue(torch.equal(plugin.matmul(x[r:r + 1].clone(), head, torch.float32,
+                                                                  prompt=long_call(x[r:r + 1].clone(), plugin))[0],
+                                                    plugin.matmul(x, head, torch.float32,
+                                                                  prompt=long_call(x, plugin))[r]), r)
         # A head stored quantized stays as stored, and a draft-only head is the drafter's (encode) in every mode.
         kernels.use_quality_mode("speed")
         plugin = self.assemble()["projections"]
@@ -747,9 +764,9 @@ class DraftEncodingTests(PluginTestCase):
                 self.assertEqual((odd.rows, odd.out_rows, padded.out_rows), (48, 40, None))
                 for n in (3, 300):   # decode rows and prompt rows
                     x = torch.randn(n, 96, generator=torch.Generator().manual_seed(n)).to(self.where).to(w.dtype)
-                    got = plugin.matmul(x, odd)
+                    got = plugin.matmul(x, odd, prompt=long_call(x, plugin))
                     self.assertEqual(tuple(got.shape), (n, 40))
-                    self.assertTrue(torch.equal(got, plugin.matmul(x, padded)[:, :40]), n)
+                    self.assertTrue(torch.equal(got, plugin.matmul(x, padded, prompt=long_call(x, plugin))[:, :40]), n)
                 self.assertEqual(facts["trunk_encoding"],
                                  {"stored": "bf16", "encoded": "fp8:channel", "matrices": 3,
                                   "stored_bytes": 2 * 32 * 96 * 2 + 40 * 96 * 2,

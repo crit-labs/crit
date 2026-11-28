@@ -87,6 +87,7 @@ class ExternalCandidateTests(ExternalFixture, unittest.TestCase):
             f"candidates/{candidate}/logs/engine-attempt-0001.log")]).read_text(encoding="utf-8"))
         self.assertEqual(self.started()["context"], ["8192"] * len(self.started()["server"]))
 
+        self.eval_completed(candidate)   # a measurement starts on a completed Eval (crit.run.state)
         (record,) = measure.measure(self.store, self.run_id, candidate)
         self.assertEqual(record["extensions"]["served_by"], external.SERVED_BY)
         self.assertEqual(len(record["metrics"]["decode_tps"]["samples"]), 3)
@@ -107,6 +108,7 @@ class ExternalCandidateTests(ExternalFixture, unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         candidate = self.external(render="text", checks=False)
+        self.serve_checked(candidate)   # Eval starts after a passed serve --check (crit.run.state)
         data = self.root / "eval-data"
         data.mkdir()
         write_data(data)
@@ -136,7 +138,8 @@ class ExternalCandidateTests(ExternalFixture, unittest.TestCase):
         self.assert_tree_gone()
 
     def test_ablation_serves_the_declared_options_and_says_which_pays(self):
-        candidate = self.external(options=FAST, extra=("--delay-ms", "8"))
+        # 40 ms a token: Windows sleeps in steps of about 15.6 ms, where 8 and 4 ms both slept one step
+        candidate = self.external(options=FAST, extra=("--delay-ms", "40"))
         found = ablate.ablate(self.store, self.run_id, candidate, repetitions=2, smoke=False)
         names = [row["name"] for row in found["variants"]]
         self.assertEqual(names, ["full", "set:fast=true"])

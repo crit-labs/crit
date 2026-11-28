@@ -14,7 +14,7 @@ crit_models.testing (the harness a model plugin's tests run on, an installed pac
 imports: a module of it that a file outside tests/ imports, directly or through another module of the package (whose
 __init__ runs with it), is runtime code and is read like any other.
 
-Three rules:
+Four rules:
 
 1. No model name. A model family's name (FAMILIES, and the first word of every model_type a models/cache plugin
    serves) starts no word of a shared file, whatever follows it, in any case: `LlamaForCausalLM`, `deepseekv3`,
@@ -41,6 +41,15 @@ Three rules:
    crit_models.testing.Respelled class (a GGUF is read back under the techniques' names before they see it); and each model technique
    (models/techniques/CATEGORY/ID) is composed by a layout whose plugin does. A technique one model uses today is
    fine: what it must be is built so another model's layout can use it, which rules 1 and 2 and these tests hold.
+
+4. A family's own code stays in its package. A finished model plugin may hold code only its family uses (a model
+   technique of its own under techniques/ID, laid out as models/techniques' are; a tool format), built from crit's
+   interfaces and engine-tested as a library technique is: its manifest's sources stay inside its folder or point into
+   shared code, its code names no other family package, its techniques are its manifest's own sources, give names no
+   library technique and no other family gives, and are composed by its own layout only. A piece a second family
+   needs moves to models/techniques (or inference/techniques) under its general name in the same change. No shared
+   file imports a family package: no shared manifest's source lies in models/cache, and no shared file names a
+   models/cache package.
 
 No debt and no allowlist of names: a shared file that names a model fails, wherever it is, and the fix is to move the
 name to the model plugin's layout or a test fixture, or to describe the shape or kind instead (or, for a format's or
@@ -361,12 +370,111 @@ def untested_techniques():
         problems += wrong
         if len(found) >= 2:
             tested |= _layout_blocks(json.loads(layout.read_text(encoding="utf-8")))
-    for entry in sorted((ROOT / "models/techniques").glob("*/*/entry.json")):
+    for entry in sorted((ROOT / "models/techniques").glob("*/*/entry.json")) + sorted(
+            (ROOT / "models/cache").glob("*/" + FAMILY_TECHNIQUES)):
         technique = json.loads(entry.read_text(encoding="utf-8"))
         provided = {name for names in technique.get("provides", {}).values() for name in names}
         if not provided & tested:
             problems.append(f"{technique['id']}: no model plugin's layout composes it with engine tests in two "
                             "checkpoint layouts")
+    return problems
+
+
+# A family's own pieces (models/cache/README.md): code in its finished model plugin that only that family uses.
+FAMILY_TECHNIQUES = "techniques/*/entry.json"   # a family's techniques, laid out as models/techniques' are
+CODE_SUFFIXES = (".py", ".cu", ".cuh", ".cpp", ".h", ".inc", ".in")
+
+
+def _plugin_folders(root):
+    return sorted(p.parent for p in (Path(root) / "models/cache").glob("*/plugin.json"))
+
+
+def _technique_names(entry):
+    return {name for names in entry.get("provides", {}).values() for name in names}
+
+
+def _own_code(folder):
+    """A family package's code files: every file under it but its tests, Markdown and JSON."""
+    return [path for path in sorted(Path(folder).rglob("*")) if path.is_file() and path.suffix in CODE_SUFFIXES
+            and "tests" not in path.relative_to(folder).parts[:-1] and "__pycache__" not in path.parts]
+
+
+def _package_pattern(ids):
+    """A package id as written (gemma4-model) or as a module name (gemma4_model), as a whole word."""
+    return re.compile("|".join(rf"(?<![\w-]){re.escape(i)}(?![\w-])|(?<!\w){re.escape(i.replace('-', '_'))}(?!\w)"
+                               for i in sorted(ids, key=len, reverse=True)) or r"(?!)")
+
+
+def family_problems(root=ROOT):
+    """[problems] of the rule that keeps a family's own code in its finished model plugin (models/cache/<family>): its
+    manifest's sources resolve inside its own folder or into shared code, never into another family's package; its
+    code names no other family package; each of its techniques (techniques/ID/entry.json) is mounted by its own
+    manifest from its own folder, gives names no library technique and no other family gives, and is composed by its
+    own layout and by no other family's: a piece a second family needs moves to models/techniques (or
+    inference/techniques) under its general name, in the same change."""
+    root = Path(root)
+    cache = (root / "models/cache").resolve()
+    folders = _plugin_folders(root)
+    library = {}
+    for path in sorted((root / "models/techniques").glob("*/*/entry.json")):
+        for name in _technique_names(json.loads(path.read_text(encoding="utf-8"))):
+            library[name] = path.parent.relative_to(root).as_posix()
+    problems, given, layouts = [], {}, {}
+    for folder in folders:
+        where = folder.relative_to(root).as_posix()
+        manifest = json.loads((folder / "plugin.json").read_text(encoding="utf-8"))
+        layout = folder / "layout.json"
+        layouts[folder.name] = (_layout_blocks(json.loads(layout.read_text(encoding="utf-8")))
+                                if layout.is_file() else set())
+        sources = manifest.get("sources", {})
+        for key, source in sources.items():
+            target = (folder / source).resolve()
+            if target.is_relative_to(cache) and not target.is_relative_to(folder.resolve()):
+                problems.append(f"{where}: source {key} is {source}, code of another family's package; a piece two "
+                                "families use is shared code (models/techniques, inference/techniques)")
+        others = _package_pattern([f.name for f in folders if f != folder])
+        for path in _own_code(folder):
+            for match in others.finditer(path.read_text(encoding="utf-8", errors="ignore")):
+                problems.append(f"{path.relative_to(root).as_posix()} names the package {match.group(0)}: a family's "
+                                "code uses its own package and shared code only")
+        for entry_path in sorted(folder.glob(FAMILY_TECHNIQUES)):
+            entry = json.loads(entry_path.read_text(encoding="utf-8"))
+            name = entry_path.relative_to(root).as_posix()
+            key, code = entry.get("source"), entry_path.parent / "code"
+            if key not in sources or (folder / sources[key]).resolve() != code.resolve():
+                problems.append(f"{name}: the package's manifest mounts it as its source {key!r} "
+                                f"(sources: {{{key}: {code.relative_to(folder).as_posix()}}})")
+            for technique in sorted(_technique_names(entry)):
+                if technique in library:
+                    problems.append(f"{name}: {technique} is the library technique {library[technique]}'s name")
+                if technique in given:
+                    problems.append(f"{name}: {technique} is given by {given[technique]} too")
+                given[technique] = name
+            if not _technique_names(entry) & layouts[folder.name]:
+                problems.append(f"{name}: its package's layout composes none of what it provides (a family's piece "
+                                "serves its family)")
+    for plugin, blocks in sorted(layouts.items()):
+        for technique in sorted(blocks):
+            owner = given.get(technique)
+            if owner is not None and not owner.startswith(f"models/cache/{plugin}/"):
+                problems.append(f"models/cache/{plugin}: its layout composes {technique}, which {owner} gives: a piece "
+                                "a second family needs moves to models/techniques under its general name")
+    return problems
+
+
+def shared_family_imports():
+    """[problems]: shared code that imports a family package: a shared manifest's source in models/cache, or a shared
+    file naming a models/cache package (by its id, or its id as a module name)."""
+    cache = (ROOT / "models/cache").resolve()
+    pattern = _package_pattern([folder.name for folder in model_plugins()])
+    problems = []
+    for path, text in _shared():
+        if path.name == "plugin.json":
+            for key, source in json.loads(path.read_text(encoding="utf-8")).get("sources", {}).items():
+                if (path.parent / source).resolve().is_relative_to(cache):
+                    problems.append(f"{relative(path)}: source {key} is a family package's code ({source})")
+        for match in pattern.finditer(text):
+            problems.append(f"{relative(path)} names the family package {match.group(0)}")
     return problems
 
 
@@ -404,6 +512,39 @@ class ModelNeutral(unittest.TestCase):
 
     def test_each_model_technique_is_engine_tested_in_two_checkpoint_layouts(self):
         self.assertEqual(untested_techniques(), [])
+
+    def test_a_familys_own_code_stays_in_its_package(self):
+        self.assertEqual(family_problems(), [])
+
+    def test_no_shared_code_imports_a_family_package(self):
+        self.assertEqual(shared_family_imports(), [])
+
+    def test_the_family_rule_sees_a_piece_out_of_its_package(self):
+        # Two family packages: one mounts the other's code and names it, its technique is not mounted by its
+        # manifest and takes a library technique's name, and the other family's layout composes it.
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "models/techniques/mixers/attention").mkdir(parents=True)
+            (root / "models/techniques/mixers/attention/entry.json").write_text(
+                json.dumps({"provides": {"blocks": ["attention"]}}), encoding="utf-8")
+            one, two = root / "models/cache/one-model", root / "models/cache/two-model"
+            (one / "techniques/own/code").mkdir(parents=True)
+            (two / "code").mkdir(parents=True)
+            files = {one / "techniques/own/entry.json": {"source": "own",
+                                                         "provides": {"blocks": ["own-block", "attention"]}},
+                     one / "plugin.json": {"sources": {"theirs": "../two-model/code"}},
+                     one / "layout.json": {"mixers": {"full_attention": {"block": "own-block"}}},
+                     two / "plugin.json": {"sources": {}},
+                     two / "layout.json": {"mixers": {"full_attention": {"block": "own-block"}}}}
+            for path, data in files.items():
+                path.write_text(json.dumps(data), encoding="utf-8")
+            (one / "techniques/own/code/own.py").write_text("from two_model import x\n", encoding="utf-8")
+            found = "\n".join(family_problems(root))
+        for wanted in ("source theirs is ../two-model/code", "names the package two_model",
+                       "mounts it as its source 'own'", "attention is the library technique",
+                       "two-model: its layout composes own-block"):
+            self.assertIn(wanted, found)
 
     def test_each_identifier_is_a_listed_formats_value_that_still_occurs(self):
         problems = []

@@ -13,6 +13,8 @@ residuals={"my-residual": MyResidual} for a way blocks join the residual stream.
 import json
 from pathlib import Path
 
+from crit_plugins.steps import CORE
+
 from .blocks import library
 from .model import ComposedModel
 from .residual import DEFAULT
@@ -26,12 +28,13 @@ KEYS = {"schema", "norm_offset", "mixers", "ffn", "draft", "pre_norm",
 # The options every composed model reads, with their defaults: this core's plugin.json declares the same
 # (tests/test_plugin.py holds them equal), and a model plugin takes them by extending it.
 DEFAULTS = {
-    "concurrency": 4, "pending": 2, "context": 4096, "kv_margin": 8192, "kv": "auto",
-    "prefill_chunk": 512, "span_seconds": 0.75, "passes": "auto", "pass_mib": 1024,
-    "activations_mib": 768, "release_below_mib": 640,   # release_below_mib: no longer read (Core's Steps.threshold)
+    # concurrency, pending, span_seconds and activations_mib: CORE (-1), Core's Steps decide (step contract 3)
+    "concurrency": CORE, "pending": CORE, "context": 4096, "kv_margin": 8192, "kv": "auto",
+    "prefill_chunk": 512, "span_seconds": float(CORE), "passes": "auto", "pass_mib": 1024,
+    "activations_mib": CORE, "release_below_mib": 640,   # release_below_mib: no longer read (Core's Steps.threshold)
     "prompt_cache": 1, "rounds": True, "prompt_buckets": "", "mtp": False, "width": 3, "widths": "",
     "width_policy": "fixed", "mtp_encode": "auto", "mtp_kv": "auto", "draft_head": "shared", "draft_head_slices": 8,
-    "kernel_tuning": "",
+    "kernel_tuning": "", "draft_folder": "",
 }
 
 
@@ -54,6 +57,9 @@ def check(layout, where="layout", blocks=None, residuals=None):
         for kind, spec in mixers.items():
             if not isinstance(spec, dict) or spec.get("block") not in known:
                 problems.append(f"{where}: mixers.{kind} names a block ({', '.join(sorted(known - {'auto'}))})")
+            elif "otherwise" in spec and spec["otherwise"] not in known - {"auto"}:
+                problems.append(f"{where}: mixers.{kind}.otherwise names the block its layers run where its block does "
+                                "not serve them (a block whose serves() says why not)")
     ffn = layout.get("ffn", {"block": "auto"})
     if not isinstance(ffn, dict) or ffn.get("block") not in known or any(
             ffn.get(key, "moe") not in known - {"auto"} for key in ("routed", "dense")):
@@ -61,9 +67,13 @@ def check(layout, where="layout", blocks=None, residuals=None):
                         "routed and dense layers)")
     draft = layout.get("draft")
     if draft is not None and (not isinstance(draft, dict) or draft.get("block") not in {"mtp", *drafts}
-                              or not draft.get("prefix")):
-        problems.append(f"{where}: draft is {{block, prefix}}, block mtp or a drafter technique's "
-                        f"({', '.join(sorted(drafts)) or 'none mounted'})")
+                              or not (draft.get("prefix") or draft.get("companion"))
+                              or (draft.get("companion") and (draft.get("block") == "mtp" or draft.get("prefix")
+                                                              or not isinstance(draft["companion"], str)))):
+        problems.append(f"{where}: draft is {{block, prefix}} (block mtp or a drafter technique's: "
+                        f"{', '.join(sorted(drafts)) or 'none mounted'}) for a draft block stored in the checkpoint, "
+                        "or {block, companion} for a drafter technique's companion folder (companion: its config's "
+                        "model_type, companion.py)")
     if not isinstance(layout.get("norm_offset", 0.0), (int, float)):
         problems.append(f"{where}: norm_offset is a number")
     residual = layout.get("residual", {"block": DEFAULT})
@@ -151,7 +161,7 @@ def resolve(context, options, dry, layout=LAYOUT, blocks=None, folder=None, resi
     checkpoint = handed if handed is not None else open_checkpoint(context.model, context.config, chosen)[0]
     shape = Shape(parse_model_config(context.config), options, chosen, blocks, checkpoint, residuals=residuals,
                   context_tokens=context.context_tokens, drafter=dry.plugin("drafter") is not None,
-                  steps=getattr(context, "steps", None))
+                  steps=getattr(context, "steps", None), facts=dry.facts)
     price = getattr(dry.module("kv_cache"), "position_bytes", None)
     return shape.kv_facts(price) if callable(price) else {}
 

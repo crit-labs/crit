@@ -198,12 +198,17 @@ def with_headroom(configuration, run):
     if stated is not None and stated != headroom:
         raise ValueError(f"configuration.vram_headroom_bytes {stated} differs from the run's VRAM headroom "
                          f"({headroom}): leave it out, crit writes the run's")
-    return {**configuration, "vram_headroom_bytes": headroom}
+    found = {**configuration, "vram_headroom_bytes": headroom}
+    # Where the run's headroom came from (its request's sources, crit_core.spec), carried into the engine's spec
+    source = (run["spec"]["hardware_constraints"].get("sources") or {}).get("vram_headroom_bytes")
+    if source:
+        found["provenance"] = {**(configuration.get("provenance") or {}), "vram_headroom_bytes": source}
+    return found
 
 
 # What crit completes in a candidate's configuration: the recon's frozen block, the exactness of its rows in full, the
 # run's quality mode and VRAM headroom, and the prompt activations its plan declared.
-COMPLETED = ("recon", "exactness", "quality_mode", "prompt_activations", "vram_headroom_bytes")
+COMPLETED = ("recon", "exactness", "quality_mode", "prompt_activations", "vram_headroom_bytes", "provenance")
 
 
 def before_completion(supplied, configuration):
@@ -316,9 +321,14 @@ class RunStore:
         prompt_path = safe_path(root, f"segments/{bounds['segment_id']}/agent_request.md")
         # The run's rung-unreachable state, and what it means for certification (crit.run.ladder).
         unreachable = ladder.unreachable(root)
+        # Each candidate's state and the operations the run's transition table lets start in it (crit.run.state)
+        from .state import candidate_state
+        states = {c["candidate_id"]: candidate_state(root, run, c["candidate_id"]) for c in candidates}
         return {"run": run, "state": state, "segment": bounds, "candidates": candidates, "errors": errors,
                 "folder": str(root), "prompt": prompt_path.read_text(encoding="utf-8"),
-                "ladder": {"rung_unreachable": unreachable, "certified": ladder.uncertified(root)}}
+                "ladder": {"rung_unreachable": unreachable, "certified": ladder.uncertified(root)},
+                "candidate_states": {cid: {"state": row["state"], "allowed": row["allowed"]}
+                                     for cid, row in states.items()}}
 
     @store_operation
     def list(self):
@@ -680,6 +690,16 @@ class RunStore:
         with lease(root):
             run, _, bounds = self._active(root)
             value = plans.build(root, run, bounds, data)
+            # The same request recorded again while the first is still open (plan --record run twice: no candidate
+            # built from it yet) is the plan already recorded, not a new one.
+            def asked(plan):   # what a plan's payload asked (its own fields, not crit's)
+                return digest({key: plan[key] for key in plans.FIELDS | plans.OPTIONAL if key in plan})
+            for summary in plans.summaries(root, run):
+                if (summary["segment_id"] == bounds["segment_id"] and summary["superseded_by"] is None
+                        and summary["candidate_id"] is None
+                        and asked(plans.load(root, run, summary["plan_id"])) == asked(value)):
+                    raise ValueError(f"This plan is recorded already, as {summary['plan_id']}: build from it, or record "
+                                     f"a revision that supersedes it (supersedes {summary['plan_id']})")
             plan_id = next_id(safe_path(root, "plans"), "plan")
             value = record("plan", run_id, plan_id=plan_id, **value)
             path = safe_path(root, f"plans/{plan_id}/plan.json")
@@ -854,6 +874,11 @@ class RunStore:
         root = self._recording(run_id)
         with lease(root):
             run, _, bounds = self._active(root)
+            if candidate_id:   # the one transition table (crit.run.state): where this operation may start
+                from .state import candidate_state, refusal
+                refused = refusal(operation, candidate_state(root, run, candidate_id))
+                if refused:
+                    raise ValueError(refused)
             cap = attempt_process_cap(bounds, candidate_id, operation)
             if sum(a["segment_id"] == bounds["segment_id"] for a in self.attempts(root)) >= bounds["limits"]["attempt_limit"]:
                 raise ValueError("Segment attempt limit exhausted")
@@ -983,6 +1008,11 @@ class RunStore:
                 if digest({key: outcome[key] for key in ("lifecycle", "failure")}) != digest({"lifecycle": lifecycle, "failure": failure}):
                     raise ValueError("Candidate outcome already exists with different lifecycle/failure")
             else:
+                # the one transition table (crit.run.state): never beside a running attempt, never twice
+                from .state import candidate_state, refusal
+                refused = refusal("seal", candidate_state(root, load_run(root), candidate_id), strict=False)
+                if refused:
+                    raise ValueError(refused)
                 if lifecycle == "completed":
                     self._unmeasured_cases(root, folder, candidate_id)
                 outcome = record("candidate_outcome", run_id, candidate_id=candidate_id, lifecycle=lifecycle, failure=failure, closed_at=now())

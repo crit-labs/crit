@@ -1,4 +1,6 @@
 """Layer-cut checkpoints: a real checkpoint with only a few of its decoder layers, every kept tensor byte for byte.
+The preflight (crit run ... preflight) serves the run's own checkpoint cut this way, the release-time stress test
+(tests/stress.py) the checkpoints it targets.
 
 A cut keeps the decoder layers that cover every kind of layer the model has, and everything outside the decoder
 layers a text model reads: embeddings, head, final norms, the draft (MTP) layer, lookup tables (hashed n-gram rows)
@@ -12,7 +14,7 @@ A shard all of whose tensors are kept under their own names is hard-linked into 
 file); any other shard is written again with its kept tensors only, their bytes copied as stored. So a cut of a
 checkpoint whose large lookup table sits in shards of its own costs the disk only its kept layers.
 
-    python tests/support/layer_cut.py SOURCE TARGET [--layers 0,1,2,3]
+    python -m crit.preflight.cut SOURCE TARGET [--layers 0,1,2,3] [--copy]
 
 Without --layers the cut keeps the decoder's first layers up to the first of every layer kind (layer_types), of
 every layer a `before` table joins (ple_layer_ids) and of a dense and a routed layer where both exist, so periodic
@@ -149,22 +151,38 @@ def _write_shard(source, target, renames):
                 left -= len(chunk)
 
 
-def cut(source, target, layers=None, link=True):
-    """Write the cut of checkpoint `source` into `target` (a new folder); returns a summary dict."""
+def shards(source):
+    """The checkpoint's safetensors files, relative to it: those its index names, then any other beside them."""
+    source = Path(source)
+    index = source / INDEX
+    found = sorted(set(json.loads(index.read_text(encoding="utf-8"))["weight_map"].values())) if index.is_file() \
+        else sorted(p.name for p in source.glob("*.safetensors"))
+    return found + sorted(p.relative_to(source).as_posix() for p in source.glob("*.safetensors")
+                          if p.relative_to(source).as_posix() not in found)
+
+
+def tensor_names(source):
+    """Every tensor name the checkpoint's safetensors headers hold (no tensor bytes read)."""
+    names = set()
+    for shard in shards(source):
+        _, header = _header(Path(source) / shard)
+        names.update(name for name in header if name != "__metadata__")
+    return names
+
+
+def cut(source, target, layers=None, link=True, draft_prefixes=DRAFT):
+    """Write the cut of checkpoint `source` into `target` (a new folder); returns a summary dict. draft_prefixes: the
+    prefixes of the draft layer's tensors, whose own layers.N are not the decoder's (a model plugin's layout names its
+    draft prefix)."""
     source, target = Path(source), Path(target)
     if target.exists() and any(target.iterdir()):
         raise ValueError(f"{target} is not empty")
     target.mkdir(parents=True, exist_ok=True)
     config = json.loads((source / "config.json").read_text(encoding="utf-8"))
     count = int(text_config(config)["num_hidden_layers"])
-    plan = Cut(default_layers(config) if layers is None else layers, count)
-    index = source / INDEX
-    shards = sorted(set(json.loads(index.read_text(encoding="utf-8"))["weight_map"].values())) if index.is_file() \
-        else sorted(p.name for p in source.glob("*.safetensors"))
-    shards += sorted(p.relative_to(source).as_posix() for p in source.glob("*.safetensors")
-                     if p.relative_to(source).as_posix() not in shards)
+    plan = Cut(default_layers(config) if layers is None else layers, count, draft_prefixes)
     weight_map, linked, written, copied = {}, [], [], 0
-    for shard in shards:
+    for shard in shards(source):
         _, header = _header(source / shard)
         header.pop("__metadata__", None)
         renames = {}

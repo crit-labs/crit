@@ -2,6 +2,7 @@
 first, a floor one past the highest page in use, and a borrower called before a page at or past its bound is handed
 out and after the floor falls to its low bound."""
 from crit_plugins import StepBatch
+from crit_plugins.device import DECODE, PREFILL
 from crit_plugins.testing import PluginTestCase
 
 
@@ -32,12 +33,12 @@ class LendingTests(PluginTestCase):
         pool = self.pool()
         for name in "ab":
             pool.open(name)
-        pool.reserve(StepBatch.build([("a", 0, 8), ("b", 0, 4)], self.device()))
+        pool.reserve(StepBatch.build([("a", 0, 8, PREFILL), ("b", 0, 4, PREFILL)], self.device()))
         self.assertEqual((pool.table("a"), pool.table("b"), pool.floor), ([0, 1], [2], 3))
         pool.close("a")
         self.assertEqual(pool.floor, 3)
         pool.open("c")
-        pool.reserve(StepBatch.build([("c", 0, 4)], self.device()))
+        pool.reserve(StepBatch.build([("c", 0, 4, PREFILL)], self.device()))
         self.assertEqual(pool.table("c"), [0])
         pool.close("b")
         self.assertEqual(pool.floor, 1)
@@ -53,9 +54,9 @@ class LendingTests(PluginTestCase):
         pool.on_reserve(lender)
         self.assertEqual(calls, [(0, 0, 16)])
         pool.open("a")
-        pool.reserve(StepBatch.build([("a", 0, 12)], self.device()))    # pages 0, 1, 2: below the bound
+        pool.reserve(StepBatch.build([("a", 0, 12, PREFILL)], self.device()))    # pages 0, 1, 2: below the bound
         self.assertEqual(len(calls), 1)
-        pool.reserve(StepBatch.build([("a", 12, 2)], self.device()))    # page 3: the bound
+        pool.reserve(StepBatch.build([("a", 12, 2, DECODE)], self.device()))    # page 3: the bound
         self.assertEqual(calls[-1], (4, 3, 13))    # told the new floor before the page left the free heap
         pool.keep("a", 4)                          # pages 1, 2, 3 freed: the floor falls to 1
         self.assertEqual(calls[-1][0], 1)

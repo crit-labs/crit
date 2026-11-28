@@ -54,6 +54,10 @@ def parser():
                              "crit installed without a checkout takes any folder (default: the current one)")
     parser.add_argument("--root", type=Path, help="Run root; defaults to PROJECT/runs")
     parser.add_argument("--id", help="Existing run identity")
+    parser.add_argument("--same-host", action="store_true",
+                        help="Reload engines in one resident host (serve --check's reopens, ablate's variants, the "
+                             "preflight's reopens, Eval's lower context) instead of one fresh host process an engine, "
+                             "the default (crit.run.served.Served)")
     subs = parser.add_subparsers(dest="action", required=True)
     for name, text in (("create", "Create a run and its first segment from a request"),
                        ("resolve", "Freeze the verified model and input identities"),
@@ -277,6 +281,20 @@ def parser():
     sub.add_argument("--agent", metavar="CMD", help="Start an agent on every replay at once with this command (any "
                      "harness; {brief}, {folder}, {root} and {number} name the replay's), wait for all, then collect")
     sub.add_argument("--collect", action="store_true", help="Instead: check and list the plans the replays under --out wrote")
+    sub = subs.add_parser("preflight", help="Before the build: cut the run's own checkpoint (the first layer of every "
+                                            "kind, the draft layer, the tables), package the library's plugins at "
+                                            "their defaults for it and serve it as serve --check does, with the "
+                                            "scenarios its facts make meaningful sized from the run; the report is "
+                                            "kept in RUN/preflight/KEY/ (crit.preflight). A failed scenario is "
+                                            "toolkit feedback at the library's defaults, not a gate")
+    sub.add_argument("--budget-minutes", type=float, default=None, metavar="MINUTES",
+                     help="The preflight's time budget, loads included: a scenario it has no room for is left out and "
+                          "says so (default 15)")
+    sub.add_argument("--gpu-lock", metavar="FILE", help="The machine's shared GPU lock, an flock file each load takes "
+                     "(default: CRIT_GPU_LOCK, else settings.toml's gpu_lock; empty for none)")
+    sub.add_argument("--plugin-tests", action="store_true", help="Also run the package's plugin tests first, as "
+                     "serve --check does (they test the library's plugins on tiny checkpoints, not this one; the "
+                     "release-time stress test runs them)")
     subs.add_parser("next", help="Print the run's one next step: where the run and its open candidate stand, the "
                                  "command to run and why (crit.run.state)")
     subs.add_parser("show", help="Print the run, its state and its candidates as JSON")
@@ -292,6 +310,9 @@ def main(argv=None):
         signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
     if args.action != "create" and not args.id:
         command.error("--id is required for an existing run")
+    if args.same_host:
+        from .served import Served
+        Served.one_process = False
     # Eval reads the machine's settings from the settings.toml this run reads, the project's.
     with named_project(args.project):
         return act(command, args)
@@ -330,6 +351,12 @@ def act(command, args):
         elif args.action == "next":
             from .state import render
             result = store.next(args.id)
+            print(render(result), file=sys.stderr)
+        elif args.action == "preflight":
+            from ..preflight.plan import BUDGET_MINUTES
+            from ..preflight.run import preflight, render
+            result = preflight(store, args.id, args.budget_minutes or BUDGET_MINUTES, args.gpu_lock,
+                               args.plugin_tests, log=lambda line: print(line, file=sys.stderr, flush=True))
             print(render(result), file=sys.stderr)
         elif args.action == "replay" and args.collect:
             from .replay import collect, render_collected
@@ -438,6 +465,8 @@ def act(command, args):
             result = store.recover(args.id)
         else:
             result = store.get(args.id)
+            from ..preflight.records import brief
+            result["preflight"] = brief(store.directory(args.id), result["run"]["spec"]["model_path"])
         print(json.dumps(result, indent=2, allow_nan=False))
         return 0
     except (ValueError, OSError, KeyError, TypeError, RecursionError) as exc:

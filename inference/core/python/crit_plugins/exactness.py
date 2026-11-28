@@ -35,6 +35,7 @@ structures a phase may run); the levels themselves are Core's (core/README.md#wh
 LEVELS = ("repeatable", "row-exact", "exact", "declared")   # from the least exact
 PHASES = ("decode", "prompt")
 QUALITY_MODES = ("preserve", "speed")
+DEFAULT_QUALITY_MODE = "speed"   # the mode a run, a plan or Eval judges in where it names none
 # The level each quality mode asks where an engine states none (the module's description), for both phases.
 MODE_LEVELS = {"preserve": "exact", "speed": "row-exact"}
 

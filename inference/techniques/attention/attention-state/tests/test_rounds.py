@@ -3,6 +3,7 @@ RoundBatch's slots computed on the device (in a CUDA graph too), lengths committ
 from types import SimpleNamespace
 
 from crit_plugins import StepBatch
+from crit_plugins.device import PREFILL
 from crit_plugins.device import RoundBatch
 from crit_plugins.testing import PluginTestCase
 
@@ -19,7 +20,7 @@ class RoundSlotTests(PluginTestCase):
     def prefill(self, pool, sequence, count, seed=0):
         pool.open(sequence)
         g = self.torch.Generator().manual_seed(seed)
-        batch = StepBatch.build([(sequence, 0, count)], self.dev)
+        batch = StepBatch.build([(sequence, 0, count, PREFILL)], self.dev)
         slots = pool.reserve(batch)
         for layer in (0, 1):
             pool.write(layer, slots, self.torch.randn(count, 2, 16, generator=g).to(self.dev),
@@ -260,7 +261,7 @@ class KeyRowsTests(PluginTestCase):
                 pool = kv.pool([0], 1, 32, 256, self.dev, dtype, value_dim=0)
                 self.assertEqual(pool.value_dim, 0)
                 pool.open("a")
-                batch = StepBatch.build([("a", 0, 40)], self.dev)
+                batch = StepBatch.build([("a", 0, 40, PREFILL)], self.dev)
                 keys = torch.randn(40, 1, 32, device=self.dev)
                 slots = pool.reserve(batch)
                 pool.write(0, slots, keys, None)
@@ -300,7 +301,7 @@ class KeyRowsTests(PluginTestCase):
         pool.set_scales(1, 0.25, 4.0)
         pool.open("a")
         keys = torch.randn(10, 2, 32, device=self.dev)
-        pool.write(1, pool.reserve(StepBatch.build([("a", 0, 10)], self.dev)), keys, keys)
+        pool.write(1, pool.reserve(StepBatch.build([("a", 0, 10, PREFILL)], self.dev)), keys, keys)
         # Read as bytes, as pages.py moves FP8 pages: torch indexes no FP8 tensor on the CPU (index_cpu).
         stored = pool.k[1].view(torch.uint8).view(-1, 2, 32)[
             torch.tensor(pool.table("a"), device=self.dev).repeat_interleave(16)[:10] * 16

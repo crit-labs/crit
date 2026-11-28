@@ -208,7 +208,9 @@ def bench(engine, store, data, out=None, project=ROOT, device=None, parts=None, 
     if "quality" in parts and not (data / STORE / "index.json").is_file():
         if reference:
             from crit_eval.quality.reference import score_data
-            log("crit bench: scoring the reference on the checkpoint (crit eval reference)")
+            # the scores, the allowance and the 16-bit baseline, each a pass score_data makes by default
+            log("crit bench: scoring the reference on the checkpoint (crit eval reference: the scores, the allowance "
+                "and the 16-bit baseline)")
             score_data(model, data, log)
         else:
             log(f"crit bench: {data} holds no reference scores for the checkpoint: measuring speed only (--reference "

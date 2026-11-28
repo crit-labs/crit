@@ -101,9 +101,11 @@ class DeviceTableTests(PluginTestCase):
                 with open(paths[-1], "wb") as handle:
                     handle.write(b"h" * 24 + part)
             return {"paths": paths, "offsets": [24, 24], "rows": [5, 8]}
+        plugin = self.assemble()["embeddings"]
+        # the reference plugin's assembly, closed before the harness checks that closing this one returned its memory
+        # (cleanups run last first): its tables are read after the harness's level
         other = assemble({"use": {"embeddings": "lookup-table-rows"}, "options": {}}, self.registry())
         self.addCleanup(other.close)
-        plugin = self.assemble()["embeddings"]
         self.assertIn("embeddings:host", self.registry()["memory-table-rows"]["provides"])
         ids = torch.tensor([12, 0, 5, 4, 12], device=device)
         plain = plugin.open(files(rows, "bf16"), 8, torch.bfloat16, device)

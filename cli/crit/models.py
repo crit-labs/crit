@@ -4,8 +4,13 @@
     crit models inspect MODEL                 what the checkpoint needs: the model plugin that serves it, the
                                               techniques that read its config keys and tensors, and what none reads
     crit models tiny MODEL --out DIR          a small random checkpoint of the same architecture, from its reference
+                                              (and of the companion drafter beside MODEL its model plugin reads,
+                                              beside DIR: --companion FOLDER names it, --no-companion leaves it)
+    crit models random --seed N --out DIR     a small random checkpoint of sampled geometry (head widths 32 to 512,
+                                              vocabularies to 300k, windows, mixed layer kinds: crit.preflight.geometry)
     crit models diff --model TINY             the model plugin against the reference on that checkpoint (--plugin
-                                              ENGINE/plugins/ID: the one being built)
+                                              ENGINE/plugins/ID: the one being built); a companion drafter beside
+                                              it is planned as the engine's draft head, and reported
     crit models cache add ENGINE/plugins/ID   keep a finished model plugin in the user's cache: crit plugins add ID
                                               then puts it into any engine
 
@@ -76,10 +81,51 @@ def techniques():
     return found
 
 
+def family_techniques(folder):
+    """[entry] of a finished model plugin's own techniques (FOLDER/techniques/*/entry.json), each with its folder."""
+    found = []
+    for path in sorted(Path(folder).glob("techniques/*/entry.json")):
+        found.append({**json.loads(path.read_text(encoding="utf-8")), "folder": str(path.parent)})
+    return found
+
+
+def family_pieces(folder):
+    """The pieces a model plugin holds of its own (models/cache/README.md, a family's own pieces): [{kind, id,
+    summary, provides}] of its techniques (techniques/*/entry.json, kind "technique") and its tool-call and reasoning
+    syntax (its manifest's tool_format and reasoning_format, kind the key, id FILE.py:NAME)."""
+    folder = Path(folder)
+    found = []
+    for path in sorted(folder.glob("techniques/*/entry.json")):
+        entry = json.loads(path.read_text(encoding="utf-8"))
+        found.append({"kind": "technique", "id": entry.get("id", path.parent.name), "summary": entry.get("summary", ""),
+                      "provides": entry.get("provides", {}), "folder": str(path.parent)})
+    manifest = json.loads((folder / MANIFEST).read_text(encoding="utf-8")) if (folder / MANIFEST).is_file() else {}
+    for key, what in (("tool_format", "the tool-call syntax its model writes"),
+                      ("reasoning_format", "the markers its model's reasoning is written between")):
+        if manifest.get(key):
+            found.append({"kind": key, "id": manifest[key], "summary": what, "provides": {}})
+    return found
+
+
+def companion_draft(plugin, folder):
+    """The draft entry of a finished model plugin's layout ({block, companion, ...}) where it reads the companion
+    drafter in `folder` (its config.json's model_type the layout's draft companion: models core companion.py), else
+    None. plugin: a model_plugins() row or None."""
+    draft = ((plugin or {}).get("layout") or {}).get("draft") or {}
+    if not draft.get("companion"):
+        return None
+    path = Path(folder) / "config.json"
+    try:
+        model_type = json.loads(path.read_text(encoding="utf-8")).get("model_type") if path.is_file() else None
+    except (OSError, ValueError):
+        return None
+    return draft if model_type == draft["companion"] else None
+
+
 def model_plugins(folders=None):
-    """[{id, title, model_types, folder, layout, where}] of the finished model plugins: crit's (models/cache,
+    """[{id, title, model_types, folder, layout, where, pieces}] of the finished model plugins: crit's (models/cache,
     where "library"), then the user's cache (where "cache") for the ids crit's does not hold. model_types: the
-    config model_types its manifest needs."""
+    config model_types its manifest needs; pieces: what it holds of its own (family_pieces)."""
     found, seen = [], set()
     for where, folder in (("library", CACHE), ("cache", user_cache())) if folders is None else folders:
         for path in sorted(Path(folder).glob(f"*/{MANIFEST}")) if Path(folder).is_dir() else ():
@@ -92,7 +138,7 @@ def model_plugins(folders=None):
                      for fact in ([need] if isinstance(need, str) else need) if fact.startswith("model_type:")]
             layout = path.parent / LAYOUT
             found.append({"id": ident, "title": manifest.get("title", ""), "model_types": types,
-                          "folder": path.parent, "where": where,
+                          "folder": path.parent, "where": where, "pieces": family_pieces(path.parent),
                           "layout": json.loads(layout.read_text(encoding="utf-8")) if layout.is_file() else {}})
     return found
 
@@ -179,7 +225,11 @@ def inspect(model):
         names = {rename(n, layout.get("names", [])): v for n, v in names.items()}
         layout_keys = {v for v in _strings(layout)} | set(layout.get("defaults", {}))
     patterns = sorted({pattern(n) for n in names})
-    listed = techniques()
+    # The library's techniques and the matched plugin's own (its family pieces), but those whose reads are a companion
+    # drafter's (entry "reads_of": "companion": its config keys and tensors are the companion folder's, which the
+    # target's config would match by name, a companion's hidden_size among them)
+    listed = [entry for entry in techniques() + (family_techniques(matched[0]["folder"]) if matched else [])
+              if entry.get("reads_of", "target") != "companion"]
     # What a checkpoint can show of a technique's reads: its config keys at the config's top level (ENTRY.KEY, a key
     # inside an entry, is not one) and its tensor suffixes. reads.layout names layout fields, which no checkpoint has.
     keys_of = {e["id"]: sorted(k for k in e["reads"]["config"] if "." not in k) for e in listed}
@@ -211,6 +261,27 @@ def inspect(model):
             "tensors": len(names)}
 
 
+def companions_near(model, plugin=None):
+    """The companion drafter folders near the checkpoint that its model plugin's layout reads as its draft block
+    (companion_draft), nearest first as the models core looks (companion.py: the checkpoint folder's siblings and
+    their subfolders, then one level up; never inside the checkpoint). plugin: a model_plugins() row (default: the
+    finished one that serves its model_type). [] where its layout reads no companion."""
+    plugin = plugin_for(_types(model)) if plugin is None else plugin
+    if not (((plugin or {}).get("layout") or {}).get("draft") or {}).get("companion"):
+        return []
+    checkpoint = Path(model).resolve()
+    found = []
+    for base in (checkpoint.parent, checkpoint.parent.parent):
+        siblings = sorted(p for p in base.iterdir() if p.is_dir()) if base.is_dir() else []
+        for folder in [f for s in siblings for f in [s] + sorted(p for p in s.iterdir() if p.is_dir())]:
+            if not folder.resolve().is_relative_to(checkpoint) and companion_draft(plugin, folder) \
+                    and folder not in found:
+                found.append(folder)
+        if found:
+            return found
+    return found
+
+
 # -- tiny ---------------------------------------------------------------------------------------------------------
 # Size keys and the value a tiny checkpoint gives them; every other key (layer kinds, loops, windows, routing) stays.
 TINY = {"hidden_size": 64, "intermediate_size": 128, "moe_intermediate_size": 32, "shared_expert_intermediate_size": 32,
@@ -239,10 +310,14 @@ def tiny_config(config, layers=None):
     return out
 
 
-def tiny(model, out, layers=None, trust_remote_code=False, seed=0):
+def tiny(model, out, layers=None, trust_remote_code=False, seed=0, companion=None):
     """A tiny random checkpoint of the model's architecture in `out`: its config shrunk (tiny_config), the
     reference's own modeling code (transformers, or the checkpoint's with trust_remote_code) given random weights,
-    saved as safetensors with the checkpoint's tokenizer and generation files. Returns out."""
+    saved as safetensors with the checkpoint's tokenizer and generation files. Returns out.
+
+    companion: the companion drafter folder to shrink beside it (tiny_companion, into OUT-companion, where the models
+    core finds it); None: the one companions_near finds beside `model` (none where it finds none; ValueError where
+    it finds several); False: none."""
     import torch
     import transformers
     out = Path(out)
@@ -259,6 +334,37 @@ def tiny(model, out, layers=None, trust_remote_code=False, seed=0):
                  "chat_template.jinja"):
         if (source / name).is_file() and not (out / name).exists():
             shutil.copy2(source / name, out / name)
+    if companion is None:
+        near = companions_near(source)
+        if len(near) > 1:
+            raise ValueError(f"{len(near)} companion drafters are beside {source} ({', '.join(map(str, near))}): "
+                             "--companion names the one to shrink")
+        companion = near[0] if near else False
+    if companion:
+        tiny_companion(companion, out.parent / f"{out.name}-companion", config, small, seed + 1)
+    return out
+
+
+def tiny_companion(companion, out, target, small, seed=1):
+    """The companion drafter `companion` shrunk beside a tiny target (`out`): its config by tiny_config, every
+    top-level width that was the target's hidden size (its backbone_hidden_size) the tiny target's, random weights
+    from the reference's own modeling code. target, small: the target's config.json before and after tiny_config.
+    Returns out."""
+    import torch
+    import transformers
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    config = json.loads((Path(companion) / "config.json").read_text(encoding="utf-8"))
+    shrunk = tiny_config(config)
+    hidden = (target.get("text_config") or target).get("hidden_size")
+    for key, value in config.items():
+        if key != "hidden_size" and isinstance(value, int) and not isinstance(value, bool) and value == hidden:
+            shrunk[key] = (small.get("text_config") or small)["hidden_size"]
+    (out / "config.json").write_text(json.dumps(shrunk, indent=2), encoding="utf-8")
+    torch.manual_seed(seed)
+    built = transformers.AutoConfig.from_pretrained(str(out))
+    drafter = transformers.AutoModelForCausalLM.from_config(built)
+    drafter.save_pretrained(str(out), safe_serialization=True)
     return out
 
 
@@ -267,19 +373,26 @@ def tiny(model, out, layers=None, trust_remote_code=False, seed=0):
 PLAIN = {"placement": "device-placement", "projections": "projections-dense",
          "attention": "softmax-attention", "kv_cache": "attention-state", "sampler": "token-sampling",
          "norms": "torch-norms", "embeddings": "memory-table-rows"}
-ROUTED = {"router": "topk-router", "experts": "experts-reference", "expert_source": "expert-tensors"}
 RECURRENT = {"recurrence": "sequential-recurrence"}
-SMALL = {"context": 1024, "kv_margin": 256, "prefill_chunk": 64, "activations_mib": 64, "concurrency": 4}
+from crit_models.engines import ROUTED, SMALL_OPTIONS as SMALL   # noqa: E402 - the small engine's, one definition
+# The drafter slot's plugin that drafts from a model's draft head, the head a companion drafter is planned as.
+COMPANION_DRAFTER = "greedy-head-drafter"
 
 
 MOUNTED = "crit_models_mounted"
 
 
-def mounted(key):
+def mounted(key, plugin=None):
     """The module of the technique the models core's manifest mounts as `key` (its code/KEY.py), imported the way
-    the core's package lays its sources out: for tests and tools that read a technique without loading an engine."""
+    the core's package lays its sources out: for tests and tools that read a technique without loading an engine.
+    plugin: the folder of a model plugin whose own source `key` is (a family's technique in its finished model
+    plugin), imported in that plugin's package, the core it extends beside it."""
     import importlib
     import types
+    if plugin is not None:
+        from crit_plugins.assemble import plugin_package
+        from crit_plugins.manifest import load_manifest
+        return importlib.import_module(f"{plugin_package(load_manifest(Path(plugin))).__name__}.{key}.{key}")
     if MOUNTED not in sys.modules:
         manifest = json.loads((TEMPLATE / "plugin.json").read_text(encoding="utf-8"))
         root = types.ModuleType(MOUNTED)
@@ -341,11 +454,12 @@ def reference_logprobs(model, ids, trust_remote_code=False):
         return torch.log_softmax(reference(torch.tensor([ids])).logits[0].float(), -1)
 
 
-def engine_scores(model, ids, use=None, plugin=None):
+def engine_scores(model, ids, use=None, plugin=None, info=None):
     """Each next token's log-probability as an engine of a model plugin scores `ids`: Core's loader over a package of
     the plugin, the models core it extends and the plain plugins of the slots it asks (selection_for), copied with
     crit plugins add. plugin: the folder of a model plugin in an engine (ENGINE/plugins/ID), the one being built:
-    the package is that engine's plugins as they are, and what the selection lacks is added from the library."""
+    the package is that engine's plugins as they are, and what the selection lacks is added from the library.
+    info: a dict the loaded engine's model info (engine.model.info()) is written into."""
     import tempfile
     from .plugins import IGNORE, add
     from crit_core.engine import load
@@ -366,12 +480,14 @@ def engine_scores(model, ids, use=None, plugin=None):
         lacking = sorted(set(use.values()) - {manifest["id"] for manifest in held})
         if lacking:
             add(package / "plugins", lacking)
-        configuration = {"plugins": {"use": use, "options": {use["model"]: dict(SMALL),
-                                                              **options_for(model, use, layout)}}}
+        own = dict(SMALL, **({"mtp": True} if use.get("drafter") else {}))
+        configuration = {"plugins": {"use": use, "options": {use["model"]: own, **options_for(model, use, layout)}}}
         (package / "configuration.json").write_text(json.dumps(configuration), encoding="utf-8")
         import torch
         engine = load(package, model, device="cuda" if torch.cuda.is_available() else "cpu")
         try:
+            if info is not None:
+                info.update(engine.model.info())
             return [float(x) for x in engine.score(ids, 1, "prefill", top_k=1).target]
         finally:
             engine.close()
@@ -381,7 +497,12 @@ def diff(model, use=None, tokens=24, seed=0, trust_remote_code=False, limit=0.25
     """A model plugin against the reference on `model` (a tiny checkpoint): both score one random token sequence.
     {positions, max_abs, mean_abs, first_divergent}: per position the difference of the next token's
     log-probability, and the first position past `limit` nats (None when every one is within it). plugin: the
-    folder of the model plugin being built (engine_scores), else the finished one for the model_type."""
+    folder of the model plugin being built (engine_scores), else the finished one for the model_type.
+
+    Where its model plugin's layout reads a companion drafter beside the checkpoint (companions_near), the engine
+    also plans it as its draft head (COMPANION_DRAFTER in the selection, the model's mtp on) and the result says
+    which folder it drafts from: {companion: {folder, kind, bytes_per_step}}. Its drafts are a GPU's (Core's
+    captured rounds); the scores stay the target's."""
     import random
     config = json.loads((Path(model) / "config.json").read_text(encoding="utf-8"))
     vocab = config.get("vocab_size") or config.get("text_config", {}).get("vocab_size")
@@ -389,10 +510,18 @@ def diff(model, use=None, tokens=24, seed=0, trust_remote_code=False, limit=0.25
     ids = [rng.randrange(min(vocab, 250)) for _ in range(tokens)]
     logp = reference_logprobs(model, ids, trust_remote_code)
     expected = [float(logp[i, ids[i + 1]]) for i in range(len(ids) - 1)]
-    errors = [abs(a - b) for a, b in zip(engine_scores(model, ids, use, plugin), expected)]
+    near = companions_near(model) if plugin is None else []
+    if near and use is None:
+        use = {**selection_for(model), "drafter": COMPANION_DRAFTER}
+    info = {}
+    errors = [abs(a - b) for a, b in zip(engine_scores(model, ids, use, plugin, info), expected)]
     first = next((i for i, e in enumerate(errors) if e > limit), None)
-    return {"positions": len(errors), "max_abs": max(errors), "mean_abs": sum(errors) / len(errors),
-            "first_divergent": first}
+    found = {"positions": len(errors), "max_abs": max(errors), "mean_abs": sum(errors) / len(errors),
+             "first_divergent": first}
+    if near and (use or {}).get("drafter"):
+        found["companion"] = {"folder": info.get("draft_folder"), "kind": info.get("drafter_kind"),
+                              "bytes_per_step": info.get("draft_bytes_per_step")}
+    return found
 
 
 # -- cache --------------------------------------------------------------------------------------------------------
@@ -497,6 +626,14 @@ def parser():
     made.add_argument("--layers", type=int, help="Decoder layers to keep (default: up to 4)")
     made.add_argument("--trust-remote-code", action="store_true",
                       help="Run the checkpoint's own modeling code (downloaded code: only on the user's word)")
+    made.add_argument("--companion", type=Path, help="The companion drafter folder to shrink beside it (default: "
+                      "the one its model plugin reads beside MODEL)")
+    made.add_argument("--no-companion", action="store_true", help="Shrink no companion drafter")
+    drawn = subs.add_parser("random", help="A small random checkpoint of sampled geometry (crit.preflight.geometry)")
+    drawn.add_argument("--seed", type=int, required=True)
+    drawn.add_argument("--out", type=Path, required=True)
+    drawn.add_argument("--family", help="dense, routed or windows (default: drawn from the seed)")
+    drawn.add_argument("--tokenizer", type=Path, help="A checkpoint folder whose tokenizer files to copy beside it")
     compared = subs.add_parser("diff", help="A model plugin against the reference on a tiny checkpoint")
     compared.add_argument("--model", type=Path, required=True)
     compared.add_argument("--tokens", type=int, default=24)
@@ -526,7 +663,9 @@ def main(argv=None):
         if args.command == "list":
             rows = {"techniques": [{k: e[k] for k in ("id", "category", "provides", "summary")} for e in techniques()],
                     "plugins": [{"id": p["id"], "model_types": p["model_types"], "where": p["where"],
-                                 "folder": str(p["folder"])} for p in model_plugins()]}
+                                 "folder": str(p["folder"]),
+                                 "pieces": [{k: v for k, v in piece.items() if k != "folder"} for piece in p["pieces"]]}
+                                for p in model_plugins()]}
             if args.json:
                 print(json.dumps(rows, indent=2))
             else:
@@ -536,6 +675,8 @@ def main(argv=None):
                 for c in rows["plugins"]:
                     kept = "" if c["where"] == "library" else f"  (your cache: {c['folder']})"
                     print(f"{c['id']:<32} {'model':<9} {', '.join(c['model_types'])}{kept}")
+                    for piece in c["pieces"]:   # the family's own pieces in it
+                        print(f"  {piece['kind'] + ': ' + piece['id']:<30} {piece['summary'][:80]}")
             return 0
         if args.command == "inspect":
             found = inspect(args.model)
@@ -553,7 +694,16 @@ def main(argv=None):
                     print("  tensor " + p)
             return 0
         if args.command == "tiny":
-            print(tiny(args.model, args.out, args.layers, args.trust_remote_code))
+            print(tiny(args.model, args.out, args.layers, args.trust_remote_code,
+                       companion=False if args.no_companion else args.companion))
+            return 0
+        if args.command == "random":
+            from .preflight import geometry
+            config = geometry.sample(args.seed, args.family)
+            folder = geometry.write(config, args.out, args.tokenizer, args.seed)
+            if folder is None:
+                raise ValueError(f"this transformers lacks {config['model_type']}")
+            print(f"{folder}: {geometry.geometry(config)}")
             return 0
         if args.command == "diff":
             selection = json.loads(args.selection.read_text(encoding="utf-8")) if args.selection else None
@@ -562,6 +712,10 @@ def main(argv=None):
             print(json.dumps(found, indent=2) if args.json else
                   f"{found['positions']} positions: max |dlogp| {found['max_abs']:.4f}, mean {found['mean_abs']:.4f}, "
                   f"first past 0.25 nats: {found['first_divergent']}")
+            if found.get("companion") and not args.json:
+                drafted = found["companion"]
+                print(f"draft head: {drafted['kind'] or 'none'} from {drafted['folder'] or 'no folder'} "
+                      f"({drafted['bytes_per_step'] or 0} bytes a draft step)")
             return 0 if found["first_divergent"] is None else 1
         if args.command == "cache":
             if args.action == "add":

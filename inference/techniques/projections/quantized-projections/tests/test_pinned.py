@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from crit_plugins.testing import PluginTestCase
+from crit_plugins.testing import long_call
 
 # (format, options, N, K, runs): runs, for NVFP4 W4A4, the rows of each global scale of a stacked matrix (q/k/v,
 # gate/up); the widths of a model of hidden size 5120 cut to keep 4096 calls short.
@@ -91,13 +92,15 @@ class PinnedTests(PluginTestCase):
             x = torch.randn(4096, k, generator=self.g).cuda().to(torch.bfloat16)
             for out in (None, torch.float32):
                 with self.subTest(format=format, options=options, out=out):
-                    whole = plugin.matmul(x, m, out)
+                    whole = plugin.matmul(x, m, out, prompt=long_call(x, plugin))
                     rows = range(17, 4097) if out is None else (17, 63, 64, 65, 127, 128, 129, 511, 513, 1025, 2049)
                     for count in rows:
-                        if not torch.equal(plugin.matmul(x[:count], m, out), whole[:count]):
+                        if not torch.equal(plugin.matmul(x[:count], m, out,
+                                                         prompt=long_call(x[:count], plugin)), whole[:count]):
                             self.fail(f"{format} {options}: the first {count} rows differ from the 4096-row call's")
                     for first, count in ((17, 40), (1025, 1023), (2048, 2048), (3000, 583)):
-                        self.assertTrue(torch.equal(plugin.matmul(x[first:first + count].clone(), m, out),
+                        self.assertTrue(torch.equal(plugin.matmul(x[first:first + count].clone(), m, out,
+                                                                  prompt=long_call(x[first:first + count].clone(), plugin)),
                                                     whole[first:first + count]), (first, count))
 
     def test_a_padded_bucket_replays_the_rows_of_a_longer_prompt(self):
@@ -111,11 +114,12 @@ class PinnedTests(PluginTestCase):
             table = torch.randn(97, k, generator=self.g).cuda().to(torch.bfloat16)
 
             def forward(batch):
-                return plugin.matmul(table.index_select(0, batch.tokens_t), m, torch.float32)
+                return plugin.matmul(table.index_select(0, batch.tokens_t), m, torch.float32,
+                                     prompt=long_call(table.index_select(0, batch.tokens_t), plugin))
             prompts = PromptGraphs(forward, device="cuda", buckets=(64, 128, 512))
             self.assertEqual(prompts.prepare(), [64, 128, 512])
             tokens = torch.randint(0, 97, (583,), generator=self.g).tolist()
-            whole = plugin.matmul(table[tokens], m, torch.float32)
+            whole = plugin.matmul(table[tokens], m, torch.float32, prompt=long_call(table[tokens], plugin))
             for count in (17, 23, 64, 65, 100, 128, 129, 300, 512):
                 out = prompts.run(0, 0, tokens[:count])
                 self.assertIsNotNone(out, count)
@@ -131,9 +135,9 @@ class PinnedTests(PluginTestCase):
                 provider = self.assemble(options={**options, "prompt_gemm": "provider"}, context=OnCuda())["projections"]
                 m, p = plugin.load(stored, format), provider.load(stored, format)
                 x = torch.randn(700, k, generator=self.g).cuda().to(torch.bfloat16)
-                pinned, theirs = plugin.matmul(x, m, torch.float32), provider.matmul(x, p, torch.float32)
+                pinned, theirs = plugin.matmul(x, m, torch.float32, prompt=long_call(x, plugin)), provider.matmul(x, p, torch.float32, prompt=long_call(x, provider))
                 self.assertLess(float((pinned - theirs).abs().max() / theirs.abs().max()), 2e-5)
-                bf16 = plugin.matmul(x, m)
+                bf16 = plugin.matmul(x, m, prompt=long_call(x, plugin))
                 self.assertEqual(bf16.dtype, torch.bfloat16)
                 self.assertLess(float((bf16.float() - theirs).abs().max() / theirs.abs().max()), 1e-2)
 
@@ -152,10 +156,12 @@ class PinnedTests(PluginTestCase):
             with self.subTest(format=format, options=options, shape=(n, k)):
                 plugin, m = self.loaded(format, options, n, k, runs)
                 x = torch.randn(4096, k, generator=self.g).cuda().to(torch.bfloat16)
-                whole = plugin.matmul(x, m)
+                whole = plugin.matmul(x, m, prompt=long_call(x, plugin))
                 for count in (17, 23, 64, 65, 129, 513, 1025, 2048, 2049):
-                    self.assertTrue(torch.equal(plugin.matmul(x[:count], m), whole[:count]), count)
-                self.assertTrue(torch.equal(plugin.matmul(x[1025:3073].clone(), m), whole[1025:3073]))
+                    self.assertTrue(torch.equal(plugin.matmul(x[:count], m,
+                                                              prompt=long_call(x[:count], plugin)), whole[:count]), count)
+                self.assertTrue(torch.equal(plugin.matmul(x[1025:3073].clone(), m,
+                                                          prompt=long_call(x[1025:3073].clone(), plugin)), whole[1025:3073]))
                 del whole, x, m
 
     def test_without_the_kernel_one_row_a_call_keeps_the_bits(self):
@@ -172,9 +178,10 @@ class PinnedTests(PluginTestCase):
                     self.assertIsNone(m.native_gemm)
                     self.assertTrue(plugin.facts()["row_invariance"]["prompt_rows"])
                     x = torch.randn(60, k, generator=self.g).cuda().to(torch.bfloat16)
-                    whole = plugin.matmul(x, m)
+                    whole = plugin.matmul(x, m, prompt=long_call(x, plugin))
                     for count in (17, 33, 59):
-                        self.assertTrue(torch.equal(plugin.matmul(x[:count], m), whole[:count]), count)
+                        self.assertTrue(torch.equal(plugin.matmul(x[:count], m,
+                                                                  prompt=long_call(x[:count], plugin)), whole[:count]), count)
 
     def test_the_contract_s_prompt_row_check_passes_and_other_prompts_are_refused(self):
         self.kernel_here()

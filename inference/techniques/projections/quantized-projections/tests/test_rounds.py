@@ -4,6 +4,7 @@ fallbacks alike."""
 import unittest
 
 from crit_plugins.testing import PluginTestCase
+from crit_plugins.testing import long_call
 
 # A wide projection (a fused q/k/v or gate/up) and a down projection of a model of hidden size 5120.
 SHAPES = ((10240, 5120), (5120, 17408))
@@ -40,9 +41,10 @@ class RoundTests(PluginTestCase):
     def check(self, plugin, m, k):
         torch = self.torch
         x = torch.randn(8, k, generator=self.g).cuda().to(torch.bfloat16)
-        alone = [plugin.matmul(x[r:r + 1].clone(), m, torch.float32)[0] for r in range(8)]
+        alone = [plugin.matmul(x[r:r + 1].clone(), m, torch.float32,
+                               prompt=long_call(x[r:r + 1].clone(), plugin))[0] for r in range(8)]
         for rows in range(1, 9):
-            batch = plugin.matmul(x[:rows], m, torch.float32)
+            batch = plugin.matmul(x[:rows], m, torch.float32, prompt=long_call(x[:rows], plugin))
             for r in range(rows):
                 self.assertTrue(torch.equal(batch[r], alone[r]), (m.format, m.decode, rows, r))
         for rows in (1, 3, 8):
@@ -50,16 +52,18 @@ class RoundTests(PluginTestCase):
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
-                plugin.matmul(static, m, torch.float32)   # the round's eager run before its capture
+                plugin.matmul(static, m, torch.float32,
+                              prompt=long_call(static, plugin))   # the round's eager run before its capture
             torch.cuda.current_stream().wait_stream(stream)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                captured = plugin.matmul(static, m, torch.float32)
+                captured = plugin.matmul(static, m, torch.float32, prompt=long_call(static, plugin))
             fresh = torch.randn(rows, k, generator=self.g).cuda().to(torch.bfloat16)
             static.copy_(fresh)
             graph.replay()
             torch.cuda.synchronize()
-            self.assertTrue(torch.equal(captured, plugin.matmul(fresh, m, torch.float32)), (m.format, m.decode, rows))
+            self.assertTrue(torch.equal(captured, plugin.matmul(fresh, m, torch.float32,
+                                                                prompt=long_call(fresh, plugin))), (m.format, m.decode, rows))
 
     def test_every_decode_arithmetic_captures_and_keeps_rows_at_real_widths(self):
         cases = [("bf16", {}), ("fp8:channel", {}), ("fp8:channel", {"decode_activations": "bf16"}), ("mxfp8", {}),
@@ -81,7 +85,7 @@ class RoundTests(PluginTestCase):
         static = torch.randn(5, 256, generator=self.g).cuda().to(torch.bfloat16)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):   # the load warmed every row count the GEMV takes
-            plugin.matmul(static, m)
+            plugin.matmul(static, m, prompt=long_call(static, plugin))
         import importlib
         from crit_plugins.assemble import load_module
         nvfp4 = importlib.import_module(load_module(self.registry()["quantized-projections"]).device_matrices.__package__
@@ -91,7 +95,7 @@ class RoundTests(PluginTestCase):
         try:
             with self.assertRaisesRegex(RuntimeError, "run the step once eagerly before capturing it"):
                 with torch.cuda.graph(torch.cuda.CUDAGraph()):
-                    plugin.matmul(static, m)
+                    plugin.matmul(static, m, prompt=long_call(static, plugin))
         finally:
             nvfp4._WARM.update(warm)
 

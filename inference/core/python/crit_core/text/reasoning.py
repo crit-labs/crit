@@ -24,11 +24,15 @@ class ReasoningFormat(NamedTuple):
     """A reasoning syntax: the literal markers around the thinking. A tokenizer may hold them as special tokens, which
     the reply text then has to keep (ResidentChat does). `delimiters="auto"` uses token identity for single special
     tokens when a tokenizer is supplied; `delimiters="text"` always matches their spelling. `repeated`: the
-    reasoning is a message of its own that a reply may open again after text (each opening marker more reasoning)."""
+    reasoning is a message of its own that a reply may open again after text (each opening marker more reasoning).
+    `label`: text right after the opening marker that names the channel the reasoning is written in (a template that
+    opens a named channel), dropped with the whitespace around it; reasoning that does not begin with it is kept
+    whole."""
     opening: str
     closing: str
     delimiters: str = "auto"
     repeated: bool = False
+    label: str = ""
 
 
 REASONING_FORMATS = {
@@ -71,6 +75,8 @@ class ReasoningSplitter:
         self.token_ids = marker_ids(tokenizer, (self.format.opening, self.format.closing), self.format.delimiters)
         self.state = "reasoning" if opened else "start"   # start -> reasoning -> text, or start -> text
         self.buffer, self.finished, self._leading = MarkerBuffer(), False, True
+        self._label = bool(self.format.label)   # the channel's label may still follow the opening marker
+        self._finishing = False
 
     def _reasoning(self, text, events):
         if self._leading:
@@ -92,10 +98,19 @@ class ReasoningSplitter:
             stripped = self.buffer.lstrip()
             if stripped.find(opening, self.token_ids) == 0:
                 self.state, self.buffer = "reasoning", stripped.slice(len(opening))
+                self._label = bool(self.format.label)
             elif not stripped.text or (opening not in self.token_ids and opening.startswith(stripped.text)):
                 return events   # still whitespace or a partial opening marker
             else:
                 self.state = "text"
+        if self.state == "reasoning" and self._label:
+            stripped, label = self.buffer.lstrip(), self.format.label
+            if stripped.text.startswith(label):
+                self.buffer, self._label = stripped.slice(len(label)), False
+            elif label.startswith(stripped.text) and not self._finishing:
+                return events   # nothing yet, or a part of the label
+            else:
+                self._label = False
         if self.state == "reasoning":
             end = self.buffer.find(closing, self.token_ids)
             if end < 0:
@@ -120,6 +135,7 @@ class ReasoningSplitter:
                 if start >= 0:
                     self._text(self.buffer.slice(0, start), events)
                     self.state, self.buffer, self._leading = "reasoning", self.buffer.slice(start + len(opening)), True
+                    self._label = bool(self.format.label)
                     return events + self.push("")
                 keep = self.buffer.held(opening, self.token_ids)
                 self._text(self.buffer.slice(0, len(self.buffer.text) - keep), events)
@@ -131,6 +147,7 @@ class ReasoningSplitter:
 
     def finish(self):
         """Flush held text: a reply cut inside the reasoning keeps it as reasoning."""
+        self._finishing = True
         events = self.push("")
         self.finished = True
         if self.state == "reasoning":

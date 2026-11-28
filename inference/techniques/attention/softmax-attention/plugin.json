@@ -20,6 +20,7 @@
     "attention:sinks",
     "attention:sliding",
     "attention:latent",
+    "attention:latent-layers",
     "attention:distance-bias",
     "prompts:attention"
   ],
@@ -162,6 +163,12 @@
       },
       "attention:latent": {
         "methods": {}
+      },
+      "attention:latent-layers": {
+        "methods": {
+          "forward_latent_layers": "forward_latent_layers(layers, queries, pool, batch, rank, scale=None) -> out: attention:latent over several of the pool's layers in one call, queries [tokens][len(layers) x group][R + P] (layer i's `group` query heads at i x group), each layer one KV head of latent rows; out [tokens][len(layers) x group][R], each layer's heads the bits forward(layer, its queries, ..., latent=R) gives them"
+        },
+        "about": "Latent reads of several pseudo layers of one pool in one call (shared-KV attention's KV heads): where the layers lie consecutively in the pool, prompt rows read as window pieces through the decode reader's fused launch (prompt_reader decode) take one launch for every layer; elsewhere a forward a layer."
       },
       "attention:distance-bias": {
         "methods": {}

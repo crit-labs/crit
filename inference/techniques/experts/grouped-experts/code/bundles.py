@@ -400,7 +400,9 @@ def _table(device, which):
             values = [float(c if c < 8 else c - 16) for c in range(16)]
         else:
             values = [math.ldexp(1.0, b - 127) for b in range(255)] + [float("nan")]
-        _TABLES[key] = torch.tensor(values, dtype=torch.float32, device=device)
+        from crit_plugins.memory import of   # the process's, for every engine on the device (crit_plugins.lifetime)
+        _TABLES[key] = of(device).process("grouped-experts", f"decode.{which}",
+                                          torch.tensor(values, dtype=torch.float32, device=device))
     return _TABLES[key]
 
 

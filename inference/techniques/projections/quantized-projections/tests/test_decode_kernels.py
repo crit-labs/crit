@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from crit_plugins.testing import PluginTestCase
+from crit_plugins.testing import long_call
 
 SHAPES = ((16384, 5120), (5120, 6144), (2560, 640))   # a 27B's qkvz and out, a hybrid MoE's shared-expert down
 
@@ -51,12 +52,14 @@ class DotTests(PluginTestCase):
             x = x.cuda().to(torch.bfloat16)
             exact = x.double() @ (stored["weight"].double() * stored["scale"].double()[:, None]).cuda().t()
             for out in (torch.float32, None):
-                alone = torch.cat([plugin.matmul(x[r:r + 1].clone(), m, out) for r in range(24)])
+                alone = torch.cat([plugin.matmul(x[r:r + 1].clone(), m, out,
+                                                 prompt=long_call(x[r:r + 1].clone(), plugin)) for r in range(24)])
                 if out == torch.float32:
                     self.assertLess(float((alone.double() - exact).abs().max() / exact.abs().max()), 2e-5)
                 for rows in range(1, 17):
                     for first in (0, 3, 24 - rows):
-                        self.assertTrue(torch.equal(plugin.matmul(x[first:first + rows].clone(), m, out),
+                        self.assertTrue(torch.equal(plugin.matmul(x[first:first + rows].clone(), m, out,
+                                                                  prompt=long_call(x[first:first + rows].clone(), plugin)),
                                                     alone[first:first + rows]), (n, k, rows, first, out))
         facts = plugin.facts()
         self.assertEqual(facts["decode_paths"]["fp8"], ["dot"])
@@ -90,8 +93,10 @@ class DotTests(PluginTestCase):
             buffer = torch.randn(40, 4096, generator=self.g).cuda().to(torch.bfloat16)
             for rows in range(1, 17):
                 for out in (None, torch.float32):
-                    plugin.matmul(buffer[:rows, :2048], m, out)   # a strided slice, as a model's buffers give
-                    plugin.matmul(buffer[:rows, :2048].contiguous(), m, out)
+                    plugin.matmul(buffer[:rows, :2048], m, out,
+                                  prompt=long_call(buffer[:rows, :2048], plugin))   # a strided slice, as a model's buffers give
+                    plugin.matmul(buffer[:rows, :2048].contiguous(), m, out,
+                                  prompt=long_call(buffer[:rows, :2048].contiguous(), plugin))
             torch.cuda.synchronize()
         finally:
             triton.knobs.runtime.jit_cache_hook = hook
@@ -138,17 +143,20 @@ class Fp4DecodeTests(PluginTestCase):
             x[:, torch.randperm(k, generator=self.g)[:8]] *= 60.0
             x = x.cuda().to(torch.bfloat16)
             for out in (torch.float32, None):
-                alone = torch.cat([fp4.matmul(x[r:r + 1].clone(), m, out) for r in range(24)])
+                alone = torch.cat([fp4.matmul(x[r:r + 1].clone(), m, out,
+                                              prompt=long_call(x[r:r + 1].clone(), fp4)) for r in range(24)])
                 for rows in range(1, 17):
                     for first in (0, 5, 24 - rows):
-                        self.assertTrue(torch.equal(fp4.matmul(x[first:first + rows].clone(), m, out),
+                        self.assertTrue(torch.equal(fp4.matmul(x[first:first + rows].clone(), m, out,
+                                                               prompt=long_call(x[first:first + rows].clone(), fp4)),
                                                     alone[first:first + rows]), (n, rows, first, out))
             with patch.object(self.nvfp4.mma("cuda"), "fp4_mma", lambda device=None: False):
                 bf16 = self.assemble(options={"decode_activations": "prompt"}, context=OnCuda())["projections"]
                 b = bf16.load(stored, "nvfp4")
             self.assertEqual(b.mma_acts["decode"], "nvfp4")
-            ref = torch.cat([bf16.matmul(x[r:r + 1].clone(), b, torch.float32) for r in range(16)])
-            got = fp4.matmul(x[:16], m, torch.float32)
+            ref = torch.cat([bf16.matmul(x[r:r + 1].clone(), b, torch.float32,
+                                         prompt=long_call(x[r:r + 1].clone(), bf16)) for r in range(16)])
+            got = fp4.matmul(x[:16], m, torch.float32, prompt=long_call(x[:16], fp4))
             self.assertLess(float((got - ref).abs().max() / ref.abs().max()), 1e-5)
             del m, b
         facts = fp4.facts()
@@ -204,8 +212,10 @@ class DecodeFormatsTests(PluginTestCase):
             u = uniform.load(stored, format)
             self.assertEqual(u.path, matrix.path)
             for rows in (1, 4, 9, 16):
-                self.assertTrue(torch.equal(split.matmul(x[:rows], matrix, torch.float32),
-                                            uniform.matmul(x[:rows], u, torch.float32)), (format, rows))
+                self.assertTrue(torch.equal(split.matmul(x[:rows], matrix, torch.float32,
+                                                         prompt=long_call(x[:rows], split)),
+                                            uniform.matmul(x[:rows], u, torch.float32,
+                                                           prompt=long_call(x[:rows], uniform))), (format, rows))
         both = self.plugin(decode_activations="bf16", decode_formats="fp8=prompt")
         both.load(fp8, "fp8:channel")
         both.load(nvfp4, "nvfp4")
@@ -264,8 +274,9 @@ class CrossoverTests(PluginTestCase):
             m = cross.load(stored, "nvfp4", role="down")
         self.assertEqual((m.gemv_rows, m.path, m.invariant_rows), (2, "gemv_mma", 2))
         for rows in range(1, 17):
-            want = gemv.matmul(x[:rows], g, torch.float32) if rows <= 2 else tile.matmul(x[:rows], t, torch.float32)
-            self.assertTrue(torch.equal(cross.matmul(x[:rows], m, torch.float32), want), rows)
+            want = gemv.matmul(x[:rows], g, torch.float32, prompt=long_call(x[:rows], gemv)) if rows <= 2 else tile.matmul(x[:rows], t, torch.float32, prompt=long_call(x[:rows], tile))
+            self.assertTrue(torch.equal(cross.matmul(x[:rows], m, torch.float32,
+                                                     prompt=long_call(x[:rows], cross)), want), rows)
         facts = cross.facts()
         self.assertEqual((facts["row_invariance"]["rows"], facts["decode_crossover"]), (2, {"down": 2}))
         self.assertEqual(facts["decode_kernels"]["down"]["kernels"], ["gemv_mma"])

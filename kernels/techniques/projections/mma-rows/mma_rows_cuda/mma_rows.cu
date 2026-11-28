@@ -449,7 +449,7 @@ cudaError_t by_staged(const Problem& p, int T, int R, cudaStream_t stream) {
 // SPF, picked per matrix and row count by the build's tuning; SW 0: the register tile): SW + 1 with SPF.
 inline int staged_warps(const Problem& p) {
   switch (crit_lookup_decode_tile(p.weights, p.N, p.K, p.M)) {
-#define CRIT_DECODE_CONFIG(index, groups, warps, splits, sw, spf) \
+#define CRIT_DECODE_CONFIG(index, groups, warps, sw, spf) \
   case index:                                                    \
     return sw ? sw + (spf ? 1 : 0) : 0;
     CRIT_CONFIGS_decode_tile(CRIT_DECODE_CONFIG)
@@ -463,7 +463,7 @@ inline int staged_warps(const Problem& p) {
 template <int V>
 constexpr bool tuned_staged() {
   bool found = false;
-#define CRIT_DECODE_CONFIG(index, groups, warps, splits, sw, spf) found = found || ((sw ? sw + (spf ? 1 : 0) : 0) == V);
+#define CRIT_DECODE_CONFIG(index, groups, warps, sw, spf) found = found || ((sw ? sw + (spf ? 1 : 0) : 0) == V);
   CRIT_CONFIGS_decode_tile(CRIT_DECODE_CONFIG)
 #undef CRIT_DECODE_CONFIG
   return found;

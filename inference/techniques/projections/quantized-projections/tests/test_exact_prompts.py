@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from crit_plugins.testing import PluginTestCase
+from crit_plugins.testing import long_call
 
 SHAPES = ((10240, 5120), (5120, 17408))   # a wide projection and a down projection of a model of hidden size 5120
 CASES = [("bf16", {}), ("fp8:channel", {}), ("fp8:channel", {"decode_activations": "bf16"}),
@@ -60,11 +61,14 @@ class ExactPromptTests(PluginTestCase):
                     self.assertEqual((m.path, m.gemm), ("mma", "tile"))
                     x = torch.randn(300, k, generator=self.g).cuda().to(torch.bfloat16)
                     for out in (torch.float32, None):
-                        alone = torch.cat([plugin.matmul(x[r:r + 1].clone(), m, out) for r in range(300)])
+                        alone = torch.cat([plugin.matmul(x[r:r + 1].clone(), m, out,
+                                                         prompt=long_call(x[r:r + 1].clone(), plugin)) for r in range(300)])
                         for rows in (17, 64, 65, 129, 300):
-                            self.assertTrue(torch.equal(plugin.matmul(x[:rows], m, out), alone[:rows]),
+                            self.assertTrue(torch.equal(plugin.matmul(x[:rows], m, out,
+                                                                      prompt=long_call(x[:rows], plugin)), alone[:rows]),
                                             (format, options, (n, k), rows, out))
-                        decode = torch.cat([plugin.matmul(x[r:r + 16], m, out) for r in range(0, 288, 16)])
+                        decode = torch.cat([plugin.matmul(x[r:r + 16], m, out,
+                                                          prompt=long_call(x[r:r + 16], plugin)) for r in range(0, 288, 16)])
                         self.assertTrue(torch.equal(decode, alone[:288]), "decode calls of 16 rows")
                     del m
             facts = plugin.facts()
@@ -80,8 +84,9 @@ class ExactPromptTests(PluginTestCase):
         plugin = self.assemble(options={"activations": "bf16", **TILE}, context=OnCuda())["projections"]
         m = plugin.load(self.stored("nvfp4", 5120, 17408), "nvfp4")
         x = torch.randn(2048, 17408, generator=self.g).cuda().to(torch.bfloat16)
-        found = plugin.matmul(x, m, torch.float32)
-        alone = torch.cat([plugin.matmul(x[r:r + 1].clone(), m, torch.float32) for r in range(2048)])
+        found = plugin.matmul(x, m, torch.float32, prompt=long_call(x, plugin))
+        alone = torch.cat([plugin.matmul(x[r:r + 1].clone(), m, torch.float32,
+                                         prompt=long_call(x[r:r + 1].clone(), plugin)) for r in range(2048)])
         self.assertTrue(torch.equal(found, alone))
 
     def test_a_quantized_prompt_past_the_scratch_s_rows_keeps_every_row_s_decode_bits(self):
@@ -93,9 +98,12 @@ class ExactPromptTests(PluginTestCase):
             m = plugin.load(self.stored(format, 320, 10240), format)
             self.assertEqual((m.path, m.gemm), ("mma", "tile"))
             x = torch.randn(1000, 10240, generator=self.g).cuda().to(torch.bfloat16)
-            decode = torch.cat([plugin.matmul(x[r:r + 16], m, torch.float32) for r in range(0, 1000, 16)])
-            self.assertTrue(torch.equal(plugin.matmul(x, m, torch.float32), decode), format)
-            self.assertTrue(torch.equal(plugin.matmul(x[:500], m, torch.float32), decode[:500]), format)
+            decode = torch.cat([plugin.matmul(x[r:r + 16], m, torch.float32,
+                                              prompt=long_call(x[r:r + 16], plugin)) for r in range(0, 1000, 16)])
+            self.assertTrue(torch.equal(plugin.matmul(x, m, torch.float32,
+                                                      prompt=long_call(x, plugin)), decode), format)
+            self.assertTrue(torch.equal(plugin.matmul(x[:500], m, torch.float32,
+                                                      prompt=long_call(x[:500], plugin)), decode[:500]), format)
             del m
 
     def test_w4a4_rows_on_the_fp4_mma_keep_their_decode_bits_in_prompts(self):
@@ -111,14 +119,18 @@ class ExactPromptTests(PluginTestCase):
                 self.assertEqual((m.path, m.gemm, m.prompt_kernel), ("mma_fp4", "tile", "mma-rows fp4-prompt-tile"))
                 x = torch.randn(1100, k, generator=self.g).cuda().to(torch.bfloat16)
                 for out in (torch.float32, None):
-                    alone = torch.cat([plugin.matmul(x[r:r + 1].clone(), m, out) for r in range(300)])
+                    alone = torch.cat([plugin.matmul(x[r:r + 1].clone(), m, out,
+                                                     prompt=long_call(x[r:r + 1].clone(), plugin)) for r in range(300)])
                     for rows in (17, 64, 65, 129, 300):
-                        self.assertTrue(torch.equal(plugin.matmul(x[:rows], m, out), alone[:rows]), ((n, k), rows, out))
-                    decode = torch.cat([plugin.matmul(x[r:r + 16], m, out) for r in range(0, 288, 16)])
+                        self.assertTrue(torch.equal(plugin.matmul(x[:rows], m, out,
+                                                                  prompt=long_call(x[:rows], plugin)), alone[:rows]), ((n, k), rows, out))
+                    decode = torch.cat([plugin.matmul(x[r:r + 16], m, out,
+                                                      prompt=long_call(x[r:r + 16], plugin)) for r in range(0, 288, 16)])
                     self.assertTrue(torch.equal(decode, alone[:288]), "decode calls of 16 rows")
-                long = plugin.matmul(x, m)
-                self.assertTrue(torch.equal(long[:300], plugin.matmul(x[:300], m)))
-                self.assertTrue(torch.equal(long[1000:], torch.cat([plugin.matmul(x[r:r + 1].clone(), m)
+                long = plugin.matmul(x, m, prompt=long_call(x, plugin))
+                self.assertTrue(torch.equal(long[:300], plugin.matmul(x[:300], m, prompt=long_call(x[:300], plugin))))
+                self.assertTrue(torch.equal(long[1000:], torch.cat([plugin.matmul(x[r:r + 1].clone(), m,
+                                                                                  prompt=long_call(x[r:r + 1].clone(), plugin))
                                                                     for r in range(1000, 1100)])))
                 del m
         other = plugin.load(self.stored("fp8:channel", 1024, 2048), "fp8:channel")
@@ -139,8 +151,9 @@ class ExactPromptTests(PluginTestCase):
             kept[asked] = (m.gemm, plugin.exactness())
             if asked == "exact":
                 x = torch.randn(40, 2048, generator=self.g).cuda().to(torch.bfloat16)
-                alone = torch.cat([plugin.matmul(x[r:r + 1].clone(), m) for r in range(40)])
-                self.assertTrue(torch.equal(plugin.matmul(x, m), alone))
+                alone = torch.cat([plugin.matmul(x[r:r + 1].clone(), m,
+                                                 prompt=long_call(x[r:r + 1].clone(), plugin)) for r in range(40)])
+                self.assertTrue(torch.equal(plugin.matmul(x, m, prompt=long_call(x, plugin)), alone))
             del m
         self.assertEqual(kept["exact"], ("tile", {"decode": "row-exact", "prompt": "exact"}))
         self.assertEqual(kept["row-exact"][1], {"decode": "row-exact", "prompt": "row-exact"})
@@ -165,7 +178,7 @@ class ExactPromptTests(PluginTestCase):
         self.assertEqual((m.path, m.gemm), ("mma", "provider"))
         self.assertEqual(plugin.facts()["row_invariance"]["prompt_exact"], False)
         x = torch.randn(40, 2048, generator=self.g).cuda().to(torch.bfloat16)
-        self.assertEqual(tuple(plugin.matmul(x, m).shape), (40, 1024))
+        self.assertEqual(tuple(plugin.matmul(x, m, prompt=long_call(x, plugin)).shape), (40, 1024))
 
     def test_the_projections_contract_checks_the_claim(self):
         plugin = self.assemble(options=TILE, context=OnCuda())["projections"]

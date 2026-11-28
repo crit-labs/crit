@@ -13,6 +13,10 @@
 namespace gr = crit::techniques::gguf_rows;
 namespace gg = crit::kcore::gguf;
 
+// The multiprocessors the untuned split rule counts: a definition (an RTX 5090's 170 SMs, where the rule was measured),
+// never this device's, so a row's sums take the same order on every GPU.
+constexpr int kOrderMultiprocessors = 170;
+
 namespace {
 int kind_of(const torch::Tensor& t, const char* what) {
     if (t.scalar_type() == torch::kFloat32) return 0;
@@ -70,9 +74,8 @@ void quantize(const torch::Tensor& x, torch::Tensor& xq, torch::Tensor& xd, torc
 int64_t splits(const torch::Tensor& blocks, int64_t type, int64_t k) {
     const gr::Matrix w = matrix(blocks, type, k);
     const c10::cuda::CUDAGuard guard(blocks.device());
-    int count = 0;
-    cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, blocks.get_device());
-    return gr::splits(w, count);
+    // the order's multiprocessors, never this device's: a row's bits follow the parts
+    return gr::splits(w, kOrderMultiprocessors);
 }
 
 void gemv(const torch::Tensor& blocks, int64_t type, int64_t k, const torch::Tensor& xq, const torch::Tensor& xd,

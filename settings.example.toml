@@ -31,3 +31,8 @@ context_tokens = 200000
 # Where Eval fetches reference packages (a checkpoint's prepared data and reference scores): a folder
 # or an https base URL. With one, crit eval run and crit run eval fetch them instead of scoring here.
 # eval_packages = "https://huggingface.co/datasets/ORG/REPO/resolve/main"
+
+# The machine's shared GPU lock, an flock file (Linux) that crit run ... preflight takes for each load and gives back
+# after, so other work on the GPU waits for it and it for them; unset: none. CRIT_GPU_LOCK, where set, wins (a job
+# runner that holds the lock itself sets it empty).
+# gpu_lock = "/var/lock/gpu.lock"

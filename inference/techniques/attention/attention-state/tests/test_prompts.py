@@ -62,22 +62,51 @@ class FreshBufferTests(PluginTestCase):
             self.assertEqual(declared["device"], mib << 20)
             del kv
 
-    def test_a_staged_chunk_past_the_window_reads_itself_fresh_and_a_shorter_one_its_pages(self):
+    def test_a_staged_chunk_reads_itself_fresh_however_short(self):
         if self.dev != "cuda":
             self.skipTest("the fresh buffer is a CUDA engine's")
         kv = self.assemble(options={"fresh_mib": 4, "page": 16, "window": 16})["kv_cache"]
         pool = kv.pool([0], 2, 64, 512, self.dev, "fp8:row")
         pool.open("a")
         batch = PromptBatch(64, self.dev)
-        pool.stage_prompt(batch.fill(64, "a", 0, list(range(40))))       # 40 real tokens: a prompt row, fresh
-        self.assertEqual(int(pool.prompt_fresh_first), 0)
-        pool.commit_prompt(batch)
-        pool.stage_prompt(batch.fill(16, "a", 40, list(range(16))))      # up to the window: its pages, as a step's
-        self.assertEqual(int(pool.prompt_fresh_first), 40 + 16)
+        frontier = 0
+        for count in (40, 16, 1):   # past the window, up to it, one token: every prompt chunk a prompt row, fresh
+            pool.stage_prompt(batch.fill(64, "a", frontier, list(range(count))))
+            self.assertEqual(int(pool.prompt_fresh_first), frontier, count)
+            pool.commit_prompt(batch)
+            frontier += count
         self.assertIsNone(kv.pool([0], 2, 64, 512, self.dev, "bf16").prompt_fresh_first, "16-bit pages keep nothing")
+
+    def test_a_step_keeps_its_prompt_rows_fresh_by_their_phase_not_their_length(self):
+        # The fresh buffer on the CPU (a pool made with one, as a CUDA engine's plugin makes it): a one-token prompt
+        # chunk keeps its keys and values fresh as a long one does; a step of decode rows (a token, a verify window of
+        # the window's width) keeps nothing.
+        from crit_plugins import StepBatch
+        from crit_plugins.device import DECODE, PREFILL
+        import sys
+        torch = self.torch
+        kv = self.assemble(options={"page": 16, "window": 16})["kv_cache"]
+        pages = sys.modules[type(kv.pool([0], 2, 64, 64, self.dev, "bf16")).__module__]   # the plugin's pages.py
+        fresh = pages.FreshBuffer(torch.empty(1 << 20, dtype=torch.uint8, device=self.dev))
+        pool = pages.KVPool([0], 2, 64, 512, self.dev, "fp8:row", page=16, window=16, fresh=fresh)
+        for s in "abc":
+            pool.open(s)
+        pool.write(0, pool.reserve(StepBatch.build([("a", 0, 40, PREFILL), ("b", 0, 3, PREFILL)], self.dev)),
+                   torch.randn(43, 2, 64, device=self.dev), torch.randn(43, 2, 64, device=self.dev))
+        for rows, kept in (([("a", 40, 1, PREFILL)], True), ([("c", 0, 1, PREFILL)], True),
+                           ([("a", 41, 1, DECODE)], False), ([("b", 3, 16, DECODE)], False),
+                           ([("a", 42, 1, DECODE), ("c", 1, 2, PREFILL)], True)):
+            batch = StepBatch.build(rows, self.dev)
+            keys = torch.randn(batch.tokens, 2, 64, device=self.dev)
+            pool.write(0, pool.reserve(batch), keys, keys)
+            found = pool.fresh_rows(0, batch.tokens)
+            self.assertEqual(found is not None, kept, rows)
+            if kept:
+                self.assertTrue(torch.equal(found[0], keys.to(found[0].dtype)), rows)
 
     def test_a_prompt_step_keeps_its_keys_and_values_and_the_facts_say_so(self):
         from crit_plugins import StepBatch
+        from crit_plugins.device import DECODE, PREFILL
         if self.dev != "cuda":
             self.skipTest("the fresh buffer is a CUDA engine's")
         torch = self.torch
@@ -86,7 +115,7 @@ class FreshBufferTests(PluginTestCase):
         pool = kv.pool([0, 1], 2, 64, 512, self.dev, "int8")
         self.assertEqual(pool.fresh_tokens, (4 << 20) // (2 * (64 + 64) * 2))
         pool.open("a")
-        batch = StepBatch.build([("a", 0, 40)], self.dev)              # a prompt row (past the window)
+        batch = StepBatch.build([("a", 0, 40, PREFILL)], self.dev)              # a prompt row (past the window)
         keys, values = torch.randn(40, 2, 64, device=self.dev), torch.randn(40, 2, 64, device=self.dev)
         pool.write(1, pool.reserve(batch), keys, values)
         found = pool.fresh_rows(1, 40)
@@ -94,11 +123,11 @@ class FreshBufferTests(PluginTestCase):
         self.assertIsNone(pool.fresh_rows(0, 40), "another layer's write is not this one's")
         other = kv.pool([0], 2, 64, 512, self.dev, "fp8:row")      # the plugin's other pool, the same buffer
         other.open("b")
-        other.write(0, other.reserve(StepBatch.build([("b", 0, 40)], self.dev)), values, keys)
+        other.write(0, other.reserve(StepBatch.build([("b", 0, 40, PREFILL)], self.dev)), values, keys)
         self.assertIsNone(pool.fresh_rows(1, 40), "another pool's write took the buffer: the pages are read")
         self.assertTrue(torch.equal(other.fresh_rows(0, 40)[0], values.to(torch.bfloat16)))
         pool.keep("a", 40)
-        pool.write(1, pool.reserve(StepBatch.build([("a", 40, 1)], self.dev)), keys[:1], values[:1])
+        pool.write(1, pool.reserve(StepBatch.build([("a", 40, 1, DECODE)], self.dev)), keys[:1], values[:1])
         self.assertIsNone(pool.fresh_rows(1, 1), "a decode step keeps nothing fresh")
         facts = kv.facts()
         self.assertIn("as the projections gave them", facts["prompt_kv"])

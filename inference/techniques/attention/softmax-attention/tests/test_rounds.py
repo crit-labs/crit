@@ -5,7 +5,7 @@ lengths. Bit for bit where crit's split-KV reader serves; within the fallback's 
 from types import SimpleNamespace
 
 from crit_plugins import StepBatch
-from crit_plugins.device import RoundBatch
+from crit_plugins.device import DECODE, PREFILL, RoundBatch
 from crit_plugins.testing import PluginTestCase
 
 USE = {"kv_cache": "attention-state"}
@@ -46,7 +46,7 @@ class RoundAttentionTests(PluginTestCase):
 
     def prefill(self, pool, sequence, count, seed):
         pool.open(sequence)
-        batch = StepBatch.build([(sequence, 0, count)], "cuda")
+        batch = StepBatch.build([(sequence, 0, count, PREFILL)], "cuda")
         keys, values = self.kv_at(range(count), seed, pool.kv_heads, pool.head_dim)
         pool.write(0, pool.reserve(batch), keys, values)
         pool.keep(sequence, count)
@@ -117,7 +117,7 @@ class RoundAttentionTests(PluginTestCase):
             for r, sequence in enumerate("ab"):
                 first = (300, 37)[r]
                 for count in (1, 4):   # the pending token alone (plain decoding), the whole window
-                    step = StepBatch.build([(sequence, first, count)], "cuda")
+                    step = StepBatch.build([(sequence, first, count, DECODE)], "cuda")
                     span = slice(4 * r, 4 * r + count)
                     pool.write(0, pool.reserve(step), keys[span], values[span])
                     found = attention.forward(0, q[span], pool, step)
@@ -211,7 +211,7 @@ class RoundAttentionTests(PluginTestCase):
         pool = self.pool("bf16")
         self.prefill(pool, "a", 500, seed=7)
         q = self.queries([500, 501, 502], 8)
-        step = StepBatch.build([("a", 500, 3)], "cuda")
+        step = StepBatch.build([("a", 500, 3, DECODE)], "cuda")
         keys, values = self.kv_at([500, 501, 502], 7)
         pool.write(0, pool.reserve(step), keys, values)
         stepped = self.attention.forward(0, q, pool, step)
@@ -229,7 +229,7 @@ class RoundAttentionTests(PluginTestCase):
             self.prefill(pool, "a", 50, seed=11)
             keys, values = self.kv_at([50], 11)
             q = self.queries([50], 12).to(dtype)
-            step = StepBatch.build([("a", 50, 1)], "cuda")
+            step = StepBatch.build([("a", 50, 1, DECODE)], "cuda")
             pool.write(0, pool.reserve(step), keys, values)
             stepped = self.attention.forward(0, q, pool, step)
             pool.keep("a", 50)
@@ -287,7 +287,7 @@ class RoundAttentionTests(PluginTestCase):
         torch = self.torch
         pool = self.kv.pool([0], 4, 256, 210_000, "cuda", "fp8:row", page=64)
         pool.open("a")
-        batch = StepBatch.build([("a", 0, 200_000)], "cuda")
+        batch = StepBatch.build([("a", 0, 200_000, PREFILL)], "cuda")
         slots = pool.reserve(batch)
         for at in range(0, 200_000, 20_000):
             part = torch.randn(20_000, 4, 256, device="cuda")

@@ -2,10 +2,10 @@
 technique: an NVFP4, FP8, MXFP8 or BF16 matrix [N][K] times BF16 rows [M][K], the activations used as they are
 (weight only: W4A16, W8A16) or quantized as a prompt's are (FP8 per row: W8A8; NVFP4 per 16-value block: W4A4), FP32
 sums. Every value enters mma.m16n8k16 exactly (BF16 operands, FP32 accumulate) and each weight is read once a call.
-The order of every output's sum depends on N, K and `splits` only: a row gets the same bits alone, in a decode call of
-up to 16 rows or in a prompt's tile of up to 64. plan() picks `groups`, `warps` (speed only) and `splits` (the sums'
-order) from the build's tuning for the matrix (kernel.json's structures decode-tile and fp4-tile), or untuned from the
-matrix and the device, so a process keeps one plan per matrix.
+The order of every output's sum depends on N, K and `splits` only, and plan()'s splits on the matrix only
+(order_splits: the shipped table's count for the shape, else its rule; the same on every device and in every tuning): a row gets the same bits alone, in a decode call of up to
+16 rows, in a prompt's tile of any length, on any GPU. plan() picks `groups` and `warps` (speed only) from the build's
+tuning for the matrix (kernel.json's structures decode-tile and fp4-tile).
 
 Quantized activations go through a pre-pass into `scratch` (scratch_bytes); splits > 1 add their partial sums in
 `partial` (partial_elements) with one int32 counter a row tile in `counters` (row_tiles(N, 1, warps): calls of more
@@ -26,6 +26,7 @@ import torch
 
 from ._crit_tuning import knobs
 from ._ops import ops
+from .orders import ORDERS
 
 WEIGHTS = {"nvfp4": 0, "fp8": 1, "mxfp8": 2, "bf16": 3, "int4_zp": 4}
 ACTS = {"bf16": 0, "fp8_rows": 1, "nvfp4": 2, "nvfp4_mma": 3}
@@ -37,8 +38,8 @@ MAX_WARPS, MAX_SPLITS = 4, 32
 WARPS = 4          # warps a CTA, each its own 16 x groups matrix rows
 PROMPT_TOKENS = 64   # activation rows a CTA of mm_prompt takes, untuned (structure prompt-tile's PT)
 
-__all__ = ["ACTS", "FP4_STEP", "MAX_ROWS", "PROMPT_TOKENS", "STEP", "VALUES", "WEIGHTS", "eligible", "fp4_mma",
-           "interleave_glu", "mm_prompt", "mm_rows", "partial_elements", "plan", "prompt_ctas", "quantize_fp8_rows", "quantize_nvfp4", "row_tiles",
+__all__ = ["ACTS", "FP4_STEP", "ORDERS", "MAX_ROWS", "PROMPT_TOKENS", "STEP", "VALUES", "WEIGHTS", "eligible", "fp4_mma",
+           "interleave_glu", "mm_prompt", "mm_rows", "order_splits", "partial_elements", "plan", "prompt_ctas", "quantize_fp8_rows", "quantize_nvfp4", "row_tiles",
            "scratch_bytes"]
 
 
@@ -47,45 +48,49 @@ def eligible(rows: int, columns: int) -> bool:
     return rows >= 1 and columns >= STEP and columns % STEP == 0
 
 
+# The sums' order: a matrix's splits of K, each a chain from zero, added in split order (every tile of this kernel and
+# its prompt tiles, mm_rows and mm_prompt alike). It is a function of the matrix alone, never of the device, the build's
+# tuning or the row count, so every GPU and every tuning gives an output the same bits: the shipped table's count for
+# the shape (orders.ORDERS, chosen once by benchmarks/order_sweep.py as the count whose decode calls cost least), else
+# the fewest splits whose canonical tiles (64 matrix rows each: one 16-row group a warp, WARPS warps) reach ORDER_CTAS
+# CTAs, at least two steps of K a split, at most MAX_SPLITS. Neither tunes per device: a GPU with more or fewer
+# resident CTAs runs the same splits.
+ORDER_CTAS = 512
+
+
+def order_splits(rows: int, columns: int, weights: str, acts: str = "bf16") -> int:
+    """The splits of K that fix the order of every output's sum for a rows x columns matrix of `weights` (with
+    `acts`): the shipped table's (orders.ORDERS, keyed by weights, the MMA, N and K), else ORDER_CTAS's rule; the
+    same on every device and in every tuning."""
+    mma = "fp4" if acts == "nvfp4_mma" else "bf16"
+    found = ORDERS.get((weights, mma, int(rows), int(columns)))
+    if found is not None:
+        return int(found)
+    steps = columns // FP4_STEP if acts == "nvfp4_mma" else math.ceil(columns / VALUES[weights])
+    tiles = row_tiles(rows, 1, WARPS)
+    return max(1, min(math.ceil(ORDER_CTAS / tiles), max(1, steps // 2), MAX_SPLITS))
+
+
 def plan(rows: int, columns: int, weights: str, device=None, acts: str = "bf16"):
-    """(groups, warps, splits) for a rows x columns matrix of `weights` (with `acts`) on `device`: the build's tuning
-    for the matrix (structure fp4-tile for acts nvfp4_mma, else decode-tile; one plan for every row count), its
-    splits capped at the matrix's steps. Untuned (the default knobs): one 16-row group a warp, WARPS warps a CTA, and
-    the splits of K (of VALUES[weights] steps, of FP4_STEP on the FP4 MMA, acts nvfp4_mma) whose CTAs fill the
-    multiprocessors' resident CTAs of the one-row kernel best (decode_ctas: that kernel's occupancy there, the decode
-    tile's or the FP4 MMA's), the fewer splits on a tie; splits of one step only while every CTA fits one wave. A
-    decode call is a stream of weights: CTAs that overrun a whole number of waves leave a short last wave the call
-    waits for (a 44032 x 7168 NVFP4 matrix in 688 CTAs for 680 resident ran 10% slower than in seven splits), and
-    waves of one-step splits leave a CTA nothing to keep in flight (a 7168 x 7168 one in 14 splits, 12% slower than in
-    6). A tuning's SPLITS 0 keeps that rule for its groups and warps."""
+    """(groups, warps, splits) for a rows x columns matrix of `weights` (with `acts`) on `device`. splits, the sums'
+    order, is order_splits(): the matrix's alone, never the device's or the tuning's (a swept tuning that changed the
+    splits changed the outputs' bits, and two GPUs gave the same engine two answers). groups and warps change no bits:
+    the build's tuning for the matrix (structure fp4-tile for acts nvfp4_mma, else decode-tile; one plan for every row
+    count), else one 16-row group a warp and WARPS warps a CTA. `device` is kept for callers; the plan does not
+    depend on it."""
     if weights not in WEIGHTS:
         raise ValueError(f"weights are {', '.join(WEIGHTS)}, not {weights!r}")
     if not eligible(rows, columns):
         raise ValueError(f"mm_rows takes K a multiple of {STEP}, not {columns}")
     if acts == "nvfp4_mma" and (weights != "nvfp4" or columns % FP4_STEP):
         raise ValueError(f"the FP4 MMA takes NVFP4 weights with K a multiple of {FP4_STEP}, not {weights} x {columns}")
-    fp4 = acts == "nvfp4_mma"
-    if fp4:
+    if acts == "nvfp4_mma":
         tuned = knobs("fp4-tile", {"N": rows, "K": columns}, 1)
         groups = 1
     else:
         tuned = knobs("decode-tile", {"weights": WEIGHTS[weights], "N": rows, "K": columns}, 1)
         groups = tuned["GROUPS"]
-    warps = tuned["WARPS"]
-    steps = columns // FP4_STEP if fp4 else math.ceil(columns / VALUES[weights])
-    if tuned["SPLITS"]:
-        return groups, warps, max(1, min(tuned["SPLITS"], steps, MAX_SPLITS))
-    device = torch.device(device or "cuda")
-    with torch.cuda.device(device):
-        resident = int(ops.decode_ctas(WEIGHTS[weights], ACTS["nvfp4_mma" if fp4 else "bf16"]))
-    slots = torch.cuda.get_device_properties(device).multi_processor_count * resident
-    tiles = row_tiles(rows, groups, warps)
-
-    def filled(splits):   # the share of the resident CTAs a call's waves keep busy
-        waves = tiles * splits / slots
-        return waves if waves <= 1 else waves / math.ceil(waves)
-    choices = [s for s in range(1, min(MAX_SPLITS, steps) + 1) if steps // s >= 2 or tiles * s <= slots] or [1]
-    return groups, warps, max(choices, key=lambda s: (filled(s), -s))
+    return groups, tuned["WARPS"], order_splits(rows, columns, weights, acts)
 
 
 def row_tiles(rows: int, groups: int, warps: int) -> int:

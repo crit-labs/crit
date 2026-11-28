@@ -146,6 +146,7 @@ class PlanFixture(RunFixture):
     def evaluated(self, candidate_id, value, completed=True, **result):
         """A retained Eval attempt of the candidate, as crit run eval leaves it; `result` adds sections beside the
         status (headroom, speed)."""
+        self.serve_checked(candidate_id)   # an Eval starts after a passed serve --check (crit.run.state)
         reservation = self.store.reserve(self.run_id, candidate_id, "eval")
         path = self.directory / "candidates" / candidate_id / "eval" / (reservation["attempt_id"] + ".json")
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -874,6 +875,31 @@ class PlanRecordTests(PlanFixture, unittest.TestCase):
         result = self.store.stop(self.run_id, "search_exhausted", critique="critique", headroom=account)
         self.assertEqual(result["state"]["stopping_reason"], "search_exhausted")
 
+    def test_a_stop_plan_from_the_newest_ladder_candidate_without_an_eval_stands(self):
+        # 2026-11-25: the newest candidate on the ladder was sealed built below its rung's Eval, so a plan from it
+        # froze no Eval, and the stop asked for the run's newest Eval (an older candidate's): the build had to plan
+        # from the older one to stop. A stop plan from the newest ladder candidate stands where it has no Eval.
+        from unittest import mock
+        stop = {"plan_id": "plan-0009", "parent_candidate_id": "candidate-0003", "decision": "stop",
+                "inputs": {"eval": None}}
+        bounds = {"segment_id": "segment-0001"}
+        summary = {"plan_id": "plan-0009", "segment_id": "segment-0001", "superseded_by": None, "decision": "stop"}
+        root = self.directory
+        with (mock.patch.object(plans, "summaries", lambda *a: [summary]),
+              mock.patch.object(plans, "load", lambda *a: stop),
+              mock.patch.object(plans, "newest_eval", lambda *a: root / "candidates/candidate-0002/eval/a.json"),
+              mock.patch.object(plans.ladder, "counted", lambda *a: {"candidate-0002": 1, "candidate-0003": 1})):
+            with mock.patch.object(plans, "completed_evals", lambda *a: []):
+                self.assertEqual(plans.require_stop_plan(root, self.run, bounds), stop)
+            with mock.patch.object(plans, "completed_evals", lambda *a: ["an eval"]):
+                with self.assertRaisesRegex(ValueError, "not the newest Eval"):
+                    plans.require_stop_plan(root, self.run, bounds)
+            older = {**stop, "parent_candidate_id": "candidate-0002"}
+            with (mock.patch.object(plans, "load", lambda *a: older),
+                  mock.patch.object(plans, "completed_evals", lambda *a: [])):
+                with self.assertRaisesRegex(ValueError, "not the newest Eval"):
+                    plans.require_stop_plan(root, self.run, bounds)
+
     def test_with_the_budget_used_no_stop_plan_is_needed(self):
         parent = self.first()["candidate_id"]
         for _ in range(2):
@@ -1139,7 +1165,7 @@ class ObjectiveTests(PlanFixture, unittest.TestCase):
                                                 "Eval's status: a lever repairing a failed one serves check:resources"):
             self.store.plan(self.run_id, plan(parent, forecast=self.SAME, levers=[{**repair, "serves": "gate:resources"}]))
         with self.assertRaisesRegex(ValueError, "A check repair names checks candidate-0001 did not fail: arithmetic "
-                                                "\\(its newest, check-0001 for case-0001, passed\\)\\. check:NAME "
+                                                "\\(its newest, check-0002 for case-0001, passed\\)\\. check:NAME "
                                                 "repairs a check whose newest record of candidate-0001 failed$"):
             self.store.plan(self.run_id, plan(parent, forecast=self.SAME,
                                               levers=[repair, {**repair, "id": "x", "serves": "check:arithmetic"}]))
@@ -1172,7 +1198,7 @@ class ObjectiveTests(PlanFixture, unittest.TestCase):
             path = self.directory / "candidates" / parent / "checks" / f"{check_id}.json"
             checks.append({"path": path.relative_to(self.directory).as_posix(), "sha256": file_sha(path)})
         package = read_json(self.directory / "candidates" / parent / "package/manifest.json")
-        with self.assertRaisesRegex(ValueError, "did not fail: resources \\(its newest, check-0003 for case-0001, "
+        with self.assertRaisesRegex(ValueError, "did not fail: resources \\(its newest, check-0004 for case-0001, "
                                                 "passed\\)"):
             self.store.plan(self.run_id, plan(parent, forecast=self.SAME, levers=[self.CHECK_REPAIR]))
         within = self.benchmark_data(package, checks)
@@ -1351,8 +1377,9 @@ class CandidateLadderTests(PlanFixture, unittest.TestCase):
         first = self.store.plan(self.run_id, plan(levers=[], forecast=None))
         self.assertEqual(self.rung(first), (1, "proof_of_concept", "none"))
         draft = self.candidate(plan_id=first["plan_id"])["candidate_id"]
-        # Candidate 1 has no Eval, and no plan starts from it before it stands on its rung.
-        with self.assertRaisesRegex(ValueError, "first rung: no Eval"):
+        # Candidate 1 has no Eval (it is not even built: the transition table refuses an Eval before a passed serve
+        # --check), and no plan starts from it before it stands on its rung.
+        with self.assertRaisesRegex(ValueError, "is created, where crit run's eval does not start"):
             self.store.reserve(self.run_id, draft, "eval")
         with self.assertRaisesRegex(ValueError, f"{draft} is not on the candidate ladder yet"):
             self.store.plan(self.run_id, plan(draft))
@@ -1776,7 +1803,7 @@ class RoundAccountTests(PlanFixture, unittest.TestCase):
             self.store.plan(self.run_id, plan(parent, forecast=same,
                                               levers=[lever(), {**repair, "serves": "resources: VRAM headroom"}]))
         recorded = self.store.plan(self.run_id, plan(parent, forecast=same, levers=[lever(), repair]))
-        self.assertEqual(recorded["inputs"]["objective"]["check_repairs"]["resources"][0]["check_id"], "check-0003")
+        self.assertEqual(recorded["inputs"]["objective"]["check_repairs"]["resources"][0]["check_id"], "check-0004")
         self.assertNotIn("reach", recorded["inputs"])   # check 15 does not apply to it either
 
     def test_an_unknown_noise_takes_its_own_familys(self):
@@ -1877,7 +1904,10 @@ class RoundAccountTests(PlanFixture, unittest.TestCase):
         # A placement whose link is the faster source asks nothing.
         placement["plain_pass_floor_ms"] = {"link": 10.0, "cpu": 12.0, "split": 11.0}
         recon.write_text(json.dumps({"gathered": {"placement": placement}}), encoding="utf-8")
-        self.assertNotIn("cpu_tier", self.store.plan(self.run_id, first)["inputs"])
+        # checked, not recorded: the same plan as the first, still open, is recorded already
+        self.assertNotIn("cpu_tier", self.store.plan(self.run_id, first, check=True)["inputs"])
+        with self.assertRaisesRegex(ValueError, "This plan is recorded already, as plan-0001"):
+            self.store.plan(self.run_id, first)
 
 class LongContextAndEvidenceTests(unittest.TestCase):
     """A candidate planned for the long-context KPIs alone is a candidate, and a lever change measured before the plan

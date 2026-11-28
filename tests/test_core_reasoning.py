@@ -59,6 +59,24 @@ class SplitterTests(unittest.TestCase):
                 with self.subTest(text=text, chunk=chunk):
                     self.assertEqual(split(text, chunk, **options), expected)
 
+    def test_a_channels_label_after_the_opening_marker_is_dropped(self):
+        channel = ReasoningFormat("[[c]]", "[[/c]]", label="thought")
+        cases = [("[[c]]thought\nplan it\n[[/c]]Answer.", ("plan it", "Answer.")),
+                 ("[[c]]thought\n[[/c]]Answer.", ("", "Answer.")),            # an empty channel
+                 ("[[c]]thinking aloud[[/c]]x", ("thinking aloud", "x")),      # no label: kept whole
+                 ("[[c]]thou", ("thou", ""))]                                 # cut inside the label
+        for text, expected in cases:
+            for chunk in (None, 1, 3):
+                with self.subTest(text=text, chunk=chunk):
+                    splitter, events = ReasoningSplitter(channel), []
+                    for piece in ([text] if chunk is None else [text[i:i + chunk] for i in range(0, len(text), chunk)]):
+                        events += splitter.push(piece)
+                    events += splitter.finish()
+                    found = {"reasoning": "", "text": ""}
+                    for kind, value in events:
+                        found[kind] += value if isinstance(value, str) else value.text
+                    self.assertEqual((found["reasoning"], found["text"]), expected)
+
     def test_template_detection_and_package_formats(self):
         self.assertEqual(template_reasoning_format([THINK_TEMPLATE, "{{ x }}"]), "think-tags")
         self.assertIsNone(template_reasoning_format(["{{ messages[0].content }}"]))

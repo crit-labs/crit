@@ -257,11 +257,12 @@ def kv_elements_per_token(config, source=CONFIG_NAME):
     return tensors * kv_heads * head_dim * full
 
 
-def fixed_state_bytes(config, kv_bytes_per_element, source=CONFIG_NAME):
+def fixed_state_bytes(config, kv_bytes_per_element, source=CONFIG_NAME, sliding=True):
     """Bytes of state that does not grow with the context: the linear-attention recurrence (FP32 state, BF16
     convolution window of linear_conv_kernel_dim - 1, default kernel 4), the Mamba-2 recurrence of "mamba" layers
-    (FP32 state, BF16 convolution window of conv_kernel - 1) and the KV cache of sliding_attention layers
-    at kv_bytes_per_element. Layer kinds come from layer_types (or the sliding layers' ids); the linear_* sizes are
+    (FP32 state, BF16 convolution window of conv_kernel - 1) and, with `sliding`, the KV cache of sliding_attention
+    layers at kv_bytes_per_element (one window; without it, a caller that prices the rings itself: an EngineSpec's
+    kv_ring_bytes). Layer kinds come from layer_types (or the sliding layers' ids); the linear_* sizes are
     read only for linear_attention layers and the sliding window only for sliding_attention layers. A layer a looped
     decoder runs several times (layer_passes) keeps its state once a pass."""
     element = kv_bytes_per_element
@@ -293,7 +294,7 @@ def fixed_state_bytes(config, kv_bytes_per_element, source=CONFIG_NAME):
         hk = _integer(config, "linear_num_key_heads", source) or hv
         conv = max(0, (_integer(config, "linear_conv_kernel_dim", source) or 4) - 1) * (2 * hk * dk + hv * dv)
         total += linear * (hv * dk * dv * 4 + conv * 2)
-    sliding = count("sliding_attention")
+    sliding = count("sliding_attention") if sliding else 0
     head_dim = _head_dim(config, source)   # crit eval computes it for every config
     window = _sliding_window(config, source) if sliding else None
     if window and head_dim:
@@ -489,8 +490,8 @@ class Architecture:
     def kv_elements_per_token(self):
         return kv_elements_per_token(self.section, source=self.source)
 
-    def fixed_state_bytes(self, kv_bytes_per_element):
-        return fixed_state_bytes(self.section, kv_bytes_per_element, source=self.source)
+    def fixed_state_bytes(self, kv_bytes_per_element, sliding=True):
+        return fixed_state_bytes(self.section, kv_bytes_per_element, source=self.source, sliding=sliding)
 
     def routed_layers(self):
         return routed_layers(self.section, source=self.source)

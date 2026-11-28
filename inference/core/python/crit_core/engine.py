@@ -27,8 +27,10 @@ import copy
 import json
 import os
 import re
+import sys
 import threading
 import time
+import weakref
 from pathlib import Path
 
 from crit_core.native import NativeError, StepEngine
@@ -37,6 +39,7 @@ from crit_core.serving import (ENGINE_FACTS, EXPERT_FACTS, REQUEST_FACTS, SAMPLI
 from crit_core.serving import capabilities as serving_capabilities
 from crit_plugins import IMAGES, Image, PluginError, Registry, assemble, check, model_problems
 from crit_plugins.assemble import exactness_shortfalls, normalize, resolution_problems, resolve as resolve_selection
+from crit_plugins import lifetime
 from crit_plugins.host import current as host_of
 from crit_plugins.memory import device_bytes, device_memory, of as memory_of, release_cached
 from crit_plugins.manifest import HOST
@@ -421,6 +424,11 @@ def check_package(package, model, configuration=None, device=None, probe=None):
     return check(chosen, registry, architecture_facts(model) + machine_facts(device, probe), device=device)
 
 
+# The folder crit serve --one-process names to its hosts for the files kept stores write themselves to, so the next
+# engine's host reopens them (LoadContext.kept_file).
+KEPT_FILES = "CRIT_KEPT_FILES"
+
+
 class DryContext:
     """What a plugin's resolve() gets as `context` outside a load (resolve_package): LoadContext's description of
     the engine (package, model, config, configuration, context_tokens, device, speculative, model_file) without its
@@ -634,6 +642,19 @@ class LoadContext:
         """A file of the checkpoint: crit serve's verified copy when served, else the model folder's."""
         return Path(self.serving.model_file(name)) if self.serving is not None else self.model / name
 
+    def kept_file(self, name, key):
+        """The file a kept store may write itself to and reopen from in a later process, or None: under crit serve
+        --one-process each engine's host ends with it (crit_api.residency), so a store kept for the next engine
+        outlasts its process as a file (KEPT_FILES, the folder the server names; a store that reopens a complete file
+        instead of building it again, an expert source's bundle store); elsewhere None and keep() holds it in the
+        process."""
+        folder = os.environ.get(KEPT_FILES)
+        if not folder:
+            return None
+        from .kept import key_digest
+        safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in str(name))
+        return Path(folder) / f"{safe}-{key_digest(key)[:16]}.store"
+
     def keep(self, name, key, build, close=None, nbytes=None):
         """A host-side store the plugin builds from the checkpoint, kept for the next engine built for the same model
         in this host (crit_core.kept.Kept.keep): `key` names everything its bytes depend on (any JSON value; the
@@ -706,6 +727,13 @@ def load(package, model, configuration=None, *, context_tokens=None, speculative
     engine's facts carry the plugins it runs. kept: the in-process keeper of the plugins' host-side stores
     (LoadContext.keep), which outlives the engine.
 
+    The engine's close proves the device got its memory back (crit_plugins.lifetime): once the engine dropped every
+    reference it held, every elastic range, giver and captured graph its load made is gone and torch's bytes are at
+    their level before the load (what the process keeps for every engine named apart). A close that did not return
+    it warns (raises under CRIT_CLOSE_CHECK=raise), its report is the closed engine's telemetry's "close", and the
+    next load on the device refuses to start beside it (LeakingClose, the report its message), as does a load that
+    failed and kept what it made.
+
     The engine's policy (policy_of: what its configuration asks of its plugins; cache: the folder for files they can
     build again, else PLUGIN_CACHE's) is its own: it is active while the engine loads and around every call Core
     makes into its plugins after (StepEngine's scope), and the engine carries it (`engine.policy`), so two engines in
@@ -718,10 +746,27 @@ def load(package, model, configuration=None, *, context_tokens=None, speculative
     package = Path(package)
     configuration = read_configuration(package) if configuration is None else dict(configuration)
     policy = policy_of(package, configuration, cache)
+    full_speed()   # every process that loads an engine keeps its speed behind another window (crit_core.machine)
     with policy.active():
         return _load(package, model, configuration, policy, context_tokens=context_tokens, speculative=speculative,
                      device=device, serving=serving, library=library, kept=kept,
                      max_concurrent_requests=max_concurrent_requests, pending_timeout=pending_timeout)
+
+
+_FULL_SPEED = {}   # the process's answer, asked once: whether Windows took the opt-out from power throttling
+
+
+def full_speed():
+    """Opt the process out of Windows' power throttling once (crit_core.machine.keep_full_speed), before its first
+    engine loads: Core's load does it for every caller (crit serve's host, crit run, crit eval in process, the
+    tools that load an engine), so no engine slows while its window is in the background. Returns whether it held."""
+    if "held" not in _FULL_SPEED:
+        from .machine import keep_full_speed
+        _FULL_SPEED["held"] = keep_full_speed()
+        if not _FULL_SPEED["held"]:
+            print("crit_core: Windows refused full-speed scheduling; the engine slows while its window is in the "
+                  "background", file=sys.stderr, flush=True)
+    return _FULL_SPEED["held"]
 
 
 def _load(package, model, configuration, policy, *, context_tokens, speculative, device, serving, library, kept,
@@ -732,10 +777,15 @@ def _load(package, model, configuration, policy, *, context_tokens, speculative,
     registry = registry_of(package)
     device = device or engine_device(registry, chosen["use"], configuration)
     from crit_plugins import compiles
-    compiles.record()   # every compile from here on: one after load says what changed since the load's (Watch)
     context = LoadContext(package, model, configuration, context_tokens, device, speculative, serving, kept, policy,
                           max_concurrent_requests)
+    # what the model plugin declares it can take of Core's step settings (its manifest's steps): Core decides within
+    if chosen["use"].get("model") in registry:
+        context.steps.capable(registry[chosen["use"]["model"]].get("steps"))
     memory = context.memory
+    # The device's level before the load, which the engine's close is measured against; refused beside an earlier
+    # close that did not return its memory (crit_plugins.lifetime), before anything is made.
+    opened = lifetime.open(memory)
     # The device memory the givers leave free at every moment is the run's headroom, the device's to keep: no plugin
     # sizes or tunes it (crit_plugins.memory's step frames).
     memory.headroom = headroom_of(configuration)
@@ -745,9 +795,22 @@ def _load(package, model, configuration, policy, *, context_tokens, speculative,
     known = architecture_facts(model) + machine_facts(device)
     # What the plugins say the engine will be before any of them is made (their resolve()): the loaded engine is held
     # to it below, so the answer crit run checks a plan against before any load is the one every load gives.
-    resolved = resolve_selection(registry, *check(chosen, registry, known, device=device), context)
-    assembly = assemble(chosen, registry, context, known, device=device, observe=calls,
-                        measure=lambda: device_bytes(device))
+    # every compile from here to the engine's close: one after load says what changed since the load's (Watch)
+    recording = compiles.record()
+    try:
+        resolved = resolve_selection(registry, *check(chosen, registry, known, device=device), context)
+        assembly = assemble(chosen, registry, context, known, device=device, observe=calls,
+                            measure=lambda: device_bytes(device))
+    except BaseException as failure:   # what the plugins made is closed (assemble): the device has it back
+        recording.stop()
+        try:
+            context.scratch.close()
+            context.release_kept()
+        finally:
+            _returned_after(opened, failure)
+        raise
+    # The engine's plugins, followed to the close: one still alive then is named with what holds it.
+    opened.watch({**assembly.instances, "model": assembly["model"]})
     engine = None
     try:
         step_model = assembly["model"]
@@ -785,6 +848,19 @@ def _load(package, model, configuration, policy, *, context_tokens, speculative,
             found, now = device_memory(device), memory.report()
             return found if found is None or now is None else {**found, "other": now["other"]}
         load = {"made": held(), "released_cached": release_cached(device), "resolved": dict(resolved["facts"])}
+        # The engine's description with every value's source (crit_core.spec), the one the load was held to
+        from .spec import spec_of
+        load["spec"] = spec_of(package, model, configuration, resolved, context_tokens=context.context_tokens,
+                               speculative=speculative)
+        from crit_plugins.assemble import PRICES
+        prices = {name: item["value"] for name, item in load["spec"]["values"].items() if name in PRICES}
+        if prices:   # what crit Eval sizes the engine by (crit_core.serving.engine_facts: spec_prices)
+            facts["spec_prices"] = prices
+        # The engine is its spec: every resolved value as resolved, the context it is asked for at least
+        from .spec import differences
+        unlike = differences(load["spec"], {**assembly.facts(), **stated})
+        if unlike:
+            raise PluginError("the engine is not its spec (crit_core.spec, telemetry load.spec): " + "; ".join(unlike))
         load["opened"] = held()
         # The plugin objects themselves, past the loader's counting proxies: a frame is Core's call, not the
         # model's use of a slot. One object in two slots is told once.
@@ -808,19 +884,25 @@ def _load(package, model, configuration, policy, *, context_tokens, speculative,
             memory.unwatch()
             if watched.get("compiles") is not None:
                 watched.pop("compiles").stop()
+            recording.stop()
             try:
                 assembly.close()
             finally:
                 context.scratch.close()
                 context.release_kept()
+                memory.retire_pool()   # the step pool's segments go back with it: the next load's steps take a new one
         def health():   # a host handoff that failed (its job threw, or ran past the job budget) ends the engine
             failed = context.host.failures()
             return "; ".join(f"the host handoff {label} failed: {why}" for label, why in failed.items()) or None
         engine = StepEngine(step_model, library, facts=facts, close=close, telemetry=telemetry, frames=frames,
                             relieve=memory.relieve, health=health, memory=memory, timed=context.steps.observe,
                             scope=policy.active, max_concurrent_requests=max_concurrent_requests,
-                            pending_timeout=pending_timeout)
+                            pending_timeout=pending_timeout, returned=opened.close)
         engine.policy, engine.steps = policy, context.steps
+        # An engine dropped without close() leaves the device (crit_plugins.lifetime: measured at the next load),
+        # instead of staying open beside every later engine, whose closes would then go unjudged.
+        weakref.finalize(engine, opened.dropped)
+        weakref.finalize(engine, recording.stop)   # and its compile recording ends with it
         problems = slot_problems(engine, assembly.use, calls, contracts=registry.contracts)
         if problems:
             raise PluginError(f"{assembly.use['model']}: the engine is not its plugins: " + "; ".join(problems))
@@ -854,17 +936,42 @@ def _load(package, model, configuration, policy, *, context_tokens, speculative,
         # telemetry says what compiled (core.compiles_after_load), which crit run serve --check fails.
         from crit_plugins.compiles import Watch
         watched["compiles"] = Watch()
+        # an engine dropped without its close stops watching compiles once it is collected, as its close would
+        weakref.finalize(engine, _stop_watch, watched)
         return engine
-    except BaseException:
+    except BaseException as failure:
         if engine is not None:
+            # Measured quietly: the failure's traceback still holds this frame and the plugins it refers to, so a
+            # leak is only recorded, and the next load measures it again once the traceback is gone (refuse()).
+            engine._returned = lambda: opened.close(quiet=True)
             engine.close()
         else:
+            recording.stop()
             try:
                 assembly.close()
             finally:
-                context.scratch.close()
-                context.release_kept()
+                try:
+                    context.scratch.close()
+                    context.release_kept()
+                    memory.retire_pool()
+                finally:
+                    _returned_after(opened, failure)
         raise
+
+
+def _stop_watch(watched):
+    """The compile watch of an engine collected without its close (a weakref finalizer: it holds no engine)."""
+    found = watched.pop("compiles", None)
+    if found is not None:
+        found.stop()
+
+
+def _returned_after(opened, failure):
+    """A load that failed before its engine was made closed what it made: measured as a close is, quietly (the
+    failure's traceback still holds the loader's frame and what it refers to), so a leak is recorded and the next
+    load measures it again once the traceback is gone and refuses beside it if it holds (crit_plugins.lifetime's
+    refuse). The load's own failure is the one raised."""
+    opened.close(quiet=True)
 
 
 # What a placement plan need not list: the small tensors (norms, tables) and the workspace a model keeps, as a share of
@@ -1064,6 +1171,11 @@ class EvalEngine:
                 "native_libraries": list(self.facts.get("native_libraries") or []), "replay": True,
                 "plain": self.speculative, "plugins": self.facts.get("plugins")}
         info.update({key: self.facts[key] for key in FACTS if key in self.facts})
+        # The engine's spec, every value with its source (crit_core.spec), so Eval's result tells a user's choice
+        # from a default
+        spec = ((self.native.telemetry() or {}).get("load") or {}).get("spec")
+        if spec:
+            info["spec"] = spec["values"]
         return info
 
     def _result(self, tokens, result):
@@ -1144,7 +1256,9 @@ class EvalEngine:
         """One closed-loop level of crit-eval's concurrency part, in process: clients[c] is client c's prompts, each
         generated (stop tokens off) once the client's previous one ended, every client starting at once on its own
         thread: greedily, or with sampling (sampling[c][r] the sampling fields of client c's r-th request, those the
-        engine applies kept, as generate_sampled keeps them) sampled. {"seconds": the level's wall interval, "requests": per request its client,
+        engine applies kept, as generate_sampled keeps them) sampled; max_new_tokens every request's output tokens, or
+        each one's (max_new_tokens[c][r], crit-eval's case requests at their own lengths). {"seconds": the level's
+        wall interval, "requests": per request its client,
         index, prompt_tokens, the seconds from the level's start when it was sent, its first and last tokens came and
         it ended (started, first, last, finished), completion_tokens, finish_reason, cached_tokens (0: no prompt
         cache in process), errors (none: no stream to validate), its tokens and, where the engine reports them, its
@@ -1159,9 +1273,11 @@ class EvalEngine:
                 chosen = (self.sampling if not sampling else
                           {key: value for key, value in sampling[index][position].items()
                            if key in self.sampling_fields})
+                length = (max_new_tokens[index][position] if isinstance(max_new_tokens, (list, tuple))
+                          else max_new_tokens)
                 try:
                     tokens, result = self.native.generate(
-                        list(prompt), int(max_new_tokens), stop_tokens=[], sampling=dict(chosen),
+                        list(prompt), int(length), stop_tokens=[], sampling=dict(chosen),
                         on_tokens=lambda found, *rest: stamps.append(time.perf_counter() - epoch[0]))
                 except BaseException as error:  # noqa: BLE001 - the level stops with it
                     failures.append(error)
@@ -1189,7 +1305,10 @@ class EvalEngine:
         return {"seconds": seconds, "requests": rows}
 
     def close(self):
+        """Close the engine; returns its close's report (crit_plugins.lifetime: "returned", "message", what still
+        holds memory), which crit-eval records where it opens an engine again (eval-v1's optional close report)."""
         self.native.close()
+        return self.native.close_report
 
 
 def release_override(configuration):
@@ -1362,8 +1481,12 @@ class ResidentEngine(ResidentChat):
         return self.native.telemetry()
 
     def close(self):
+        """Close the engine (a request's copy closes nothing); returns its close's report (crit_plugins.lifetime),
+        which crit serve's host reports as the last close (crit_api.host)."""
         if self._owns_native:
             self.native.close()
+            return self.native.close_report
+        return None
 
 
 def resident(context, package):

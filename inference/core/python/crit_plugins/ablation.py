@@ -317,6 +317,13 @@ def blame(report_variants, selection, noise=NOISE):
                 and by_name.get("full", {}).get("state") == "failed":
             breaks.add("load")   # the engine loads without it and not with it
         row["breaks"] = sorted(breaks)
+        failed = [by_name[name] for name in (f"without:{plugin_id}", f"only:{plugin_id}") if name in by_name
+                  and by_name[name].get("state") == "failed" and by_name[name].get("infrastructure")]
+        if failed and not row["breaks"] and not effects["in_engine"] and not effects["alone"]:
+            # its variant failed, and the engine as built failed right after it too: not the plugin's doing
+            row.update(verdict="unmeasured", detail=failed[0]["infrastructure"], judged=[])
+            out.append(row)
+            continue
         def judged(effect):
             if ROUND in effect and plugin_id not in drafting:
                 return {kpi: e for kpi, e in effect.items() if kpi != "decode_tps" and e[0] is not None}
@@ -353,7 +360,11 @@ def settings(report_variants, noise=NOISE):
             row["in_engine"] = {kpi: effect[0] for kpi, effect in effects["in_engine"].items()}
             row["breaks"] = sorted(_failed(variant) - _failed(full))
         _paired_rows(row, effects)
-        if variant.get("state") == "failed" and full is None:
+        if variant.get("state") == "failed" and variant.get("infrastructure"):
+            # the engine as built failed right after it too (cli ablate's recheck): the machine's, not the option's
+            row["verdict"] = "unmeasured"
+            row["detail"] = variant["infrastructure"]
+        elif variant.get("state") == "failed" and full is None:
             # The engine as built did not serve either: what stopped both is not the option's doing (a refused serve,
             # a load that fails with every option), so nothing is blamed on it.
             row["verdict"] = "unmeasured"

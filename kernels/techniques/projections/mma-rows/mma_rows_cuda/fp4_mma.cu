@@ -718,7 +718,7 @@ cudaError_t enqueue_fp4(const Problem& given, cudaStream_t stream) {
   // The configuration crit_tuning.h's table names for this matrix and row count (0, the defaults, where it names
   // none); warps and splits come with p (plan()'s, from the same table).
   switch (crit_lookup_fp4_tile(p.N, p.K, p.M)) {
-#define CRIT_FP4_CONFIG(index, warps, splits, hoist) \
+#define CRIT_FP4_CONFIG(index, warps, hoist) \
   case index:                                        \
     return by_rows<hoist>(p, stream);
     CRIT_CONFIGS_fp4_tile(CRIT_FP4_CONFIG)

@@ -139,7 +139,7 @@ def capture_workspaces(stream):
     pool = _WORKSPACE_POOLS.get(device)
     if pool is None:
         pool = _WORKSPACE_POOLS[device] = torch.cuda.MemPool()
-        memory_of(device).pool("captures", "matrix workspaces", pool.id)
+        memory_of(device).pool("captures", "matrix workspaces", pool.id, process=True)
     empty = torch.cuda.CUDAGraph()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")   # torch warns that the capture is empty
@@ -934,7 +934,7 @@ class SpeculativeRounds:
             observed = self._observer.snapshot() if self._observer is not None else None
             try:
                 capture_workspaces(stream)
-                with memory.capturing(pool), torch.cuda.graph(graph, pool=pool, stream=stream):
+                with memory.capturing(pool, graph), torch.cuda.graph(graph, pool=pool, stream=stream):
                     self._round(rows, width, mode, logprobs)
             finally:
                 if collecting:

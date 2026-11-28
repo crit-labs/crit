@@ -35,7 +35,9 @@ def _constants(device):
     import torch
     key = str(device)
     if key not in _CONSTANTS:
-        _CONSTANTS[key] = {"e2m1": torch.tensor(E2M1, dtype=torch.float32, device=device)}
+        from crit_plugins.memory import of   # the process's, for every engine on the device (crit_plugins.lifetime)
+        _CONSTANTS[key] = {"e2m1": of(device).process("grouped-experts", "fallback.e2m1",
+                                                      torch.tensor(E2M1, dtype=torch.float32, device=device))}
     return _CONSTANTS[key]
 
 

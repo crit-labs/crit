@@ -2069,6 +2069,15 @@ def require_stop_plan(root, run, bounds):
     if not plans or plans[-1]["decision"] != "stop":
         raise ValueError("search_exhausted with candidates left in the budget requires a stop plan: " + hint)
     plan = load(root, run, plans[-1]["plan_id"])
+    # A stop plan from the newest candidate on the ladder stands where that candidate has no completed Eval (sealed
+    # built, below its rung's Eval): it froze none, as every plan from it does, and the run's newest Eval is an older
+    # candidate's (the 2026-11-25 run, which had to plan from an older candidate to stop).
+    counted = ladder.counted(root)
+    newest_on_ladder = max(counted) if counted else None
+    if (newest_on_ladder is not None and plan["parent_candidate_id"] == newest_on_ladder
+            and plan["inputs"]["eval"] is None
+            and not completed_evals(root, newest_on_ladder)):
+        return plan
     if (plan["inputs"]["eval"] or {}).get("path") != expected:
         raise ValueError(f"{plan['plan_id']} froze {(plan['inputs']['eval'] or {}).get('path')}, not the newest Eval "
                          f"{expected}: " + hint)

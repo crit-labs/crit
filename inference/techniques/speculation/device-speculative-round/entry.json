@@ -3,7 +3,7 @@
   "category": "speculation",
   "summary": "GPU-resident speculative round: draft, verify, device accept and frontier advance in two CUDA graphs with one readback, for greedy requests and for sampled requests verified by rejection sampling",
   "implementation_status": "reference",
-  "implementation_scope": "The rules of a device round and a Python round/step budget. Sampled requests reuse the greedy accept on predictions from token-sampling's verify (the target's own draws for greedy drafts, rejection sampling for sampled drafts, Core's counter-based draws). Engine draft, verify and state steps are the engine's; no tuned or model-specific kernels. Engines' rounds run on Core's round driver (crit_plugins.rounds: the same accept, truncation and pack over engine hooks or the library's device forms, one CUDA graph per row count, width and mode, replay and forced modes), with the technique's rejection-sampling predictions and copied drafts (python_round.py) and an adaptive width policy (width_policy.py).",
+  "implementation_scope": "The rules of a device round and a Python round/step budget. Sampled requests reuse the greedy accept on predictions from token-sampling's verify (the target's own draws for greedy drafts, rejection sampling for sampled drafts, Core's counter-based draws). Engine draft, verify and state steps are the engine's; no tuned or model-specific kernels. Engines' rounds run on Core's round driver (crit_plugins.rounds: the same accept, truncation and pack over engine hooks or the library's device forms, one CUDA graph per row count, width and mode, replay and forced modes), with the technique's rejection-sampling predictions and copied drafts (python_round.py); the adaptive draft width is Core's round driver's (crit_plugins.rounds width_policy rate).",
   "agent_guidance": {
     "use_when": "A synchronous speculative loop is correct but host round trips, per-token readbacks or host acceptance dominate the round, for greedy or sampled requests",
     "avoid_when": "Verifying K+1 columns costs about K+1 ordinary steps, or the engine cannot keep per-column state for prefix selection; or routed experts stream from host memory, where every verify column adds its own expert misses",
@@ -23,7 +23,6 @@
       "A host check that a batched operator computes every column bitwise identically at any batch width, with fixed-order and width-dependent reference operators",
       "Python engines: rounds on Core's round driver (crit_plugins.rounds, SpeculativeRounds over three hooks: draft with catch-up, verify writing predictions, commit from the round's start), greedy, sampled, replay and forced modes, one CUDA graph per (rows, width, mode) captured at load, rows that join, leave and move between rounds, truncation to Core's count and one pinned readback per round",
       "rejection_predictions: per-column predictions under which the greedy accept rule is rejection sampling (accept with min(1, p/q), else draw from max(p - q, 0)), so a sampled verify needs no kernel of its own",
-      "WidthPolicy (width_policy.py): the draft width per round from each row's decayed per-depth acceptance over the fitted round cost, for the rows that decode together",
       "Copied drafts for Python rounds: CopyDrafts stages a copy drafter's tokens and match lengths between rounds and override_drafts replaces a neural drafter's tokens where the match is long, with one-hot draft laws for sampled rows; capture-safe"
     ],
     "engine_supplies": [
@@ -70,10 +69,6 @@
     {
       "path": "inference/techniques/speculation/device-speculative-round/code/python_round.py",
       "purpose": "Rejection-sampling predictions and copied drafts for rounds on Core's round driver (crit_plugins.rounds)"
-    },
-    {
-      "path": "inference/techniques/speculation/device-speculative-round/code/width_policy.py",
-      "purpose": "Adaptive draft width per round from per-depth acceptance over the measured round cost"
     }
   ],
   "requires": {
@@ -101,7 +96,6 @@
     "width_split_dot",
     "rejection_predictions",
     "draw",
-    "WidthPolicy",
     "override_drafts",
     "CopyDrafts"
   ],

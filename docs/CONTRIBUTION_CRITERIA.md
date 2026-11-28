@@ -32,7 +32,8 @@ licensing).
 ## Interfaces, not instances
 
 When a model needs something crit does not offer, add the **general mechanism** to
-crit and put the model's **instance** in its engine package.
+crit and put the model's **instance** in its family's package or its engine package
+([a family's own pieces](#a-familys-own-pieces)).
 
 | A model needs | Don't add to crit | Add to crit instead |
 | --- | --- | --- |
@@ -54,10 +55,39 @@ between them on each device ([guarding against one GPU](../kernels/README.md#one
 technique as mechanism, how a plugin declares and loads a kernel with its fallback, and what a technique keeps
 instead of a list of kernels.
 
-The tool-call work from the Gemma 4 run shows the pattern. A Gemma-only parser
+The tool-call work from the Gemma 4 runs shows the pattern. A Gemma-only parser
 (`gemma-call`) went into Core first and was then replaced by `ResidentChat.tool_format`,
 which lets any package supply its own syntax. The second version is what belongs in
-crit.
+crit's shared code; Gemma 4's syntax itself lives in its family's package
+(`models/cache/gemma4-model/tools.py`), so the next Gemma 4 engine takes it instead of
+writing it again.
+
+## A family's own pieces
+
+A piece only one model family uses (its tool-call syntax, a drafter published beside its checkpoints, a technique only
+its layout composes) has a home in crit: that family's finished model plugin, `models/cache/<family>`
+([a family's own pieces](../models/cache/README.md#a-familys-own-pieces)), where the family's name is already data. It
+holds code only that family uses, and holds it to the library's standard, not an engine's:
+
+- **Built from crit's interfaces.** A model technique of its own (`techniques/ID`: an `entry.json`, a README, `code/`,
+  laid out as [models/techniques](../models/techniques/README.md)' are, its manifest mounting it as its own source),
+  or a hook crit defines (`tool_format`, `reasoning_format`). It reads its tensors and config keys through the layout
+  and declares them (`reads`, held by [test_technique_reads.py](../tests/test_technique_reads.py)), takes its kernels
+  from crit's templates with their torch fallback, and holds no constant measured on one GPU.
+- **Engine-tested.** Its package's tests serve tiny random checkpoints of the family in its two checkpoint layouts
+  against the official implementation (transformers where it has one, else a host reference written from the published
+  config, which the test says), as every model technique is.
+- **Its family's only.** Its package's layout composes it and no other family's does. Shared code still names no
+  model and imports no family package. When a second family needs a piece, the change that makes it use it moves the
+  piece to [models/techniques](../models/techniques/README.md) (or `inference/techniques`) under its general name, in
+  that same change.
+
+[test_model_neutral.py](../tests/test_model_neutral.py) holds the placement (family code only inside its own package,
+no shared module importing one). So an engine build that writes a family-only piece that works proposes it back to the
+family's package as toolkit feedback, and the next build of that family starts from it instead of writing it again
+(the next build cannot learn from a sealed engine).
+
+## Shared knowledge
 
 Knowledge that is shared across model families is fine to put in crit. Examples are
 published checkpoint formats (NVFP4 in ModelOpt or compressed-tensors layout), config
@@ -74,7 +104,7 @@ When Python and C++ both need the same table, they read one source.
 ## Model-neutral code
 
 crit's shared code names no model. Shared code is everything but the finished model plugins in
-[models/cache](../models/cache/README.md): Core and the Inference techniques, Kernels, the models core, the model
+[models/cache](../models/cache/README.md) (which hold [a family's own pieces](#a-familys-own-pieces)): Core and the Inference techniques, Kernels, the models core, the model
 techniques, the CLI, the API, Eval, the MCP server, smoke and tools, every text file there whatever its suffix
 (`.py`, `.cu`, `.inc`, `.in`, `.toml`, a file with none) but Markdown. A model name, a model type or one checkpoint's
 tensor spelling may appear only as data, in a model plugin's `plugin.json` and `layout.json` (and its README and
@@ -172,8 +202,8 @@ declares and the official code ignores).
   the device; is a new instruction behind a feature check with the other GPUs' path
   beside it and tested on the reference GPU; does a new structure sit beside the one
   it beat; does every number name its device?
-- Is the model-specific part, if there is one, in the engine package behind a general
-  interface?
+- Is the model-specific part, if there is one, behind a general interface, in its family's package
+  (built and tested to the library's standard) or in the engine package?
 - Does the change add a second copy of something crit already has?
 - Does it decide how an engine computes or schedules on the device (a level, a default, a budget, the order of
   requests)? Then it is Core's ([what Core decides](../inference/core/README.md#what-core-decides)), and every other place
@@ -181,5 +211,6 @@ declares and the official code ignores).
 - Do the host suite (`tests/test_model_neutral.py` among it) and, for native code, the CMake suite pass?
 
 When the answer to any of these is unclear, keep the change in the engine and record
-it as toolkit feedback in the run's `summary.md`. It can move into crit once a second
+it as toolkit feedback in the run's `summary.md`. A family-only piece that meets the
+standard above moves into its family's package; shared code takes it once a second
 model or machine shows that it generalizes.

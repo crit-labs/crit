@@ -146,6 +146,7 @@ SELECTION = {"use": {**USE, "attention": "attn-slow", "drafter": "draft-three"},
 
 
 class AblateTests(run_measure.MeasureFixture, unittest.TestCase):
+    evaluated = False   # an ablation checks a packaged candidate
     def setUp(self):
         super().setUp()
         # A candidate-budget run: its safety window outlasts the ablation's reservation.
@@ -376,6 +377,29 @@ class AblateTests(run_measure.MeasureFixture, unittest.TestCase):
         self.assertEqual((row["plugin"], row["verdict"]), ("set:draft-three.width=1", "unmeasured"), row)
         self.assertIn("as built", row["detail"])
 
+    def test_a_failed_variant_is_checked_against_the_engine_as_built_served_right_after_it(self):
+        import crit.run.ablate as ablate_module
+
+        class Served:
+            expired, opened = False, 0
+
+            def __init__(self, fails):
+                self.fails = fails
+
+            def open(self):
+                self.opened += 1
+                if self.fails:
+                    raise RuntimeError("CUDA error: device lost")
+        lines = []
+        row = ablate_module._recheck(Served(True), {"name": "set:a.x=1", "state": "failed"}, lines.append)
+        self.assertIn("the engine as built failed right after it too (RuntimeError: CUDA error: device lost)",
+                      row["infrastructure"])
+        self.assertIn("is not blamed on it", lines[-1])
+        served = Served(False)
+        self.assertNotIn("infrastructure", ablate_module._recheck(served, {"name": "set:b", "state": "failed"},
+                                                                  lines.append))
+        self.assertEqual(served.opened, 1)
+
     def test_an_interrupted_ablation_settles_its_attempt_and_keeps_the_variants_it_served(self):
         # Ctrl+C or SIGTERM while a variant is served: the variant leaves no empty entry the report cannot combine,
         # the attempt settles as interrupted (an unsettled one refuses every later serve of the run) and the interrupt
@@ -414,7 +438,8 @@ class AblateTests(run_measure.MeasureFixture, unittest.TestCase):
         def item(engine, info, prepared, protocol, data, mode, budget, log):
             seen.update(mode=mode, budget=budget, data=data)
             return {"name": "precheck_quality", "state": "passed", "detail": "within", "budget_used": 0.38,
-                    "worst_set": "long-32768/prompt"}
+                    "worst_set": "long-32768/prompt",
+                    "baseline": {"budget_used": 0.21, "set": "long-32768/prompt", "dtype": "bfloat16"}}
         judge = {"prepared": {"speed": []}, "model": "m", "kv_tokens": 4096, "protocol": {}, "data": "d", "mode": "speed",
                  "budget": {"kld_mean_max": 0.4}}
         lines = []
@@ -422,9 +447,11 @@ class AblateTests(run_measure.MeasureFixture, unittest.TestCase):
                 mock.patch("crit_eval.run.precheck.quality_item", item):
             found = ablate_module._quality(judge, 1, "run/candidate", lines.append, "set:x.keep=8")
         self.assertEqual(found, {"state": "passed", "detail": "within", "budget_used": 0.38,
-                                 "worst_set": "long-32768/prompt"})
+                                 "worst_set": "long-32768/prompt",
+                                 "baseline": {"budget_used": 0.21, "set": "long-32768/prompt", "dtype": "bfloat16"}})
         self.assertEqual(seen, {"mode": "speed", "budget": {"kld_mean_max": 0.4}, "data": "d"})
         self.assertIn("set:x.keep=8: quality passed, 38% of the drift budget", lines[-1])
+        self.assertIn("the 16-bit baseline 21% of it there", lines[-1])   # beside it, never judged
 
     def test_a_single_pass_that_judged_a_change_asks_for_rounds_before_it_is_acted_on(self):
         import contextlib
@@ -443,6 +470,21 @@ class AblateTests(run_measure.MeasureFixture, unittest.TestCase):
         result = ablate(self.store, self.run_id, candidate, smoke=False)
         self.assertEqual([row["name"] for row in result["variants"]], ["full"])
         self.assertEqual(result["blame"], [])
+
+
+
+class PreviousCloseTests(unittest.TestCase):
+    def test_a_variant_row_says_how_the_engine_served_before_it_closed(self):
+        # Served.open reads each reload's close (crit serve's last_close): the variant's row carries the one its
+        # reload made, and a row whose reload closed nothing carries none.
+        from types import SimpleNamespace
+        from crit.run.ablate import _closed
+        served = SimpleNamespace(closes=[{"returned": True, "judged": True, "message": "returned", "close": 1}])
+        self.assertNotIn("previous_close", _closed(served, 1, {"name": "base"}))
+        served.closes.append({"returned": False, "judged": True, "message": "elastic range a/b is open", "close": 2,
+                              "reopened_at": None})
+        self.assertEqual(_closed(served, 1, {"name": "full"})["previous_close"],
+                         {"returned": False, "judged": True, "message": "elastic range a/b is open"})
 
 
 if __name__ == "__main__":

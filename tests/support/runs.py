@@ -3,8 +3,10 @@ records executes. Every candidate's source and package is a plugin package, as c
 plugins (support/engines.py) beside the fixture's files. Importing it puts crit's packages, and crit Eval beside this
 checkout, on the path."""
 from datetime import datetime
+import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sys
 import tempfile
@@ -107,7 +109,13 @@ class RunFixture:
                               "choice": "current", "reason": "fixture"}, **updates}
         if self.run["spec"]["correctness"]["quality_mode"] == "speed":
             value.setdefault("prompt_activations", "stored")
-        return self.store.plan(self.run_id, value)["plan_id"]
+        try:
+            return self.store.plan(self.run_id, value)["plan_id"]
+        except ValueError as error:   # the same first plan, still open, is recorded already: that one is it
+            found = re.search(r"recorded already, as (plan-\d+)", str(error))
+            if found is None:
+                raise
+            return found.group(1)
 
     def child_plan(self, parent, **updates):
         """Record a build plan from `parent`, a candidate on the candidate ladder without an Eval (on_ladder), with one
@@ -121,10 +129,21 @@ class RunFixture:
     def on_ladder(self, candidate):
         """Put a candidate below the full Eval on the candidate ladder, as serve --check and seal built do: a passed
         functional check that serve --check recorded, and the seal. Returns its id."""
-        candidate_id = candidate["candidate_id"]
+        candidate_id = self.serve_checked(candidate)
+        self.store.seal(self.run_id, candidate_id, "built")
+        return candidate_id
+
+    def serve_checked(self, candidate):
+        """A candidate (or its id) packaged where it is not, with the passed functional check serve --check records:
+        the state crit run's transition table lets an Eval start in (crit.run.state). Returns its id. A candidate that
+        has one already is left as it is."""
+        candidate_id = candidate if isinstance(candidate, str) else candidate["candidate_id"]
         folder = self.directory / "candidates" / candidate_id
         if not (folder / "package").is_dir():
-            self.package(candidate)
+            self.package({"candidate_id": candidate_id})
+        if any(read_json(path).get("extensions", {}).get("recorded_by") == "crit run serve --check"
+               for path in (folder / "checks").glob("check-*.json")):
+            return candidate_id
         package = read_json(folder / "package" / "manifest.json")
         path = folder / "logs" / "serve-check-fixture.json"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -135,8 +154,25 @@ class RunFixture:
             "evidence": [{"path": path.relative_to(self.directory).as_posix(), "sha256": file_sha(path)}],
             "evidence_level": "artifact_verified", "recorded_at": now(),
             "extensions": {"recorded_by": "crit run serve --check"}})
-        self.store.seal(self.run_id, candidate_id, "built")
         return candidate_id
+
+    def eval_completed(self, candidate, value=None):
+        """A candidate that passed serve --check (serve_checked) with a completed Eval attempt retained (its result
+        {"status": value}): the state crit run's transition table lets a measurement start in. Returns the attempt."""
+        candidate_id = self.serve_checked(candidate)
+        reservation = self.store.reserve(self.run_id, candidate_id, "eval")
+        path = self.directory / "candidates" / candidate_id / "eval" / (reservation["attempt_id"] + ".json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # the engine served what its plan declared (a child plan is checked against it)
+        plan_id = read_json(self.directory / "candidates" / candidate_id / "candidate.json").get("plan_id")
+        declared = (read_json(self.directory / "plans" / plan_id / "plan.json").get("prompt_activations")
+                    if plan_id and (self.directory / "plans" / plan_id / "plan.json").is_file() else None)
+        path.write_text(json.dumps({"status": value or {"gates": []},
+                                    **({"engine": {"prompt_activations": declared}} if declared else {})}),
+                        encoding="utf-8")
+        self.store.settle(self.run_id, reservation, {"outcome": "completed", "ended_at": reservation["reserved_at"],
+                          "exit_code": 0, "cleanup_settled": True, "logs": [], "failure": None})
+        return reservation["attempt_id"]
 
     def candidate(self, **updates):
         """A candidate from a recorded plan: the given plan_id, else a plan crit records for it, a child plan of its
